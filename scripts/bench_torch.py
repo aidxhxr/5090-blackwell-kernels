@@ -37,6 +37,7 @@ HGEMM_SHAPES = [(1024, 1024, 1024), (2048, 2048, 2048), (4096, 4096, 4096), (819
                 (4096, 4096, 11008), (4096, 11008, 4096),
                 (1, 4096, 4096), (16, 4096, 4096), (32, 4096, 4096), (64, 4096, 4096),
                 (16, 11008, 4096), (64, 4096, 11008)]
+FP8GEMM_SHAPES = HGEMM_SHAPES  # bench_fp8gemm.cu times bench_hgemm's list
 # (B, H_q, H_kv, S_q, S_kv, D, causal): the timed shapes of bench_attention.cu (its small
 # validation shapes are timed there too but are not worth a torch line). H_kv < H_q is
 # grouped-query attention (Llama-3-8B is 32/8), which torch's SDPA takes with enable_gqa=True.
@@ -161,6 +162,29 @@ def bench_hgemm(sk, add, M, N, K):
     ours = time_ms(lambda: sk.hgemm(a, next_b()))
     ref = time_ms(lambda: a @ next_b())
     add("hgemm", "bf16", gemm_shape(M, N, K), ours, ref, tflops=2.0 * M * N * K / ours / 1e9)
+
+
+def bench_fp8gemm(sk, add, M, N, K):
+    # a [M, K] and b_t [N, K] e4m3, per-tensor fp32 scales, bf16 out. torch._scaled_mm is
+    # cuBLASLt and takes b_t.t() (column-major [K, N]), the same bytes in the same layout.
+    a = torch.randn(M, K, device="cuda").to(torch.float8_e4m3fn)
+    scale_a = torch.tensor(0.75, device="cuda")
+    scale_b = torch.tensor(1.5, device="cuda")
+    # Decode shapes (M <= 64) stream b_t, which alone fits the RTX 5090's 96 MB L2 (16 MB for
+    # 4096^2 in e4m3), so the loop rotates through enough copies to exceed L2.
+    copies = (256 << 20) // (K * N) + 1 if M <= 64 else 1
+    bts = [torch.randn(N, K, device="cuda").to(torch.float8_e4m3fn) for _ in range(copies)]
+    turn = [0]
+
+    def next_bt():
+        b_t = bts[turn[0] % copies]
+        turn[0] += 1
+        return b_t
+
+    ours = time_ms(lambda: sk.fp8gemm(a, next_bt(), scale_a, scale_b))
+    ref = time_ms(lambda: torch._scaled_mm(a, next_bt().t(), scale_a=scale_a, scale_b=scale_b,
+                                           out_dtype=torch.bfloat16))
+    add("fp8gemm", "e4m3", gemm_shape(M, N, K), ours, ref, tflops=2.0 * M * N * K / ours / 1e9)
 
 
 def sdpa_backend(fn) -> str:
@@ -301,6 +325,8 @@ def main() -> int:
             bench_sgemm(sk, add, M, N, K)
         for M, N, K in HGEMM_SHAPES:
             bench_hgemm(sk, add, M, N, K)
+        for M, N, K in FP8GEMM_SHAPES:
+            bench_fp8gemm(sk, add, M, N, K)
     for B, Hq, Hkv, Sq, Skv, D, causal in ATTENTION_SHAPES:
         bench_attention(sk, add, B, Hq, Hkv, Sq, Skv, D, causal)
     if args.only or args.sdpa_backend:

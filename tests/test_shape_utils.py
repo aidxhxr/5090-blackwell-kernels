@@ -14,6 +14,7 @@ import shape_utils as su  # noqa: E402
     [
         ("sgemm", "M4096_N4096_K11008", {"M": 4096, "N": 4096, "K": 11008}),
         ("hgemm", "4096", {"M": 4096, "N": 4096, "K": 4096}),
+        ("fp8gemm", "16x4096x4096", {"M": 16, "N": 4096, "K": 4096}),
         ("rmsnorm", "4096x8192", {"rows": 4096, "cols": 8192}),
         ("softmax", "rows16_cols4096", {"rows": 16, "cols": 4096}),
         ("swiglu", "14336", {"rows": 1, "cols": 14336}),
@@ -92,6 +93,38 @@ def test_gemm_flops_and_intensity():
     assert su.flops("sgemm", dims) == 2 * 1024**3
     # 2*n^3 FLOP over 3*n^2 elements of 4 bytes
     assert su.arithmetic_intensity("sgemm", "f32", "1024") == pytest.approx(2 * 1024 / 12)
+
+
+def test_fp8gemm_counts_bytes_per_operand_and_uses_the_fp8_peak():
+    dims = {"M": 16, "N": 4096, "K": 4096}
+    # e4m3 operands are one byte each, the bf16 output two: half the bytes of the bf16 GEMM
+    assert su.traffic_bytes("fp8gemm", "e4m3", dims) == 16 * 4096 + 4096 * 4096 + 2 * 16 * 4096
+    assert su.traffic_bytes("hgemm", "bf16", dims) == 2 * (16 * 4096 + 4096 * 4096 + 16 * 4096)
+    assert su.flops("fp8gemm", dims) == 2 * 16 * 4096 * 4096
+    assert su.is_compute_bound_kernel("fp8gemm") and su.uses_tensor_cores("fp8gemm")
+    assert su.compute_peak_key("fp8gemm") == "fp8_tflops"
+    assert su.compute_peak_key("hgemm") == "bf16_tflops"
+    assert su.compute_peak_key("attention") == "bf16_tflops"
+    assert su.compute_peak_key("sgemm") == "fp32_tflops"
+    assert su.DEVICE_PEAKS["RTX 5090"]["fp8_tflops"] is None  # measured, never guessed
+
+
+def test_measured_peaks_reads_the_fp8_roof_and_not_the_documentation_rows(tmp_path):
+    rows = [{"device": "NVIDIA GeForce RTX 5090", "kernel": "peak_bf16_mma", "tflops": 258.7},
+            {"device": "NVIDIA GeForce RTX 5090", "kernel": "sm_clock", "ref_ms": 2976.0},
+            {"device": "NVIDIA GeForce RTX 5090", "kernel": "peak_fp8_mma", "tflops": 1013.9},
+            {"device": "NVIDIA GeForce RTX 5090", "kernel": "peak_fp8_mma_plain",
+             "tflops": 517.4},
+            {"device": "NVIDIA GeForce RTX 5090", "kernel": "peak_fp8_mma_f16acc",
+             "tflops": 1026.8},
+            {"device": "NVIDIA GeForce RTX 5090", "kernel": "peak_fp32_fma", "tflops": 123.4}]
+    import json
+    (tmp_path / su.PEAK_FILE).write_text("".join(json.dumps(r) + "\n" for r in rows))
+    measured = su.measured_peaks(tmp_path)
+    assert measured["fp8_tflops"] == 1013.9 and measured["bf16_tflops"] == 258.7
+    key, peaks = su.peaks_for_rows([{"device": "NVIDIA GeForce RTX 5090"}], measured=measured)
+    assert peaks["fp8_tflops"] == 1013.9 and peaks["bf16_tflops"] == 258.7
+    assert peaks["sm_mhz"] == 2976.0 and peaks["measured"]
 
 
 def test_ridge_points_match_the_hardware_sheets():

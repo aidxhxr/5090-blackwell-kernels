@@ -60,6 +60,34 @@ def test_hgemm_rows_are_reported_in_tflops(results):
         out / "headline.md").read_text()
 
 
+def test_fp8gemm_rows_use_the_fp8_peak_and_the_cublaslt_label(results):
+    out, write = results
+    write("fp8gemm.json", [
+        bench_row("fp8gemm", "e4m3", 1, "4096x4096x4096", 0.25, tflops=549.8, ref_ms=0.2),
+        bench_row("fp8gemm", "e4m3", 2, "4096x4096x4096", 0.2, tflops=687.2, ref_ms=0.2),
+    ])
+    write("hgemm.json", [
+        bench_row("hgemm_bf16", "bf16", 5, "4096x4096x4096", 0.56, tflops=245.4, ref_ms=0.6),
+    ])
+    write("peak.json", [
+        {"device": DEVICE, "kernel": "peak_bf16_mma", "tflops": 258.7},
+        {"device": DEVICE, "kernel": "peak_fp8_mma", "tflops": 1013.9},
+        {"device": DEVICE, "kernel": "peak_fp8_mma_plain", "tflops": 517.4},
+    ])
+    assert mrt.main() == 0
+    md = (out / "RESULTS.md").read_text()
+    fp8 = md.split("## fp8gemm")[1]
+    assert "% of peak (1013.9 TFLOPS)" in fp8 and "% of cuBLASLt" in fp8
+    assert "| e4m3 | 4096x4096x4096 | 2 | 0.2000 | 0.1960 | 687.20 | 67.8% | 100.0% |" in fp8
+    hgemm = md.split("## hgemm")[1].split("## fp8gemm")[0]
+    assert "% of peak (258.7 TFLOPS)" in hgemm and "% of cuBLAS |" in hgemm
+    assert "1013.9 TFLOPS fp8 tensor" in md
+    headline = (out / "headline.md").read_text()
+    assert "| fp8gemm | e4m3 | 4096x4096x4096 | v2 | 0.2000 | 687.2 TFLOPS | 67.8% | 100.0% |" in (
+        headline)
+    assert headline.index("| hgemm |") < headline.index("| fp8gemm |")  # KERNEL_ORDER
+
+
 def test_torch_rows_from_another_machine_are_ignored(results, capsys):
     out, write = results
     shape = "4096x8192"

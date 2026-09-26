@@ -11,23 +11,26 @@ from pathlib import Path
 # the benches write into every row. Provenance in docs/RTX5090.md and docs/GB10.md:
 #   RTX 5090  1792 GB/s GDDR7 (512-bit @ 28 Gbps, NVIDIA spec)
 #             104.8 TFLOPS fp32 CUDA cores (21760 cores x 2 FLOP x 2.41 GHz, theoretical)
-#             bf16 tensor-core peak: not published and not measured yet -> None; pass
-#             --bf16-peak=<TFLOPS> to the scripts once you have an mma.sync measurement
+#             bf16 and fp8 tensor-core peaks: not published as dense figures and not guessed
+#             here -> None; bench_peak measures them into results/peak.json, and
+#             --bf16-peak=<TFLOPS> overrides the bf16 one
 #   GB10      273 GB/s LPDDR5X (256-bit @ 8533 MT/s, NVIDIA spec)
 #             31 TFLOPS fp32 CUDA cores (6144 cores x 2 FLOP x 2.42 GHz, theoretical)
 #             213 TFLOPS bf16/fp16 tensor cores, fp32 accumulate, dense (community measurement)
+#             fp8 tensor cores: no measurement yet -> None
 DEVICE_PEAKS: dict[str, dict[str, float | None]] = {
-    "RTX 5090": {"bw_gbps": 1792.0, "fp32_tflops": 104.8, "bf16_tflops": None},
-    "GB10": {"bw_gbps": 273.0, "fp32_tflops": 31.0, "bf16_tflops": 213.0},
+    "RTX 5090": {"bw_gbps": 1792.0, "fp32_tflops": 104.8, "bf16_tflops": None,
+                 "fp8_tflops": None},
+    "GB10": {"bw_gbps": 273.0, "fp32_tflops": 31.0, "bf16_tflops": 213.0, "fp8_tflops": None},
 }
 DEFAULT_DEVICE = "RTX 5090"  # rows written before the benches recorded a device name
 
-ITEMSIZE = {"f32": 4, "bf16": 2, "fp32": 4, "float32": 4, "bfloat16": 2}
+ITEMSIZE = {"f32": 4, "bf16": 2, "fp32": 4, "float32": 4, "bfloat16": 2, "e4m3": 1, "fp8": 1}
 
 TORCH_COMPARISON = "torch_comparison.json"
-# Written by bench_peak: measured mma.sync bf16 and fp32 FMA peaks, plus the SM clock they were
-# measured at. When present it overrides the spec-sheet compute peaks above (the memory
-# bandwidth stays the spec figure, which cudaMemcpy never reaches).
+# Written by bench_peak: measured mma.sync bf16 and fp8 peaks and the fp32 FMA peak, plus the SM
+# clock they were measured at. When present it overrides the spec-sheet compute peaks above
+# (the memory bandwidth stays the spec figure, which cudaMemcpy never reaches).
 PEAK_FILE = "peak.json"
 
 # The C++ benches name some rows after the entry point they time rather than the kernel family
@@ -79,6 +82,8 @@ def measured_peaks(results_dir: Path) -> dict:
         out.setdefault("device", r.get("device"))
         if r.get("kernel") == "peak_bf16_mma":
             out["bf16_tflops"] = r["tflops"]
+        elif r.get("kernel") == "peak_fp8_mma":  # the instruction fp8gemm runs; the _plain and
+            out["fp8_tflops"] = r["tflops"]      # _f16acc rows are documentation, not roofs
         elif r.get("kernel") == "peak_fp32_fma":
             out["fp32_tflops"] = r["tflops"]
         elif r.get("kernel") == "sm_clock":
@@ -99,7 +104,7 @@ def peaks_for_rows(rows: list[dict], bf16_peak: float | None = None,
     key = keys.pop() if keys else DEFAULT_DEVICE
     peaks = dict(DEVICE_PEAKS[key])
     if measured and device_key(measured.get("device")) == key:
-        for k in ("bf16_tflops", "fp32_tflops", "sm_mhz"):
+        for k in ("bf16_tflops", "fp8_tflops", "fp32_tflops", "sm_mhz"):
             if measured.get(k):
                 peaks[k] = measured[k]
         peaks["measured"] = True
@@ -139,9 +144,13 @@ def row_shape(rows: int, cols: int) -> str:
     return f"{rows}x{cols}"
 
 
+GEMM_KERNELS = ("sgemm", "hgemm", "fp8gemm", "gemm")
+
+
 def gemm_shape(M: int, N: int, K: int) -> str:
-    """Shape string of an (M x K) @ (K x N) GEMM, as bench_sgemm / bench_hgemm write it. The
-    results table joins the torch comparison on this string, so both sides must agree."""
+    """Shape string of an (M x K) @ (K x N) GEMM, as bench_sgemm / bench_hgemm / bench_fp8gemm
+    write it. The results table joins the torch comparison on this string, so both sides must
+    agree."""
     return f"{M}x{N}x{K}"
 
 
@@ -185,7 +194,7 @@ def parse_shape(kernel: str, shape: str) -> dict:
     """
     v = ints_in(shape)
     k = kernel.lower()
-    if k in ("sgemm", "hgemm", "gemm"):
+    if k in GEMM_KERNELS:
         if len(v) >= 3:
             return {"M": v[0], "N": v[1], "K": v[2]}
         if len(v) == 1:
@@ -221,7 +230,10 @@ def traffic_bytes(kernel: str, dtype: str, dims: dict) -> float:
         return 3.0 * dims["rows"] * dims["cols"] * isz
     if k == "bandwidth":
         return 2.0 * dims["n"] * isz
-    if k in ("sgemm", "hgemm", "gemm"):
+    if k == "fp8gemm":  # e4m3 operands (one byte each), bf16 output
+        M, N, K = dims["M"], dims["N"], dims["K"]
+        return float(M * K + K * N) + 2.0 * M * N
+    if k in GEMM_KERNELS:
         M, N, K = dims["M"], dims["N"], dims["K"]
         return float(M * K + K * N + M * N) * isz
     if k == "attention":  # Q and O once (H_q heads), K and V once (H_kv heads under GQA)
@@ -233,7 +245,7 @@ def traffic_bytes(kernel: str, dtype: str, dims: dict) -> float:
 
 def flops(kernel: str, dims: dict) -> float:
     k = kernel.lower()
-    if k in ("sgemm", "hgemm", "gemm"):
+    if k in GEMM_KERNELS:
         return 2.0 * dims["M"] * dims["N"] * dims["K"]
     if k == "attention":  # Q K^T and P V, halved under the causal mask as FlashAttention counts it
         fl = 4.0 * dims["B"] * dims["H"] * dims["S_q"] * dims["S_kv"] * dims["D"]
@@ -254,9 +266,17 @@ def arithmetic_intensity(kernel: str, dtype: str, shape: str) -> float:
 
 
 def is_compute_bound_kernel(kernel: str) -> bool:
-    return kernel.lower() in ("sgemm", "hgemm", "gemm", "attention")
+    return kernel.lower() in GEMM_KERNELS + ("attention",)
 
 
 def uses_tensor_cores(kernel: str) -> bool:
-    """Kernels judged against the bf16 tensor-core peak rather than the fp32 one."""
-    return kernel.lower() in ("hgemm", "attention")
+    """Kernels judged against a tensor-core peak (bf16 or fp8) rather than the fp32 one."""
+    return kernel.lower() in ("hgemm", "fp8gemm", "attention")
+
+
+def compute_peak_key(kernel: str) -> str:
+    """The DEVICE_PEAKS entry a compute-bound kernel is judged against."""
+    k = kernel.lower()
+    if k == "fp8gemm":
+        return "fp8_tflops"
+    return "bf16_tflops" if uses_tensor_cores(k) else "fp32_tflops"

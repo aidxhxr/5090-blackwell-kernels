@@ -28,7 +28,8 @@ def test_row_kernel_widths_match_the_cpp_defaults():
 
 def test_gemm_shapes_match_the_cpp_defaults():
     for bench, shapes in (("bench_sgemm", bench_torch.SGEMM_SHAPES),
-                          ("bench_hgemm", bench_torch.HGEMM_SHAPES)):
+                          ("bench_hgemm", bench_torch.HGEMM_SHAPES),
+                          ("bench_fp8gemm", bench_torch.FP8GEMM_SHAPES)):
         flat = ints_after(bench, r"shapes =")
         assert [tuple(flat[i:i + 3]) for i in range(0, len(flat), 3)] == shapes
 

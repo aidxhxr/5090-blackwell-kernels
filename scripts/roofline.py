@@ -3,8 +3,9 @@
 
 Reads results/*.json (from run_all_benches.sh) and writes results/roofline.png. The ceilings
 come from shape_utils.DEVICE_PEAKS for the device named in the rows (RTX 5090: 1792 GB/s DRAM,
-104.8 TFLOPS fp32; GB10: 273 GB/s, 31 TFLOPS fp32, 213 TFLOPS bf16). The bf16 tensor-core roof
-is only drawn when it is known: pass --bf16-peak=<TFLOPS> for the RTX 5090.
+104.8 TFLOPS fp32; GB10: 273 GB/s, 31 TFLOPS fp32, 213 TFLOPS bf16), overridden by the measured
+ones in results/peak.json. The bf16 and fp8 tensor-core roofs are only drawn when they are
+known: run bench_peak, or pass --bf16-peak=<TFLOPS> for the bf16 one.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ RESULTS = ROOT / "results"
 OUT = RESULTS / "roofline.png"
 
 MARKERS = {"bandwidth": "P", "rmsnorm": "o", "add_rmsnorm": "D", "swiglu": "s", "softmax": "^",
-           "sgemm": "v", "hgemm": "*", "attention": "X"}
+           "sgemm": "v", "hgemm": "*", "fp8gemm": "h", "attention": "X"}
 
 
 def achieved_tflops(r: dict) -> float:
@@ -89,9 +90,10 @@ def main() -> int:
     fig, ax = plt.subplots(figsize=(9, 6), dpi=150)
     ai = [2.0**k for k in range(-4, 13)]
     roofs = [("fp32 CUDA cores", peaks["fp32_tflops"], "#444"),
-             ("bf16 tensor cores", peaks["bf16_tflops"], "#76b900")]
+             ("bf16 tensor cores", peaks["bf16_tflops"], "#76b900"),
+             ("fp8 tensor cores", peaks.get("fp8_tflops"), "#1f77b4")]
     for label, tflops, color in roofs:
-        if not tflops:  # unknown for this device (RTX 5090 bf16 until measured)
+        if not tflops:  # unknown for this device (the tensor peaks until bench_peak has run)
             continue
         ax.plot(ai, [min(bw * x, tflops * 1e12) / 1e12 for x in ai], color=color, lw=1.5,
                 label=f"{label}: {tflops:.0f} TFLOPS")

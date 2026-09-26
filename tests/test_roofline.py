@@ -25,6 +25,20 @@ def test_compute_kernels_use_their_arithmetic_intensity():
     assert roofline.achieved_tflops(r) == pytest.approx(2 * 1024**3 / 5e-3 / 1e12)
 
 
+def test_fp8gemm_intensity_counts_one_byte_operands():
+    # 16 x 4096 x 4096: 2 M N K FLOP over M K + K N bytes of e4m3 plus 2 M N bytes of bf16 out
+    r = {"kernel": "fp8gemm", "dtype": "e4m3", "shape": "16x4096x4096", "median_ms": 0.0133}
+    fl = 2 * 16 * 4096 * 4096
+    by = 16 * 4096 + 4096 * 4096 + 2 * 16 * 4096
+    assert roofline.plot_intensity(r) == pytest.approx(fl / by)
+    assert roofline.achieved_tflops(r) == pytest.approx(fl / 0.0133e-3 / 1e12)
+    # the same shape in bf16 has half the intensity: twice the bytes for the same FLOPs
+    h = {**r, "kernel": "hgemm", "dtype": "bf16"}
+    assert roofline.plot_intensity(h) == pytest.approx(fl / (2 * (16 * 4096 + 4096 * 4096 +
+                                                                 16 * 4096)))
+    assert roofline.MARKERS["fp8gemm"] != roofline.MARKERS["hgemm"]
+
+
 def test_zero_time_rows_do_not_divide_by_zero():
     r = {"kernel": "rmsnorm", "dtype": "bf16", "shape": "4096x8192", "median_ms": 0.0}
     assert roofline.achieved_tflops(r) == 0.0
