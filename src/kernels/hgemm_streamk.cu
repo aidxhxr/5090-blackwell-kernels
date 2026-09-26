@@ -32,10 +32,12 @@
 // is resident because the grid never exceeds the resident block count. Chains end at the
 // piece that starts the tile, which never waits, so there is no cycle.
 //
-// Requires N % 64 == 0, K % 64 == 0, any M % 16 == 0 (the same rules as variant 3).
+// Requires N % 64 == 0, K % 64 == 0, any M >= 1 (the same rules as variant 3: rows past M
+// are zero-filled by the tile and skipped by the epilogue).
 
 #include <algorithm>
 
+#include "hgemm_internal.cuh"
 #include "hgemm_tile.cuh"
 #include "spark/common.cuh"
 #include "spark/kernels.h"
@@ -341,14 +343,18 @@ constexpr int STAGES = 3;
 
 // Tile selection. The 128x128 tile has the best smem-side intensity and wins whenever each
 // block's share of the (tile, k-step) space is long enough to amortize the pipeline and
-// the fixup; below that the 64-row tiles, and for decode shapes (M <= 64, bound by
-// streaming B) the 64x64x64 tile with a fourth stage, as in variant 3.
+// the fixup; below that the 64-row tiles. Decode shapes (M <= 64, bound by streaming B) go
+// to the same weight-streaming kernel as variant 3 (hgemm_decode.cu): it streams B at the
+// single-launch floor, which the 64x64x64 tile on this schedule does not quite reach
+// (1,352 against 1,459 GB/s at 64x4096x4096).
 void launch_auto(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N,
                  int K, cudaStream_t stream) {
     auto share = [&](int bm, int bn, int bk, int resident) {  // k-steps per block
         return static_cast<long long>(cdiv(M, bm)) * (N / bn) * (K / bk) / resident;
     };
-    if (M <= 64) {
+    if (M <= 64 && hgemm_decode::supports(M, N, K)) {
+        hgemm_decode::launch(A, B, C, M, N, K, stream);
+    } else if (M <= 64) {
         launch<64, 64, 64, 4>(A, B, C, M, N, K, stream);
     } else if (N % 128 == 0 &&
                share(128, 128, BK, resident_blocks<128, 128, BK, STAGES>()) >= kMinShare) {

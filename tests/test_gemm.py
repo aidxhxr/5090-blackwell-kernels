@@ -37,9 +37,12 @@ HGEMM_TOL = dict(atol=3e-2, rtol=3e-2)
 # three pieces per tile, a problem past four waves with a tail and a ragged M (2064x11008x1024:
 # 1462 tiles of 128x128 on 340 blocks, queue mode, two K-passes per tile in the last wave), a
 # decode shape, and a one-wave shape with no partials at all (1024^3).
+# Decode shapes (M <= 64) run the same weight-streaming kernel as variant 3, and any M >= 1
+# works: (1, 4096, 4096) is the single-token decode, (100, 1024, 1024) a ragged M on the tile.
 HGEMM_SHAPES_V4 = [(16, 64, 64), (16, 4096, 1024), (64, 256, 512), (272, 128, 4096),
                    (208, 1088, 192), (1024, 1024, 1024), (1152, 1152, 4096), (128, 22016, 64),
-                   (2048, 2048, 2048), (128, 64, 16384), (2064, 11008, 1024)]
+                   (2048, 2048, 2048), (128, 64, 16384), (2064, 11008, 1024), (1, 4096, 4096),
+                   (100, 1024, 1024)]
 
 
 def _variants(name):
