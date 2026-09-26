@@ -1,15 +1,22 @@
 """Parity of every attention variant against torch's scaled_dot_product_attention (in fp32,
 from the same bf16 inputs), on shapes that cover both head sizes, both masks, a sequence that
-is not a multiple of the 128 x 64 tile, a decode step, and the split-KV tail of variant 3."""
+is not a multiple of the 128 x 64 tile, a decode step, the split-KV tail of variant 3, and
+grouped-query attention (H_q / H_kv in {1, 4, 8}) in prefill and decode."""
 
 import pytest
 import torch
 import torch.nn.functional as F
 
-# (B, H, S_q, S_kv, D)
-SHAPES = [(1, 2, 128, 128, 64), (1, 2, 200, 200, 128), (2, 3, 512, 512, 64),
-          (1, 1, 1000, 1000, 128), (1, 4, 1, 512, 128), (1, 3, 64, 1000, 128),
-          (1, 2, 7, 300, 64)]
+# (B, H_q, H_kv, S_q, S_kv, D)
+SHAPES = [(1, 2, 2, 128, 128, 64), (1, 2, 2, 200, 200, 128), (2, 3, 3, 512, 512, 64),
+          (1, 1, 1, 1000, 1000, 128), (1, 4, 4, 1, 512, 128), (1, 3, 3, 64, 1000, 128),
+          (1, 2, 2, 7, 300, 64),
+          # GQA: groups of 4 and 8 in prefill, and decode steps where the whole group's rows
+          # fit the 16-row flash-decoding tile (4 heads x 1 token, 8 x 2, 4 x 4) or do not
+          # (4 heads x 7 tokens, 8 x 5, which run the 64-row tile with the K/V head stride)
+          (1, 8, 2, 300, 300, 128), (2, 8, 1, 200, 200, 64), (1, 32, 8, 1, 4096, 128),
+          (1, 16, 2, 2, 1000, 128), (1, 8, 2, 4, 700, 64), (1, 8, 2, 7, 300, 128),
+          (2, 16, 2, 5, 333, 128), (3, 8, 2, 1, 96, 128)]
 TOL = dict(atol=2e-2, rtol=2e-2)  # one bf16 rounding of an fp32 result, P in bf16 for v2/v3
 
 
@@ -22,31 +29,46 @@ def _variants():
         return [0]
 
 
-def _inputs(B, H, Sq, Skv, D):
+def _inputs(B, Hq, Hkv, Sq, Skv, D):
     torch.manual_seed(0)
-    q = torch.randn(B, H, Sq, D, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(B, H, Skv, D, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(B, H, Skv, D, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(B, Hq, Sq, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, Hkv, Skv, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(B, Hkv, Skv, D, device="cuda", dtype=torch.bfloat16)
     return q, k, v
 
 
 def _reference(q, k, v, causal):
-    return F.scaled_dot_product_attention(q.float(), k.float(), v.float(), is_causal=causal)
+    # enable_gqa (torch >= 2.5) broadcasts the K/V heads over the query heads of each group;
+    # with equal head counts it is a no-op.
+    return F.scaled_dot_product_attention(q.float(), k.float(), v.float(), is_causal=causal,
+                                          enable_gqa=k.shape[1] != q.shape[1])
+
+
+def _shape_id(s):
+    return "b{}_hq{}_hkv{}_sq{}_skv{}_d{}".format(*s)
 
 
 @pytest.mark.parametrize("variant", _variants())
 @pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
-@pytest.mark.parametrize("shape", SHAPES, ids=lambda s: "b{}_h{}_sq{}_skv{}_d{}".format(*s))
+@pytest.mark.parametrize("shape", SHAPES, ids=_shape_id)
 def test_attention_matches_sdpa(sk, shape, causal, variant):
-    B, H, Sq, Skv, D = shape
-    q, k, v = _inputs(B, H, Sq, Skv, D)
+    q, k, v = _inputs(*shape)
     got = sk.attention(q, k, v, causal=causal, variant=variant)
     assert got.shape == q.shape and got.dtype == torch.bfloat16
     torch.testing.assert_close(got.float(), _reference(q, k, v, causal), **TOL)
 
 
+def test_attention_gqa_matches_repeated_kv_heads(sk):
+    # the other spelling of the same thing: K/V heads repeated to the query head count
+    q, k, v = _inputs(2, 8, 2, 64, 500, 128)
+    k8, v8 = k.repeat_interleave(4, dim=1), v.repeat_interleave(4, dim=1)
+    for causal in (False, True):
+        torch.testing.assert_close(sk.attention(q, k, v, causal=causal).float(),
+                                   sk.attention(q, k8, v8, causal=causal).float(), **TOL)
+
+
 def test_attention_default_is_the_top_rung(sk):
-    q, k, v = _inputs(1, 2, 256, 256, 128)
+    q, k, v = _inputs(1, 2, 2, 256, 256, 128)
     top = sk.num_variants("attention") - 1
     torch.testing.assert_close(sk.attention(q, k, v, causal=True),
                                sk.attention(q, k, v, causal=True, variant=top), atol=0, rtol=0)
@@ -54,7 +76,17 @@ def test_attention_default_is_the_top_rung(sk):
 
 def test_attention_split_tail_is_stable_across_calls(sk):
     # variant 3 reuses a workspace for the split tiles; repeated calls must agree
-    q, k, v = _inputs(1, 4, 512, 512, 128)
+    q, k, v = _inputs(1, 4, 4, 512, 512, 128)
+    a = sk.attention(q, k, v, variant=3)
+    b = sk.attention(q, k, v, variant=3)
+    torch.testing.assert_close(a, b, atol=0, rtol=0)
+    torch.testing.assert_close(a.float(), _reference(q, k, v, False), **TOL)
+
+
+def test_attention_decode_split_is_stable_across_calls(sk):
+    # the flash-decoding kernel merges its key slices through a workspace and per-head
+    # counters that every launch must leave zero; repeated calls and a long cache must agree
+    q, k, v = _inputs(1, 32, 8, 1, 20000, 128)
     a = sk.attention(q, k, v, variant=3)
     b = sk.attention(q, k, v, variant=3)
     torch.testing.assert_close(a, b, atol=0, rtol=0)
@@ -62,14 +94,17 @@ def test_attention_split_tail_is_stable_across_calls(sk):
 
 
 def test_attention_rejects_bad_inputs(sk):
-    q, k, v = _inputs(1, 2, 64, 64, 64)
+    q, k, v = _inputs(1, 2, 2, 64, 64, 64)
     with pytest.raises(RuntimeError):
         sk.attention(q.float(), k.float(), v.float())  # bf16 only
     with pytest.raises(RuntimeError):
         sk.attention(q, k[:, :, :32], v)  # k and v disagree on S_kv
+    q3, k3, v3 = _inputs(1, 3, 3, 64, 64, 64)
     with pytest.raises(RuntimeError):
-        sk.attention(q, k[:, :1], v[:, :1])  # H_q != H_kv (no GQA)
-    q96, k96, v96 = _inputs(1, 2, 64, 64, 96)
+        sk.attention(q3, k3[:, :2], v3[:, :2])  # H_q not a multiple of H_kv
+    with pytest.raises(RuntimeError):
+        sk.attention(q, k.repeat(1, 2, 1, 1), v.repeat(1, 2, 1, 1))  # more K/V heads than Q
+    q96, k96, v96 = _inputs(1, 2, 2, 64, 64, 96)
     with pytest.raises(RuntimeError):
         sk.attention(q96, k96, v96)  # D not in {64, 128}
     with pytest.raises(RuntimeError):

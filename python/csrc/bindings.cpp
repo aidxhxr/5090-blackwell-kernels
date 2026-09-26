@@ -195,8 +195,9 @@ Tensor hgemm(const Tensor& a, const Tensor& b, int variant) {
     return c;
 }
 
-// O = softmax(q k^T / sqrt(D)) v over [B, H, S, D] bf16 tensors; every variant takes any
-// S_q, S_kv >= 1 and D in {64, 128}.
+// O = softmax(q k^T / sqrt(D)) v for q = [B, H_q, S_q, D] and k, v = [B, H_kv, S_kv, D] bf16
+// tensors, H_q a multiple of H_kv (grouped-query attention: query head h reads k/v head
+// h / (H_q / H_kv)); every variant takes any S_q, S_kv >= 1 and D in {64, 128}.
 Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, bool causal, int variant) {
     check_cuda_contig(q, "q");
     check_cuda_contig(k, "k");
@@ -207,8 +208,10 @@ Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, bool causal,
     TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
                 "attention expects [B, H, S, D] tensors");
     TORCH_CHECK(k.sizes() == v.sizes(), "k and v must have the same shape");
-    TORCH_CHECK(q.size(0) == k.size(0) && q.size(1) == k.size(1) && q.size(3) == k.size(3),
-                "q and k must agree on B, H and D (q is ", q.sizes(), ", k is ", k.sizes(), ")");
+    TORCH_CHECK(q.size(0) == k.size(0) && q.size(3) == k.size(3),
+                "q and k must agree on B and D (q is ", q.sizes(), ", k is ", k.sizes(), ")");
+    TORCH_CHECK(q.size(1) % k.size(1) == 0, "q must have a multiple of k's heads (GQA), got ",
+                q.size(1), " query heads and ", k.size(1), " k/v heads");
     TORCH_CHECK(q.size(3) == 64 || q.size(3) == 128, "attention supports D = 64 or 128, got ",
                 q.size(3));
     TORCH_CHECK(
@@ -219,10 +222,10 @@ Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, bool causal,
     const c10::cuda::CUDAGuard guard(q.device());
     Tensor out = at::empty_like(q);
     const int var = resolve_variant(variant, spark::attention_num_variants());
-    spark::attention_bf16(bf16_ptr(q), bf16_ptr(k), bf16_ptr(v), bf16_ptr_mut(out),
-                          static_cast<int>(q.size(0)), static_cast<int>(q.size(1)),
-                          static_cast<int>(q.size(2)), static_cast<int>(k.size(2)),
-                          static_cast<int>(q.size(3)), causal, var, current_stream(q));
+    spark::attention_bf16(
+        bf16_ptr(q), bf16_ptr(k), bf16_ptr(v), bf16_ptr_mut(out), static_cast<int>(q.size(0)),
+        static_cast<int>(q.size(1)), static_cast<int>(k.size(1)), static_cast<int>(q.size(2)),
+        static_cast<int>(k.size(2)), static_cast<int>(q.size(3)), causal, var, current_stream(q));
     return out;
 }
 
@@ -252,7 +255,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("sgemm", &sgemm, "fp32 GEMM: a @ b", py::arg("a"), py::arg("b"), py::arg("variant") = -1);
     m.def("hgemm", &hgemm, "bf16 tensor-core GEMM: a @ b", py::arg("a"), py::arg("b"),
           py::arg("variant") = -1);
-    m.def("attention", &attention, "softmax(q k^T / sqrt(D)) v over [B, H, S, D] bf16 tensors",
+    m.def("attention", &attention,
+          "softmax(q k^T / sqrt(D)) v over [B, H, S, D] bf16 tensors (k, v may have fewer heads)",
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("causal") = false,
           py::arg("variant") = -1);
     m.def("num_variants", &num_variants, "number of implementation variants for a kernel",

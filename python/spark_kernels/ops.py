@@ -90,9 +90,13 @@ def attention(
 ) -> torch.Tensor:
     """Fused attention forward: softmax(q @ k^T / sqrt(D)) @ v, fp32 math, bf16 out.
 
-    q is [B, H, S_q, D], k and v are [B, H, S_kv, D], all bfloat16, contiguous, with D 64 or 128
-    (MHA only: one K/V head per Q head). `causal` hides key j from query i when j > i, the
-    same top-left convention as `F.scaled_dot_product_attention(is_causal=True)`. Any S_q and
-    S_kv; a decode step is S_q = 1 against the cache. Returns [B, H, S_q, D] bfloat16.
+    q is [B, H_q, S_q, D], k and v are [B, H_kv, S_kv, D], all bfloat16, contiguous, with D 64
+    or 128 and H_q a multiple of H_kv: grouped-query attention, where query head h reads k/v
+    head h // (H_q // H_kv), the same as `F.scaled_dot_product_attention(enable_gqa=True)`;
+    H_kv == H_q is plain multi-head attention. `causal` hides key j from query i when j > i,
+    the same top-left convention as `F.scaled_dot_product_attention(is_causal=True)`. Any S_q
+    and S_kv; a decode step is S_q = 1 against the cache, and the default variant runs a
+    flash-decoding kernel for it that reads each k/v head once for all the query heads that
+    share it. Returns [B, H_q, S_q, D] bfloat16.
     """
     return _C.attention(q, k, v, causal, variant)

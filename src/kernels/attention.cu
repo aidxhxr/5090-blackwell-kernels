@@ -1,10 +1,14 @@
 // Fused scaled-dot-product attention forward for Blackwell sm_12x: RTX 5090 (sm_120), GB10.
 //
-//   O[b,h] = softmax(Q[b,h] K[b,h]^T / sqrt(D)) V[b,h]     Q, K, V, O = [B, H, S, D], row-major
+//   O[b,h] = softmax(Q[b,h] K[b,kv(h)]^T / sqrt(D)) V[b,kv(h)]
+//   Q, O = [B, H_q, S_q, D], K, V = [B, H_kv, S_kv, D], row-major, kv(h) = h / (H_q / H_kv)
 //
-// bf16 in and out, fp32 for every score, exponential and accumulator. One head at a time, no
-// sharing between heads (MHA). The causal mask hides key j from query i when j > i (the
-// top-left alignment torch's is_causal uses). Every variant runs the online softmax: a running
+// bf16 in and out, fp32 for every score, exponential and accumulator. One query head per
+// block; under grouped-query attention (H_kv < H_q) the H_q / H_kv heads of a group read the
+// same K/V head, which is a stride on the K/V base pointer and nothing else in these kernels
+// (the decode kernel in attention_decode.cu groups them into one tile so K/V are read once).
+// The causal mask hides key j from query i when j > i (the top-left alignment torch's
+// is_causal uses). Every variant runs the online softmax: a running
 // row max m and row sum l, with the O accumulator rescaled by exp(m_old - m_new) whenever a
 // new key tile raises the max. Scores are scaled by log2(e)/sqrt(D) and exponentiated with
 // ex2, so the exp is one MUFU instruction.
@@ -17,11 +21,15 @@
 //              loop, S = Q K^T and O += P V on the tensor cores, P repacked in registers from
 //              the S accumulators, 3-stage cp.async pipeline on K and V.
 //   variant 3: variant 2's kernel with a schedule: the tiles of the last partial wave are
-//              split along the keys over the idle SMs and merged by a combine kernel, and a
-//              64-row tile takes S_q <= 64 (decode) so a single query does not pay for 128.
+//              split along the keys over the idle SMs and merged by a combine kernel; a
+//              64-row tile takes S_q <= 64 so a short query does not pay for 128 rows; and
+//              decode shapes, where the query rows sharing a K/V head fit 16 rows, run the
+//              flash-decoding kernel of attention_decode.cu.
 
 #include <algorithm>
+#include <cstdlib>
 
+#include "attention_internal.cuh"
 #include "spark/common.cuh"
 #include "spark/kernels.h"
 
@@ -29,21 +37,12 @@ namespace spark {
 
 namespace {
 
-using bf16 = __nv_bfloat16;
-
-constexpr float kLog2e = 1.4426950408889634f;
-
-// 2^x on the MUFU pipe. ex2.approx takes -inf to +0, which is what a masked score needs.
-__device__ __forceinline__ float ex2(float x) {
-    float y;
-    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
-    return y;
-}
-
-__device__ __forceinline__ unsigned pack_bf16x2(float lo, float hi) {
-    const __nv_bfloat162 h = __floats2bfloat162_rn(lo, hi);
-    return *reinterpret_cast<const unsigned*>(&h);
-}
+using attn::bf16;
+using attn::ex2;
+using attn::kLog2e;
+using attn::kv_index;
+using attn::pack_bf16x2;
+using attn::swz;
 
 // 8 bf16 (one 16-byte chunk) to 8 floats.
 __device__ __forceinline__ void unpack8(const uint4& u, float (&f)[8]) {
@@ -54,12 +53,6 @@ __device__ __forceinline__ void unpack8(const uint4& u, float (&f)[8]) {
         f[2 * i] = p.x;
         f[2 * i + 1] = p.y;
     }
-}
-
-// Physical 16-byte chunk of logical (row, chunk) in a tile whose rows are 128 or 256 bytes:
-// the eight rows an ldmatrix (or eight lanes reading eight rows) touch land in eight bank groups.
-__device__ __forceinline__ int swz(int row, int chunk) {
-    return chunk ^ (row & 7);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -96,16 +89,17 @@ __device__ __forceinline__ void load_vec(const bf16* p, float (&f)[VEC]) {
 template <int D>
 __global__ void __launch_bounds__(THREADS)
     attention_v0_kernel(const bf16* __restrict__ Q, const bf16* __restrict__ K,
-                        const bf16* __restrict__ V, bf16* __restrict__ O, int S_q, int S_kv,
-                        float scale_log2, int causal) {
+                        const bf16* __restrict__ V, bf16* __restrict__ O, int H_q, int H_kv,
+                        int S_q, int S_kv, float scale_log2, int causal) {
     constexpr int VEC = D / 32;
     const int lane = threadIdx.x & 31;
     const int row = blockIdx.x * (THREADS / 32) + (threadIdx.x >> 5);
     const int bh = blockIdx.y;
+    const int bkv = kv_index(bh, H_q, H_kv);
     if (row >= S_q) return;
     const bf16* q = Q + (static_cast<size_t>(bh) * S_q + row) * D + lane * VEC;
-    const bf16* k = K + static_cast<size_t>(bh) * S_kv * D + lane * VEC;
-    const bf16* v = V + static_cast<size_t>(bh) * S_kv * D + lane * VEC;
+    const bf16* k = K + static_cast<size_t>(bkv) * S_kv * D + lane * VEC;
+    const bf16* v = V + static_cast<size_t>(bkv) * S_kv * D + lane * VEC;
 
     float qr[VEC];
     load_vec<VEC>(q, qr);
@@ -173,8 +167,8 @@ constexpr int smem_bytes() {
 template <int D>
 __global__ void __launch_bounds__(THREADS, 1)
     attention_v1_kernel(const bf16* __restrict__ Q, const bf16* __restrict__ K,
-                        const bf16* __restrict__ V, bf16* __restrict__ O, int S_q, int S_kv,
-                        float scale_log2, int causal) {
+                        const bf16* __restrict__ V, bf16* __restrict__ O, int H_q, int H_kv,
+                        int S_q, int S_kv, float scale_log2, int causal) {
     constexpr int CH = D / 8;                    // 16-byte chunks per bf16 row
     constexpr int DD = D / 32;                   // float4 chunks of O per lane
     constexpr int Q_ITERS = BM * CH / THREADS;   // 8 (D = 128), 4 (D = 64)
@@ -193,9 +187,10 @@ __global__ void __launch_bounds__(THREADS, 1)
     // Causal: the heavy tiles (most KV tiles) launch first so the tail of the grid is short.
     const int q_tile = causal ? gridDim.y - 1 - blockIdx.y : blockIdx.y;
     const int q0 = q_tile * BM;
+    const int bkv = kv_index(bh, H_q, H_kv);
     const bf16* Qg = Q + static_cast<size_t>(bh) * S_q * D;
-    const bf16* Kg = K + static_cast<size_t>(bh) * S_kv * D;
-    const bf16* Vg = V + static_cast<size_t>(bh) * S_kv * D;
+    const bf16* Kg = K + static_cast<size_t>(bkv) * S_kv * D;
+    const bf16* Vg = V + static_cast<size_t>(bkv) * S_kv * D;
     bf16* Og = O + static_cast<size_t>(bh) * S_q * D;
 
     // Q tile, rows past S_q zeroed.
@@ -417,8 +412,9 @@ constexpr int BN = 64;
 // the remaining tiles `split` ways along the keys, write unnormalized fp32 partials (O, m, l)
 // to `ws`, and a combine kernel merges them (variant 3; variant 2 has dp_tiles = tiles).
 struct Sched {
-    int bh_count;  // B * H
-    int q_tiles;   // ceil(S_q / BM)
+    int bh_count;   // B * H_q
+    int H_q, H_kv;  // tile bh reads K/V head kv_index(bh, H_q, H_kv)
+    int q_tiles;    // ceil(S_q / BM)
     int dp_tiles;
     int split;
     float* ws;  // (tiles - dp_tiles) * split partials of BM * (D + 2) floats each
@@ -474,9 +470,10 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
     const int q_rank = tile / sched.bh_count;
     const int q_tile = causal ? sched.q_tiles - 1 - q_rank : q_rank;
     const int q0 = q_tile * BM;
+    const int bkv = kv_index(bh, sched.H_q, sched.H_kv);
     const bf16* Qg = Q + static_cast<size_t>(bh) * S_q * D;
-    const bf16* Kg = K + static_cast<size_t>(bh) * S_kv * D;
-    const bf16* Vg = V + static_cast<size_t>(bh) * S_kv * D;
+    const bf16* Kg = K + static_cast<size_t>(bkv) * S_kv * D;
+    const bf16* Vg = V + static_cast<size_t>(bkv) * S_kv * D;
     bf16* Og = O + static_cast<size_t>(bh) * S_q * D;
 
     // Q tile through stage 0 into A fragments: qf[kk] covers d = 16kk .. 16kk+15.
@@ -740,14 +737,16 @@ struct Workspace {
 
 // `split_tail`: variant 3. Variant 2 runs every tile whole on the 8-warp tile.
 template <int D, int WARPS>
-void launch(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H, int S_q, int S_kv,
-            float scale_log2, bool causal, bool split_tail, cudaStream_t stream) {
+void launch(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv, int S_q,
+            int S_kv, float scale_log2, bool causal, bool split_tail, cudaStream_t stream) {
     constexpr int BM = 16 * WARPS;
     constexpr int bytes = smem_bytes<D, STAGES>();
     const int resident = resident_blocks<D, WARPS>();
 
     Sched s;
-    s.bh_count = B * H;
+    s.bh_count = B * H_q;
+    s.H_q = H_q;
+    s.H_kv = H_kv;
     s.q_tiles = cdiv(S_q, BM);
     const int tiles = s.bh_count * s.q_tiles;
     s.dp_tiles = tiles;
@@ -786,8 +785,8 @@ void launch(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H, 
 }  // namespace v2
 
 template <int D>
-void launch_v1(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H, int S_q,
-               int S_kv, float scale_log2, bool causal, cudaStream_t stream) {
+void launch_v1(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv,
+               int S_q, int S_kv, float scale_log2, bool causal, cudaStream_t stream) {
     constexpr int bytes = v1::smem_bytes<D>();
     static bool opted_in = false;
     if (!opted_in) {
@@ -795,17 +794,42 @@ void launch_v1(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int 
                                               cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
         opted_in = true;
     }
-    const dim3 grid(B * H, cdiv(S_q, v1::BM));
-    v1::attention_v1_kernel<D>
-        <<<grid, v1::THREADS, bytes, stream>>>(Q, K, V, O, S_q, S_kv, scale_log2, causal ? 1 : 0);
+    const dim3 grid(B * H_q, cdiv(S_q, v1::BM));
+    v1::attention_v1_kernel<D><<<grid, v1::THREADS, bytes, stream>>>(
+        Q, K, V, O, H_q, H_kv, S_q, S_kv, scale_log2, causal ? 1 : 0);
 }
 
 template <int D>
-void launch_v0(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H, int S_q,
-               int S_kv, float scale_log2, bool causal, cudaStream_t stream) {
-    const dim3 grid(cdiv(S_q, v0::THREADS / 32), B * H);
-    v0::attention_v0_kernel<D>
-        <<<grid, v0::THREADS, 0, stream>>>(Q, K, V, O, S_q, S_kv, scale_log2, causal ? 1 : 0);
+void launch_v0(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv,
+               int S_q, int S_kv, float scale_log2, bool causal, cudaStream_t stream) {
+    const dim3 grid(cdiv(S_q, v0::THREADS / 32), B * H_q);
+    v0::attention_v0_kernel<D><<<grid, v0::THREADS, 0, stream>>>(Q, K, V, O, H_q, H_kv, S_q, S_kv,
+                                                                 scale_log2, causal ? 1 : 0);
+}
+
+// SPARK_ATTENTION_DECODE=0 keeps decode shapes on the 64-row tile of variant 3 (the path
+// before attention_decode.cu existed), for the tile comparison in the design doc.
+bool use_decode_kernel() {
+    static int v = -1;
+    if (v < 0) {
+        v = 1;
+        if (const char* e = std::getenv("SPARK_ATTENTION_DECODE")) v = std::atoi(e) != 0 ? 1 : 0;
+    }
+    return v == 1;
+}
+
+// Variant 3's dispatch by shape: the flash-decoding kernel when the query rows sharing a
+// K/V head fit its 16-row tile, the 64-row tile for other short queries, else 128 rows.
+template <int D>
+void launch_v3(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv,
+               int S_q, int S_kv, float scale_log2, bool causal, cudaStream_t stream) {
+    if (use_decode_kernel() && attn::decode_fits(H_q, H_kv, S_q)) {
+        attn::decode_launch(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, D, scale_log2, causal, 0, stream);
+    } else if (S_q <= 64) {
+        v2::launch<D, 4>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, true, stream);
+    } else {
+        v2::launch<D, 8>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, true, stream);
+    }
 }
 
 }  // namespace
@@ -821,57 +845,47 @@ bool attention_supports(int S_q, int S_kv, int D, int variant) {
 }
 
 void attention_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_bfloat16* V,
-                    __nv_bfloat16* O, int B, int H, int S_q, int S_kv, int D, bool causal,
-                    int variant, cudaStream_t stream) {
+                    __nv_bfloat16* O, int B, int H_q, int H_kv, int S_q, int S_kv, int D,
+                    bool causal, int variant, cudaStream_t stream) {
     SPARK_REQUIRE(Q != nullptr && K != nullptr && V != nullptr && O != nullptr,
                   "attention: null pointer");
-    SPARK_REQUIRE(B > 0 && H > 0 && S_q > 0 && S_kv > 0,
-                  "attention: B, H, S_q, S_kv must be positive");
+    SPARK_REQUIRE(B > 0 && H_q > 0 && H_kv > 0 && S_q > 0 && S_kv > 0,
+                  "attention: B, H_q, H_kv, S_q, S_kv must be positive");
+    SPARK_REQUIRE(H_q % H_kv == 0, "attention: H_q must be a multiple of H_kv");
     SPARK_REQUIRE(D == 64 || D == 128, "attention: D must be 64 or 128");
     SPARK_REQUIRE(variant >= 0 && variant < attention_num_variants(), "attention: unknown variant");
     SPARK_REQUIRE(is_aligned16(Q) && is_aligned16(K) && is_aligned16(V) && is_aligned16(O),
                   "attention: Q, K, V, O must be 16-byte aligned");
-    SPARK_REQUIRE(static_cast<int64_t>(B) * H * std::max(S_q, S_kv) * D < (int64_t{1} << 40),
+    SPARK_REQUIRE(static_cast<int64_t>(B) * H_q * std::max(S_q, S_kv) * D < (int64_t{1} << 40),
                   "attention: tensor too large");
 
     const float scale_log2 = kLog2e / std::sqrt(static_cast<float>(D));
     switch (variant) {
         case 0:
             if (D == 64)
-                launch_v0<64>(Q, K, V, O, B, H, S_q, S_kv, scale_log2, causal, stream);
+                launch_v0<64>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, stream);
             else
-                launch_v0<128>(Q, K, V, O, B, H, S_q, S_kv, scale_log2, causal, stream);
+                launch_v0<128>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, stream);
             break;
         case 1:
             if (D == 64)
-                launch_v1<64>(Q, K, V, O, B, H, S_q, S_kv, scale_log2, causal, stream);
+                launch_v1<64>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, stream);
             else
-                launch_v1<128>(Q, K, V, O, B, H, S_q, S_kv, scale_log2, causal, stream);
+                launch_v1<128>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, stream);
             break;
         case 2:
             if (D == 64)
-                v2::launch<64, 8>(Q, K, V, O, B, H, S_q, S_kv, scale_log2, causal, false, stream);
+                v2::launch<64, 8>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, false,
+                                  stream);
             else
-                v2::launch<128, 8>(Q, K, V, O, B, H, S_q, S_kv, scale_log2, causal, false, stream);
+                v2::launch<128, 8>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, false,
+                                   stream);
             break;
         case 3:
-            // A decode step (S_q <= 64) runs the 4-warp, 64-row tile: half the tensor-core
-            // work per KV tile on rows that are mostly zero-filled anyway.
-            if (S_q <= 64) {
-                if (D == 64)
-                    v2::launch<64, 4>(Q, K, V, O, B, H, S_q, S_kv, scale_log2, causal, true,
-                                      stream);
-                else
-                    v2::launch<128, 4>(Q, K, V, O, B, H, S_q, S_kv, scale_log2, causal, true,
-                                       stream);
-            } else {
-                if (D == 64)
-                    v2::launch<64, 8>(Q, K, V, O, B, H, S_q, S_kv, scale_log2, causal, true,
-                                      stream);
-                else
-                    v2::launch<128, 8>(Q, K, V, O, B, H, S_q, S_kv, scale_log2, causal, true,
-                                       stream);
-            }
+            if (D == 64)
+                launch_v3<64>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, stream);
+            else
+                launch_v3<128>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, stream);
             break;
         default:
             break;

@@ -124,11 +124,12 @@ int hgemm_num_variants();
 bool hgemm_supports(int M, int N, int K, int variant);
 
 // ---- Fused attention (scaled dot product, forward) ----------------------------------------
-// O = softmax(Q K^T / sqrt(D)) V per (b, h), for Q, O = [B, H, S_q, D] and K, V = [B, H, S_kv, D],
-// row-major contiguous, bf16 in/out, fp32 scores / softmax / accumulation. MHA only (the same
-// H for Q and K/V), D in {64, 128}, no dropout, no bias. `causal` masks key j from query i
-// when j > i (top-left alignment, as torch's is_causal). Any S_q, S_kv >= 1; 16-byte aligned
-// pointers.
+// O = softmax(Q K^T / sqrt(D)) V per (b, h), for Q, O = [B, H_q, S_q, D] and
+// K, V = [B, H_kv, S_kv, D], row-major contiguous, bf16 in/out, fp32 scores / softmax /
+// accumulation. Grouped-query attention: H_q % H_kv == 0 and query head h reads K/V head
+// h / (H_q / H_kv) (H_kv == H_q is plain multi-head attention). D in {64, 128}, no dropout,
+// no bias. `causal` masks key j from query i when j > i (top-left alignment, as torch's
+// is_causal). Any S_q, S_kv >= 1; 16-byte aligned pointers.
 // variant 0: one warp per query row, lanes own D/32 columns, online softmax key by key
 // variant 1: 128-row Q tile, 64-row K/V tiles as fp32 in shared memory, CUDA-core FMAs,
 //            online softmax per row with the O accumulator rescaled when the row max moves
@@ -137,10 +138,16 @@ bool hgemm_supports(int M, int N, int K, int variant);
 //            shared memory, 3-stage cp.async pipeline on K and V
 // variant 3: variant 2 scheduled: the tiles of the last partial wave are split along the keys
 //            over the idle SMs and merged by a combine kernel (fp32 partials in a per-device
-//            workspace shared by every stream), and S_q <= 64 (decode) runs a 64-row tile
+//            workspace shared by every stream); S_q <= 64 runs a 64-row tile; and when the
+//            (H_q / H_kv) * S_q query rows that share a K/V head fit 16 rows (a decode step)
+//            the flash-decoding kernel of src/kernels/attention_decode.cu runs instead: those
+//            rows in one 16-row tile so K and V are read once per group, the keys of each
+//            (b, kv head) split over blocks that fill the SMs, four warps per block each
+//            streaming its own keys, partials merged in shared memory and by the last block
+//            to arrive (one launch, no combine kernel)
 void attention_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_bfloat16* V,
-                    __nv_bfloat16* O, int B, int H, int S_q, int S_kv, int D, bool causal,
-                    int variant, cudaStream_t stream);
+                    __nv_bfloat16* O, int B, int H_q, int H_kv, int S_q, int S_kv, int D,
+                    bool causal, int variant, cudaStream_t stream);
 int attention_num_variants();
 bool attention_supports(int S_q, int S_kv, int D, int variant);
 
