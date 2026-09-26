@@ -197,7 +197,8 @@ Tensor hgemm(const Tensor& a, const Tensor& b, int variant) {
 
 // O = softmax(q k^T / sqrt(D)) v for q = [B, H_q, S_q, D] and k, v = [B, H_kv, S_kv, D] bf16
 // tensors, H_q a multiple of H_kv (grouped-query attention: query head h reads k/v head
-// h / (H_q / H_kv)); every variant takes any S_q, S_kv >= 1 and D in {64, 128}.
+// h / (H_q / H_kv)); every variant takes any S_q, S_kv >= 1 and D in {64, 128}. The default
+// steps down from the top rung if a future rung ever refuses a shape, as hgemm's does.
 Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, bool causal, int variant) {
     check_cuda_contig(q, "q");
     check_cuda_contig(k, "k");
@@ -221,7 +222,11 @@ Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, bool causal,
                 "attention needs 16-byte aligned q, k, v storage");
     const c10::cuda::CUDAGuard guard(q.device());
     Tensor out = at::empty_like(q);
-    const int var = resolve_variant(variant, spark::attention_num_variants());
+    int var = resolve_variant(variant, spark::attention_num_variants());
+    while (variant < 0 && var > 0 &&
+           !spark::attention_supports(static_cast<int>(q.size(2)), static_cast<int>(k.size(2)),
+                                      static_cast<int>(q.size(3)), var))
+        --var;
     spark::attention_bf16(
         bf16_ptr(q), bf16_ptr(k), bf16_ptr(v), bf16_ptr_mut(out), static_cast<int>(q.size(0)),
         static_cast<int>(q.size(1)), static_cast<int>(k.size(1)), static_cast<int>(q.size(2)),

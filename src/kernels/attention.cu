@@ -25,6 +25,11 @@
 //              64-row tile takes S_q <= 64 so a short query does not pay for 128 rows; and
 //              decode shapes, where the query rows sharing a K/V head fit 16 rows, run the
 //              flash-decoding kernel of attention_decode.cu.
+//   variant 4: variant 3's tile with K and V fed by TMA (cp.async.bulk.tensor) into stages
+//              guarded by full / empty mbarriers, issued by one lane, so the loop has no
+//              __syncthreads: the 8 warps drift out of phase and one warp's softmax runs under
+//              the other's mma on each scheduler. Same tail split as variant 3, and
+//              the same decode paths.
 
 #include <algorithm>
 #include <cstdlib>
@@ -735,54 +740,523 @@ struct Workspace {
     size_t floats = 0;
 };
 
-// `split_tail`: variant 3. Variant 2 runs every tile whole on the 8-warp tile.
-template <int D, int WARPS>
-void launch(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv, int S_q,
-            int S_kv, float scale_log2, bool causal, bool split_tail, cudaStream_t stream) {
-    constexpr int BM = 16 * WARPS;
-    constexpr int bytes = smem_bytes<D, STAGES>();
-    const int resident = resident_blocks<D, WARPS>();
-
+// The whole-tile schedule for B * H heads of q_tiles Q tiles each.
+template <int WARPS>
+Sched whole_tiles(int B, int H_q, int H_kv, int S_q) {
     Sched s;
     s.bh_count = B * H_q;
     s.H_q = H_q;
     s.H_kv = H_kv;
-    s.q_tiles = cdiv(S_q, BM);
-    const int tiles = s.bh_count * s.q_tiles;
-    s.dp_tiles = tiles;
+    s.q_tiles = cdiv(S_q, 16 * WARPS);
+    s.dp_tiles = s.bh_count * s.q_tiles;
     s.split = 1;
     s.ws = nullptr;
-    if (split_tail) {
-        // The tail tiles are the last in the heaviest-first order, so the last one has the
-        // fewest KV tiles; every slice must get at least one.
-        const int tail = tiles % resident;
-        const int q_last = causal ? 0 : s.q_tiles - 1;  // rank tiles - 1
-        const int T_last = cdiv(causal ? std::min(S_kv, q_last * BM + BM) : S_kv, BN);
-        const int split = tail > 0 ? std::min(T_last, resident / tail) : 1;
-        if (split > 1) {
-            s.dp_tiles = tiles - tail;
-            s.split = split;
-            static Workspace w;
-            const size_t need = static_cast<size_t>(tail) * split * partial_floats<D, WARPS>();
-            if (w.floats < need) {
-                if (w.ws) SPARK_CUDA_CHECK(cudaFree(w.ws));
-                SPARK_CUDA_CHECK(cudaMalloc(&w.ws, need * sizeof(float)));
-                w.floats = need;
-            }
-            s.ws = w.ws;
-        }
+    return s;
+}
+
+// Splits the tiles of the last partial wave (variants 3 and 4). The tail tiles are the last in
+// the heaviest-first order, so the last one has the fewest KV tiles; every slice must get at
+// least one. The workspace is one per (D, WARPS), shared by the variants that use it.
+template <int D, int WARPS>
+void split_tail_tiles(Sched& s, int resident, int S_kv, bool causal) {
+    constexpr int BM = 16 * WARPS;
+    const int tiles = s.bh_count * s.q_tiles;
+    const int tail = tiles % resident;
+    const int q_last = causal ? 0 : s.q_tiles - 1;  // rank tiles - 1
+    const int T_last = cdiv(causal ? std::min(S_kv, q_last * BM + BM) : S_kv, BN);
+    const int split = tail > 0 ? std::min(T_last, resident / tail) : 1;
+    if (split <= 1) return;
+    s.dp_tiles = tiles - tail;
+    s.split = split;
+    static Workspace w;
+    const size_t need = static_cast<size_t>(tail) * split * partial_floats<D, WARPS>();
+    if (w.floats < need) {
+        if (w.ws) SPARK_CUDA_CHECK(cudaFree(w.ws));
+        SPARK_CUDA_CHECK(cudaMalloc(&w.ws, need * sizeof(float)));
+        w.floats = need;
     }
-    const int grid = s.dp_tiles + (tiles - s.dp_tiles) * s.split;
+    s.ws = w.ws;
+}
+
+// Blocks in the grid for a schedule: the whole tiles plus `split` slices of each tail tile.
+inline int grid_blocks(const Sched& s) {
+    return s.dp_tiles + (s.bh_count * s.q_tiles - s.dp_tiles) * s.split;
+}
+
+template <int D, int WARPS>
+void launch_combine(bf16* O, int S_q, bool causal, const Sched& s, cudaStream_t stream) {
+    constexpr int per_tile = 16 * WARPS * (D / 8);
+    const dim3 cgrid(cdiv(per_tile, 256), s.bh_count * s.q_tiles - s.dp_tiles);
+    attention_combine_kernel<D, WARPS><<<cgrid, 256, 0, stream>>>(O, S_q, causal ? 1 : 0, s);
+}
+
+// `split_tail`: variant 3. Variant 2 runs every tile whole on the 8-warp tile.
+template <int D, int WARPS>
+void launch(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv, int S_q,
+            int S_kv, float scale_log2, bool causal, bool split_tail, cudaStream_t stream) {
+    constexpr int bytes = smem_bytes<D, STAGES>();
+    const int resident = resident_blocks<D, WARPS>();
+
+    Sched s = whole_tiles<WARPS>(B, H_q, H_kv, S_q);
+    if (split_tail) split_tail_tiles<D, WARPS>(s, resident, S_kv, causal);
+    const int grid = grid_blocks(s);
     attention_v2_kernel<D, WARPS, STAGES>
         <<<grid, WARPS * 32, bytes, stream>>>(Q, K, V, O, S_q, S_kv, scale_log2, causal ? 1 : 0, s);
-    if (s.split > 1) {
-        constexpr int per_tile = BM * (D / 8);
-        const dim3 cgrid(cdiv(per_tile, 256), tiles - s.dp_tiles);
-        attention_combine_kernel<D, WARPS><<<cgrid, 256, 0, stream>>>(O, S_q, causal ? 1 : 0, s);
-    }
+    if (s.split > 1) launch_combine<D, WARPS>(O, S_q, causal, s, stream);
 }
 
 }  // namespace v2
+
+// ---------------------------------------------------------------------------------------
+// Variant 4: the mbarrier pipeline. Variant 2's 128 x 64 tile, fragments, softmax and epilogue
+// with the operand traffic moved off the warps:
+//   * K and V tiles arrive by TMA (cp.async.bulk.tensor) into STAGES stages with a full / empty
+//     mbarrier pair each, as in hgemm variant 5, and the Q tile comes the same way through
+//     stage 0 before the loop. Lane 0 of warp 0 issues the loads (two or four instructions per
+//     tile); the other 255 threads never compute a copy address;
+//   * a warp waits on a stage's full barrier before reading it and arrives on its empty barrier
+//     after its P V, and the producer waits on empty before refilling. Nothing in the loop is
+//     block-wide. Variant 2's __syncthreads per tile kept the two warps of each scheduler in
+//     the same phase, so their softmaxes were a hole in the tensor pipe; here the warps drift,
+//     and while one is in its softmax the other is usually issuing mma;
+//   * the TMA 128-byte swizzle lays a tile out as D/64 boxes of rows x 64 columns, each row
+//     128 B with its 16-byte chunks XORed by row % 8. ldmatrix addresses go through box_off().
+// The barrier bookkeeping counts the Q tile as load 0 and KV tile t as load t + 1, so load u
+// lives in stage u % STAGES and is the (u / STAGES)-th use of it.
+//
+// The kernel also carries the ping-pong schedules that were tried and measured slower
+// (docs/design/attention.md, "Variant 4"): two groups of four warps taking turns on the tensor
+// pipe through named barriers, FlashAttention-3 style. They compile only with
+// -DSPARK_ATTN_V4_EXPERIMENTS and are picked by SPARK_ATTN_V4_MODE.
+// ---------------------------------------------------------------------------------------
+namespace v4 {
+
+using v2::BN;
+using v2::Sched;
+
+constexpr int WARPS = 8, THREADS = 256, BM = 16 * WARPS;
+constexpr int GROUP_THREADS = THREADS / 2;
+constexpr int BOX_COLS = 64;   // 128 B, one swizzle span
+constexpr int BAR_GROUP0 = 1;  // named barriers 1 and 2: "group g may issue mma"
+
+template <int D>
+constexpr int tile_bytes() {
+    return BN * D * 2;  // one K or V tile
+}
+template <int D>
+constexpr int stage_bytes() {
+    return 2 * tile_bytes<D>();
+}
+// STAGES stages, then the barriers in a final KB. Stages are whole KB and the region starts on
+// a 1 KB boundary (the kernel checks), which the swizzle needs.
+template <int D, int STAGES>
+constexpr int smem_bytes() {
+    return STAGES * stage_bytes<D>() + 1024;
+}
+
+// Element offset of logical (row, 16-byte chunk) in a tile of ROWS rows x D columns laid out
+// as D/64 TMA boxes of ROWS x 64 with the 128-byte swizzle: box, then row, then the chunk
+// XORed with row % 8. Eight consecutive rows at one logical chunk hit eight bank groups.
+template <int ROWS>
+__device__ __forceinline__ int box_off(int row, int ch) {
+    return (ch >> 3) * (ROWS * BOX_COLS) + row * BOX_COLS + ((ch & 7) ^ (row & 7)) * 8;
+}
+
+// Schedule knobs for the experiments in docs/design/attention.md; the shipped kernel is
+// <D, 3, 0, 0, 0>. MODE: 0 = every warp runs variant 2's loop on the TMA pipeline, 1 = ping-pong
+// with two turns per tile (Q K^T, then P V), 2 = one turn per tile (Q K^T of tile t+1 with P V
+// of tile t). PAIR: 0 = the groups are warps 0-3 and 4-7 (one warp of each group per
+// scheduler), 1 = even and odd warps. OPT bits: 1 = a warp skips a causal tile whose keys all
+// follow its 16 rows (the fully masked half of the second diagonal tile), 2 = the O rescale is
+// skipped when no row max in the warp moved (warp-uniform branch).
+template <int D, int STAGES, int MODE, int PAIR, int OPT>
+__global__ void __launch_bounds__(THREADS, 1)
+    attention_v4_kernel(const __grid_constant__ CUtensorMap tmQ,
+                        const __grid_constant__ CUtensorMap tmK,
+                        const __grid_constant__ CUtensorMap tmV, bf16* __restrict__ O, int S_q,
+                        int S_kv, float scale_log2, int causal, Sched sched) {
+    constexpr int KT = D / 16;   // k16 steps of Q K^T
+    constexpr int DT = D / 8;    // n8 tiles of O
+    constexpr int NT = BN / 8;   // n8 tiles of S
+    constexpr int PT = BN / 16;  // k16 steps of P V
+    constexpr int BOXES = D / BOX_COLS;
+    constexpr int STAGE = stage_bytes<D>();
+    static_assert(BM * D * 2 <= STAGE, "the Q tile is staged through stage 0");
+    static_assert(MODE != 2 || STAGES >= 3,
+                  "one turn per tile reads K of t+1 while V of t is live");
+
+    extern __shared__ __align__(1024) unsigned char smem[];
+    uint64_t* full_bar = reinterpret_cast<uint64_t*>(smem + STAGES * STAGE);
+    uint64_t* empty_bar = full_bar + STAGES;
+    if (smem_u32(smem) % 1024 != 0) __trap();
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31, warp = tid >> 5;
+    const int g = lane >> 2, c2 = (lane & 3) * 2;
+    const int group = PAIR == 0 ? warp >> 2 : warp & 1;
+    const int bar_mine = BAR_GROUP0 + group, bar_other = BAR_GROUP0 + 1 - group;
+
+    int tile, slice = 0, split = 1;
+    if (static_cast<int>(blockIdx.x) < sched.dp_tiles) {
+        tile = blockIdx.x;
+    } else {
+        const int r = blockIdx.x - sched.dp_tiles;
+        tile = sched.dp_tiles + r / sched.split;
+        slice = r % sched.split;
+        split = sched.split;
+    }
+    const int bh = tile % sched.bh_count;
+    const int bkv = kv_index(bh, sched.H_q, sched.H_kv);  // the K/V head this tile reads
+    const int q_rank = tile / sched.bh_count;
+    const int q_tile = causal ? sched.q_tiles - 1 - q_rank : q_rank;
+    const int q0 = q_tile * BM;
+    bf16* Og = O + static_cast<size_t>(bh) * S_q * D;
+
+    const int kv_end = causal ? min(S_kv, q0 + BM) : S_kv;
+    const int T = cdiv(kv_end, BN);
+    const int tb = slice * T / split;
+    const int te = (slice + 1) * T / split;
+    const int n = te - tb;    // KV tiles of this block
+    const int loads = n + 1;  // plus the Q tile
+
+    if (tid == 0) {
+#pragma unroll
+        for (int s = 0; s < STAGES; ++s) {
+            mbar_init(&full_bar[s], 1);       // the producer's arrive.expect_tx
+            mbar_init(&empty_bar[s], WARPS);  // one arrive per warp
+        }
+        fence_mbar_init();
+    }
+    __syncthreads();
+
+    // Load u into stage u % STAGES: the Q tile (u = 0) or KV tile tb + u - 1. The n-th use of a
+    // stage (n >= 1) waits for the warps' release of the (n-1)-th.
+    auto produce = [&](int u) {
+        const int s = u % STAGES;
+        const int use = u / STAGES;
+        if (use > 0) mbar_wait(&empty_bar[s], (use - 1) & 1);
+        unsigned char* dst = smem + s * STAGE;
+        if (u == 0) {
+            mbar_arrive_expect_tx(&full_bar[s], BM * D * 2);
+#pragma unroll
+            for (int b = 0; b < BOXES; ++b)
+                tma_load_3d(dst + b * BM * BOX_COLS * 2, &tmQ, &full_bar[s], b * BOX_COLS, q0, bh);
+        } else {
+            const int j0 = (tb + u - 1) * BN;
+            mbar_arrive_expect_tx(&full_bar[s], STAGE);
+#pragma unroll
+            for (int b = 0; b < BOXES; ++b) {
+                tma_load_3d(dst + b * BN * BOX_COLS * 2, &tmK, &full_bar[s], b * BOX_COLS, j0, bkv);
+                tma_load_3d(dst + tile_bytes<D>() + b * BN * BOX_COLS * 2, &tmV, &full_bar[s],
+                            b * BOX_COLS, j0, bkv);
+            }
+        }
+    };
+    if (tid == 0) {
+        prefetch_tensormap(&tmQ);
+        prefetch_tensormap(&tmK);
+        prefetch_tensormap(&tmV);
+        for (int u = 0; u < min(STAGES, loads); ++u) produce(u);
+    }
+    // Stage and parity of KV tile tb + it (load it + 1).
+    auto stage_of = [&](int it) -> const bf16* {
+        return reinterpret_cast<const bf16*>(smem + ((it + 1) % STAGES) * STAGE);
+    };
+    auto wait_tile = [&](int it) {
+        mbar_wait(&full_bar[(it + 1) % STAGES], ((it + 1) / STAGES) & 1);
+    };
+    auto release_tile = [&](int it) {
+        fence_proxy_async_smem();
+        __syncwarp();
+        if (lane == 0) mbar_arrive(&empty_bar[(it + 1) % STAGES]);
+    };
+
+    // Q tile into A fragments: qf[kk] covers d = 16kk .. 16kk+15. Then stage 0 is released.
+    unsigned qf[KT][4];
+    {
+        mbar_wait(&full_bar[0], 0);
+        const bf16* qs = reinterpret_cast<const bf16*>(smem);
+        const int row = warp * 16 + (lane & 15);
+#pragma unroll
+        for (int kk = 0; kk < KT; ++kk)
+            ldmatrix_x4(qf[kk], qs + box_off<BM>(row, 2 * kk + (lane >> 4)));
+        fence_proxy_async_smem();
+        __syncwarp();
+        if (lane == 0) mbar_arrive(&empty_bar[0]);
+    }
+
+    float o[DT][4];
+#pragma unroll
+    for (int dj = 0; dj < DT; ++dj)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) o[dj][e] = 0.f;
+    float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.f, 0.f};
+    float sacc[NT][4];
+    unsigned pa[PT][4];
+
+    // S = Q K^T of the tile in `ks`: 16 rows x 64 keys per warp, 8 n8 accumulators.
+    auto qk = [&](const bf16* ks) {
+#pragma unroll
+        for (int nj = 0; nj < NT; ++nj)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) sacc[nj][e] = 0.f;
+#pragma unroll
+        for (int kk = 0; kk < KT; ++kk) {
+#pragma unroll
+            for (int nj = 0; nj < NT; nj += 2) {
+                const int row = nj * 8 + (lane & 15);
+                unsigned r[4];
+                ldmatrix_x4(r, ks + box_off<BN>(row, 2 * kk + (lane >> 4)));
+                const unsigned b0[2] = {r[0], r[2]};
+                const unsigned b1[2] = {r[1], r[3]};
+                mma_bf16_16816(sacc[nj], qf[kk], b0);
+                mma_bf16_16816(sacc[nj + 1], qf[kk], b1);
+            }
+        }
+    };
+    // Mask, online softmax on the S accumulators (rows g and g+8, the O rescale included) and
+    // P packed as the A fragments of P V: variant 2's code.
+    auto softmax = [&](int t) {
+        const int kv0 = t * BN;
+        if (kv0 + BN > S_kv || (causal && kv0 + BN - 1 > q0)) {  // warp-uniform
+#pragma unroll
+            for (int nj = 0; nj < NT; ++nj)
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const int i = q0 + warp * 16 + g + (e >> 1) * 8;
+                    const int j = kv0 + nj * 8 + c2 + (e & 1);
+                    if (j >= S_kv || (causal && j > i)) sacc[nj][e] = -INFINITY;
+                }
+        }
+        float alpha[2];
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            float mx = fmaxf(sacc[0][2 * r], sacc[0][2 * r + 1]);
+#pragma unroll
+            for (int nj = 1; nj < NT; ++nj)
+                mx = fmaxf(mx, fmaxf(sacc[nj][2 * r], sacc[nj][2 * r + 1]));
+            mx = fmaxf(mx, __shfl_xor_sync(kFullMask, mx, 1));
+            mx = fmaxf(mx, __shfl_xor_sync(kFullMask, mx, 2));
+            const float m_new = fmaxf(m[r], mx * scale_log2);
+            const float m_use = m_new == -INFINITY ? 0.f : m_new;
+            alpha[r] = ex2(m[r] - m_use);
+            float rs = 0.f;
+#pragma unroll
+            for (int nj = 0; nj < NT; ++nj) {
+                const float p0 = ex2(fmaf(sacc[nj][2 * r], scale_log2, -m_use));
+                const float p1 = ex2(fmaf(sacc[nj][2 * r + 1], scale_log2, -m_use));
+                sacc[nj][2 * r] = p0;
+                sacc[nj][2 * r + 1] = p1;
+                rs += p0 + p1;
+            }
+            l[r] = fmaf(l[r], alpha[r], rs);
+            m[r] = m_new;
+        }
+        // The rescale is 1 for every row of the warp once the maxima have settled; with OPT
+        // bit 2 the 64 multiplies are skipped on those tiles (a warp-uniform vote).
+        if (!(OPT & 2) || __any_sync(kFullMask, alpha[0] != 1.f || alpha[1] != 1.f)) {
+#pragma unroll
+            for (int dj = 0; dj < DT; ++dj) {
+                o[dj][0] *= alpha[0];
+                o[dj][1] *= alpha[0];
+                o[dj][2] *= alpha[1];
+                o[dj][3] *= alpha[1];
+            }
+        }
+#pragma unroll
+        for (int kt = 0; kt < PT; ++kt) {
+            pa[kt][0] = pack_bf16x2(sacc[2 * kt][0], sacc[2 * kt][1]);
+            pa[kt][1] = pack_bf16x2(sacc[2 * kt][2], sacc[2 * kt][3]);
+            pa[kt][2] = pack_bf16x2(sacc[2 * kt + 1][0], sacc[2 * kt + 1][1]);
+            pa[kt][3] = pack_bf16x2(sacc[2 * kt + 1][2], sacc[2 * kt + 1][3]);
+        }
+    };
+    // O += P V with the V tile in `vs`: 16 rows x D per warp, D/8 n8 accumulators.
+    auto pv = [&](const bf16* vs) {
+#pragma unroll
+        for (int kt = 0; kt < PT; ++kt) {
+#pragma unroll
+            for (int dj = 0; dj < DT; dj += 2) {
+                const int row = kt * 16 + (lane & 15);
+                unsigned r[4];
+                ldmatrix_x4_trans(r, vs + box_off<BN>(row, dj + (lane >> 4)));
+                const unsigned b0[2] = {r[0], r[1]};
+                const unsigned b1[2] = {r[2], r[3]};
+                mma_bf16_16816(o[dj], pa[kt], b0);
+                mma_bf16_16816(o[dj + 1], pa[kt], b1);
+            }
+        }
+    };
+    // Turns. A turn is one bar.sync by the 128 threads that take it and one bar.arrive by the
+    // 128 that hand it over, on a 256-thread barrier. Group 0 has the first turn, so group 1
+    // arrives once up front and skips its last arrive to leave the barriers balanced.
+    auto take_turn = [&]() {
+        if (MODE != 0) named_barrier_sync(bar_mine, THREADS);
+    };
+    auto give_turn = [&](bool last) {
+        if (MODE != 0 && !(last && group == 1)) named_barrier_arrive(bar_other, THREADS);
+    };
+    if (MODE != 0 && group == 1) named_barrier_arrive(BAR_GROUP0, THREADS);
+
+    if constexpr (MODE == 2) {
+        // Turn 0: S_0. Then, per tile t: one turn with S_{t+1} and O += P_t V_t, then the
+        // softmax of tile t+1 under the other group's turn. Group 0's turn starts when group 1
+        // has finished P V of tile t-1, so that tile's stage is free: lane 0 refills it.
+        wait_tile(0);
+        take_turn();
+        qk(stage_of(0));
+        give_turn(false);
+        softmax(tb);
+        for (int it = 0; it < n; ++it) {
+            const bool more = it + 1 < n;
+            if (more) wait_tile(it + 1);
+            take_turn();
+            if (tid == 0 && it + STAGES < loads) produce(it + STAGES);
+            if (more) qk(stage_of(it + 1));
+            pv(stage_of(it) + BN * D);
+            release_tile(it);
+            give_turn(!more);
+            if (more) softmax(tb + it + 1);
+        }
+    } else {
+        for (int it = 0; it < n; ++it) {
+            wait_tile(it);
+            // Under the causal mask the keys of a tile may all follow every row of this warp
+            // (rows q0 + 16 warp .. + 15 against keys from (tb + it) BN): every score is masked,
+            // every p is 0, and the tile is a no-op for the warp.
+            const bool dead =
+                (OPT & 1) && MODE == 0 && causal && (tb + it) * BN > q0 + warp * 16 + 15;
+            take_turn();
+            if (tid == 0 && it + STAGES < loads) produce(it + STAGES);
+            if (!dead) qk(stage_of(it));
+            give_turn(false);
+            if (!dead) softmax(tb + it);
+            take_turn();
+            if (!dead) pv(stage_of(it) + BN * D);
+            release_tile(it);
+            give_turn(it + 1 == n);
+        }
+    }
+
+    // Epilogue, as variant 2's.
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+        float ls = l[r];
+        ls += __shfl_xor_sync(kFullMask, ls, 1);
+        ls += __shfl_xor_sync(kFullMask, ls, 2);
+        const int lrow = warp * 16 + g + 8 * r;
+        if (split == 1) {
+            const int row = q0 + lrow;
+            if (row >= S_q) continue;
+            const float inv = 1.f / ls;
+            bf16* out = Og + static_cast<size_t>(row) * D + c2;
+#pragma unroll
+            for (int dj = 0; dj < DT; ++dj)
+                *reinterpret_cast<__nv_bfloat162*>(out + dj * 8) =
+                    __floats2bfloat162_rn(o[dj][2 * r] * inv, o[dj][2 * r + 1] * inv);
+        } else {
+            float* part = sched.ws + (static_cast<size_t>(tile - sched.dp_tiles) * split + slice) *
+                                         v2::partial_floats<D, WARPS>();
+            float* orow = part + lrow * D + c2;
+#pragma unroll
+            for (int dj = 0; dj < DT; ++dj)
+                *reinterpret_cast<float2*>(orow + dj * 8) =
+                    make_float2(o[dj][2 * r], o[dj][2 * r + 1]);
+            if ((lane & 3) == 0) {
+                part[BM * D + lrow] = m[r];
+                part[BM * D + BM + lrow] = ls;
+            }
+        }
+    }
+}
+
+constexpr int STAGES = 3;
+
+template <int D, int MODE, int PAIR, int OPT>
+int resident_blocks() {
+    constexpr int bytes = smem_bytes<D, STAGES>();
+    static int resident = 0;
+    if (resident == 0) {
+        SPARK_CUDA_CHECK(cudaFuncSetAttribute(attention_v4_kernel<D, STAGES, MODE, PAIR, OPT>,
+                                              cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+        int per_sm = 0;
+        SPARK_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &per_sm, attention_v4_kernel<D, STAGES, MODE, PAIR, OPT>, THREADS, bytes));
+        resident = (per_sm > 0 ? per_sm : 1) * num_sms();
+    }
+    return resident;
+}
+
+template <int D, int MODE, int PAIR, int OPT>
+void launch_mode(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv,
+                 int S_q, int S_kv, float scale_log2, bool causal, cudaStream_t stream) {
+    constexpr int bytes = smem_bytes<D, STAGES>();
+    const int resident = resident_blocks<D, MODE, PAIR, OPT>();
+    // [B*H][S][D] maps with boxes of 64 columns (one 128-byte swizzle span): 128 rows for Q,
+    // 64 for K and V. Rows past S_q / S_kv are zero-filled by the copy engine.
+    const uint64_t BHq = static_cast<uint64_t>(B) * H_q;
+    const uint64_t BHkv = static_cast<uint64_t>(B) * H_kv;  // K/V heads, fewer under GQA
+    const CUtensorMap tmQ =
+        make_tensor_map_3d_bf16(Q, D, S_q, BHq, BOX_COLS, BM, CU_TENSOR_MAP_SWIZZLE_128B);
+    const CUtensorMap tmK =
+        make_tensor_map_3d_bf16(K, D, S_kv, BHkv, BOX_COLS, BN, CU_TENSOR_MAP_SWIZZLE_128B);
+    const CUtensorMap tmV =
+        make_tensor_map_3d_bf16(V, D, S_kv, BHkv, BOX_COLS, BN, CU_TENSOR_MAP_SWIZZLE_128B);
+
+    Sched s = v2::whole_tiles<WARPS>(B, H_q, H_kv, S_q);
+    v2::split_tail_tiles<D, WARPS>(s, resident, S_kv, causal);
+    attention_v4_kernel<D, STAGES, MODE, PAIR, OPT><<<v2::grid_blocks(s), THREADS, bytes, stream>>>(
+        tmQ, tmK, tmV, O, S_q, S_kv, scale_log2, causal ? 1 : 0, s);
+    if (s.split > 1) v2::launch_combine<D, WARPS>(O, S_q, causal, s, stream);
+}
+
+template <int D>
+void launch(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv, int S_q,
+            int S_kv, float scale_log2, bool causal, cudaStream_t stream) {
+#ifdef SPARK_ATTN_V4_EXPERIMENTS
+    // SPARK_ATTN_V4_MODE = MODE + 10 * PAIR + 100 * OPT (see the kernel).
+    static int mode = -1;
+    if (mode < 0) {
+        mode = 0;
+        if (const char* e = std::getenv("SPARK_ATTN_V4_MODE")) mode = std::atoi(e);
+    }
+    switch (mode) {
+        case 1:
+            launch_mode<D, 1, 0, 0>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal,
+                                    stream);
+            return;
+        case 11:
+            launch_mode<D, 1, 1, 0>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal,
+                                    stream);
+            return;
+        case 2:
+            launch_mode<D, 2, 0, 0>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal,
+                                    stream);
+            return;
+        case 12:
+            launch_mode<D, 2, 1, 0>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal,
+                                    stream);
+            return;
+        case 100:
+            launch_mode<D, 0, 0, 1>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal,
+                                    stream);
+            return;
+        case 200:
+            launch_mode<D, 0, 0, 2>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal,
+                                    stream);
+            return;
+        case 300:
+            launch_mode<D, 0, 0, 3>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal,
+                                    stream);
+            return;
+        default:
+            break;
+    }
+#endif
+    launch_mode<D, 0, 0, 0>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, stream);
+}
+
+}  // namespace v4
 
 template <int D>
 void launch_v1(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv,
@@ -835,7 +1309,7 @@ void launch_v3(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int 
 }  // namespace
 
 int attention_num_variants() {
-    return 4;
+    return 5;
 }
 
 bool attention_supports(int S_q, int S_kv, int D, int variant) {
@@ -886,6 +1360,22 @@ void attention_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_b
                 launch_v3<64>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, stream);
             else
                 launch_v3<128>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, stream);
+            break;
+        case 4:
+            // Short queries take variant 3's paths (the flash-decoding kernel or the 64-row
+            // tile); the TMA kernel takes every 128-row tile.
+            if (S_q <= 64) {
+                if (D == 64)
+                    launch_v3<64>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, stream);
+                else
+                    launch_v3<128>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, stream);
+            } else {
+                if (D == 64)
+                    v4::launch<64>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, stream);
+                else
+                    v4::launch<128>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal,
+                                    stream);
+            }
             break;
         default:
             break;

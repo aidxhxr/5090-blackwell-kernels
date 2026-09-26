@@ -145,6 +145,10 @@ bool hgemm_supports(int M, int N, int K, int variant);
 //            (b, kv head) split over blocks that fill the SMs, four warps per block each
 //            streaming its own keys, partials merged in shared memory and by the last block
 //            to arrive (one launch, no combine kernel)
+// variant 4: variant 3's tile and schedule with K and V fed by TMA into a full / empty
+//            mbarrier pipeline issued by one lane, so the KV loop has no block-wide barrier and
+//            one warp's softmax runs under the other warp's mma on each scheduler. Same tail
+//            split and decode paths as variant 3
 void attention_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_bfloat16* V,
                     __nv_bfloat16* O, int B, int H_q, int H_kv, int S_q, int S_kv, int D,
                     bool causal, int variant, cudaStream_t stream);
