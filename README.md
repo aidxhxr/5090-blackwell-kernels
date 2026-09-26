@@ -22,7 +22,7 @@ Best rung of each ladder on its largest shape:
 |---|---|---|---|---|---|---|
 | bf16 GEMM | 4096 x 4096 x 4096 | v3 | 0.611 ms | 225 TFLOPS | 99.7% of cuBLAS | 1.01x |
 | bf16 GEMM | 8192 x 8192 x 8192 | v3 | 4.99 ms | 220 TFLOPS | 94.9% of cuBLAS | 0.96x |
-| bf16 GEMM, decode | 16 x 4096 x 4096 | v3 | 27.7 us | 1,220 GB/s | 104.5% of cuBLAS | 1.08x |
+| bf16 GEMM, decode | 16 x 4096 x 4096 | v3 | 23.5 us | 1,438 GB/s | 126.8% of cuBLAS | |
 | fp32 GEMM | 4096 x 4096 x 11008 | v5 | 6.45 ms | 57 TFLOPS | 86.2% of cuBLAS | 0.87x |
 | rmsnorm bf16 | 16384 x 8192 | v4 | 0.351 ms | 1,529 GB/s | 10.4x over naive | 1.06x |
 | add + rmsnorm bf16 | 16384 x 8192 | fused | 0.711 ms | 1,509 GB/s | | 1.24x |
@@ -36,7 +36,8 @@ the copy roof. The spec sheet says 1,792 GB/s. Nothing reaches that.
 
 Variant 3 is raw `mma.sync.m16n8k16` with `ldmatrix`, an XOR-swizzled shared-memory tile, a
 three-stage `cp.async` pipeline, and split-K on the last partial wave of tiles. It picks a
-128x128, 64x128 or 64x64 tile per call depending on whether the grid fills the card.
+128x128, 64x128 or 64x64 tile per call depending on whether the grid fills the card, and for
+M <= 64 it runs a separate weight-streaming kernel with a 16, 32 or 64-row tile.
 
 | M x N x K | v3 TFLOPS | cuBLAS TFLOPS | v3 / cuBLAS |
 |---|---|---|---|
@@ -49,14 +50,22 @@ three-stage `cp.async` pipeline, and split-K on the last partial wave of tiles. 
 
 Decode shapes, where the whole thing is streaming the weight matrix once. The bench rotates
 through enough copies of B to get past the 96 MB L2, otherwise both sides read out of cache
-and report numbers above what the memory can do.
+and report numbers above what the memory can do. These run a dedicated kernel: one CTA per
+column strip of B, a 16, 32 or 64-row tile, no split-K and no memsets, so a call is one
+launch and nothing waits on a reduction at the end.
 
 | M x N x K | v3 | cuBLAS | v3 / cuBLAS |
 |---|---|---|---|
-| 16 x 4096 x 4096 | 1,220 GB/s | 1,168 GB/s | 104.5% |
-| 64 x 4096 x 4096 | 1,163 GB/s | 1,135 GB/s | 102.5% |
-| 16 x 11008 x 4096 | 1,449 GB/s | 1,494 GB/s | 97.0% |
-| 64 x 4096 x 11008 | 1,469 GB/s | 1,444 GB/s | 101.7% |
+| 1 x 4096 x 4096 | 1,427 GB/s | 841 GB/s | 169.5% |
+| 16 x 4096 x 4096 | 1,438 GB/s | 1,135 GB/s | 126.8% |
+| 32 x 4096 x 4096 | 1,447 GB/s | 1,152 GB/s | 125.5% |
+| 64 x 4096 x 4096 | 1,459 GB/s | 1,138 GB/s | 128.4% |
+| 16 x 11008 x 4096 | 1,607 GB/s | 1,497 GB/s | 107.5% |
+| 64 x 4096 x 11008 | 1,543 GB/s | 1,446 GB/s | 106.7% |
+
+A read-only kernel that streams 32 MB and does nothing else takes 23.6 us timed the same way,
+so the 4096-wide rows are at the floor of a single launch; queued back to back the same
+launches take 21.5 us, 1,574 GB/s. M = 1 to 64 all cost the same 23.5 us.
 
 Two things I didn't expect. `bench_peak` measures 258.7 TFLOPS of dense bf16 `mma.sync` at
 2,976 MHz, but a real 8192 cubed GEMM hits the 600 W power limit within a second and the clock
@@ -83,7 +92,7 @@ dumps in `results/ncu_*.txt`.
 | `swiglu` | scalar, 128-bit vectorized | PyTorch eager, two kernels |
 | `softmax` | three pass, warp online softmax, block online softmax, single pass with the row in registers | `torch.softmax` |
 | `sgemm` fp32 | naive, smem tile, 8x8 register tile, cp.async, register prefetch with swizzle, 256x128 tile | cuBLAS SGEMM |
-| `hgemm` bf16 | WMMA, smem tile, cp.async, `mma.sync` + `ldmatrix` with swizzle, 3 stages and split-K | cuBLAS GemmEx |
+| `hgemm` bf16 | WMMA, smem tile, cp.async, `mma.sync` + `ldmatrix` with swizzle, 3 stages and split-K, a weight-streaming kernel for decode | cuBLAS GemmEx |
 | `attention` bf16 | warp per query row, CUDA-core flash attention, `mma.sync` + `ldmatrix` flash attention, split-KV tail and decode | `F.scaled_dot_product_attention` |
 | `bench_peak` | | measures the card's real `mma.sync` and FMA peaks and the clock they run at |
 
@@ -148,8 +157,9 @@ numbers, and which Nsight metric moved:
   [sgemm](docs/design/sgemm.md), [hgemm](docs/design/hgemm.md),
   [attention](docs/design/attention.md)
 
-Things I'd still like to do: Stream-K proper instead of only splitting the tail, a 16-row tile
-for M under 32, and figuring out why the 11008-wide fp32 shapes lose 10% per FLOP. Both cards
+Things I'd still like to do: Stream-K proper instead of only splitting the tail, CUDA graphs
+for the 2 us a lone decode launch pays over the back-to-back rate, and figuring out why the
+11008-wide fp32 shapes lose 10% per FLOP. Both cards
 are consumer Blackwell, so `mma.sync`, `cp.async` and TMA are available and `tcgen05` isn't.
 
 ```
