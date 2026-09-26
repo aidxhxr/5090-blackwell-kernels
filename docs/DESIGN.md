@@ -82,3 +82,4 @@ docs:
 - [softmax](design/softmax.md)
 - [sgemm](design/sgemm.md)
 - [hgemm](design/hgemm.md)
+- [attention](design/attention.md)

@@ -84,6 +84,7 @@ dumps in `results/ncu_*.txt`.
 | `softmax` | three pass, warp online softmax, block online softmax, single pass with the row in registers | `torch.softmax` |
 | `sgemm` fp32 | naive, smem tile, 8x8 register tile, cp.async, register prefetch with swizzle, 256x128 tile | cuBLAS SGEMM |
 | `hgemm` bf16 | WMMA, smem tile, cp.async, `mma.sync` + `ldmatrix` with swizzle, 3 stages and split-K | cuBLAS GemmEx |
+| `attention` bf16 | warp per query row, CUDA-core flash attention, `mma.sync` + `ldmatrix` flash attention, split-KV tail and decode | `F.scaled_dot_product_attention` |
 | `bench_peak` | | measures the card's real `mma.sync` and FMA peaks and the clock they run at |
 
 Every kernel takes a `variant` argument so each rung can be run, timed and tested on its own.
@@ -111,6 +112,7 @@ make ncu              # Nsight Compute on the top two rungs of every ladder, nee
 ```bash
 ./build/bench_hgemm --m=16 --n=4096 --k=4096 --variant=3
 ./build/bench_rmsnorm --rows=16384 --cols=8192
+./build/bench_attention --b=1 --h=32 --s=4096 --d=128 --causal=1 --variant=3
 ```
 
 Each bench checks every variant against a reference, CPU double precision for the row kernels
@@ -130,6 +132,7 @@ out = sk.add_rmsnorm_(x, resid, w)         # resid += x, then norm, in place
 h = sk.swiglu(gate, up)
 p = sk.softmax(scores)
 c = sk.hgemm(a_bf16, b_bf16)               # tensor-core GEMM
+o = sk.attention(q, k, v, causal=True)     # fused attention, q/k/v are [B, H, S, D] bf16
 ```
 
 ## notes
@@ -142,7 +145,8 @@ numbers, and which Nsight metric moved:
 - [docs/GB10.md](docs/GB10.md), the card that hasn't arrived
 - [bandwidth](docs/design/bandwidth.md), [rmsnorm](docs/design/rmsnorm.md),
   [swiglu](docs/design/swiglu.md), [softmax](docs/design/softmax.md),
-  [sgemm](docs/design/sgemm.md), [hgemm](docs/design/hgemm.md)
+  [sgemm](docs/design/sgemm.md), [hgemm](docs/design/hgemm.md),
+  [attention](docs/design/attention.md)
 
 Things I'd still like to do: Stream-K proper instead of only splitting the tail, a 16-row tile
 for M under 32, and figuring out why the 11008-wide fp32 shapes lose 10% per FLOP. Both cards
