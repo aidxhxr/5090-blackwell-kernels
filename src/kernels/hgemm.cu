@@ -23,6 +23,7 @@
 #include <algorithm>
 
 #include "hgemm_internal.cuh"
+#include "hgemm_tile.cuh"
 #include "spark/common.cuh"
 #include "spark/kernels.h"
 
@@ -331,28 +332,8 @@ __global__ void __launch_bounds__(TILE_THREADS)
 // ---------------------------------------------------------------------------------------
 namespace v3 {
 
-constexpr int THREADS = 256;
-constexpr int WARPS_M = 2, WARPS_N = 4;  // 8 warps as 2 (M) x 4 (N), whatever the tile
-
-// Physical 16-byte chunk for logical (row, chunk) of an A tile whose rows are BK bf16 long.
-// Rows of 64 B (BK=32): chunk ^= (row/2)%4; rows of 128 B (BK=64): chunk ^= row%8. Either
-// way the 8 rows an ldmatrix touches land in 8 different bank groups.
-template <int BK>
-__device__ __forceinline__ int swz_a(int row, int chunk) {
-    if constexpr (BK == 32)
-        return chunk ^ ((row >> 1) & 3);
-    else
-        return chunk ^ (row & 7);
-}
-// B rows are >= 256 B (BN >= 128 bf16): XOR the low three bits of the chunk index with row%8.
-__device__ __forceinline__ int swz_b(int row, int chunk) {
-    return chunk ^ (row & 7);
-}
-
-template <int BM, int BN, int BK, int STAGES>
-constexpr int smem_bytes() {
-    return STAGES * (BM * BK + BK * BN) * static_cast<int>(sizeof(__nv_bfloat16));
-}
+using hgemm_tile::smem_bytes;
+using hgemm_tile::THREADS;
 
 // Work assignment (see `plan` below). Blocks [0, dp_tiles) each own one full output tile;
 // blocks from dp_tiles on split the remaining tiles `split` ways along K, accumulate their
@@ -366,37 +347,22 @@ struct Sched {
     int* counters;
 };
 
-// Tile rows past M are zero-filled on the way in and skipped on the way out, so any
-// M % 16 == 0 works with any BM; N % BN == 0 and K % BK == 0 are required.
+// The tile (swizzle, pipeline, mma loop, register epilogue) is hgemm_tile.cuh. Tile rows
+// past M are zero-filled on the way in and skipped on the way out, so any M % 16 == 0 works
+// with any BM; N % BN == 0 and K % BK == 0 are required.
 template <int BM, int BN, int BK, int STAGES>
 __global__ void __launch_bounds__(THREADS)
     hgemm_v3_kernel(const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,
                     __nv_bfloat16* __restrict__ C, int M, int N, int K, Sched sched) {
-    static_assert(BK == 32 || BK == 64, "swizzle assumes 64 B or 128 B rows of A");
-    static_assert(BM == 64 || BM == 128, "warp tile is BM/2 tall: 32 or 64");
-    static_assert(BN == 64 || BN == 128 || BN == 256, "warp tile is BN/4 wide: 16, 32 or 64");
-    constexpr int WM = BM / WARPS_M;  // 32 or 64
-    constexpr int WN = BN / WARPS_N;  // 16, 32 or 64
-    constexpr int MT = WM / 16;       // m16 tiles per warp
-    constexpr int NT = WN / 8;        // n8 tiles per warp (even: ldmatrix.x4 loads two)
-    static_assert(NT % 2 == 0, "");
-    constexpr int B_CPR = BN / 8;                    // 16-byte chunks per smem row of B
-    constexpr int A_CPR = BK / 8;                    // chunks per A row
-    constexpr int A_ITERS = (BM * A_CPR) / THREADS;  // chunks per thread per stage
-    constexpr int B_ITERS = (BK * B_CPR) / THREADS;
-    static_assert(A_ITERS * THREADS == BM * A_CPR && B_ITERS * THREADS == BK * B_CPR, "");
-    constexpr int A_STAGE = BM * BK;  // elements
-    constexpr int B_STAGE = BK * BN;
-
+    using Cfg = hgemm_tile::Cfg<BM, BN, BK, STAGES>;
+    constexpr int WM = Cfg::WM, WN = Cfg::WN, MT = Cfg::MT, NT = Cfg::NT;
     extern __shared__ __align__(128) unsigned char smem_raw[];
-    __nv_bfloat16* As = reinterpret_cast<__nv_bfloat16*>(smem_raw);
-    __nv_bfloat16* Bs = As + STAGES * A_STAGE;
 
     const int tid = threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
-    const int wm = warp / WARPS_N;
-    const int wn = warp % WARPS_N;
+    const int wm = warp / hgemm_tile::WARPS_N;
+    const int wn = warp % hgemm_tile::WARPS_N;
 
     const int KT = K / BK;
     int tile, kt_begin, kt_end, slice = 0;
@@ -413,122 +379,21 @@ __global__ void __launch_bounds__(THREADS)
     }
     const int bm = (tile / sched.tiles_n) * BM;
     const int bn = (tile % sched.tiles_n) * BN;
-
-    const __nv_bfloat16* Ab = A + static_cast<size_t>(bm) * K + static_cast<size_t>(kt_begin) * BK;
-    const __nv_bfloat16* Bb = B + static_cast<size_t>(kt_begin) * BK * N + bn;
     const int m_valid = M - bm;  // rows of this tile that exist
 
-    auto load_stage = [&](int stage, int k0) {
-        __nv_bfloat16* as = As + stage * A_STAGE;
-        __nv_bfloat16* bs = Bs + stage * B_STAGE;
-#pragma unroll
-        for (int i = 0; i < A_ITERS; ++i) {
-            const int c = tid + i * THREADS;
-            const int row = c / A_CPR;
-            const int ch = c % A_CPR;
-            const bool ok = row < m_valid;
-            cp_async_16_zfill(as + row * BK + swz_a<BK>(row, ch) * 8,
-                              Ab + static_cast<size_t>(ok ? row : 0) * K + k0 + ch * 8, ok);
-        }
-#pragma unroll
-        for (int i = 0; i < B_ITERS; ++i) {
-            const int c = tid + i * THREADS;
-            const int row = c / B_CPR;
-            const int ch = c % B_CPR;
-            cp_async_16(bs + row * BN + swz_b(row, ch) * 8,
-                        Bb + static_cast<size_t>(k0 + row) * N + ch * 8);
-        }
-    };
+    typename Cfg::Acc acc;
+    hgemm_tile::mainloop<Cfg>(A, B, N, K, bm, bn, m_valid, kt_begin, kt_end - kt_begin, smem_raw,
+                              acc);
 
-    float acc[MT][NT][4];
-#pragma unroll
-    for (int i = 0; i < MT; ++i)
-#pragma unroll
-        for (int j = 0; j < NT; ++j)
-#pragma unroll
-            for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.f;
-
-    const int nkt = kt_end - kt_begin;  // K-tiles this block accumulates (k0 below is relative)
-
-    // Prologue: the first STAGES-1 tiles are in flight before any compute starts.
-#pragma unroll
-    for (int s = 0; s < STAGES - 1; ++s) {
-        if (s < nkt) load_stage(s, s * BK);
-        cp_async_commit();
-    }
-
-    // Per-lane ldmatrix row/chunk selectors (constant across the K loop).
-    const int a_row_in_tile = lane & 15;   // row within a 16-row m tile
-    const int a_kchunk = lane >> 4;        // 0/1: k 0-7 or 8-15 of the current k16 step
-    const int b_krow_in_step = lane & 15;  // k row within the k16 step
-    const int b_nchunk = lane >> 4;        // 0/1: which n8 tile of the pair
-
-    for (int kt = 0; kt < nkt; ++kt) {
-        cp_async_wait<STAGES - 2>();  // tile kt has landed (for this thread)
-        __syncthreads();              // ... for every thread; and stage (kt-1)%STAGES is free
-        {
-            const int nk = kt + STAGES - 1;
-            if (nk < nkt) load_stage(nk % STAGES, nk * BK);
-            cp_async_commit();  // always commit so the group count stays uniform
-        }
-        const __nv_bfloat16* as = As + (kt % STAGES) * A_STAGE;
-        const __nv_bfloat16* bs = Bs + (kt % STAGES) * B_STAGE;
-
-#pragma unroll
-        for (int kk = 0; kk < BK; kk += 16) {
-            unsigned afrag[MT][4];
-            unsigned bfrag[NT][2];
-#pragma unroll
-            for (int mi = 0; mi < MT; ++mi) {
-                const int row = wm * WM + mi * 16 + a_row_in_tile;
-                const int ch = kk / 8 + a_kchunk;
-                ldmatrix_x4(afrag[mi], as + row * BK + swz_a<BK>(row, ch) * 8);
-            }
-#pragma unroll
-            for (int nj = 0; nj < NT; nj += 2) {
-                const int krow = kk + b_krow_in_step;
-                const int ch = (wn * WN + nj * 8) / 8 + b_nchunk;
-                unsigned r[4];
-                ldmatrix_x4_trans(r, bs + krow * BN + swz_b(krow, ch) * 8);
-                bfrag[nj][0] = r[0];
-                bfrag[nj][1] = r[1];
-                bfrag[nj + 1][0] = r[2];
-                bfrag[nj + 1][1] = r[3];
-            }
-#pragma unroll
-            for (int mi = 0; mi < MT; ++mi)
-#pragma unroll
-                for (int nj = 0; nj < NT; ++nj) mma_bf16_16816(acc[mi][nj], afrag[mi], bfrag[nj]);
-        }
-    }
-    cp_async_wait<0>();
-
-    // Epilogue: each lane owns (row g, cols 2c..2c+1) and (row g+8, same cols) of every
-    // 16x8 tile; two bf16 per store, straight from registers.
-    const int g = lane >> 2;
-    const int c2 = (lane & 3) * 2;
     if (tile < sched.dp_tiles) {
-#pragma unroll
-        for (int mi = 0; mi < MT; ++mi) {
-#pragma unroll
-            for (int nj = 0; nj < NT; ++nj) {
-                const int row = bm + wm * WM + mi * 16 + g;
-                const int col = bn + wn * WN + nj * 8 + c2;
-                __nv_bfloat16* p0 = C + static_cast<size_t>(row) * N + col;
-                __nv_bfloat16* p1 = p0 + static_cast<size_t>(8) * N;
-                if (row < M)  // M % 16 == 0: row and row + 8 are in or out together
-                    *reinterpret_cast<__nv_bfloat162*>(p0) =
-                        __floats2bfloat162_rn(acc[mi][nj][0], acc[mi][nj][1]);
-                if (row + 8 < M)
-                    *reinterpret_cast<__nv_bfloat162*>(p1) =
-                        __floats2bfloat162_rn(acc[mi][nj][2], acc[mi][nj][3]);
-            }
-        }
+        hgemm_tile::store_bf16<Cfg>(acc, C, M, N, bm, bn);
         return;
     }
 
     // Tail tile: accumulate this K-slice into the fp32 workspace tile. The adds are
     // performed at L2, so no ordering between the slices is needed.
+    const int g = lane >> 2;
+    const int c2 = (lane & 3) * 2;
     float* wt = sched.ws + static_cast<size_t>(tile - sched.dp_tiles) * BM * BN;
 #pragma unroll
     for (int mi = 0; mi < MT; ++mi) {
