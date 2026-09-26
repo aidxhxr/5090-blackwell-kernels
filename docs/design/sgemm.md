@@ -201,15 +201,155 @@ from the memory-system-specific rungs above.
 * **Small shapes underfill 170 SMs.** 16 tiles at 512³ and 64 at 1024³ (32 for rung 5), so
   those rows are occupancy numbers, not kernel-quality numbers: 33% and 47% of cuBLAS at best.
   cuBLAS presumably switches to a smaller tile or split-K there.
-* **The Llama MLP shapes are ~10% slower per FLOP than 4096³** on rungs 2–4 (e.g. rung 4: 59.3
-  TFLOPS at 4096³ vs 51.7–52.6 with N or K = 11008), while cuBLAS is flat across them. An
-  11008-float row is 44 KB, so a 128-row A tile spans 5.6 MB of address space per load instead
-  of 2 MB; I have not profiled it, TLB reach is the first suspect. Rung 5, with its 256-row tiles,
-  is the one rung that does not show the effect (56.4 vs 56.7–57.3).
+* **The Llama MLP shapes read ~10% slower per FLOP than 4096³** (rung 4: 59.3 TFLOPS at
+  4096³ vs 51.7–52.6 with N or K = 11008; rung 5 in the re-measurement below: 65.4 vs
+  57.0–57.4), while cuBLAS is flat across them. My first guess was the 44 KB row stride and
+  the TLB. It is neither: at a fixed clock the kernel runs at the same rate on every shape,
+  and the difference is the SM clock the card's limiter allows. The measurements are in
+  "The 11008 shapes" below.
 * **Occupancy cap** confirmed: the register file is 64 K per SM, `launch__registers_per_thread`
   is 128 for rung 4 (2 blocks) and 245 for rung 5 (1 block).
-* `min_ms` and the median agree to within 1–2% on every row; the 600 W limit is a steady-state
-  clock, not jitter.
+* `min_ms` and the median agreed to within 1–2% on every row of the first run. That was luck,
+  not a property of the kernel: on 4096³ rung 5 has a 1.80 ms minimum and a median anywhere
+  between 1.83 and 2.42 depending on when the clock limiter reacts (next section).
+
+### The 11008 shapes
+
+The earlier note above blamed the 44 KB row stride and guessed at the TLB. That was wrong. I
+went through the four candidates one at a time, and the loss is not in the kernel at all.
+
+**1. Stride.** `4096×4096×K` and `4096×N×4096` for K, N from 4096 to 12288, rung 5, 20
+iterations each. A stride effect would be a dip at 11008 and its neighbours. There is none:
+the per-FLOP rate falls from ~75 TFLOPS to ~57 somewhere between K = 8192 and K = 10240 and
+stays there, and 10944, 11008, 11072 and 12288 all sit on the same floor. A scratch copy of
+the kernel with separate leading dimensions makes it explicit: 4096³ with `lda`, `ldb` and
+`ldc` all padded to 11008 (the exact 44,032 B stride of the MLP shapes, same FLOPs, same
+tiles) runs at 2.42 ms against 2.39 ms unpadded, and 4112 (a 16 KB + 64 B stride) at 2.38.
+The stride is not the variable.
+
+**2. The tail split.** Overriding `split` in the scratch copy at 4096³: 1 (no tail split)
+2.45 ms, 2 → 2.43, 8 → 2.38, 32 → 2.41, the launcher's 85 → 2.39. The tail is worth 2–3%
+and is the same on every shape; it is not the 10%.
+
+**3. Tile order.** Groups of G tile rows walked column-major, G = 2, 4, 8, 16, at all three
+shapes: every result within ±1% of the row-major order (2.36–2.42 ms at 4096³, 6.47–6.50 at
+4096×4096×11008, 6.45–6.46 at 4096×11008×4096). Nsight says why there was nothing to gain:
+L2 hit rate 90% at 4096³ and at 4096×4096×11008, 80% at 4096×11008×4096, DRAM at 9%, 9% and
+19% of peak, `long_scoreboard` stalls under 1% of issue slots on all three. The global loads
+are not the limiter, so a better order for them cannot be the fix.
+
+**4. Nsight at a fixed clock.** This is the measurement that settles it. Nsight Compute pins
+the SM clock (2.43–2.48 GHz here) for the launch it profiles, and at that clock every shape
+runs at the same rate:
+
+| shape | ms | TFLOPS (2.43–2.48 GHz) | FMA pipe active | L2 hit | DRAM |
+|---|---|---|---|---|---|
+| 4096³ | 1.92 | 71.6 | 73.0% | 90.3% | 9.1% |
+| 4096×4096×8192 | 3.73 | 73.7 | 73.7% | 90.5% | 9.3% |
+| 4096×4096×11008 | 4.92 | 75.1 | 74.9% | 90.6% | 9.3% |
+| 4096×11008×4096 | 5.10 | 72.4 | 74.0% | 80.4% | 19.2% |
+
+Eight consecutive profiled launches of 4096³ agree to 0.5%. The kernel does the same work
+per clock on every shape, and 73–75% of the FMA pipe is the whole story on the instruction
+side. So the shape dependence in the results table is a clock dependence.
+
+**The clock.** `nvidia-smi` sampled during the bench, unlocked, on 4096×4096×11008:
+
+| phase | SM clock | board power | throttle reason |
+|---|---|---|---|
+| cuBLAS timing loop | 2,317–2,370 MHz | 580 W | SW power cap |
+| rung 5 timing loop | 1,890 MHz | 455 W | SW power cap |
+
+The limiter holds rung 5 at 1.89 GHz while the board draws 145 W less than its 600 W limit,
+and gives cuBLAS 2.32 GHz at the limit. It is not reacting to measured power. Locking the
+clock at 1.9 GHz (`nvidia-smi -lgc`, under the GPU lock, reset afterwards) reproduces the
+"slow" numbers exactly and puts both kernels on the same footing:
+
+| shape, 1.9 GHz locked | cuBLAS ms | rung 5 ms | rung 5 / cuBLAS | rung 5 unlocked |
+|---|---|---|---|---|
+| 4096³ | 2.594 | 2.493 | 104% | 2.39–2.42 (slow mode) |
+| 4096×4096×8192 | 4.979 | 4.900 | 102% | 4.74–4.87 |
+| 4096×4096×11008 | 6.874 | 6.504 | 106% | 6.48–6.51 |
+| 4096×11008×4096 | 6.552 | 6.602 | 99% | 6.38–6.45 |
+| 8192³ | 18.99 | 19.58 | 97% | |
+| 2048³ | 0.354 | 0.413 | 86% | 0.27–0.33 |
+
+The cuBLAS kernel behind those rows is `cutlass_80_simt_sgemm_256x128_8x4_nn_align1`: the
+same 256×128 block tile as rung 5, 256 threads, 210 registers, one block per SM, 49 KB of
+pipelined shared memory, launched as 3,072 blocks (6-way split-K) on 4096×4096×11008.
+Nsight puts it at 71.9% FMA pipe active against rung 5's 74.9%, with 10% more LSU
+instructions and 32% more shared-memory wavefronts for the same 5.8 G FMA instructions.
+By every activity counter it is the same kernel or a slightly busier one.
+
+At an equal clock rung 5 is faster than cuBLAS on the three large shapes, and its unlocked
+time on the 11008 shapes is its 1.9 GHz time: the limiter sits at 1.89 GHz for the entire
+timing loop there. At the same locked clock the two kernels draw about the same board power
+(rung 5 450 W, cuBLAS 440 W, for 2–6% more FLOP/s), so per joule rung 5 is the better
+kernel; per second, under this limiter, it is not. Locking at 2.4 GHz does not help: the
+limiter pulls rung 5 below it anyway (6.44 ms at 4096×4096×11008, the same number).
+
+**Why 4096³ looked fine and 11008 looked bad.** The limiter takes a few hundred
+milliseconds to settle, and it responds to how much of the chip is busy: at 2048³ (128 tiles
+on 170 SMs) it lets rung 5 run at 2.4 GHz or more. A 4096³ timing loop is 20–100 launches of
+2 ms, and the first part of it runs at 2.4–2.8 GHz before the clock drops to 1.9: `min_ms` 1.80,
+median anywhere from 1.83 to 2.42 depending on when the drop lands. Three back-to-back runs
+of the default bench gave medians of 2.39, 2.23 and 2.35 ms with a 1.80 min each time. The
+11008 shapes run 6.5 ms per launch and are preceded by a longer cuBLAS loop, so the timing
+window is always inside the 1.9 GHz state and the median is stable at 6.4–6.5. cuBLAS is at
+2.32 GHz throughout on every shape and reads as flat. That is the whole 10%: the same kernel,
+at 1.9 GHz instead of at whatever the limiter allowed 4096³ that day. The sentence earlier in
+this section about `min_ms` and the median agreeing within 1–2% was true of that one run
+and is not true in general for this kernel; for rung 5 on 4096³ they differ by 30%.
+
+Two corrections to the table above follow. Rung 5's 4096³ row (2.4357 ms) is a slow-mode
+median; the kernel does 1.92 ms at 2.43 GHz and 1.80 at the clocks it gets before the
+limiter reacts, and it does not "trail rung 4" for any reason inside the kernel. And rung 4's
+11008 rows (51.7–52.6 TFLOPS) are the same effect one rung down: at a locked 1.9 GHz rung 4
+does 7.32 ms on 4096×4096×11008 against its 7.0–7.1 unlocked.
+
+**hgemm does not show it.** The same K and N sweep on `bench_hgemm --variant=3`: the K sweep
+is 99–101% of cuBLAS at every K including 11008 (221–224 TFLOPS); the N sweep moves with
+the tile count, 97% at N = 8192 (6.02 waves), 95% at 11008 (8.09 waves) and 12288, but 88% at
+10944 and 87% at 11072, which are not multiples of the 128-wide tile. No stride signature,
+and cuBLAS's bf16 kernel gets faster at N = 11008 (231 vs 223 TFLOPS in this sweep, 239 vs
+226 in the results table), which is where the 93.8% in its table comes from. The tensor-core kernel runs at 2.7–2.8 GHz under the same
+limiter (see the hgemm note); whatever the limiter keys on, fp32 FMA at 73% of the pipe on
+all 170 SMs trips it and `mma.sync` at 95% does not.
+
+**Is there a kernel-side fix?** Not one that survives the limiter. Since it responds to
+chip-wide activity, I tried the only lever that leaves: a persistent grid that keeps some SMs
+idle on purpose (each block loops over tiles, `grid` blocks in all). On 4096×4096×11008,
+170 / 160 / 150 blocks give 6.58 / 6.57 / 6.55 ms, 136 and 128 give 6.70 and 6.69, 112 and
+96 give 7.89 and 8.34. Removing a quarter of the SMs costs only 2% of the time, so the clock
+rose by roughly that quarter (the limiter holds the product of busy SMs and clock about
+constant), but it never comes out ahead. Two more knobs in the same scratch copy, in case
+the limiter keys on the blocks marching in lockstep: a block-dependent spin of up to 4 K,
+20 K or 100 K cycles at kernel start (6.52 / 6.53 / 6.62 ms against 6.52 without), and
+cuBLAS's own schedule of splitting every tile along K with atomics into a zeroed C, 2, 4 and
+6 ways (6.53 / 6.49 / 6.48 ms). Neither moves it. The tile order, the split and the stride
+were ruled out above; at a fixed clock the kernel is already past cuBLAS. So rung 5 stays as it is, and
+the honest statement of its result is: at equal clock, 102–106% of cuBLAS SGEMM on the
+large shapes; at the clock this card's limiter gives an fp32 FMA kernel that keeps 73% of
+the pipe busy on all 170 SMs, 84–86% on the long shapes and a coin toss between 85% and 98%
+on 4096³.
+
+**Re-measured, default sweep, rung 5, 100 iterations, clocks unlocked** (the same run
+conditions as the results table, one more time to show the spread):
+
+| shape | cuBLAS ms | rung 5 ms (median / min) | TFLOPS | % of cuBLAS |
+|---|---|---|---|---|
+| 512³ | 0.0146 | 0.0442 / 0.0432 | 6.07 | 33.0 |
+| 1024³ | 0.0443 | 0.0944 / 0.0849 | 22.74 | 46.9 |
+| 2048³ | 0.2456 | 0.2733 / 0.2694 | 62.85 | 89.9 |
+| 4096³ | 2.0678 | 2.1029 / 1.8120 | 65.36 | 98.3 |
+| 4096×4096×11008 | 5.5559 | 6.4310 / 5.6459 | 57.44 | 86.4 |
+| 4096×11008×4096 | 5.4594 | 6.4866 / 6.4700 | 56.94 | 84.2 |
+
+The 4096³ row landed on the fast side of the coin this time (98.3%, against 84.2% in the
+table above, same binary, same shape). Read the two large-shape rows, or better the
+locked-clock table, for the kernel; read the 4096³ row for the limiter. Median and min are
+now both in every JSON row, and for this kernel the gap between them is the clock, not
+noise.
 
 ## Results (RTX 5090, sm_120, CUDA 13.2, driver 595.58)
 
@@ -246,10 +386,15 @@ Rungs 0 and 1 at the small shapes: v0 5.82 / 7.46 / 7.58 TFLOPS and v1 7.03 / 8.
 
 ## What remains
 
-* **The 11008-stride slowdown** on rungs 2–4: profile with `--section MemoryWorkloadAnalysis`
-  and the L1/TLB counters, and try a grouped (L2-aware) tile order.
-* **Rung 5 at 4096³** should not trail rung 4; the tail phase with one block per SM is the
-  place to look (a smaller `split`, or letting rung 5's tail use rung 4's tile).
+* **Energy per FLOP is now the lever.** The clock limiter, not the instruction stream, sets
+  rung 5's time on the large shapes ("The 11008 shapes" above), and it keys on activity, not
+  on the 455 W the board actually draws. Anything that does the same FMAs with less
+  switching (fewer `STS` in the transposed A fill, a wider `LDS` for B) is worth trying for
+  the clock it might buy, and has to be judged unlocked, over a long enough loop for the
+  limiter to settle.
+* **Report a locked-clock row.** The bench could take a `--lgc` flag (needs root) or at least
+  print `min_ms` next to the median, which it now does; a results table that mixes 1.9 and
+  2.6 GHz runs of the same kernel is not a kernel table.
 * **Small shapes**: a 64×64 tile or whole-problem split-K for 512³ / 1024³.
 * **TF32 tensor cores** would roughly triple the ceiling, but that is a different precision
   contract (10-bit mantissa inputs), which is why cuBLAS is run without it here; it would be a
