@@ -12,6 +12,7 @@
 //   variant 2: variant 1 + two-stage cp.async pipeline (load tile k+1 while computing tile k).
 //   variant 3: raw mma.sync + ldmatrix, XOR-swizzled smem, 3-stage cp.async pipeline,
 //              register-direct epilogue, split-K on the last partial wave of tiles.
+//   variant 4: the same tile on a persistent Stream-K schedule (hgemm_streamk.cu).
 //   variant 5: variant 3's tile and k-loop fed by TMA loads through a warp-specialized
 //              mbarrier pipeline (src/kernels/hgemm_tma.cu).
 //
@@ -547,10 +548,9 @@ bool hgemm_supports(int M, int N, int K, int variant) {
     if (variant < 0 || variant >= hgemm_num_variants()) return false;
     if (M <= 0 || N <= 0 || K <= 0) return false;
     if (N % WMMA_N != 0 || K % WMMA_K != 0) return false;
-    if (M % WMMA_M != 0 && variant != 3) return false;  // variant 3 zero-fills rows past M
+    if (M % WMMA_M != 0 && variant < 3) return false;  // variants 3 and 4 zero-fill rows past M
     if (variant == 2) return M % BM == 0 && N % BN == 0 && K % BK == 0;
-    if (variant == 3) return N % 64 == 0 && K % 64 == 0;  // any M >= 1
-    if (variant == 4) return false;  // Stream-K, built on its own branch; takes no shape here
+    if (variant == 3 || variant == 4) return N % 64 == 0 && K % 64 == 0;  // any M >= 1
     if (variant == 5) return hgemm_tma_supports(M, N, K);
     return true;
 }
@@ -560,7 +560,8 @@ void hgemm_bf16(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C
     SPARK_REQUIRE(A != nullptr && B != nullptr && C != nullptr, "hgemm: null pointer");
     SPARK_REQUIRE(M > 0 && N > 0 && K > 0, "hgemm: M, N, K must be positive");
     SPARK_REQUIRE(N % WMMA_N == 0 && K % WMMA_K == 0, "hgemm: N, K must be multiples of 16");
-    SPARK_REQUIRE(M % WMMA_M == 0 || variant == 3, "hgemm: M must be a multiple of 16");
+    SPARK_REQUIRE(M % WMMA_M == 0 || variant == 3 || variant == 4,
+                  "hgemm: M must be a multiple of 16");
     SPARK_REQUIRE(variant >= 0 && variant < hgemm_num_variants(), "hgemm: unknown variant");
 
     switch (variant) {
@@ -587,9 +588,12 @@ void hgemm_bf16(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C
             v3::launch_auto(A, B, C, M, N, K, stream);
             break;
         }
-        case 4:
-            SPARK_REQUIRE(false, "hgemm variant 4: not built in this tree");
+        case 4: {
+            SPARK_REQUIRE(hgemm_supports(M, N, K, 4),
+                          "hgemm variant 4: requires N % 64 == 0, K % 64 == 0");
+            hgemm_streamk_bf16(A, B, C, M, N, K, stream);
             break;
+        }
         case 5:
             hgemm_tma(A, B, C, M, N, K, stream);
             break;

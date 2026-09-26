@@ -1,5 +1,6 @@
-// The mma.sync + ldmatrix block tile of hgemm variant 3, in a header so that another
-// schedule can run the same tile. Private to src/kernels.
+// The mma.sync + ldmatrix block tile shared by hgemm variant 3 (hgemm.cu) and variant 4
+// (hgemm_streamk.cu). Private to src/kernels: the two kernels differ only in how they hand
+// out (tile, K-range) work to blocks, so the tile itself lives here once.
 //
 // Block tile BM x BN x BK, 8 warps as 2 (M) x 4 (N), warp tile (BM/2) x (BN/4), XOR-swizzled
 // shared memory, STAGES-deep cp.async pipeline. Rows past M are zero-filled on the way in
@@ -197,3 +198,10 @@ __device__ __forceinline__ void store_bf16(const typename C::Acc& acc,
 }
 
 }  // namespace spark::hgemm_tile
+
+namespace spark {
+// Variant 4 (hgemm_streamk.cu); dispatched to by hgemm_bf16. The caller has validated the
+// shape with hgemm_supports(M, N, K, 4).
+void hgemm_streamk_bf16(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M,
+                        int N, int K, cudaStream_t stream);
+}  // namespace spark

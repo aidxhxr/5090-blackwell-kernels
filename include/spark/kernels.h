@@ -96,12 +96,16 @@ int sgemm_num_variants();
 //            decode-sized problems (M <= 64) run a dedicated weight-streaming kernel with a
 //            16, 32 or 64-row tile (src/kernels/hgemm_decode.cu). Rows past M are zero-filled,
 //            so any M >= 1 works; requires N % 64 == 0 and K % 64 == 0
-// variant 4: reserved (Stream-K scheduling; not in this build)
+// variant 4: variant 3's tile on a persistent Stream-K schedule: a grid of resident blocks,
+//            L2-aware grouped tile order, whole tiles from a queue and the last wave split
+//            along K with a memset-free, deterministic fixup (partials summed in K order
+//            through a per-tile fp32 slot, so the output is the same bits every run). Same
+//            shape rules as variant 3, and the same decode kernel for M <= 64.
 // variant 5: variant 3's 128x128 tile and mma.sync k-loop fed by TMA (cp.async.bulk.tensor)
 //            through a warp-specialized mbarrier pipeline: one producer warp issues the
 //            loads, eight consumer warps run the tensor cores. Same split-K tail as variant 3.
 //            Requires M % 128 == 0, N % 128 == 0, K % 64 == 0 and at least one 128x128 tile
-//            per SM; smaller and decode shapes step down to variant 3. On the RTX 5090 it is
+//            per SM; smaller and decode shapes step down to variant 4. On the RTX 5090 it is
 //            7 to 9% faster than variant 3 on every shape it takes (2048^3 and up), 102 to
 //            109% of cuBLAS
 void hgemm_bf16(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N,

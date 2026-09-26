@@ -28,9 +28,18 @@ HGEMM_SHAPES_ANY_M = [(1, 4096, 4096), (5, 4096, 256), (17, 1024, 1024), (33, 25
 HGEMM_SHAPES_V5 = [(128, 21760, 64), (1792, 1792, 128), (256, 11008, 4096), (2048, 2048, 2048),
                    (2560, 2560, 4096), (1024, 16384, 3072)]
 # Shapes variant 5 refuses: a grid under one wave, a decode shape, and misaligned N and K.
+# The default then steps down to variant 4, which takes them all.
 HGEMM_SHAPES_NOT_V5 = [(1024, 1024, 1024), (16, 4096, 4096), (2048, 2112, 2048),
                        (2048, 2048, 2080)]
 HGEMM_TOL = dict(atol=3e-2, rtol=3e-2)
+# variant 4 (Stream-K): the same shape rules as variant 3. The shapes cover a tile split into
+# many K-pieces (128x64x16384: two 64x64 tiles, 8 pieces each), static ranges with two or
+# three pieces per tile, a problem past four waves with a tail and a ragged M (2064x11008x1024:
+# 1462 tiles of 128x128 on 340 blocks, queue mode, two K-passes per tile in the last wave), a
+# decode shape, and a one-wave shape with no partials at all (1024^3).
+HGEMM_SHAPES_V4 = [(16, 64, 64), (16, 4096, 1024), (64, 256, 512), (272, 128, 4096),
+                   (208, 1088, 192), (1024, 1024, 1024), (1152, 1152, 4096), (128, 22016, 64),
+                   (2048, 2048, 2048), (128, 64, 16384), (2064, 11008, 1024)]
 
 
 def _variants(name):
@@ -73,11 +82,12 @@ def test_hgemm_multiples_of_16(sk, shape, variant):
     _hgemm_case(sk, shape, variant)
 
 
-@pytest.mark.parametrize("variant", [v for v in _variants("hgemm") if v < 4])
+# Variant 5 needs a full wave of 128x128 tiles and has its own shapes below.
+@pytest.mark.parametrize("variant", [v for v in _variants("hgemm") if v < 5])
 @pytest.mark.parametrize("shape", HGEMM_SHAPES_128, ids=lambda s: f"M{s[0]}_N{s[1]}_K{s[2]}")
 def test_hgemm_multiples_of_128(sk, shape, variant):
-    if variant == 3 and shape[2] % 64 != 0:
-        pytest.skip("variant 3 needs K % 64 == 0")
+    if variant >= 3 and shape[2] % 64 != 0:
+        pytest.skip("variants 3 and 4 need K % 64 == 0")
     _hgemm_case(sk, shape, variant)
 
 
@@ -132,9 +142,39 @@ def test_hgemm_variant5_steps_down(sk, shape):
     b = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
     with pytest.raises(ValueError):  # an explicit variant is never substituted
         sk.hgemm(a, b, 5)
-    got = sk.hgemm(a, b)  # the default steps down to variant 3
+    got = sk.hgemm(a, b)  # the default steps down to variant 4
     ref = (a.float() @ b.float()).to(torch.bfloat16)
     torch.testing.assert_close(got.float(), ref.float(), **HGEMM_TOL)
+
+
+@pytest.mark.parametrize("shape", HGEMM_SHAPES_V4, ids=lambda s: f"M{s[0]}_N{s[1]}_K{s[2]}")
+def test_hgemm_variant4_any_m(sk, shape):
+    if 4 not in _variants("hgemm"):
+        pytest.skip("variant 4 not built")
+    _hgemm_case(sk, shape, 4)
+    # Repeated calls must agree too: the Stream-K flags, slots and queue are reused across
+    # launches and are never cleared by the host.
+    for _ in range(3):
+        _hgemm_case(sk, shape, 4)
+
+
+@pytest.mark.parametrize("shape", [(272, 128, 4096), (128, 64, 16384), (2064, 11008, 1024),
+                                   (16, 4096, 1024)],
+                         ids=lambda s: f"M{s[0]}_N{s[1]}_K{s[2]}")
+def test_hgemm_variant4_is_deterministic(sk, shape):
+    # The fixup sums the K-pieces of a tile in K order whichever block computed them, so two
+    # calls give the same bits (variant 3's atomics do not promise that). In queue mode
+    # (2064x11008x1024) the block-to-piece assignment changes from call to call.
+    if 4 not in _variants("hgemm"):
+        pytest.skip("variant 4 not built")
+    M, N, K = shape
+    torch.manual_seed(1)
+    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
+    first = sk.hgemm(a, b, 4)
+    for _ in range(5):
+        again = sk.hgemm(a, b, 4)
+        assert torch.equal(first, again)
 
 
 def test_hgemm_rejects_unaligned(sk):
@@ -160,7 +200,7 @@ def test_hgemm_default_variant_takes_any_multiple_of_16(sk):
     torch.manual_seed(0)
     a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
     b = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
-    got = sk.hgemm(a, b)  # N % 64 != 0: steps down past variants 3 and 2 to variant 1
+    got = sk.hgemm(a, b)  # N % 64 != 0: steps down past variants 4, 3 and 2 to variant 1
     ref = (a.float() @ b.float()).to(torch.bfloat16)
     torch.testing.assert_close(got.float(), ref.float(), **HGEMM_TOL)
     with pytest.raises(ValueError):  # an explicit variant is never substituted
