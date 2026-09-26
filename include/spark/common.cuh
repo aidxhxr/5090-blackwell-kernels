@@ -3,6 +3,7 @@
 // Secondary target: NVIDIA GB10 (DGX Spark), compute capability 12.1 (sm_121).
 #pragma once
 
+#include <cuda.h>  // CUtensorMap and the cuTensorMapEncodeTiled types (header only, no libcuda link)
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -209,6 +210,124 @@ __device__ __forceinline__ void mma_bf16_16816(float (&d)[4], const unsigned (&a
         "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+// ---------------------------------------------------------------------------
+// TMA / mbarrier (sm_90+; available on sm_120 / sm_121). Used by the hgemm TMA variant.
+//
+// A TMA load (cp.async.bulk.tensor) is issued by one thread: it names a tensor map (a 128-byte
+// descriptor of a global tensor and a box shape, encoded on the host), a box coordinate and a
+// shared-memory destination, and the copy engine writes the whole box into smem, applying the
+// map's swizzle. Completion is signalled on an mbarrier: the issuing thread first tells the
+// barrier how many bytes to expect (arrive.expect_tx), the copy engine counts them down as
+// they land (complete_tx), and the phase completes when the arrival count and the byte count
+// are both satisfied. Consumers wait on the phase parity: a barrier alternates between phase 0
+// and phase 1 every time it completes, and try_wait.parity P returns once the phase with
+// parity P has completed, so the n-th use of a barrier waits on parity n & 1.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ unsigned smem_u32(const void* p) {
+    return static_cast<unsigned>(__cvta_generic_to_shared(p));
+}
+// Initialize a barrier that completes a phase after `count` arrivals (plus any expected bytes).
+__device__ __forceinline__ void mbar_init(uint64_t* bar, unsigned count) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(smem_u32(bar)), "r"(count)
+                 : "memory");
+}
+// Make the initialized barriers visible to the async proxy (the TMA unit) before any
+// complete_tx can target them. Call once after mbar_init, before the __syncthreads.
+__device__ __forceinline__ void fence_mbar_init() {
+    asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+}
+// Orders this thread's generic-proxy shared-memory accesses against later async-proxy ones
+// (a TMA reading smem that threads wrote, or a TMA overwriting smem that threads read).
+__device__ __forceinline__ void fence_proxy_async_smem() {
+    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+}
+// One arrival that also registers `bytes` of transactions the phase must see before it completes.
+__device__ __forceinline__ void mbar_arrive_expect_tx(uint64_t* bar, unsigned bytes) {
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(smem_u32(bar)),
+                 "r"(bytes)
+                 : "memory");
+}
+// Plain arrival (release semantics: this thread's earlier smem reads are ordered before it).
+__device__ __forceinline__ void mbar_arrive(uint64_t* bar) {
+    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" ::"r"(smem_u32(bar)) : "memory");
+}
+// Spin until the phase with parity `parity` has completed (acquire semantics).
+__device__ __forceinline__ void mbar_wait(uint64_t* bar, unsigned parity) {
+    asm volatile(
+        "{\n"
+        ".reg .pred p;\n"
+        "SPARK_MBAR_WAIT:\n"
+        "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n"
+        "@p bra SPARK_MBAR_DONE;\n"
+        "bra SPARK_MBAR_WAIT;\n"
+        "SPARK_MBAR_DONE:\n"
+        "}\n" ::"r"(smem_u32(bar)),
+        "r"(parity)
+        : "memory");
+}
+// 2-D TMA load: the box of `map` at coordinates (c0 along the innermost dimension, c1 along the
+// outer one), in elements, into `smem_dst`, completion counted on `bar`. `map` must point at a
+// kernel parameter declared `const __grid_constant__ CUtensorMap`. The destination must be
+// aligned to the swizzle span (1 KB for the 128-byte swizzle, 512 B for the 64-byte one).
+__device__ __forceinline__ void tma_load_2d(void* smem_dst, const CUtensorMap* map, uint64_t* bar,
+                                            int c0, int c1) {
+    asm volatile(
+        "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes"
+        " [%0], [%1, {%3, %4}], [%2];\n" ::"r"(smem_u32(smem_dst)),
+        "l"(reinterpret_cast<uint64_t>(map)), "r"(smem_u32(bar)), "r"(c0), "r"(c1)
+        : "memory");
+}
+// Pull the descriptor into the TMA unit's cache ahead of the first load.
+__device__ __forceinline__ void prefetch_tensormap(const CUtensorMap* map) {
+    asm volatile("prefetch.tensormap [%0];\n" ::"l"(reinterpret_cast<uint64_t>(map)) : "memory");
+}
+// bar.sync on a named barrier for `nthreads` threads: lets a subset of the block (the consumer
+// warps of a warp-specialized kernel) synchronize without the rest of it.
+__device__ __forceinline__ void named_barrier_sync(int id, int nthreads) {
+    asm volatile("bar.sync %0, %1;\n" ::"r"(id), "r"(nthreads) : "memory");
+}
+
+// Host side: encode a tensor map for a row-major 2-D bf16 matrix (rows x cols, cols
+// contiguous) with a box of box_rows x box_cols. The driver entry point is fetched through
+// the runtime, so nothing links against libcuda. Out-of-range boxes are zero-filled by the
+// copy engine and still count their full byte size toward the barrier.
+using TensorMapEncodeFn = CUresult (*)(CUtensorMap*, CUtensorMapDataType, cuuint32_t, void*,
+                                       const cuuint64_t*, const cuuint64_t*, const cuuint32_t*,
+                                       const cuuint32_t*, CUtensorMapInterleave, CUtensorMapSwizzle,
+                                       CUtensorMapL2promotion, CUtensorMapFloatOOBfill);
+inline TensorMapEncodeFn tensor_map_encoder() {
+    static TensorMapEncodeFn fn = nullptr;
+    if (fn == nullptr) {
+        void* p = nullptr;
+        cudaDriverEntryPointQueryResult q = cudaDriverEntryPointSymbolNotFound;
+        SPARK_CUDA_CHECK(cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &p, 12000,
+                                                          cudaEnableDefault, &q));
+        if (p == nullptr || q != cudaDriverEntryPointSuccess) {
+            throw std::runtime_error("cuTensorMapEncodeTiled is not available in this driver");
+        }
+        fn = reinterpret_cast<TensorMapEncodeFn>(p);
+    }
+    return fn;
+}
+inline CUtensorMap make_tensor_map_2d_bf16(const void* base, uint64_t rows, uint64_t cols,
+                                           uint32_t box_rows, uint32_t box_cols,
+                                           CUtensorMapSwizzle swizzle) {
+    CUtensorMap map;
+    const cuuint64_t dims[2] = {cols, rows};
+    const cuuint64_t strides[1] = {cols * sizeof(__nv_bfloat16)};  // bytes, outer dim only
+    const cuuint32_t box[2] = {box_cols, box_rows};
+    const cuuint32_t elem_strides[2] = {1, 1};
+    const CUresult r = tensor_map_encoder()(
+        &map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, const_cast<void*>(base), dims, strides, box,
+        elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    if (r != CUDA_SUCCESS) {
+        throw std::runtime_error("cuTensorMapEncodeTiled failed with CUresult " +
+                                 std::to_string(static_cast<int>(r)));
+    }
+    return map;
 }
 
 }  // namespace spark
