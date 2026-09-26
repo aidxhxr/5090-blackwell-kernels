@@ -49,18 +49,24 @@ sums the pieces of a tile in K order through one fp32 slot. No memset, no atomic
 same bits every run. Variant 5 keeps variant 3's schedule and moves the copies to the TMA unit:
 one producer warp issues three `cp.async.bulk.tensor` boxes per stage, eight consumer warps
 wait on an mbarrier and run the tensor cores, and nothing in the k-loop is a block-wide barrier.
+Variant 6 is the two put together: the TMA mainloop driven by the Stream-K schedule. The
+producer lane owns the schedule, takes the pieces and publishes each one to the consumer warps
+through a small ring in shared memory, and the stage counters run on across pieces, so it is
+already loading the next piece while the consumers finish the last one's epilogue.
 
-| M x N x K | v3 | v4 Stream-K | v5 TMA | cuBLAS | best / cuBLAS |
-|---|---|---|---|---|---|
-| 1024 x 1024 x 1024 | 122.9 | 123.1 | | 121.6 | 101.5% |
-| 2048 x 2048 x 2048 | 166.1 | 207.4 | 180.6 | 172.6 | 120.2% |
-| 4096 x 4096 x 4096 | 229.5 | 231.1 | 245.4 | 225.7 | 108.7% |
-| 8192 x 8192 x 8192 | 223.0 | 227.5 | 235.9 | 232.1 | 101.6% |
-| 4096 x 4096 x 11008 | 228.2 | 228.8 | 244.3 | 227.1 | 107.6% |
-| 4096 x 11008 x 4096 | 229.2 | 227.3 | 240.1 | 239.1 | 100.3% |
+| M x N x K | v3 | v4 Stream-K | v5 TMA | v6 TMA + Stream-K | cuBLAS | best / cuBLAS |
+|---|---|---|---|---|---|---|
+| 1024 x 1024 x 1024 | 122.9 | 123.1 | | 124.1 | 122.0 | 101.7% |
+| 2048 x 2048 x 2048 | 166.1 | 207.3 | 180.7 | 224.4 | 172.7 | 129.9% |
+| 4096 x 4096 x 4096 | 229.5 | 231.1 | 242.9 | 249.1 | 225.7 | 110.4% |
+| 8192 x 8192 x 8192 | 223.0 | 227.8 | 236.3 | 243.5 | 232.5 | 104.6% |
+| 4096 x 4096 x 11008 | 228.2 | 229.9 | 244.4 | 245.7 | 227.1 | 108.1% |
+| 4096 x 11008 x 4096 | 229.2 | 229.7 | 239.1 | 246.0 | 239.4 | 102.8% |
 
-TFLOPS. Variant 5 only runs on grids of at least one 128x128 tile per SM; below that the
-default steps down to variant 4. The Python default is the highest variant that takes the shape.
+TFLOPS, variants 4 to 6 and cuBLAS from one session. Variant 5 only runs on grids of at least
+one 128x128 tile per SM. Variant 6 takes variant 4's shapes: at 1024 cubed and on the decode
+shapes it runs variant 4's tiles and the decode kernel. The Python default is the highest
+variant that takes the shape, which is now variant 6 everywhere N and K are multiples of 64.
 
 The TMA rung surprised me. Nsight had variant 3's tensor pipe at 92% active with the top stall
 on the pipe itself, so I had put the last few percent down to power. Taking the copies out of
@@ -68,7 +74,11 @@ the consumer warps' instruction stream and the `__syncthreads` out of the k-loop
 to 99% at the same 600 W and the same 2.75 GHz. Same joules, 8% more work. Variant 4's win is
 the 2048 cubed shape, 256 tiles on 340 slots, where variant 3 had to drop to a 64x128 tile:
 Stream-K keeps the big tile and spreads the k-steps evenly. At 8192 cubed the grouped tile
-order takes the L2 hit rate from 80% to 96% and DRAM traffic down four times.
+order takes the L2 hit rate from 80% to 96% and DRAM traffic down four times. Variant 6 gets
+both: at 2048 cubed it is 8% over variant 4 and 24% over variant 5, and at 8192 cubed the
+card still sits at 600 W but the clock settles at 2.81 GHz instead of 2.75, because the
+memory system is no longer taking its share of the power. That is where the 3% over variant 5
+comes from, 0.40 TFLOPS per watt against 0.39.
 
 Decode shapes, where the whole thing is streaming the weight matrix once. The bench rotates
 through enough copies of B to get past the 96 MB L2, otherwise both sides read out of cache

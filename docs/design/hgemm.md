@@ -2,8 +2,11 @@
 
 `C[M,N] = A[M,K] · B[K,N]`, row-major, bf16 inputs and outputs, fp32 accumulation.
 Source: `src/kernels/hgemm.cu` (variants 0 to 3), `src/kernels/hgemm_streamk.cu` (variant 4),
-with the `mma.sync` tile the last two share in `src/kernels/hgemm_tile.cuh`. Bench:
-`bench_hgemm` (validates every variant against cuBLAS).
+`src/kernels/hgemm_tma.cu` (variant 5) and `src/kernels/hgemm_tma_sk.cu` (variant 6), with the
+pieces they share in private headers: the `cp.async` tile of variants 3 and 4 in
+`hgemm_tile.cuh`, the Stream-K schedule of variants 4 and 6 in `hgemm_streamk.cuh`, the TMA
+tile of variants 5 and 6 in `hgemm_tma_tile.cuh`. Bench: `bench_hgemm` (validates every
+variant against cuBLAS).
 
 ## Why WMMA / mma.sync on these GPUs
 
@@ -35,6 +38,7 @@ the fragment layout is explicit and the kernel controls every shared-memory acce
 | 3 | raw `mma.sync.m16n8k16` + `ldmatrix`, XOR-swizzled smem, 3-stage `cp.async` pipeline, register-direct epilogue, split-K on the last partial wave, tile picked per call (128×128, 64×128 or 64×64) with zero-filled rows past M | fragment loads in one instruction each, no padding bytes, DRAM latency covered two tiles ahead, no epilogue staging, the wave-quantization tail on 170 SMs, and small / decode shapes (any M % 16 == 0) that a 128-row tile could not fill the card with |
 | 4 | the same tile on a persistent Stream-K schedule: a grid of resident blocks, grouped (L2-aware) tile order, equal (tile, k-step) ranges for problems up to a few waves, a tile queue plus geometrically shrinking K-passes for the rest, and a fixup that sums partials in K order through one fp32 slot per tile with no memset, no atomics and the same bits every run | shapes under one wave without dropping to a smaller tile (2048³), the last-wave quantization on long shapes, the per-SM speed spread that a static schedule exposes, DRAM re-reads of B once the operands exceed L2 (8192³: 664 to 165 GB/s), and the two memsets plus counters per call that cost the decode shapes 4 µs each |
 | 5 | v3's 128×128 tile and k-loop fed by TMA (`cp.async.bulk.tensor`) through a warp-specialized mbarrier pipeline: one producer warp issues three box loads per stage, eight consumer warps run the tensor cores, no `__syncthreads` in the k-loop (`src/kernels/hgemm_tma.cu`) | the per-K-tile block barrier (8.7 of v3's 30 stall cycles per issue) and the copy address arithmetic; tensor pipe 92% → 99% active, 102 to 109% of cuBLAS on the large shapes. |
+| 6 | v5's TMA mainloop driven by v4's Stream-K schedule: a persistent grid of 170 blocks, the producer lane owns the schedule and publishes each (tile, k-range) piece to the consumer warps through a two-deep ring in shared memory, stage counters run on across pieces, static ranges whenever A and B fit in L2, the queue with geometric K-passes otherwise, an L2-footprint raster group, the same deterministic chain fixup (`src/kernels/hgemm_tma_sk.cu`) | v5's row-major tile order (80% L2 hit at 8192³, 40% of DRAM peak) and its one-block-per-tile schedule (1.5 waves at 2048³); v4's per-piece prologue and its 8% slower `cp.async` mainloop. 224 TFLOPS at 2048³ (v4 207), 249 at 4096³ (v5 243), 243.5 at 8192³ (v5 236), 246 at 4096×11008×4096 (v5 239): 103 to 130% of cuBLAS on every large shape, the same bits every run. |
 
 ### Arithmetic intensity of the block tile
 
@@ -731,6 +735,250 @@ half the instructions, one lane issuing what 256 threads used to. The remaining 
 N % 128 == 0, K % 64 == 0 and a grid of at least 170 tiles; everything smaller and every
 decode shape stays on v3, which is where the tile heuristics live.
 
+### Variant 6: the TMA mainloop on the Stream-K schedule
+
+Source: `src/kernels/hgemm_tma_sk.cu`; the schedule it shares with v4 in
+`src/kernels/hgemm_streamk.cuh`, the tile it shares with v5 in `src/kernels/hgemm_tma_tile.cuh`.
+
+v4 and v5 each fixed one thing and left the other. v5's mainloop keeps the tensor pipe 99%
+busy but runs v3's schedule: one block per tile in row-major order, so at 8192³ its L2 hit
+rate is 80% and DRAM runs at 40% of peak, and at 2048³ it pays a 1.5-wave grid. v4's schedule
+gets a 96% L2 hit rate and no quantization, but its `cp.async` mainloop is the one v5 beat by
+8%, and every piece it computes starts with a cold three-stage prologue, which the v4 notes
+listed as the open "chain fixup's links" item. Variant 6 is the two put together. Nothing in
+either mainloop or schedule changed; what is new is how a producer warp drives a persistent
+loop.
+
+#### Factoring
+
+v4's schedule moved out of `hgemm_streamk.cu` into `hgemm_streamk.cuh` as it was: `Params`,
+the grouped raster, the geometric passes, the static ranges, the fragment-order slot layout,
+and the host `plan()` that fills the parameters and owns the workspace; v4's kernel includes
+the header and its constants are the defaults. v5's stage geometry, swizzles, the producer's
+three-box issue and the consumer's per-stage `ldmatrix` + `mma.sync` body moved into
+`hgemm_tma_tile.cuh`, and v5 calls them. Both kept their numbers, measured before and after
+the move in one session at `--iters=20`: v4 207.0 / 228.0 / 227.9 / 225.4 before and 207.1 /
+228.0 / 227.7 / 226.8 after at 2048³ / 4096³ / 8192³ / 4096×11008×4096; v5 180.7 / 241.4 /
+237.2 / 236.0 before and 180.8 / 241.1 / 237.7 / 236.0 after.
+
+#### The producer owns the schedule
+
+The block is v5's: 288 threads, eight consumer warps in a 2×4 grid over the 128×128 tile and
+one producer warp of which lane 0 does all the work. The grid is v4's: `resident` blocks (170
+at one block per SM, the configuration that ships), each walking a sequence of (tile,
+kt_begin, kt_end) pieces. Both sides of the block have to walk the same sequence, and in queue
+mode the sequence is decided at run time by an `atomicAdd`. So the producer lane owns the
+schedule. It walks the block's static range from the top, or takes items from the queue, and
+before it issues a piece's first stage it publishes the piece to the consumers through a
+two-deep ring of `int4` slots in shared memory. Each ring slot has a "full" mbarrier (count 1,
+the producer's arrive after the store) and an "empty" mbarrier (count 8, one arrive per
+consumer warp once every lane has read the slot), used exactly like the stage barriers: slot
+`i % 2` is used for pieces `i`, `i + 2`, ..., its n-th use waits on parity `(n - 1) & 1` of
+"empty". The consumers wait on "full", copy the item into registers, `__syncwarp`, arrive on
+"empty", and go. A tile of -1 ends the loop on both sides. In queue mode the producer also
+does the last-block-out queue reset after its final failing grab, as v4's thread 0 did.
+
+The stage bookkeeping is one running k-tile counter per side, `g_kt`, that never resets: stage
+`g_kt % STAGES` is used for the `g_kt / STAGES`-th time whichever piece the k-tile belongs to,
+so the parities line up across a piece boundary and the first `STAGES` fills of the launch are
+the only ones that skip the "empty" wait. That is what makes the pipeline stay full between
+pieces: the producer is bounded by the "empty" barriers and nothing else, so while the
+consumers add a slot, store bf16 or publish a partial for piece `i`, it is already filling
+stages for piece `i + 1`, up to `STAGES` k-tiles ahead. The consumers never see a prologue
+after the first one. `SPARK_HGEMM_V6_SERIAL=1` puts it back for measurement: the producer
+waits on a "done" mbarrier that the consumers arrive on after each epilogue before it issues
+the next piece's first stage.
+
+The fixup is v4's, on the consumer side, with a named barrier (`bar.sync 1, 256`) where v4 had
+`__syncthreads`, because the producer lane is not part of it. Thread 0 spins on the
+predecessor's flag with `ld.acquire.gpu`, the barrier broadcasts the fact, every consumer adds
+its lane's `float4`s from the slot with `__ldcg`; a piece that does not end its tile writes the
+slot, `__threadfence`, barrier, `st.release.gpu` of the flag. Rows past M are skipped by the
+slot traffic and the bf16 store, and zero-filled on the way in by the copy engine (a box row
+past the end of the tensor map is zero), so v6 takes any M ≥ 1 like v4 does. The deadlock
+argument is v4's unchanged: a piece waits only for the piece before it in K, which was handed
+out earlier to a block that is resident and processes its items in order; the ring adds no
+cross-block waits, only a bound of one piece between a block's producer and its consumers.
+
+**Proxy fences.** Every stage release keeps v5's `fence.proxy.async.shared::cta` before the
+arrive, since `ldmatrix` reads the stage through the generic proxy and the refill lands through
+the async one. The persistent loop adds no new fence. The slot reads and writes and the bf16
+epilogue go from registers to global memory (`__ldcg`, `float4` and `__nv_bfloat162` stores)
+and never touch shared memory, so there is no generic-proxy access to a stage other than
+`ldmatrix`, and the item ring is written and read through the generic proxy on both sides and
+ordered by its own mbarriers. Every configuration passes the cuBLAS check on every shape,
+including the two-block ones that exposed the missing fence in v5.
+
+#### Registers and residency
+
+At one block per SM the kernel takes 160 registers (v5: 126) with no spills; the extra live
+state across the k-loop is the piece (tile, k-range, `bm`, `bn`, `m_valid`), the two running
+counters and the fixup's pointers. The two-block configurations are capped at 96 registers by
+the ninth warp, not by `__launch_bounds__`: 18 warps on four sub-partitions puts five on one of
+them, and 5 × 32 × R ≤ 16,384 gives 102, rounded down to 96. v5 fits its k-loop in 96; v6
+does not, and `cuobjdump` shows `STL`/`LDL` pairs between the `HMMA`s of the (32, 3, 2) and
+(32, 2, 2) kernels. That is why those two trail v5's two-block configuration in the sweep
+below, and part of why the one-block configuration ships. (The 63 `STL` without an `LDL` that
+every v6 kernel carries are the ABI stores around the 64-bit division subroutine
+`range_start` and `pass_range` call once per piece; v5 has 15 of them for its slice
+arithmetic.) Shared memory is 65 KB: two 32 KB stages, the ring, and nine barriers.
+
+#### The sweep
+
+`--iters=20`, one session, TFLOPS. First the six pipeline configurations with v4's schedule
+constants as they were (static up to four waves when A and B fit in L2, the square-root raster
+group, which gives G = 8 on 170 blocks):
+
+| BK, stages, blocks/SM | regs | 2048³ | 4096³ | 8192³ | 4096×11008×4096 | 4096×4096×11008 |
+|---|---|---|---|---|---|---|
+| 64, 2, 1 | 160 | **224.4** | 238.5 | **241.6** | 239.7 | **243.5** |
+| 64, 3, 1 | 160 | 224.5 | 236.1 | 241.5 | **240.1** | 243.4 |
+| 32, 3, 2 | 96, spills | 208.2 | 236.0 | 234.5 | 231.7 | 236.6 |
+| 32, 2, 2 | 96, spills | 212.8 | **239.6** | 239.2 | 235.4 | 237.7 |
+| 32, 3, 1 | 158 | 224.3 | 236.9 | 238.2 | 237.4 | 240.7 |
+| 32, 6, 1 | 158 | 219.4 | 237.7 | 238.6 | 236.3 | 241.5 |
+
+Two stages of BK = 64 at one block per SM win or tie everywhere, as they did for v5 on the
+DRAM shapes, and here also on the L2-resident ones, where v5's two-block configuration had
+won by 2%: the second block's latency hiding no longer pays once the pipeline is never
+drained between tiles, and the two-block kernels spill. So (64, 2, 1) ships for every shape,
+and `SPARK_HGEMM_V6_CONFIG=<index>` forces one of the six for a re-sweep.
+
+Then the schedule, all on (64, 2, 1). With 170 blocks in flight instead of 340 the constants
+v4 settled on were worth a second look, and two of them moved.
+
+*Static or queue.* 4096³ is 1,024 tiles, 6.02 waves of 170, so v4's rule (static up to four
+waves when the operands fit in L2) sends it to the queue: 238.5. Static ranges: 246.9 to
+249.2. The same at twelve waves: 8192×4096×2048 (A 32 MB, B 16 MB) 236.8 queued, 243.5
+static; 4096×8192×2048 236.9 and 241.9. And the same answer as v4 where the operands do not
+fit: 4096×11008×4096 (124 MB) 239.5 queued, 233.0 static. So v6 uses static ranges whenever
+A and B fit in three quarters of the L2, at any wave count, and the queue with geometric
+passes beyond that; v4's two-wave rule for the non-fitting shapes stays. The static schedule
+still waits for the slowest SM, as v4 found, but with the operands in L2 that costs less than
+the queue's four chain links per tile plus its own tail.
+
+*The raster group.* v4's rule, G about the square root of the blocks in flight, gives 8 on
+170 blocks. Sweeping G at 8192³ in queue mode: 1 → 238.1, 4 → 238.9, 8 → 241.4, 16 → 243.2,
+32 → 244.2, 64 → 236.3; at 4096×11008×4096: 4 → 237.9, 8 → 239.4, 16 → 241.2, 32 → 242.7. The
+arithmetic behind the curve: in queue mode consecutive raster indices are in flight, so a
+group's G tile rows of A are re-read once per tile column and stay in L2 while the group
+runs, and B is read from DRAM once per group, `tiles_m / G` times in all. At 8192³ a tile
+row of A is 2 MB: G = 8 reads B eight times (1 GB), G = 32 twice (256 MB), and G = 64 (all
+128 MB of A resident at once) no longer fits, so A is read once per column instead. The rule
+that ships: the largest power of two whose group of A rows plus the `grid / G` tile columns
+of B in flight fit in three quarters of the L2, else the one with the smallest footprint.
+That picks G = 16 at 8192³ (54 MB; G = 32 is 76 MB, just over the 72 MB budget, and
+measures the same within noise), G = 32 at 4096×11008×4096 (all of A, 38 MB), G = 16 at
+4096×4096×11008 (2.75 MB per tile row, nothing fits, 74 MB is the smallest footprint; G = 8,
+16, 32 measured 244.0, 244.7, 244.6). In static mode the blocks in flight are strided through
+the raster and G stops mattering: at 4096³ G = 8, 16, 32 measured 246.6 / 248.7, 249.2 /
+246.5, 249.2 / 246.5 in two rounds, so the same rule applies to both modes.
+
+*Smaller knobs.* The shortest K-pass: 4 / 8 / 16 k-steps of BK = 64 measured 243.6 / 243.6 /
+242.8 at 8192³ and 243.1 / 243.3 / 240.5 at 4096×11008×4096, so v4's 8 stays. The 32 k-step
+minimum share per block stays too: 1024³ on the TMA tile (64 tiles, 6 k-steps per block if
+forced) runs 0.0193 ms against 0.0173 on v4's 64×64 tile, which is what `launch_auto` hands
+it to, and 2560²×4096 at the default runs 242.0 (v5: 219.3). Decode shapes (M ≤ 64) go to
+`hgemm_decode.cu` as in v3 and v4; N % 128 ≠ 0 goes to v4's 64-column tiles.
+
+*Does the prologue hiding show up.* Same configuration, `SPARK_HGEMM_V6_SERIAL=1` against
+the default, one session:
+
+| shape | pieces per block | serialized | overlapped | gain |
+|---|---|---|---|---|
+| 2048³ | 2 to 3 of ~48 k-steps | 218.3 | 224.3 | 2.7% |
+| 4096³ (queue mode) | ~8 | 236.1 | 238.4 | 1.0% |
+| 4096×11008×4096 | ~19 | 239.2 | 241.1 | 0.8% |
+| 8192³ | ~27 | 240.7 | 241.3 | 0.2% |
+
+A cold prologue is two 32 KB stages from L2, about a microsecond, and a block at 2048³ pays
+it two or three times in a 77 µs kernel; at 8192³ it is 27 times in 4.5 ms. The overlap is
+worth what that arithmetic says it should be, and it is the whole of v6's margin over v4 at
+2048³ beyond the mainloop.
+
+#### Measured
+
+`bench_hgemm --iters=50`, v4, v5, v6 and cuBLAS from one session. TFLOPS, and % is cuBLAS
+time over ours from the cuBLAS loop timed next to that variant.
+
+| M×N×K | cuBLAS ms / TFLOPS | v4 ms / TFLOPS / % | v5 | v6 | v6 / v5 | v6 / v4 |
+|---|---|---|---|---|---|---|
+| 1024³ | 0.0176 / 122.0 | 0.0174 / 123.1 / 101.1% | n/a | 0.0173 / 124.1 / 101.7% | | 1.00× |
+| 2048³ | 0.0995 / 172.7 | 0.0829 / 207.3 / 120.0% | 0.0951 / 180.7 / 104.5% | **0.0766 / 224.4 / 129.9%** | 1.24× | 1.08× |
+| 4096³ | 0.6090 / 225.7 | 0.5947 / 231.1 / 102.4% | 0.5658 / 242.9 / 107.6% | **0.5517 / 249.1 / 110.4%** | 1.03× | 1.08× |
+| 8192³ | 4.7284 / 232.5 | 4.8258 / 227.8 / 98.0% | 4.6540 / 236.3 / 101.6% | **4.5164 / 243.5 / 104.6%** | 1.03× | 1.07× |
+| 4096×4096×11008 | 1.6267 / 227.1 | 1.6064 / 229.9 / 101.3% | 1.5116 / 244.4 / 107.5% | **1.5036 / 245.7 / 108.1%** | 1.01× | 1.07× |
+| 4096×11008×4096 | 1.5428 / 239.4 | 1.6084 / 229.7 / 95.9% | 1.5449 / 239.1 / 99.9% | **1.5014 / 246.0 / 102.8%** | 1.03× | 1.07× |
+
+The 1024³ row and the six decode rows run the same kernels under v6 as under v4 (v4's 64×64
+tile and the weight-streaming kernel) and measure the same within the 2 µs grid the single
+launches fall on: 23.5 µs at 1, 16 and 32×4096², 25.2 (v4: 23.7) at 64×4096², 56.3 and 60.3 µs
+on the 11008 shapes. 4096×11008×4096 was the shape the v4 notes had left at 95%; it is now
+102.8%, from the mainloop (v5 got it to 99.9%) and the grouped order together. All 21 rows
+pass the cuBLAS check, the ragged shapes (1000×4096×4096, 2064×11008×2048, 2100×11008×4096)
+pass through the same binary, and `tests/test_gemm.py` checks bitwise equality across six
+calls on four of the shapes, static and queue mode both.
+
+#### Power
+
+Same method as v5's: `nvidia-smi --query-gpu=clocks.sm,power.draw -lms 200` during a
+1,500-iteration 8192³ loop of each kernel, both inside one GPU lock, samples from the last
+five seconds of each run:
+
+| kernel | TFLOPS (median of 1,500) | SM clock | power | TFLOPS per watt |
+|---|---|---|---|---|
+| cuBLAS (same runs) | 226.7 to 227.1 | 2,715 to 2,722 MHz | 600 W | 0.378 |
+| v5 | 234.6 | 2,752 MHz | 600 W | 0.391 |
+| v6 | 241.7 | 2,805 MHz | 600 W | 0.403 |
+
+Both kernels sit at the 600 W limit, and this time the clock moved: 2,805 MHz for v6 against
+2,752 for v5, the 25 samples of each window steady to the MHz. v6 moves 2.8 GB less through
+DRAM per 8192³ GEMM (next table), and at a fixed power budget the memory system's share of
+the watts went into SM clock instead. That is the reading the v4 notes gave for its own 1.8%
+at 8192³, now with the clock measured rather than inferred.
+
+#### Nsight Compute at 8192³ (`--set full`, second launch, caches warm, clocks locked by ncu)
+
+| metric | v5 (64, 2, 1) | v6 (64, 2, 1) |
+|---|---|---|
+| duration | 5.05 ms | 5.01 ms |
+| grid | 4,240 blocks | 170 blocks |
+| tensor pipe active (`sm__pipe_tensor_cycles_active`) | 98.7% | 99.3% |
+| L2 hit rate | 80.1% | 95.8% |
+| DRAM throughput, % of peak | 39.9% | 9.0% |
+| DRAM traffic over the kernel (throughput × duration) | 3.6 GB | 0.8 GB |
+| L2 read sectors from the SMs | 537 M (17.2 GB) | 538 M (17.2 GB) |
+| executed instructions | 622 M | 697 M |
+| issue slots busy | 7.4% | 8.5% |
+| stall: `math_pipe_throttle` (cycles per issue) | 20.7 | 14.6 |
+| stall: `wait` | 5.0 | 4.6 |
+| stall: `long_scoreboard` | 1.3 | 2.2 |
+| stall: `barrier` | 0.0 | 0.0 |
+| shared-memory bank conflicts / load wavefronts | 3.1 K / 403 M | 39 K / 403 M |
+| registers per thread | 126 | 160 |
+| achieved occupancy | 18.7% (9.0 warps/SM) | 18.7% (9.0 warps/SM) |
+
+The SMs read the same 17.2 GB from L2 either way; the grouped order turns 3.6 GB of DRAM
+traffic into 0.8 GB, and the L2 hit rate goes from 80% to 96%, v4's number with v5's
+mainloop. At the profiler's fixed clock that is worth 0.9% (5.05 to 5.01 ms); the other 2%
+in the benchmark is the 53 MHz of clock above. The tensor pipe is at 99.3%, and
+`math_pipe_throttle` fell from 20.7 to 14.6 cycles per issue because the consumers now spend
+part of their issue budget on the fixup and the ring (75 M more instructions over 4,654
+pieces) rather than because the pipe is less fed. The 39 K bank conflicts are the fixup's
+`bar.sync` region and the item ring, 0.01% of the wavefronts. There is still no `barrier`
+stall: the only `__syncthreads` is the one after the barrier init.
+
+#### Verdict
+
+The two rungs compose without a compromise. v6 is 7 to 8% over v4 on every large shape and
+1 to 3% over v5 on the shapes v5 ran, 24% at 2048³ where v5 paid for a 1.5-wave grid, and
+103 to 130% of cuBLAS everywhere from 1024³ up, the same bits every run, no memset, any M.
+The mechanism that made it work is small: the producer lane owns the schedule and tells the
+consumers what it is loading through a two-slot ring, and the stage counters do not reset.
+Everything else is v4 and v5 unchanged, which is what factoring them into headers was for.
+The clock told the last part of the story: at 600 W the card runs this kernel 53 MHz faster
+than v5 because the DRAM is nearly idle.
+
 ## Correctness
 
 Inputs uniform in [-1, 1]. cuBLAS (`cublasGemmEx`, `CUBLAS_COMPUTE_32F`, bf16 in/out) is the
@@ -843,25 +1091,32 @@ Done in v4:
 - Decode shapes at 1,350 to 1,550 GB/s: the two memsets and the launch between them were
   4 µs of a 28 µs call.
 
+Done in v6:
+
+- The TMA mainloop on the Stream-K schedule, with the producer lane owning the schedule and
+  the stage counters running across pieces: 8192³ from 80% to 96% L2 hit with the 99% tensor
+  pipe, 2048³ from 207 to 224 TFLOPS, 4096³ from 243 to 249, 4096×11008×4096 from 95% (v4) and
+  100% (v5) of cuBLAS to 103%.
+- The prologue-hiding item from the v4 list: measured at 2.7% at 2048³, 1% at 4096³ and 0.2%
+  at 8192³ against a serialized producer. The slot traffic stays, as expected.
+- Two schedule constants re-swept for 170 blocks in flight: static ranges at any wave count
+  when the operands fit in L2, and the L2-footprint raster group.
+
 Still open:
 
-- **4096×11008×4096 at 95.4%.** Every schedule I tried lands between 1.61 and 1.65 ms on
-  this shape against cuBLAS's 1.54; the profile is not memory-bound after the raster change,
-  so this is the same perf-per-watt question as the 128×256 warp-tile experiment below.
-- **The chain fixup's links.** Each pass past the first costs a 64 KB slot read and, unless
-  it ends the tile, a 64 KB write, about 3.5 µs, and at 4096³ in queue mode the four links
-  per tile plus a pipeline prologue per piece are the 4% between the mean block end time
-  (596 µs) and the ideal (572 µs). Prefetching the next piece's first stages during the
-  current piece's last k-steps would hide the prologue; the slot traffic is inherent.
+- **The two-block TMA configurations spill.** A ninth warp caps two blocks per SM at 96
+  registers, and the persistent loop's extra live state (the piece, two counters, the fixup's
+  pointers) pushes the k-loop over it. A 4-consumer-warp layout with a 64×64 warp tile would
+  free registers and halve the `ldmatrix` count per `mma.sync`, and it is cheaper to try with
+  the producer warp in place than it was in v3.
+- **A 64-row TMA tile.** v6 hands 1024³, ragged small grids and N % 128 ≠ 0 to v4's 64-row
+  `cp.async` tiles; the TMA tile forced onto 1024³ measured 111 TFLOPS against 124, because a
+  6 k-step share per block is all fixup. A 64×64 TMA box on the same ring would let the
+  Stream-K TMA kernel take those shapes on its own terms.
 - **The 2 µs of launch and ramp** that a single decode launch pays over the back-to-back
   rate (23.5 against 21.5 µs at 32 MB). It is not in the kernel; CUDA graphs or a persistent
   megakernel across the decoder block are the ways at it.
-- **Perf per watt** on the long shapes. Variant 5 took the first step (8% more work per joule
-  from the tensor pipe alone, 8192³ from 95% to 102% of cuBLAS). A 64×64 warp tile (4 warps
-  per 128×128 block) would halve the `ldmatrix` count per `mma.sync` on top of that; the
-  producer warp of v5 makes a 4-consumer-warp layout cheaper to try than it was.
-- **TMA on the Stream-K schedule.** v5 has v3's tile order, so its L2 hit rate at 8192³ is
-  80% where v4's grouped order gets 96%; a producer warp feeding v4's persistent schedule is
-  the obvious next kernel.
-- **v5 on smaller grids.** The TMA kernel only runs on grids of at least one 128×128 tile per
-  SM; a 64-row TMA tile for the shapes v3 handles with its small tiles is untested.
+- **Perf per watt** on the long shapes. v5 raised the work per joule 8% from the tensor pipe,
+  v6 another 3% from the DRAM traffic (2,805 against 2,752 MHz at 600 W). What is left at
+  8192³ is a 99.3% busy tensor pipe at whatever clock 600 W buys; the 64×64 warp tile above
+  is the remaining instruction-side lever.

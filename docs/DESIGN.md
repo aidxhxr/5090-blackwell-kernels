@@ -34,8 +34,9 @@ the block-per-row rmsnorm / softmax) were reasoned for 48 SMs and 273 GB/s. The 
 tuned on the 5090: `hgemm` v3 keeps the 128×128×32 tile (a sweep of BK = 64, 4 stages and
 128×256 was slower) but moves to raw `mma.sync` + `ldmatrix`, an XOR swizzle, a 3-stage
 pipeline and split-K on the last partial wave of tiles, v4 runs that tile on a persistent
-Stream-K schedule with a grouped tile order, and v5 feeds the same k-loop with TMA through a
-warp-specialized mbarrier pipeline; `sgemm` v4/v5 use register prefetch
+Stream-K schedule with a grouped tile order, v5 feeds the same k-loop with TMA through a
+warp-specialized mbarrier pipeline, and v6 runs the TMA mainloop on the Stream-K schedule with
+the producer warp owning the piece sequence; `sgemm` v4/v5 use register prefetch
 and a 256×128 / 16×8 tile against the shared-memory bandwidth limit; rmsnorm v4 and softmax v3
 keep the row in registers and pick the thread group from the row length. Each per-kernel note
 has an "RTX 5090 notes" section with what was measured.
