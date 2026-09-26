@@ -1,12 +1,15 @@
 """Build the spark_kernels PyTorch extension.
 
     pip install -e . --no-build-isolation      # RTX 5090 (CUDA 13, torch with sm_120 support)
-    TORCH_CUDA_ARCH_LIST="12.0" pip install -e . --no-build-isolation   # same thing, explicit
-    TORCH_CUDA_ARCH_LIST="12.1" pip install -e . --no-build-isolation   # DGX Spark (GB10)
+    TORCH_CUDA_ARCH_LIST="12.0a" pip install -e . --no-build-isolation  # same thing, explicit
+    TORCH_CUDA_ARCH_LIST="12.1a" pip install -e . --no-build-isolation  # DGX Spark (GB10)
 
-The default architecture is compute capability 12.0 (RTX 5090 and the other RTX Blackwell
-cards). Set TORCH_CUDA_ARCH_LIST to build for something else: "12.1" for the DGX Spark,
-"12.0;12.1" for both.
+The default architecture is compute capability 12.0 in its architecture-specific form
+(sm_120a: the RTX 5090 and the other RTX Blackwell cards). The "a" matters for one kernel:
+the fp8 GEMM's block-scaled mma.sync is only exposed on sm_120a / sm_121a, and a plain
+"12.0" build falls back to the half-rate fp8 instruction (docs/design/fp8gemm.md). Set
+TORCH_CUDA_ARCH_LIST to build for something else: "12.1a" for the DGX Spark, "12.0a;12.1a"
+for both.
 """
 
 import glob
@@ -19,13 +22,13 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # ---------------------------------------------------------------------------
 # Target architecture. torch's BuildExtension honors TORCH_CUDA_ARCH_LIST and, if it is
-# set, appends its own -gencode flags. If it is *not* set we pin the RTX 5090 (sm_120) explicitly
-# so the build does not fall back to "whatever GPU torch detects" heuristics.
+# set, appends its own -gencode flags. If it is *not* set we pin the RTX 5090 (sm_120a)
+# explicitly so the build does not fall back to "whatever GPU torch detects" heuristics.
 # ---------------------------------------------------------------------------
 arch_list = os.environ.get("TORCH_CUDA_ARCH_LIST", "").strip()
 gencode_flags = []
 if not arch_list:
-    gencode_flags = ["-gencode", "arch=compute_120,code=sm_120"]
+    gencode_flags = ["-gencode", "arch=compute_120a,code=sm_120a"]
 
 nvcc_flags = [
     "-O3",

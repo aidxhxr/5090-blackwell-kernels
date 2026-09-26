@@ -3,6 +3,12 @@
 //
 //   peak_bf16_mma   dense bf16 tensor-core throughput, fp32 accumulate (mma.sync.m16n8k16),
 //                   register-resident operands, no memory traffic: the hgemm roof
+//   peak_fp8_mma    the same for e4m3 operands, fp32 accumulate, on the instruction the fp8gemm
+//                   kernels use (the block-scaled mma.sync.m16n8k32.kind::mxf8f6f4 with unit
+//                   scales on an sm_120a build): the fp8gemm roof
+//   peak_fp8_mma_plain    the plain mma.sync.m16n8k32...e4m3 with fp32 accumulate, which the
+//                   RTX 5090 runs at half that rate, as the GeForce Ada parts did
+//   peak_fp8_mma_f16acc   the plain instruction with fp16 accumulators, the full rate
 //   peak_fp32_fma   fp32 FMA throughput on the CUDA cores: the sgemm roof
 //   sm_clock        SM clock observed *during* the mma loop (clock64 / globaltimer), so the
 //                   peaks can be related to the spec clock
@@ -62,6 +68,68 @@ __global__ void __launch_bounds__(kThreads)
 #pragma unroll
     for (int c = 0; c < kChains; ++c) s += acc[c][0] + acc[c][1] + acc[c][2] + acc[c][3];
     if (s == 12345.f) sink[threadIdx.x] = s;  // never true; defeats dead-code elimination
+}
+
+// One m16n8k32 e4m3 mma per chain per iteration, fp32 accumulators. 0x38 is e4m3 1.0.
+// PLAIN selects the plain instruction over the block-scaled one the kernels use.
+template <bool PLAIN>
+__global__ void __launch_bounds__(kThreads)
+    mma_fp8_peak_kernel(int iters, float* __restrict__ sink, long long* __restrict__ clk) {
+    const unsigned u = 0x38383838u ^ (threadIdx.x & 1);
+    const unsigned a[4] = {u, u, u, u};
+    const unsigned b[2] = {u, u};
+    float acc[kChains][4];
+#pragma unroll
+    for (int c = 0; c < kChains; ++c) acc[c][0] = acc[c][1] = acc[c][2] = acc[c][3] = 0.f;
+
+    long long c0 = 0, t0 = 0;
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        c0 = clock64();
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    }
+    for (int i = 0; i < iters; ++i) {
+#pragma unroll
+        for (int c = 0; c < kChains; ++c) {
+            if (PLAIN)
+                mma_e4m3_16832_plain(acc[c], a, b);
+            else
+                mma_e4m3_16832(acc[c], a, b);
+        }
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        long long c1 = clock64(), t1;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t1));
+        clk[0] = c1 - c0;
+        clk[1] = t1 - t0;
+    }
+    float s = 0.f;
+#pragma unroll
+    for (int c = 0; c < kChains; ++c) s += acc[c][0] + acc[c][1] + acc[c][2] + acc[c][3];
+    if (s == 12345.f) sink[threadIdx.x] = s;
+}
+
+// The same with fp16 accumulators (two f16x2 registers per chain).
+__global__ void __launch_bounds__(kThreads)
+    mma_fp8_f16acc_peak_kernel(int iters, float* __restrict__ sink) {
+    unsigned a0, a1, a2, a3, b0, b1;
+    a0 = a1 = a2 = a3 = b0 = b1 = 0x38383838u ^ (threadIdx.x & 1);
+    unsigned acc[kChains][2];
+#pragma unroll
+    for (int c = 0; c < kChains; ++c) acc[c][0] = acc[c][1] = 0u;
+    for (int i = 0; i < iters; ++i) {
+#pragma unroll
+        for (int c = 0; c < kChains; ++c) {
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.f16.e4m3.e4m3.f16 "
+                "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
+                : "+r"(acc[c][0]), "+r"(acc[c][1])
+                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+        }
+    }
+    unsigned s = 0u;
+#pragma unroll
+    for (int c = 0; c < kChains; ++c) s += acc[c][0] + acc[c][1];
+    if (s == 12345u) sink[threadIdx.x] = static_cast<float>(s);
 }
 
 // kChains independent FMA chains per thread.
@@ -147,6 +215,60 @@ int main(int argc, char** argv) {
         c.ref_ms = mhz;  // MHz, in the one free numeric column; the results script knows
         print_row(c);
         std::fprintf(stderr, "    SM clock during the mma loop: %.0f MHz\n", mhz);
+    }
+
+    // ---- fp8 (e4m3) mma.sync peaks -----------------------------------------------------------
+    const double fp8_warps = static_cast<double>(blocks) * (kThreads / kWarpSize);
+    for (int plain = 0; plain < 2; ++plain) {
+        auto run = [&](int n) {
+            if (plain)
+                mma_fp8_peak_kernel<true><<<blocks, kThreads, 0, stream>>>(n, sink, clk);
+            else
+                mma_fp8_peak_kernel<false><<<blocks, kThreads, 0, stream>>>(n, sink, clk);
+        };
+        int n = 1000;
+        Timing t = time_kernel([&] { run(n); }, stream, 1, 1);
+        n = static_cast<int>(n * target_ms / std::max(0.01, static_cast<double>(t.median_ms)));
+        n = std::max(n, 100);
+        const Timing best = time_best([&] { run(n); });
+        const double flops = fp8_warps * n * kChains * (16.0 * 8.0 * 32.0 * 2.0);
+        long long h[2] = {0, 0};
+        SPARK_CUDA_CHECK(cudaMemcpy(h, clk, sizeof(h), cudaMemcpyDeviceToHost));
+        const double mhz = h[1] > 0 ? static_cast<double>(h[0]) / h[1] * 1e3 : 0.0;
+
+        Row r;
+        r.kernel = plain ? "peak_fp8_mma_plain" : "peak_fp8_mma";
+        r.dtype = "e4m3";
+        r.variant = 0;
+        r.shape = plain ? "m16n8k32" : (SPARK_HAS_MX_MMA ? "m16n8k32_mxf8f6f4" : "m16n8k32");
+        r.median_ms = best.median_ms;
+        r.min_ms = best.min_ms;
+        r.tflops = flops / (best.median_ms * 1e-3) / 1e12;
+        r.ref_ms = mhz;  // the clock this loop ran at, MHz, as for sm_clock above
+        print_row(r);
+        std::fprintf(stderr, "    SM clock during the %s fp8 mma loop: %.0f MHz\n",
+                     plain ? "plain" : "block-scaled", mhz);
+    }
+    {
+        int n16 = 1000;
+        Timing t16 = time_kernel(
+            [&] { mma_fp8_f16acc_peak_kernel<<<blocks, kThreads, 0, stream>>>(n16, sink); }, stream,
+            1, 1);
+        n16 =
+            static_cast<int>(n16 * target_ms / std::max(0.01, static_cast<double>(t16.median_ms)));
+        n16 = std::max(n16, 100);
+        const Timing best16 = time_best(
+            [&] { mma_fp8_f16acc_peak_kernel<<<blocks, kThreads, 0, stream>>>(n16, sink); });
+        Row r16;
+        r16.kernel = "peak_fp8_mma_f16acc";
+        r16.dtype = "e4m3";
+        r16.variant = 0;
+        r16.shape = "m16n8k32_f16acc";
+        r16.median_ms = best16.median_ms;
+        r16.min_ms = best16.min_ms;
+        r16.tflops = fp8_warps * n16 * kChains * (16.0 * 8.0 * 32.0 * 2.0) /
+                     (best16.median_ms * 1e-3) / 1e12;
+        print_row(r16);
     }
 
     // ---- fp32 FMA peak -----------------------------------------------------------------------

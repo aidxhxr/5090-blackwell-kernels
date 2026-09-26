@@ -11,6 +11,7 @@
 #pragma once
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -122,6 +123,30 @@ int hgemm_num_variants();
 // True if `variant` accepts this shape (the rules above); hgemm_bf16 throws when it is false.
 // Lets a caller pick the fastest variant that fits instead of catching the exception.
 bool hgemm_supports(int M, int N, int K, int variant);
+
+// ---- FP8GEMM (e4m3 tensor cores) ----------------------------------------------------------
+// C = scale_a * scale_b * A * Bt^T, with A [M,K] and Bt [N,K] both e4m3 and row-major (K
+// contiguous: Bt is B transposed, the "TN" layout cuBLASLt requires for fp8, so a weight matrix
+// is stored [out_features, in_features] as PyTorch's nn.Linear already does), scale_a and
+// scale_b per-tensor fp32 scalars in device memory, C bf16, fp32 accumulation on
+// mma.sync.m16n8k32. Requires N % 64 == 0, K % 64 == 0 and 16-byte aligned A and Bt.
+// variant 0: one warp per 16x8 output tile, fragments loaded straight from global memory
+//            (requires M % 16 == 0)
+// variant 1: 128x128x64 block tile, mma.sync + ldmatrix out of XOR-swizzled shared memory,
+//            3-stage cp.async pipeline, split-K over the last partial wave of tiles (fp32
+//            atomics into a per-device workspace, so those tiles are not bitwise reproducible
+//            run to run), 64x128 / 64x64 tiles for small grids, and one CTA per 16, 32 or
+//            64-row strip of Bt for decode shapes (M <= 64). Rows past M are zero-filled, so
+//            any M >= 1 works
+// variant 2: variant 1's 128x128 tile fed by TMA (cp.async.bulk.tensor) through a
+//            warp-specialized mbarrier pipeline: one producer warp, eight consumer warps.
+//            Requires M % 128 == 0, N % 128 == 0, K % 128 == 0 and at least one tile per SM;
+//            everything else steps down to variant 1
+void fp8gemm(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat16* C, int M, int N, int K,
+             const float* scale_a, const float* scale_b, int variant, cudaStream_t stream);
+int fp8gemm_num_variants();
+// True if `variant` accepts this shape (the rules above); fp8gemm throws when it is false.
+bool fp8gemm_supports(int M, int N, int K, int variant);
 
 // ---- Fused attention (scaled dot product, forward) ----------------------------------------
 // O = softmax(Q K^T / sqrt(D)) V per (b, h), for Q, O = [B, H_q, S_q, D] and

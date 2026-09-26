@@ -20,15 +20,35 @@ find_package(CUDAToolkit 13.0 REQUIRED)
 option(SPARK_BUILD_BENCH "Build benchmark binaries (needs cuBLAS)" ON)
 option(SPARK_LINEINFO "Embed line info for Nsight Compute source view" ON)
 
+# The architecture-specific form of each requested arch ("120a"): the block-scaled fp8
+# mma.sync (.kind::mxf8f6f4) that gives the fp8 GEMM its full rate is only exposed there
+# (docs/design/fp8gemm.md). Only the fp8 kernels and bench_peak are built for it; an "a"
+# cubin runs on exactly that compute capability, which the plain arch already implies here.
+set(SPARK_CUDA_ARCHITECTURES_A "")
+foreach(arch ${CMAKE_CUDA_ARCHITECTURES})
+  if(arch MATCHES "a$")
+    list(APPEND SPARK_CUDA_ARCHITECTURES_A "${arch}")
+  else()
+    list(APPEND SPARK_CUDA_ARCHITECTURES_A "${arch}a")
+  endif()
+endforeach()
+
 # ---- kernel library ----------------------------------------------------------------------
 file(GLOB SPARK_KERNEL_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/kernels/*.cu)
+file(GLOB SPARK_FP8_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/kernels/fp8gemm*.cu)
+list(REMOVE_ITEM SPARK_KERNEL_SOURCES ${SPARK_FP8_SOURCES})
+add_library(spark_kernels_fp8 STATIC ${SPARK_FP8_SOURCES})
 add_library(spark_kernels STATIC ${SPARK_KERNEL_SOURCES})
-target_include_directories(spark_kernels PUBLIC ${CMAKE_SOURCE_DIR}/include)
-target_compile_options(spark_kernels PRIVATE
-  $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -Xcompiler=-Wall>
-  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<BOOL:${SPARK_LINEINFO}>>:-lineinfo>
-  $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-O3>)
-set_target_properties(spark_kernels PROPERTIES CUDA_SEPARABLE_COMPILATION OFF POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(spark_kernels PUBLIC spark_kernels_fp8)
+set_target_properties(spark_kernels_fp8 PROPERTIES CUDA_ARCHITECTURES "${SPARK_CUDA_ARCHITECTURES_A}")
+foreach(lib spark_kernels spark_kernels_fp8)
+  target_include_directories(${lib} PUBLIC ${CMAKE_SOURCE_DIR}/include)
+  target_compile_options(${lib} PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -Xcompiler=-Wall>
+    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<BOOL:${SPARK_LINEINFO}>>:-lineinfo>
+    $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<CONFIG:Release>>:-O3>)
+  set_target_properties(${lib} PROPERTIES CUDA_SEPARABLE_COMPILATION OFF POSITION_INDEPENDENT_CODE ON)
+endforeach()
 
 # ---- benchmark binaries ------------------------------------------------------------------
 if(SPARK_BUILD_BENCH)
@@ -37,9 +57,12 @@ if(SPARK_BUILD_BENCH)
     get_filename_component(name ${src} NAME_WE)
     add_executable(${name} ${src})
     target_include_directories(${name} PRIVATE ${CMAKE_SOURCE_DIR}/src/bench)
-    target_link_libraries(${name} PRIVATE spark_kernels CUDA::cublas CUDA::cudart)
+    # cublasLt is only for bench_fp8gemm's reference (cuBLAS has no fp8 GemmEx path).
+    target_link_libraries(${name} PRIVATE spark_kernels CUDA::cublas CUDA::cublasLt CUDA::cudart)
     target_compile_options(${name} PRIVATE
       $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
       $<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<BOOL:${SPARK_LINEINFO}>>:-lineinfo>)
   endforeach()
+  # bench_peak measures the block-scaled fp8 instruction, so it needs the "a" arch too.
+  set_target_properties(bench_peak PROPERTIES CUDA_ARCHITECTURES "${SPARK_CUDA_ARCHITECTURES_A}")
 endif()
