@@ -47,6 +47,7 @@ ATTENTION_SHAPES = [(1, 32, 32, 4096, 4096, 128, 0), (1, 32, 32, 4096, 4096, 128
                     (1, 32, 32, 1, 131072, 128, 0), (1, 32, 8, 1, 131072, 128, 0),
                     (8, 32, 8, 1, 4096, 128, 0)]
 WARMUP, ITERS = 10, 100
+SDPA_BACKEND = None  # --sdpa-backend: force torch's SDPA kernel instead of letting it choose
 
 
 RAMP_MS = 300  # kRampMs in src/bench/bench_common.hpp
@@ -204,7 +205,12 @@ def bench_attention(sk, add, B, Hq, Hkv, Sq, Skv, D, causal):
 
     def theirs():
         k, v = next_kv()
-        return F.scaled_dot_product_attention(q, k, v, is_causal=bool(causal), enable_gqa=gqa)
+        if SDPA_BACKEND is None:
+            return F.scaled_dot_product_attention(q, k, v, is_causal=bool(causal), enable_gqa=gqa)
+        from torch.nn.attention import sdpa_kernel
+
+        with sdpa_kernel(SDPA_BACKEND):
+            return F.scaled_dot_product_attention(q, k, v, is_causal=bool(causal), enable_gqa=gqa)
 
     ours_ms = time_ms(ours)
     ref = time_ms(theirs)
@@ -230,8 +236,14 @@ def non_negative_int(text: str) -> int:
 
 
 def main() -> int:
-    global WARMUP, ITERS
+    global WARMUP, ITERS, SDPA_BACKEND
     ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--sdpa-backend", choices=["flash", "cudnn", "efficient", "math"],
+                    help="force this SDPA kernel for the attention rows instead of torch's own "
+                         "choice (the default, which the JSON records as torch_backend)")
+    ap.add_argument("--only", choices=["attention"],
+                    help="time only this kernel's rows (with --sdpa-backend: the attention "
+                         "rows against that kernel)")
     ap.add_argument("--iters", type=positive_int, default=ITERS,
                     help="timed iterations per op (default: %(default)s, same as the C++ benches)")
     ap.add_argument("--warmup", type=non_negative_int, default=WARMUP,
@@ -239,6 +251,12 @@ def main() -> int:
                          "0 also skips the one-time clock ramp")
     args = ap.parse_args()
     WARMUP, ITERS = args.warmup, args.iters
+    if args.sdpa_backend:
+        from torch.nn.attention import SDPBackend
+
+        SDPA_BACKEND = {"flash": SDPBackend.FLASH_ATTENTION, "cudnn": SDPBackend.CUDNN_ATTENTION,
+                        "efficient": SDPBackend.EFFICIENT_ATTENTION,
+                        "math": SDPBackend.MATH}[args.sdpa_backend]
     if not torch.cuda.is_available():
         print("CUDA not available", file=sys.stderr)
         return 1
@@ -271,19 +289,22 @@ def main() -> int:
             file=sys.stderr,
         )
 
-    for dtype in (torch.float32, torch.bfloat16):
-        for rows, cols in RMSNORM_SHAPES:
-            bench_rmsnorm(sk, add, dtype, rows, cols)
-        for cols in SOFTMAX_COLS:
-            bench_softmax(sk, add, dtype, ROWS, cols)
-        for cols in SWIGLU_COLS:
-            bench_swiglu(sk, add, dtype, ROWS, cols)
-    for M, N, K in SGEMM_SHAPES:
-        bench_sgemm(sk, add, M, N, K)
-    for M, N, K in HGEMM_SHAPES:
-        bench_hgemm(sk, add, M, N, K)
+    if args.only != "attention":
+        for dtype in (torch.float32, torch.bfloat16):
+            for rows, cols in RMSNORM_SHAPES:
+                bench_rmsnorm(sk, add, dtype, rows, cols)
+            for cols in SOFTMAX_COLS:
+                bench_softmax(sk, add, dtype, ROWS, cols)
+            for cols in SWIGLU_COLS:
+                bench_swiglu(sk, add, dtype, ROWS, cols)
+        for M, N, K in SGEMM_SHAPES:
+            bench_sgemm(sk, add, M, N, K)
+        for M, N, K in HGEMM_SHAPES:
+            bench_hgemm(sk, add, M, N, K)
     for B, Hq, Hkv, Sq, Skv, D, causal in ATTENTION_SHAPES:
         bench_attention(sk, add, B, Hq, Hkv, Sq, Skv, D, causal)
+    if args.only or args.sdpa_backend:
+        return 0  # a partial or forced-backend run is not the results table's input
 
     OUT.parent.mkdir(exist_ok=True)
     with OUT.open("w") as f:
