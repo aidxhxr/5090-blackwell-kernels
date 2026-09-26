@@ -75,8 +75,10 @@ def sgemm(a: torch.Tensor, b: torch.Tensor, variant: int = -1) -> torch.Tensor:
 def hgemm(a: torch.Tensor, b: torch.Tensor, variant: int = -1) -> torch.Tensor:
     """bf16 tensor-core GEMM with fp32 accumulation: a[M,K] @ b[K,N] -> [M,N] (bf16).
 
-    Requires M, N, K multiples of 16. Variant 2 additionally requires M, N multiples of 128
-    and K a multiple of 32; the default variant uses variant 1 on shapes that do not qualify.
+    Requires N and K multiples of 16. Variant 3 (the default) takes any M >= 1 when N and K
+    are multiples of 64, and runs a dedicated weight-streaming kernel for M <= 64; variants 0
+    to 2 need M a multiple of 16, and variant 2 M, N multiples of 128 and K a multiple of 32.
+    The default steps down to the highest variant that accepts the shape.
     """
     return _C.hgemm(a, b, variant)
 

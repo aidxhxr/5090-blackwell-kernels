@@ -84,15 +84,18 @@ int sgemm_num_variants();
 
 // ---- HGEMM (bf16 tensor cores) ------------------------------------------------------------
 // C = A * B, bf16 in/out, fp32 accumulate, via mma.sync tensor-core instructions (WMMA API).
-// Requires M % 16 == 0, N % 16 == 0, K % 16 == 0.
+// Requires N % 16 == 0, K % 16 == 0, and M % 16 == 0 for variants 0 to 2 (variant 3 takes
+// any M >= 1).
 // variant 0: one warp per 16x16 output tile straight from global memory (WMMA baseline)
 // variant 1: block tile 128x128x32, 8 warps, shared-memory staged, padded to avoid bank conflicts
 // variant 2: variant 1 + cp.async double-buffered pipeline (requires M,N % 128 == 0, K % 32 == 0)
 // variant 3: raw mma.sync.m16n8k16 + ldmatrix, XOR-swizzled smem, 3-stage cp.async pipeline,
 //            split-K over the last partial wave of tiles (fp32 atomics into a per-device
 //            workspace, so those tiles are not bitwise reproducible run to run). The tile is
-//            picked per call (128x128, 64x128 or 64x64) so small and decode-sized (M <= 64)
-//            problems fill the card; requires N % 64 == 0 and K % 64 == 0, any M % 16 == 0
+//            picked per call (128x128, 64x128 or 64x64) so small problems fill the card, and
+//            decode-sized problems (M <= 64) run a dedicated weight-streaming kernel with a
+//            16, 32 or 64-row tile (src/kernels/hgemm_decode.cu). Rows past M are zero-filled,
+//            so any M >= 1 works; requires N % 64 == 0 and K % 64 == 0
 void hgemm_bf16(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N,
                 int K, int variant, cudaStream_t stream);
 int hgemm_num_variants();

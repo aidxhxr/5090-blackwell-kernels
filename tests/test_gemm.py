@@ -11,6 +11,16 @@ HGEMM_SHAPES_128 = [(256, 384, 256), (128, 128, 32), (512, 512, 4096)]
 # the split-K tail (a K long enough to split, few tiles).
 HGEMM_SHAPES_V3 = [(16, 64, 64), (16, 4096, 1024), (64, 256, 512), (272, 128, 4096),
                    (208, 1088, 192), (1024, 1024, 1024)]
+# The decode path inside variant 3 (M <= 64, src/kernels/hgemm_decode.cu): every row tile
+# (16, 32, 64) against N and K from {256, 4096, 11008}, and the shapes with few column strips
+# (N = 256, 1024) that split K and reduce through the self-resetting workspace.
+HGEMM_SHAPES_DECODE = [(16, 4096, 4096), (16, 11008, 4096), (16, 4096, 11008), (16, 256, 4096),
+                       (16, 4096, 256), (32, 4096, 4096), (32, 1024, 11008), (32, 256, 256),
+                       (64, 4096, 4096), (64, 4096, 11008), (64, 11008, 256), (64, 1024, 4096)]
+# Rows past M are zero-filled, so variant 3 takes any M >= 1: single-token decode (M = 1),
+# odd counts inside the 16, 32 and 64 row tiles, and one above 64 for the general tiles.
+HGEMM_SHAPES_ANY_M = [(1, 4096, 4096), (5, 4096, 256), (17, 1024, 1024), (33, 256, 4096),
+                      (63, 4096, 1024), (100, 1024, 1024)]
 HGEMM_TOL = dict(atol=3e-2, rtol=3e-2)
 
 
@@ -69,6 +79,29 @@ def test_hgemm_variant3_any_m(sk, shape):
     _hgemm_case(sk, shape, 3)
     # Repeated calls must agree with the reference too: the split-K tail reuses a workspace.
     _hgemm_case(sk, shape, 3)
+
+
+@pytest.mark.parametrize("shape", HGEMM_SHAPES_DECODE, ids=lambda s: f"M{s[0]}_N{s[1]}_K{s[2]}")
+def test_hgemm_decode_shapes(sk, shape):
+    if 3 not in _variants("hgemm"):
+        pytest.skip("variant 3 not built")
+    # Three calls in a row: the split-K workspace and its arrival counters are put back to
+    # zero by the kernel itself, so a second and third launch must agree with the reference.
+    for _ in range(3):
+        _hgemm_case(sk, shape, 3)
+
+
+@pytest.mark.parametrize("shape", HGEMM_SHAPES_ANY_M, ids=lambda s: f"M{s[0]}_N{s[1]}_K{s[2]}")
+def test_hgemm_variant3_any_row_count(sk, shape):
+    if 3 not in _variants("hgemm"):
+        pytest.skip("variant 3 not built")
+    _hgemm_case(sk, shape, 3)
+    M, N, K = shape
+    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
+    got = sk.hgemm(a, b)  # the default variant is 3 on these shapes, no step-down needed
+    ref = (a.float() @ b.float()).to(torch.bfloat16)
+    torch.testing.assert_close(got.float(), ref.float(), **HGEMM_TOL)
 
 
 def test_hgemm_rejects_unaligned(sk):

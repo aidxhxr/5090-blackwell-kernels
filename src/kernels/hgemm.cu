@@ -20,6 +20,7 @@
 
 #include <algorithm>
 
+#include "hgemm_internal.cuh"
 #include "spark/common.cuh"
 #include "spark/kernels.h"
 
@@ -641,6 +642,10 @@ void launch(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, in
 void launch_auto(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N,
                  int K, cudaStream_t stream) {
     auto tiles = [&](int bm, int bn) { return cdiv(M, bm) * (N / bn); };
+    if (M <= 64 && hgemm_decode::supports(M, N, K)) {  // decode: stream B (hgemm_decode.cu)
+        hgemm_decode::launch(A, B, C, M, N, K, stream);
+        return;
+    }
     if (M > 64 && N % 128 == 0 &&
         tiles(128, 128) >= resident_blocks<128, 128, V3_BK, V3_STAGES>()) {
         launch<128, 128, V3_BK, V3_STAGES>(A, B, C, M, N, K, stream);
@@ -669,9 +674,10 @@ int hgemm_num_variants() {
 bool hgemm_supports(int M, int N, int K, int variant) {
     if (variant < 0 || variant >= hgemm_num_variants()) return false;
     if (M <= 0 || N <= 0 || K <= 0) return false;
-    if (M % WMMA_M != 0 || N % WMMA_N != 0 || K % WMMA_K != 0) return false;
+    if (N % WMMA_N != 0 || K % WMMA_K != 0) return false;
+    if (M % WMMA_M != 0 && variant != 3) return false;  // variant 3 zero-fills rows past M
     if (variant == 2) return M % BM == 0 && N % BN == 0 && K % BK == 0;
-    if (variant == 3) return N % 64 == 0 && K % 64 == 0;  // any M % 16 == 0
+    if (variant == 3) return N % 64 == 0 && K % 64 == 0;  // any M >= 1
     return true;
 }
 
@@ -679,8 +685,8 @@ void hgemm_bf16(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C
                 int K, int variant, cudaStream_t stream) {
     SPARK_REQUIRE(A != nullptr && B != nullptr && C != nullptr, "hgemm: null pointer");
     SPARK_REQUIRE(M > 0 && N > 0 && K > 0, "hgemm: M, N, K must be positive");
-    SPARK_REQUIRE(M % WMMA_M == 0 && N % WMMA_N == 0 && K % WMMA_K == 0,
-                  "hgemm: M, N, K must be multiples of 16");
+    SPARK_REQUIRE(N % WMMA_N == 0 && K % WMMA_K == 0, "hgemm: N, K must be multiples of 16");
+    SPARK_REQUIRE(M % WMMA_M == 0 || variant == 3, "hgemm: M must be a multiple of 16");
     SPARK_REQUIRE(variant >= 0 && variant < hgemm_num_variants(), "hgemm: unknown variant");
 
     switch (variant) {
