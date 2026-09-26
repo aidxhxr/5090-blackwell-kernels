@@ -156,11 +156,12 @@ int run(int argc, char** argv) {
         const int m = args.geti("m", 4096);
         shapes.push_back({m, args.geti("n", m), args.geti("k", m)});
     } else {
-        // Square and Llama-7B projection shapes at 4096 tokens, then decode shapes: 16 and 64
-        // tokens against the same weights, where the GEMM is bound by streaming B.
+        // Square and Llama-7B projection shapes at 4096 tokens, then decode shapes: 1 (a
+        // single token), 16, 32 and 64 tokens against the same weights, where the GEMM is
+        // bound by streaming B.
         shapes = {{1024, 1024, 1024},  {2048, 2048, 2048},  {4096, 4096, 4096}, {8192, 8192, 8192},
-                  {4096, 4096, 11008}, {4096, 11008, 4096}, {16, 4096, 4096},   {64, 4096, 4096},
-                  {16, 11008, 4096},   {64, 4096, 11008}};
+                  {4096, 4096, 11008}, {4096, 11008, 4096}, {1, 4096, 4096},    {16, 4096, 4096},
+                  {32, 4096, 4096},    {64, 4096, 4096},    {16, 11008, 4096},  {64, 4096, 11008}};
     }
     const int iters = args.geti("iters", 50);
     std::vector<int> variants;
