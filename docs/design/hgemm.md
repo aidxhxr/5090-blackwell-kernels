@@ -9,10 +9,10 @@ Both targets are the consumer/workstation Blackwell lineage: the RTX 5090 is com
 12.0 (sm_120, primary target) and the GB10 is 12.1 (sm_121, secondary). They have
 fifth-generation tensor cores driven by the classic `mma.sync` warp-level instruction, which is
 what the WMMA C++ API compiles to. The datacenter Blackwell parts (sm_100, B200/GB200) add
-`tcgen05` instructions and thread-block clusters; those do not exist on either machine (TMA,
-`cp.async.bulk.tensor`, does exist on sm_120, but with `cp.async` already hiding the copies
-behind the tensor cores it is not used here). So `mma.sync` is not a compromise, it is the
-native path, and the same source builds for both.
+`tcgen05` instructions and thread-block clusters; those do not exist on either machine. TMA
+(`cp.async.bulk.tensor`) and mbarriers do exist on sm_120, and variant 5 uses them to feed the
+same `mma.sync` k-loop. So `mma.sync` is not a compromise, it is the native path, and the same
+source builds for both.
 
 A `wmma::fragment` is a warp-distributed register tile. One `mma_sync` on
 `fragment<..., 16, 16, 16, __nv_bfloat16, ...>` performs a 16×16×16 matrix multiply-accumulate
@@ -31,6 +31,7 @@ the fragment layout is explicit and the kernel controls every shared-memory acce
 | 1 | 128×128×32 block tile, 8 warps (2×4), each warp owns a 64×32 sub-tile (4×2 fragments), tile staged in shared memory with +8 padding | global traffic ÷ 8 vs v0 for the same FLOPs, no bank conflicts on fragment loads |
 | 2 | v1 + two-stage `cp.async` pipeline | overlaps the global→shared copy of tile *k+1* with the tensor-core work on tile *k*; copies bypass registers |
 | 3 | raw `mma.sync.m16n8k16` + `ldmatrix`, XOR-swizzled smem, 3-stage `cp.async` pipeline, register-direct epilogue, split-K on the last partial wave, tile picked per call (128×128, 64×128 or 64×64) with zero-filled rows past M, and a dedicated weight-streaming kernel with a 16, 32 or 64-row tile for M ≤ 64 (`hgemm_decode.cu`) | fragment loads in one instruction each, no padding bytes, DRAM latency covered two tiles ahead, no epilogue staging, the wave-quantization tail on 170 SMs, and small / decode shapes (any M % 16 == 0) that a 128-row tile could not fill the card with |
+| 5 | v3's 128×128 tile and k-loop fed by TMA (`cp.async.bulk.tensor`) through a warp-specialized mbarrier pipeline: one producer warp issues three box loads per stage, eight consumer warps run the tensor cores, no `__syncthreads` in the k-loop (`src/kernels/hgemm_tma.cu`) | the per-K-tile block barrier (8.7 of v3's 30 stall cycles per issue) and the copy address arithmetic; tensor pipe 92% → 99% active, 102 to 109% of cuBLAS on the large shapes. Variant 4 is reserved for Stream-K |
 
 ### Arithmetic intensity of the block tile
 
@@ -374,6 +375,198 @@ n at one k; producing the pairs takes a cross-lane transpose per fragment that
 `ldmatrix.trans` does for free from smem. With smem bandwidth nowhere near a limit (one
 `ldmatrix` per 512 B of B) there was nothing to gain, so the `cp.async` staged version is
 the only one.
+### Variant 5: TMA and warp specialization
+
+Source: `src/kernels/hgemm_tma.cu`, helpers under "TMA / mbarrier" in `include/spark/common.cuh`.
+
+v3's tensor pipe was 91 to 95% busy in Nsight with `math_pipe_throttle` the top stall, and I
+had put the last 5% at 8192³ down to power. Before believing that I wanted to remove the one
+thing the consumer warps still do besides `ldmatrix` and `mma.sync`: the copies. In v3 every
+thread computes two global addresses and two swizzled shared addresses per stage and issues
+two `cp.async` instructions, and the whole block meets at a `__syncthreads` once per K-tile.
+The Blackwell TMA unit can do all of that from a single instruction, and an mbarrier pipeline
+lets the producer and the consumers stop meeting. So v5 keeps v3's 128×128 tile, its 2×4
+warp grid and 64×32 warp tile, its `ldmatrix` + `mma.sync` k-loop body, its register-direct
+epilogue and its tail split-K (the `Sched` struct and workspace are copied, not shared, so v3
+stays untouched), and replaces only the way a stage gets to shared memory.
+
+**Tensor maps and boxes.** The host encodes one `CUtensorMap` per operand with
+`cuTensorMapEncodeTiled` (the entry point comes from `cudaGetDriverEntryPointByVersion`, so
+nothing links against libcuda): A is described as a K-innermost matrix with a box of
+BK columns × 128 rows, B as an N-innermost matrix with a box of 64 columns × BK rows. Encoding
+is 128 bytes of host arithmetic, measured at 27 ns per call, so the maps are rebuilt per call
+and passed as `__grid_constant__` kernel parameters. One producer lane issues three
+`cp.async.bulk.tensor.2d` per stage: the A box and the two 64-column halves of the B tile.
+32 KB of operands (BK = 64) for three instructions; v3 issues 512 `cp.async` for the same
+bytes.
+
+**The swizzle is the same XOR.** A TMA box lands in smem row-major with the map's swizzle
+applied. The 128-byte swizzle XORs address bits [4:7) (the 16-byte chunk within a 128 B row)
+with bits [7:10) (the row within an 8-row group), i.e. `chunk ^= row % 8` for 128 B rows,
+which is exactly v3's `swz_b` and the BK = 64 form of `swz_a`. The 64-byte swizzle XORs bits
+[4:6) with [7:9), i.e. `chunk ^= (row / 2) % 4` for 64 B rows, which is v3's BK = 32 `swz_a`.
+So the box inner dimension is fixed at one swizzle span (64 bf16 = 128 B for B and for A at
+BK = 64; 32 bf16 = 64 B for A at BK = 32), the B tile is stored as two 64-column boxes side
+by side, and the k-loop body addresses smem with v3's functions unchanged. The only change in
+the consumer is that a warp's 32 columns of B live in box `wn / 2` at chunk
+`(wn % 2) * 4 + nj + (lane / 16)`. Each `ldmatrix` still touches eight rows whose XORed chunks
+are eight different bank groups: Nsight reports 3,658 bank conflicts over 403 M
+shared-load wavefronts at 8192³ for the (64, 2, 1) configuration, against v3's 297 K. Both swizzles are keyed on the absolute shared address, so
+every stage starts on a 1 KB boundary: the stages sit at the front of the dynamic region
+(which starts aligned when the kernel declares no static smem; the kernel traps if not), the
+barriers go after them, and the allocation is rounded to a whole KB so the second block on an
+SM starts aligned too.
+
+**Two mbarriers per stage, parity.** Stage `s` has a "full" barrier initialized with an
+arrival count of 1 and an "empty" barrier initialized with 8. Per K-tile the producer lane
+does `mbarrier.arrive.expect_tx` on full[s] with the stage's byte count and issues the three
+loads with `.mbarrier::complete_tx::bytes` naming full[s]; the copy engine counts the bytes
+down as they land and the phase completes when the arrival and the bytes are both in. The
+consumers spin on `mbarrier.try_wait.parity`. A barrier flips between phase 0 and phase 1 each
+time it completes, and `try_wait.parity P` returns once the phase with parity P has finished,
+so the n-th use of a stage waits on parity `n & 1`: K-tile `kt` uses stage `kt % STAGES` for
+the `kt / STAGES`-th time. After its last `mma.sync` on the stage each consumer warp
+`__syncwarp`s and lane 0 arrives on empty[s]; before refilling a stage for its n-th use the
+producer waits on empty[s] with parity `(n - 1) & 1`. The first STAGES fills skip that wait.
+There is no `__syncthreads` after the barrier init: the consumer warps never wait for each
+other, only for the data, and the producer only waits for the slowest consumer of the stage it
+wants to reuse. The tail split-K path still needs a block-wide sync for its arrival counter;
+the producer warp has exited by then, so the consumers use a named barrier (`bar.sync 1, 256`)
+instead of `__syncthreads`.
+
+**`fence.proxy.async`, and the bug it fixed.** `ldmatrix` reads shared memory through the
+generic proxy; the TMA writes it through the async proxy, and the PTX memory model does not
+order the two without a proxy fence. The read-after-write direction is covered for free: a
+completed `cp.async.bulk` is followed by an implicit fence, so a consumer that has seen full[s]
+complete may `ldmatrix` at once. The write-after-read direction is not: without a
+`fence.proxy.async.shared::cta` before the release, the refill of a stage could land while a
+lane's `ldmatrix` of it was still outstanding. I first shipped the kernel without that fence.
+The one-block-per-SM configurations passed every shape; the two-block configurations returned
+wrong tiles, only on grids with a split-K tail, only in tail tiles whose blocks had started
+while another block was mid-pipeline on the same SM, and never when I instrumented the
+consumer (the extra work moved the timing). One fence per consumer thread per stage, issued
+before the `__syncwarp` and the arrive, and every configuration passes every shape.
+
+**Registers and residency.** `setmaxnreg` is sm_90a only, so the producer warp carries the
+same register allocation as a consumer: 288 threads × 126 registers at one block per SM, and
+`__launch_bounds__(288, 2)` caps the two-block configurations at 96 registers without spills.
+The RTX 5090 allows 101,376 B of dynamic smem per block and 102,400 B per SM with 1 KB
+reserved per block, not the 227 KB of the datacenter parts, so a 32 KB stage (BK = 64) fits
+three deep at one block per SM and two blocks per SM need BK = 32.
+
+#### The sweep
+
+TFLOPS at `--iters=50`, all configurations pass the cuBLAS check on every shape. Runs of the
+same configuration repeat to within ±1.5% (the card sits at the 600 W limit and its clock
+drifts with temperature; cuBLAS moved 229 to 233 TFLOPS at 8192³ across the session).
+
+| BK, stages, blocks/SM | smem | regs | 2048³ | 4096³ | 8192³ | 4096×4096×11008 | 4096×11008×4096 | 2560²×4096 |
+|---|---|---|---|---|---|---|---|---|
+| 64, 2, 1 | 64 KB | 126 | 176.7 | 236.9 | **235.3** | **242.0** | **236.9** | 212.5 |
+| 64, 3, 1 | 96 KB | 128 | 176.7 | 237.1 | 234.7 | 241.3 | 236.7 | 213.9 |
+| 32, 3, 2 | 48 KB | 96 | **180.6** | 241.1 | 230.1 | 237.8 | 232.0 | **219.3** |
+| 32, 2, 2 | 32 KB | 96 | **180.7** | **242.9** | 231.1 | 238.8 | 235.4 | **219.4** |
+| 32, 3, 1 | 48 KB | 123 | | 236.9 | 232.1 | | | 215.7 |
+| 32, 6, 1 | 96 KB | 129 | 176.8 | 238.6 | 234.4 | 238.8 | 234.4 | 213.9 |
+| v3 (32, 3, 2 blocks) | 48 KB | 121 | 165.9 | 222.7 | 221.5 | 222.3 | 221.5 | |
+
+Two stages of BK = 64 are enough: a stage is 2·128·128·64 = 2.1 MFLOP, 4,100 tensor-pipe
+cycles per SM at the measured rate, about 1.5 µs, and the TMA round trip from L2 is a fraction
+of that, so one stage in flight covers it. Depth beyond two buys nothing at one block per SM.
+The two-block configurations win by 2% wherever both operands fit in the 96 MB L2 (2048³,
+4096³, 2560²×4096: 16 to 64 MB) and lose by 2% wherever they do not (8192³ and the 11008
+shapes: 180 to 256 MB). It is not the L2: Nsight at 8192³ has both at an 80% hit rate and,
+with the clock locked, within 1% of each other in time (5.05 vs 5.10 ms). The difference only
+exists at the 600 W limit, and the one thing that separates the two there is the instruction
+stream: 971 M instructions for (32, 3, 2) against 622 M for (64, 2, 1) for the same
+`mma.sync` count, since a 32-deep stage pays its waits, arrives and loop overhead twice as
+often. My reading is that on the shapes that stream from DRAM the memory system takes its
+share of the 600 W and the leaner instruction stream keeps a higher SM clock, while on the
+L2-resident shapes there is clock headroom and the second block's latency hiding wins. That is
+a reading of five data points, not a measurement; the rule it gives is what ships:
+`hgemm_tma` picks (32, 3, 2) when 2(MK + KN) bytes fit in the L2 and (64, 2, 1) otherwise,
+and `SPARK_HGEMM_V5_CONFIG=<index>` forces one of the six for a re-sweep.
+
+#### Measured
+
+`bench_hgemm --iters=50`, v3 and v5 back to back, same session:
+
+| M×N×K | cuBLAS TFLOPS | v3 TFLOPS / % | v5 TFLOPS / % | v5 / v3 |
+|---|---|---|---|---|
+| 2048³ | 172.6 | 165.9 / 96.1% | **180.7 / 104.6%** | 1.09× |
+| 4096³ | 222.5 | 224.8 / 101.1% | **240.4 / 107.9%** | 1.07× |
+| 8192³ | 229.7 | 218.7 / 95.2% | **235.2 / 102.4%** | 1.08× |
+| 4096×4096×11008 | 222.0 | 222.6 / 100.3% | **242.0 / 109.0%** | 1.09× |
+| 4096×11008×4096 | 231.4 | 219.9 / 95.1% | **235.0 / 101.5%** | 1.07× |
+
+1024³ and the decode shapes are not v5 shapes (`hgemm_supports` wants a 128×128 grid of at
+least one tile per SM, so the default variant steps down to v3 on them; `tests/test_gemm.py`
+checks that). The 2048³ row is a 1.5-wave grid, so it says as much about the tail split as
+about the pipeline.
+
+#### Power
+
+`nvidia-smi --query-gpu=clocks.sm,power.draw -lms 200` sampled during a 1,500-iteration
+8192³ loop of each kernel, both inside one GPU lock, samples from the last five seconds of
+each run (the bench times cuBLAS first, then the kernel, so the tail of the trace is ours):
+
+| kernel | TFLOPS (median of 1,500) | SM clock | power | TFLOPS per watt |
+|---|---|---|---|---|
+| cuBLAS (same runs) | 226.6 | 2,715 to 2,722 MHz | 600 W | 0.378 |
+| v3 | 217.2 | 2,760 MHz | 600 W | 0.362 |
+| v5 | 234.3 | 2,752 MHz | 600 W | 0.391 |
+
+Every kernel pins the card at its 600 W limit within a second and the clock settles at the
+same 2.75 GHz for v3 and v5 (the 25 samples in each window do not move by a MHz), so the
+question in the title has a clean answer: TMA did not lower the power, it raised the work
+done per joule by 8%. At a fixed clock and a fixed power budget the 8% comes from the tensor
+pipe being busier, which is the Nsight result below.
+
+#### Nsight Compute at 8192³ (`--set full`, one launch, clocks locked by ncu at 2.55 GHz)
+
+| metric | v3 | v5 (64, 2, 1) | v5 (32, 3, 2) |
+|---|---|---|---|
+| duration | 5.49 ms | 5.05 ms | 5.10 ms |
+| tensor pipe active (`sm__pipe_tensor_cycles_active`) | 92.2% | 98.7% | 99.4% |
+| executed instructions | 1,251 M | 622 M | 971 M |
+| issue slots busy | 13.1% | 7.3% | 11.6% |
+| stall: `math_pipe_throttle` (cycles per issue) | 14.3 | 20.8 | 26.6 |
+| stall: `barrier` | 8.7 | 0.0 | 0.0 |
+| stall: `wait` | 2.7 | 5.0 | 3.7 |
+| stall: `long_scoreboard` | 0.3 | 1.3 | 2.1 |
+| L2 hit rate | 83.1% | 80.1% | 80.4% |
+| DRAM throughput | 31.5% | 39.9% | 39.2% |
+| shared-memory bank conflicts / load wavefronts | 297 K / 403 M | 3.7 K / 403 M | 1.9 M / 405 M |
+| registers per thread | 128 | 126 | 96 |
+| achieved occupancy | 33.0% (15.8 warps/SM) | 18.7% (9.0 warps/SM) | 37.4% (17.9 warps/SM) |
+
+The row that explains the result is the `barrier` stall: 8.7 of v3's 30 cycles between issues
+were spent at the per-K-tile `__syncthreads`, and the mbarrier pipeline has none. A warp that
+finishes its `mma.sync`s on a stage goes straight to the next stage's `try_wait`, which is
+already satisfied when the pipeline is healthy, so the tensor pipe stays fed through the stage
+boundary; in v3 the eight warps lined up at the barrier and the pipe drained every 32 k. Half
+the instructions are gone with the `cp.async` address generation, and the issue-slot number
+(7.3%) says how little the consumer warps now do besides feeding the tensor cores: at one
+block per SM there are nine warps on the SM, 2.2 per scheduler, and 98.7% tensor-pipe
+activity comes out of that. `math_pipe_throttle` grew from 14 to 21 cycles per issue, which
+is what a stall breakdown looks like when the pipe is the only thing left to wait for. The L2
+hit rate dropped three points and DRAM throughput rose (each SM now works through the K loop
+faster, so more tiles are in flight per unit time and the reuse window in L2 is shorter), and
+neither cost anything at 8192³; a grouped tile order would claw that back and is the next
+experiment. The 3,658 bank conflicts are effectively zero: the 128-byte-row B boxes are a
+cleaner swizzle than v3's 256-byte rows.
+
+#### Verdict
+
+TMA plus a producer/consumer mbarrier pipeline is worth 7 to 9% over v3 on every shape it
+runs, and it is the first rung to beat cuBLAS on all of the large shapes: 102 to 109%. It did
+not lower the power draw, it raised the work per joule by 8% at the same 600 W and the same
+2.75 GHz, by taking the tensor pipe from 92% to 99% active: no block barrier in the k-loop,
+half the instructions, one lane issuing what 256 threads used to. The remaining gap to the
+239 TFLOPS the card sustains at this clock is 2%, and it sits in wave quantization (2048³ is
+1.5 waves) and the split-K tail, not the mainloop. v5 ships as the default for M % 128 == 0,
+N % 128 == 0, K % 64 == 0 and a grid of at least 170 tiles; everything smaller and every
+decode shape stays on v3, which is where the tile heuristics live.
 
 ## Correctness
 
@@ -428,8 +621,10 @@ was the mma.sync/ldmatrix rung and the tail scheduling.
 
 From `results/hgemm.json` (median of 50 iterations; cuBLAS `cublasGemmEx` timed identically on
 the same stream; for M ≤ 64 both stream B from DRAM through copies that exceed L2). v2 has no
-rows for the decode shapes (n/a): it requires M % 128 == 0. A GB10 (sm_121) table is added when the
-Spark has been benchmarked.
+rows for the decode shapes (n/a): it requires M % 128 == 0. The variant 5 rows measured on
+2026-09-26 are in its section above; it takes the five shapes from 2048³ up and leaves 1024³
+and the decode shapes to v3. A GB10 (sm_121) table is added when the Spark has been
+benchmarked.
 
 | shape (M×N×K) | cuBLAS ms / TFLOPS | v0 ms / TFLOPS / % | v1 | v2 | v3 |
 |---|---|---|---|---|---|
@@ -479,9 +674,12 @@ Still open:
 - **The 2 µs of launch and ramp** that a single decode launch pays over the back-to-back
   rate (23.5 against 21.5 µs at 32 MB). It is not in the kernel; CUDA graphs or a persistent
   megakernel across the decoder block are the ways at it.
-- **Perf per watt** on the long shapes: a 64×64 warp tile (4 warps per 128×128 block, or 8 warps
-  on 128×256) halves the `ldmatrix` count per `mma.sync`. My 128×256 attempt lost with the
-  current 2×4 warp grid; a 2×2 grid with 4 warps and 2–3 blocks per SM is the untested layout.
-  8192³ at 95% of cuBLAS is the row it would move.
+- **Perf per watt** on the long shapes. Variant 5 took the first step (8% more work per joule
+  from the tensor pipe alone, 8192³ from 95% to 102% of cuBLAS). A 64×64 warp tile (4 warps
+  per 128×128 block) would halve the `ldmatrix` count per `mma.sync` on top of that; the
+  producer warp of v5 makes a 4-consumer-warp layout cheaper to try than it was.
 - **Persistent scheduling with L2-aware rasterization** (grouped tile order), which matters once
-  operands exceed the 96 MB L2 (8192³ and up).
+  operands exceed the 96 MB L2: v5's L2 hit rate at 8192³ is 80% against v3's 83%, because it
+  gets through tiles faster.
+- **v5 on smaller grids.** The TMA kernel only runs on grids of at least one 128×128 tile per
+  SM; a 64-row TMA tile for the shapes v3 handles with its small tiles is untested.
