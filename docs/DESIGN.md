@@ -33,15 +33,17 @@ warps per tile, `sgemm` 128×128×8 with an 8×8 register tile, `cols > 8192` / 
 the block-per-row rmsnorm / softmax) were reasoned for 48 SMs and 273 GB/s. The top rungs were
 tuned on the 5090: `hgemm` v3 keeps the 128×128×32 tile (a sweep of BK = 64, 4 stages and
 128×256 was slower) but moves to raw `mma.sync` + `ldmatrix`, an XOR swizzle, a 3-stage
-pipeline and split-K on the last partial wave of tiles, and v5 feeds the same k-loop with TMA
-through a warp-specialized mbarrier pipeline; `sgemm` v4/v5 use register prefetch
+pipeline and split-K on the last partial wave of tiles, v4 runs that tile on a persistent
+Stream-K schedule with a grouped tile order, and v5 feeds the same k-loop with TMA through a
+warp-specialized mbarrier pipeline; `sgemm` v4/v5 use register prefetch
 and a 256×128 / 16×8 tile against the shared-memory bandwidth limit; rmsnorm v4 and softmax v3
 keep the row in registers and pick the thread group from the row length. Each per-kernel note
 has an "RTX 5090 notes" section with what was measured.
 
 One more thing the SM count does: 170 = 2 × 5 × 17, so no power-of-two tile grid divides into
 whole waves. With 2 resident blocks per SM a 4096² output has 1,024 tiles = 3.01 waves, and
-the last 4 tiles cost a whole wave; the GEMMs split those tail tiles along K over the idle SMs.
+the last 4 tiles cost a whole wave; the GEMMs split those tail tiles along K over the idle SMs,
+and `hgemm` v4 goes further with a persistent grid that owns the whole (tile, k-step) space.
 
 ## Measuring
 

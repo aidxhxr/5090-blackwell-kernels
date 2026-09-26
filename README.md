@@ -37,16 +37,21 @@ the copy roof. The spec sheet says 1,792 GB/s. Nothing reaches that.
 Variant 3 is raw `mma.sync.m16n8k16` with `ldmatrix`, an XOR-swizzled shared-memory tile, a
 three-stage `cp.async` pipeline, and split-K on the last partial wave of tiles. It picks a
 128x128, 64x128 or 64x64 tile per call depending on whether the grid fills the card, and for
-M <= 64 it runs a separate weight-streaming kernel with a 16, 32 or 64-row tile.
+M <= 64 it runs a separate weight-streaming kernel with a 16, 32 or 64-row tile. Variant 4
+runs the same tile as a persistent Stream-K kernel: a grid of 340 resident blocks, tiles in
+an L2-friendly grouped order, equal (tile, k-step) ranges per block for problems up to a few
+waves and a tile queue with shrinking K-passes above that, and a fixup that sums the pieces of
+a tile in K order through one fp32 slot, so there is no memset, no atomic, and the output is
+the same bits every run. Measured 2026-09-26, v3 and v4 back to back, 50 iterations each.
 
-| M x N x K | v3 TFLOPS | cuBLAS TFLOPS | v3 / cuBLAS |
-|---|---|---|---|
-| 1024 x 1024 x 1024 | 122.5 | 121.4 | 100.9% |
-| 2048 x 2048 x 2048 | 166.1 | 172.5 | 96.3% |
-| 4096 x 4096 x 4096 | 224.9 | 225.7 | 99.7% |
-| 8192 x 8192 x 8192 | 220.4 | 232.2 | 94.9% |
-| 4096 x 4096 x 11008 | 224.8 | 227.6 | 98.8% |
-| 4096 x 11008 x 4096 | 224.5 | 239.4 | 93.8% |
+| M x N x K | v3 TFLOPS | v4 TFLOPS | cuBLAS TFLOPS | v4 / cuBLAS |
+|---|---|---|---|---|
+| 1024 x 1024 x 1024 | 122.7 | 123.4 | 121.8 | 101.3% |
+| 2048 x 2048 x 2048 | 166.0 | 207.3 | 172.6 | 120.1% |
+| 4096 x 4096 x 4096 | 231.3 | 231.1 | 225.8 | 102.4% |
+| 8192 x 8192 x 8192 | 223.9 | 227.9 | 232.6 | 98.0% |
+| 4096 x 4096 x 11008 | 228.6 | 229.3 | 227.1 | 101.0% |
+| 4096 x 11008 x 4096 | 229.6 | 229.1 | 240.0 | 95.4% |
 
 Decode shapes, where the whole thing is streaming the weight matrix once. The bench rotates
 through enough copies of B to get past the 96 MB L2, otherwise both sides read out of cache
@@ -75,6 +80,18 @@ output has 1,024 tiles for 340 resident blocks, 3.01 waves, and the last four ti
 alone for as long as a full wave. Splitting the tail along K took 4096 cubed from 88% to 100%
 of cuBLAS.
 
+Stream-K then did three things the tail split could not. 2048 cubed is 256 tiles of 128x128,
+three quarters of a wave, and v3 had to drop to a 64x128 tile to fill the card; v4 keeps the
+big tile and splits along K, 96% to 120% of cuBLAS. At 8192 cubed a wave of tiles in row-major
+order re-reads all 128 MB of B from DRAM; in grouped order the 340 tiles in flight touch 16
+tile rows of A and 21 tile columns of B, 75 MB, and Nsight shows the L2 hit rate go from 80%
+to 96% and DRAM traffic from 664 to 165 GB/s. The kernel is at the power limit either way, so
+the traffic it no longer moves came back as clock: 95% to 98% of cuBLAS. And on the decode
+shapes the two memsets v3 needed before every call were 4 us of a 28 us GEMM. One thing I did
+not expect: some SMs on this card run the same block 20% slower than others, in pairs, and a
+persistent kernel that assigns work statically waits for them. Whole tiles come from a queue
+for that reason.
+
 fp32 GEMM is a different story. On sm_120 an SM does 128 FMAs per clock and reads 128 bytes
 per clock from shared memory, and an 8x8 register tile needs a byte per FMA. cuBLAS SGEMM is
 stuck at the same wall, at 54% of the measured 123 TFLOPS. Variant 5 uses a 16x8 tile to get
@@ -92,7 +109,7 @@ dumps in `results/ncu_*.txt`.
 | `swiglu` | scalar, 128-bit vectorized | PyTorch eager, two kernels |
 | `softmax` | three pass, warp online softmax, block online softmax, single pass with the row in registers | `torch.softmax` |
 | `sgemm` fp32 | naive, smem tile, 8x8 register tile, cp.async, register prefetch with swizzle, 256x128 tile | cuBLAS SGEMM |
-| `hgemm` bf16 | WMMA, smem tile, cp.async, `mma.sync` + `ldmatrix` with swizzle, 3 stages and split-K, a weight-streaming kernel for decode | cuBLAS GemmEx |
+| `hgemm` bf16 | WMMA, smem tile, cp.async, `mma.sync` + `ldmatrix` with swizzle, 3 stages and split-K, persistent Stream-K, TMA with a producer warp, a weight-streaming kernel for decode | cuBLAS GemmEx |
 | `attention` bf16 | warp per query row, CUDA-core flash attention, `mma.sync` + `ldmatrix` flash attention, split-KV tail and decode | `F.scaled_dot_product_attention` |
 | `bench_peak` | | measures the card's real `mma.sync` and FMA peaks and the clock they run at |
 
@@ -157,9 +174,9 @@ numbers, and which Nsight metric moved:
   [sgemm](docs/design/sgemm.md), [hgemm](docs/design/hgemm.md),
   [attention](docs/design/attention.md)
 
-Things I'd still like to do: Stream-K proper instead of only splitting the tail, CUDA graphs
-for the 2 us a lone decode launch pays over the back-to-back rate, and figuring out why the
-11008-wide fp32 shapes lose 10% per FLOP. Both cards
+Things I'd still like to do: the last 5% on 4096 x 11008 x 4096 in bf16, CUDA graphs for
+the 2 us a lone decode launch pays over the back-to-back rate, and a GB10 run when the Spark
+arrives. Both cards
 are consumer Blackwell, so `mma.sync`, `cp.async` and TMA are available and `tcgen05` isn't.
 
 ```

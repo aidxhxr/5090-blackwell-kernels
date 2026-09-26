@@ -1,7 +1,9 @@
 # HGEMM: bf16 tensor-core GEMM
 
 `C[M,N] = A[M,K] · B[K,N]`, row-major, bf16 inputs and outputs, fp32 accumulation.
-Source: `src/kernels/hgemm.cu`. Bench: `bench_hgemm` (validates every variant against cuBLAS).
+Source: `src/kernels/hgemm.cu` (variants 0 to 3), `src/kernels/hgemm_streamk.cu` (variant 4),
+with the `mma.sync` tile the last two share in `src/kernels/hgemm_tile.cuh`. Bench:
+`bench_hgemm` (validates every variant against cuBLAS).
 
 ## Why WMMA / mma.sync on these GPUs
 
@@ -30,8 +32,9 @@ the fragment layout is explicit and the kernel controls every shared-memory acce
 | 0 | one warp per 16×16 C tile, fragments loaded straight from global memory | baseline: correct use of tensor cores, zero data reuse |
 | 1 | 128×128×32 block tile, 8 warps (2×4), each warp owns a 64×32 sub-tile (4×2 fragments), tile staged in shared memory with +8 padding | global traffic ÷ 8 vs v0 for the same FLOPs, no bank conflicts on fragment loads |
 | 2 | v1 + two-stage `cp.async` pipeline | overlaps the global→shared copy of tile *k+1* with the tensor-core work on tile *k*; copies bypass registers |
-| 3 | raw `mma.sync.m16n8k16` + `ldmatrix`, XOR-swizzled smem, 3-stage `cp.async` pipeline, register-direct epilogue, split-K on the last partial wave, tile picked per call (128×128, 64×128 or 64×64) with zero-filled rows past M, and a dedicated weight-streaming kernel with a 16, 32 or 64-row tile for M ≤ 64 (`hgemm_decode.cu`) | fragment loads in one instruction each, no padding bytes, DRAM latency covered two tiles ahead, no epilogue staging, the wave-quantization tail on 170 SMs, and small / decode shapes (any M % 16 == 0) that a 128-row tile could not fill the card with |
-| 5 | v3's 128×128 tile and k-loop fed by TMA (`cp.async.bulk.tensor`) through a warp-specialized mbarrier pipeline: one producer warp issues three box loads per stage, eight consumer warps run the tensor cores, no `__syncthreads` in the k-loop (`src/kernels/hgemm_tma.cu`) | the per-K-tile block barrier (8.7 of v3's 30 stall cycles per issue) and the copy address arithmetic; tensor pipe 92% → 99% active, 102 to 109% of cuBLAS on the large shapes. Variant 4 is reserved for Stream-K |
+| 3 | raw `mma.sync.m16n8k16` + `ldmatrix`, XOR-swizzled smem, 3-stage `cp.async` pipeline, register-direct epilogue, split-K on the last partial wave, tile picked per call (128×128, 64×128 or 64×64) with zero-filled rows past M | fragment loads in one instruction each, no padding bytes, DRAM latency covered two tiles ahead, no epilogue staging, the wave-quantization tail on 170 SMs, and small / decode shapes (any M % 16 == 0) that a 128-row tile could not fill the card with |
+| 4 | the same tile on a persistent Stream-K schedule: a grid of resident blocks, grouped (L2-aware) tile order, equal (tile, k-step) ranges for problems up to a few waves, a tile queue plus geometrically shrinking K-passes for the rest, and a fixup that sums partials in K order through one fp32 slot per tile with no memset, no atomics and the same bits every run | shapes under one wave without dropping to a smaller tile (2048³), the last-wave quantization on long shapes, the per-SM speed spread that a static schedule exposes, DRAM re-reads of B once the operands exceed L2 (8192³: 664 to 165 GB/s), and the two memsets plus counters per call that cost the decode shapes 4 µs each |
+| 5 | v3's 128×128 tile and k-loop fed by TMA (`cp.async.bulk.tensor`) through a warp-specialized mbarrier pipeline: one producer warp issues three box loads per stage, eight consumer warps run the tensor cores, no `__syncthreads` in the k-loop (`src/kernels/hgemm_tma.cu`) | the per-K-tile block barrier (8.7 of v3's 30 stall cycles per issue) and the copy address arithmetic; tensor pipe 92% → 99% active, 102 to 109% of cuBLAS on the large shapes. |
 
 ### Arithmetic intensity of the block tile
 
@@ -375,6 +378,166 @@ n at one k; producing the pairs takes a cross-lane transpose per fragment that
 `ldmatrix.trans` does for free from smem. With smem bandwidth nowhere near a limit (one
 `ldmatrix` per 512 B of B) there was nothing to gain, so the `cp.async` staged version is
 the only one.
+
+### Variant 4: Stream-K on a persistent grid
+
+Variant 3 fixes the tail of the last wave and nothing else about scheduling. Three things
+it leaves on the table showed up in its own numbers. A problem under one wave of 128×128
+tiles (2048³ is 256 tiles on 340 slots) has to drop to the 64×128 tile to fill the card,
+and pays for the lower reuse with 96% of cuBLAS. The tile order is row-major over N with
+the hardware dispatching blocks in index order, so at 8192³ each wave of 340 tiles spans
+5.3 tile rows and all 64 tile columns: A is reused 64 times from L2 but B (128 MB) is read
+from DRAM once per wave. Nsight measured 664 GB/s of DRAM traffic and an 80.5% L2 hit rate
+for v3 at 8192³ with the caches left warm between replays. And every call with a tail costs
+two `cudaMemsetAsync` launches before the kernel, which on a 28 µs decode GEMM is 4 µs.
+
+Variant 4 keeps the tile (the k-loop, the swizzle and the register epilogue moved to
+`hgemm_tile.cuh` unchanged; v3 picked up 2 registers and 1 to 2% at the large shapes from
+the move, nothing else about it changed) and replaces the block-per-tile launch with a
+persistent kernel.
+
+#### The schedule
+
+The grid is `resident` blocks, from `cudaOccupancyMaxActiveBlocksPerMultiprocessor` × SM
+count: 340 for the 128×128 tile, 340 for 64×128, 340 for 64×64×64 with three stages and
+170 with four. Tiles are numbered in a grouped order (next subsection) and the kernel
+picks one of two ways to hand them out per call:
+
+* **Static ranges**, when the problem is at most two waves, or at most four when A and B
+  together fit in three quarters of the L2. The flattened (tile, k-step) space of
+  `tiles × KT` iterations is cut into `grid` equal contiguous ranges. Every block does the
+  same number of k-steps, so there is no quantization at all; a tile is finished by at most
+  two or three blocks. The grid is `min(resident, max(tiles, tiles × KT / 32))`: never a
+  piece shorter than 32 k-steps (the fixup traffic would outweigh the mma work), and never
+  fewer blocks than tiles, so 1024³ runs as 256 whole tiles with no partials, exactly the
+  v3 schedule. A block walks its range from the top: the piece that starts a tile is
+  computed first and published, the piece that ends one last.
+* **A queue** otherwise. Whole tiles are handed out by an `atomicAdd` on a global counter
+  (one per tile), so a block on a slow SM simply takes fewer of them. The last wave plus the
+  tail (`tail + 340` tiles) are handed out by the same queue in K-passes of geometrically
+  shrinking length, half the tile, then a quarter, and so on while the next half would still
+  be longer than 8 k-steps, tile-interleaved (every tile's first pass, then every tile's
+  second, ...). The last pass is 9 to 16 k-steps, so the kernel ends within that much work
+  on every SM, at the cost of one chain link per pass: 4 at K = 4096 (64, 32, 16, 16
+  k-steps), 5 at 8192, 6 at 11008. The last block out resets the two queue words, so the
+  next launch starts from zero without a memset.
+
+The tile is chosen by the per-block share of k-steps: 128×128 whenever
+`tiles × KT / resident ≥ 32`, then 64×128 by the same rule, then 64×64×64; M ≤ 64 takes
+the 64×64×64 four-stage tile as in v3. 2048³ therefore stays on the 128×128 tile (256 tiles,
+48 k-steps per block) and 1024³ on 64×64 (256 tiles, one each).
+
+#### The fixup
+
+Every Stream-K tile has one fp32 slot of BM×BN in the workspace and one 64-bit flag. A
+piece that does not start its tile spins (thread 0, `ld.acquire.gpu`) until the flag reads
+its `kt_begin`, then adds the slot into its accumulators. A piece that does not end its tile
+writes the running sum to the slot, fences, and publishes its `kt_end` with
+`st.release.gpu`. The piece that ends the tile stores bf16 from registers like a whole
+tile. So the partials of a tile are always summed in K order, one running sum, whichever
+block computed which piece, and the output is the same bits every run; `tests/test_gemm.py`
+checks that with `torch.equal` across six calls. The slot is laid out in fragment order
+(lane-contiguous `float4`s), so a warp writes and reads 512-byte runs and a lane finds its
+own accumulator elements at the same place another block's lane put them; slot reads use
+`__ldcg` so they come from L2 and never from a stale L1 line. Rows past M are skipped on
+both sides.
+
+I chose this "the next piece waits" form over the "owner waits for every contributor" form
+in CUTLASS because it needs one slot per tile instead of one per block, each piece reads
+one slot instead of the finisher reading all of them, and in queue mode, where which block
+does which piece is decided at run time, there is no per-block bookkeeping to reconstruct.
+The flag carries a per-launch epoch in its high word: `(epoch << 32) | kt`. A value from an
+earlier launch can never match, so nothing is cleared between launches, and no counter has
+to reset itself. The workspace holds two waves of tiles (43 MB for 128×128), grown on
+demand, one per tile configuration and device; like v3's it is not safe to share between
+streams that run this kernel concurrently.
+
+Why the wait cannot deadlock. A piece only waits for the piece before it in K. In queue
+mode that piece was taken from the queue earlier by a block that is therefore running (a
+block only holds a queue item while it is resident), and the chain ends at the piece that
+starts the tile, which never waits. In static mode the previous piece belongs to the block
+with the next lower index, which the hardware dispatched no later than this one; the grid
+never exceeds the resident block count, so it is resident, and it computed that piece
+first. Cycles are impossible because waits only ever point to earlier K.
+
+#### Rasterization
+
+Tiles are numbered in groups of G tile rows walked column-major. With G = 16 (the largest
+power of two whose square is under 340) the 340 tiles in flight cover 16 tile rows and
+21.25 tile columns: at 8192³ that is 16 × 2 MB of A and 21.25 × 2 MB of B, 74.5 MB, inside
+the 96 MB L2, against 5.3 × 2 MB of A plus all 128 MB of B in row-major order. Nsight, same
+method for both (`--set full`, caches left warm, the profiler's fixed 2.55 GHz):
+
+| 8192³ | L2 hit rate | DRAM throughput | DRAM traffic over the kernel | tensor pipe | duration at 2.55 GHz | bench, power-limited clocks |
+|---|---|---|---|---|---|---|
+| v3 | 80.5% | 664 GB/s (37.7% of peak) | 3.5 GB | 94.6% | 5.34 ms | 4.91 ms |
+| v4 | 95.6% | 165 GB/s (9.4%) | 0.9 GB | 92.9% | 5.40 ms | 4.82 ms |
+
+At the profiler's fixed clock v4 is 1% slower (the chain links and the prologue each piece
+pays for), in the benchmark it is 1.8% faster: the kernel runs into the 600 W limit either
+way and the 2.6 GB of DRAM traffic it no longer moves went into clock. Sweeping G at 8192³
+in one session, queue mode: G = 1 4.848 ms, 4 4.838, 8 4.809, 16 4.777, 32 4.773. In
+static mode the tiles in flight are strided by the number of waves through the raster, so
+G matters less there, and it is one reason static mode is limited to a few waves.
+
+#### What the sweep found (all times in ms, comparisons within one session; the box drifts by up to 2% between sessions)
+
+The first version was the textbook one, contiguous ranges over the whole problem for every
+shape. It won 4096³ (0.591 vs v3 0.597) and lost 8192³ (4.94 vs 4.82), and the profile
+said why: with 12 tiles per block the tiles in flight are 12 apart in the raster, the L2 hit
+rate fell to 68% and DRAM to 1.03 TB/s; with the G = 16 grouping on top of that stride it
+fell to 40% and 1.4 TB/s and the kernel took 7.3 ms.
+
+So the multi-wave case became whole tiles plus a Stream-K share of the last wave (CUTLASS's
+"two-tile" hybrid). With the whole tiles assigned statically (block c takes tiles c, c+340,
+...) it measured 4.97 at 8192³, and per-block timestamps (`%globaltimer` at start and end)
+showed the reason: blocks end between 3.93 and 4.93 ms, and the spread is already there
+after the first phase, where every block has identical work. Some SMs run this kernel about
+20% slower than others, consistently, in TPC pairs (SMs 8/9, 30/31, 52/53, 118/119,
+140/141 on this card). v3 never sees this because the hardware dispatcher gives a slow SM
+fewer blocks; a static persistent schedule waits for it. Hence the queue.
+
+Then the order of the two phases. Queue first and a static Stream-K share last ran 4.78 at
+8192³ but 1.71 at 4096×11008×4096 (bimodal, min 1.61): the queue's phase ends with a spread
+of a whole tile-time, and a block that finishes a tile can then wait for a contributor that
+took the last queue tile on a slow SM. Stream-K first and the queue last fixed that shape
+(1.64) and lost 8192³ (5.00): the queue's own tail, a block that takes the last tile on a
+slow SM ends 1.2 tile-times after the rest. The fix for both is for the work at the end to
+be fine-grained and dynamic: the last wave in K-chunks from the same queue, which needs a
+fixup that does not care which block did which chunk, the K-ordered chain above.
+
+Uniform chunks, tile-interleaved, 4096³ / 8192³ / 4096×11008×4096 / 4096×4096×11008:
+16 k-steps 0.616 / 4.769 / 1.627 / 1.641; 32 0.619 / 4.750 / 1.615 / 1.623; 64 0.638 /
+4.768 / 1.635 / 1.608; 128 0.689 / 4.797 / 1.674 / 1.657. Handing a tile's chunks out back to
+back instead of interleaved put 4096×4096×11008 at 2.07 with 16-step chunks: the chain
+serializes and every chunk waits. Geometric passes (half, quarter, ..., last pass 9 to 16
+k-steps) beat the best uniform size everywhere: 0.611 to 0.615 / 4.83 to 4.85 (v3 4.91 to
+4.93 in that session) / 1.627 to 1.647 (v3 1.625 to 1.637) / 1.624 (v3 1.627). Letting the
+passes shrink to 5 to 8 k-steps was no better, stopping at 17 to 32 was worse (0.627 at
+4096³).
+
+That left 4096³, where the queue was still 1.5 to 2% behind v3 in three interleaved rounds
+(0.611 to 0.615 against 0.599 to 0.604): with four tail tiles split 85 ways, v3's schedule
+is already near ideal there, and the queue pays four chain links per tile plus a prologue
+per piece. Static ranges tie v3 at 4096³ (0.599 to 0.605) and win by 30% at
+4096×2048×4096 (1.5 waves, 0.306 vs 0.398) and by 25% at 2048³, but lose 2% at
+4096×4096×11008, where the operands (90 MB each) do not fit in L2 and the strided in-flight
+set costs reuse. That is the rule in the code: static ranges up to two waves, or up to
+four when A + B fit in three quarters of the L2, the queue beyond.
+
+Smaller knobs. The 32 k-step minimum share in static mode came from the decode shapes:
+16×4096×4096 at a minimum of 8, 16, 32, 64 k-steps measured 27.5, 27.5, 25.4, 35.5 µs (fewer
+blocks with longer B streams beat more blocks with a fixup each, up to the point where too
+few blocks are streaming). The tile rule came from 2048³ (128×128 on Stream-K 0.083, 64×128
+0.087, 64×64 0.089, v3's 64×128 without a split 0.1035) and 1024³ (128×128 on Stream-K
+0.0236, a 12 k-step share per block, against 0.0174 on 64×64 whole tiles).
+
+Per-block timelines of the final schedule at 8192³: the queue phase ends between 4.33 and
+4.46 ms across blocks, the passes bring every block to between 4.79 and 4.82 ms. At 4096³
+in queue mode the blocks end between 585 and 612 µs with a mean of 596 against an ideal
+572 (3.01 tiles' worth of k-steps per block), which is the 1.5 to 2% the static schedule
+gets back.
+
 ### Variant 5: TMA and warp specialization
 
 Source: `src/kernels/hgemm_tma.cu`, helpers under "TMA / mbarrier" in `include/spark/common.cuh`.
@@ -621,31 +784,28 @@ was the mma.sync/ldmatrix rung and the tail scheduling.
 
 From `results/hgemm.json` (median of 50 iterations; cuBLAS `cublasGemmEx` timed identically on
 the same stream; for M ≤ 64 both stream B from DRAM through copies that exceed L2). v2 has no
-rows for the decode shapes (n/a): it requires M % 128 == 0. The variant 5 rows measured on
-2026-09-26 are in its section above; it takes the five shapes from 2048³ up and leaves 1024³
-and the decode shapes to v3. A GB10 (sm_121) table is added when the Spark has been
-benchmarked.
+rows for the decode shapes (n/a): it requires M % 128 == 0. A GB10 (sm_121) table is added when the
+Spark has been benchmarked.
 
-| shape (M×N×K) | cuBLAS ms / TFLOPS | v0 ms / TFLOPS / % | v1 | v2 | v3 |
-|---|---|---|---|---|---|
-| 1024³ | 0.0177 / 121.6 | 0.0707 / 30.4 / 25.0% | 0.0442 / 48.6 / 40.1% | 0.0400 / 53.7 / 44.2% | **0.0175 / 122.5 / 100.9%** |
-| 2048³ | 0.0996 / 172.6 | 0.6581 / 26.1 / 15.1% | 0.1344 / 127.9 / 74.0% | 0.1035 / 166.0 / 96.2% | **0.1035 / 166.1 / 96.3%** |
-| 4096³ | 0.6091 / 225.7 | 5.4217 / 25.4 / 11.2% | 0.9091 / 151.2 / 67.0% | 0.7564 / 181.7 / 80.5% | **0.6111 / 224.9 / 99.7%** |
-| 8192³ | 4.7306 / 232.4 | 45.7073 / 24.1 / 10.3% | 6.5359 / 168.2 / 72.5% | 5.4208 / 202.8 / 87.3% | **4.9877 / 220.4 / 94.9%** |
-| 4096×4096×11008 | 1.6267 / 227.1 | 15.7354 / 23.5 / 10.3% | 2.3978 / 154.0 / 67.8% | 2.0425 / 180.8 / 79.7% | **1.6433 / 224.8 / 98.8%** |
-| 4096×11008×4096 | 1.5427 / 239.4 | 15.2551 / 24.2 / 10.1% | 2.2055 / 167.5 / 70.0% | 1.8501 / 199.6 / 83.5% | **1.6453 / 224.5 / 93.8%** |
-| 1×4096×4096 | 0.0399 / 0.8 | n/a | n/a | n/a | **0.0235 / 1.4 / 169.5%** |
-| 16×4096×4096 | 0.0298 / 18.0 | 0.1035 / 5.2 / 28.8% | 0.1794 / 3.0 / 16.0% | n/a | **0.0235 / 22.8 / 126.8%** |
-| 32×4096×4096 | 0.0296 / 36.3 | n/a | n/a | n/a | **0.0236 / 45.6 / 125.5%** |
-| 64×4096×4096 | 0.0304 / 70.6 | 0.1058 / 20.3 / 29.0% | 0.1815 / 11.8 / 16.5% | n/a | **0.0237 / 90.7 / 128.4%** |
-| 16×11008×4096 | 0.0606 / 23.8 | 0.1156 / 12.5 / 52.5% | 0.1812 / 8.0 / 33.5% | n/a | **0.0564 / 25.6 / 107.5%** |
-| 64×4096×11008 | 0.0637 / 90.6 | 0.2815 / 20.5 / 23.6% | 0.4822 / 12.0 / 13.2% | n/a | **0.0597 / 96.7 / 106.7%** |
+| shape (M×N×K) | cuBLAS ms / TFLOPS | v0 ms / TFLOPS / % | v1 | v2 | v3 | v4 |
+|---|---|---|---|---|---|---|
+| 1024³ | 0.0177 / 121.6 | 0.0707 / 30.4 / 25.0% | 0.0442 / 48.6 / 40.1% | 0.0400 / 53.7 / 44.2% | 0.0175 / 122.5 / 100.9% | **0.0174 / 123.4 / 101.3%** |
+| 2048³ | 0.0996 / 172.6 | 0.6581 / 26.1 / 15.1% | 0.1344 / 127.9 / 74.0% | 0.1035 / 166.0 / 96.2% | 0.1035 / 166.1 / 96.3% | **0.0829 / 207.3 / 120.1%** |
+| 4096³ | 0.6091 / 225.7 | 5.4217 / 25.4 / 11.2% | 0.9091 / 151.2 / 67.0% | 0.7564 / 181.7 / 80.5% | **0.6111 / 224.9 / 99.7%** | 0.5947 / 231.1 / 102.4% |
+| 8192³ | 4.7306 / 232.4 | 45.7073 / 24.1 / 10.3% | 6.5359 / 168.2 / 72.5% | 5.4208 / 202.8 / 87.3% | 4.9877 / 220.4 / 94.9% | **4.8238 / 227.9 / 98.0%** |
+| 4096×4096×11008 | 1.6267 / 227.1 | 15.7354 / 23.5 / 10.3% | 2.3978 / 154.0 / 67.8% | 2.0425 / 180.8 / 79.7% | 1.6433 / 224.8 / 98.8% | **1.6106 / 229.3 / 101.0%** |
+| 4096×11008×4096 | 1.5427 / 239.4 | 15.2551 / 24.2 / 10.1% | 2.2055 / 167.5 / 70.0% | 1.8501 / 199.6 / 83.5% | **1.6453 / 224.5 / 93.8%** | 1.6125 / 229.1 / 95.4% |
+| 16×4096×4096 | 0.0298 / 18.0 | 0.1035 / 5.2 / 28.8% | 0.1794 / 3.0 / 16.0% | n/a | 0.0277 / 19.4 / 104.5% | **0.0236 / 22.7 / 124.6%** |
+| 64×4096×4096 | 0.0307 / 70.1 | 0.1058 / 20.3 / 29.0% | 0.1815 / 11.8 / 16.5% | n/a | 0.0298 / 72.2 / 102.5% | **0.0256 / 83.9 / 120.3%** |
+| 16×11008×4096 | 0.0607 / 23.8 | 0.1156 / 12.5 / 52.5% | 0.1812 / 8.0 / 33.5% | n/a | 0.0626 / 23.1 / 97.0% | **0.0585 / 24.7 / 103.8%** |
+| 64×4096×11008 | 0.0664 / 86.9 | 0.2815 / 20.5 / 23.6% | 0.4822 / 12.0 / 13.2% | n/a | 0.0627 / 92.0 / 101.7% | **0.0604 / 95.5 / 105.6%** |
 
-"%" is cuBLAS time ÷ our time. The decode rows (v3 from the second run, on the dedicated
-kernel; v0 and v1 from the first run, and none for M = 1 or 32, which the first run did not
-have) in GB/s (2(MK + KN + MN) ÷ time): 1,427, 1,438, 1,447, 1,459, 1,607 and 1,543
-respectively, against 1,532 GB/s for `cudaMemcpy`; the first run's 64×64×64 tile had 1,220,
-1,163, 1,449 and 1,469 on the four shapes it ran. The PyTorch eager
+"%" is cuBLAS time ÷ our time. The v4 column is from a later session (2026-09-26, 50
+iterations, v3 and v4 run back to back; v3 measured 0.5943 / 4.9117 / 1.6155 / 1.6084 ms on
+the four large shapes and 27.7 / 29.8 / 62.5 / 63.8 µs on the decode shapes in that same
+session, so the bold marks the faster rung within a session, not across the two columns).
+The decode rows in GB/s (2(MK + KN + MN) ÷ time): v3 1,220, 1,163, 1,449 and 1,469; v4
+1,430, 1,352, 1,549 and 1,525, against 1,532 GB/s for `cudaMemcpy`. The PyTorch eager
 comparison (`torch.matmul` in bf16, which calls cuBLAS/cuBLASLt through its own heuristics) is
 in `results/torch_comparison.json` and `docs/RESULTS.md`; on the earlier run of the same
 kernel v3 was 1.01× at 4096³, 1.02× at 4096×4096×11008 and 0.97× at 8192³.
@@ -666,11 +826,27 @@ Done in v3, from the list I had written before the first run:
   column strip, 16/32/64-row tiles, no memsets, any M ≥ 1) at the single-launch floor,
   107–170% of cuBLAS.
 
+Done in v4:
+
+- Stream-K proper, on a persistent grid, with a memset-free and bitwise-deterministic
+  fixup. It did not replace the per-call tile heuristic: a 12 k-step share per block at
+  1024³ on the 128×128 tile costs more in fixup than it saves, so the tile is still picked
+  per call, now by the per-block share of k-steps rather than by the wave count.
+- Grouped tile order: 8192³ from 664 to 165 GB/s of DRAM traffic and from 94.9% to 98.0% of
+  cuBLAS.
+- Decode shapes at 1,350 to 1,550 GB/s: the two memsets and the launch between them were
+  4 µs of a 28 µs call.
+
 Still open:
 
-- **Stream-K proper**, i.e. persistent blocks each owning an equal share of the flattened
-  (tile, k-step) space, would handle every shape uniformly instead of only the last partial
-  wave, and would replace the per-call tile heuristic with one schedule.
+- **4096×11008×4096 at 95.4%.** Every schedule I tried lands between 1.61 and 1.65 ms on
+  this shape against cuBLAS's 1.54; the profile is not memory-bound after the raster change,
+  so this is the same perf-per-watt question as the 128×256 warp-tile experiment below.
+- **The chain fixup's links.** Each pass past the first costs a 64 KB slot read and, unless
+  it ends the tile, a 64 KB write, about 3.5 µs, and at 4096³ in queue mode the four links
+  per tile plus a pipeline prologue per piece are the 4% between the mean block end time
+  (596 µs) and the ideal (572 µs). Prefetching the next piece's first stages during the
+  current piece's last k-steps would hide the prologue; the slot traffic is inherent.
 - **The 2 µs of launch and ramp** that a single decode launch pays over the back-to-back
   rate (23.5 against 21.5 µs at 32 MB). It is not in the kernel; CUDA graphs or a persistent
   megakernel across the decoder block are the ways at it.
@@ -678,8 +854,8 @@ Still open:
   from the tensor pipe alone, 8192³ from 95% to 102% of cuBLAS). A 64×64 warp tile (4 warps
   per 128×128 block) would halve the `ldmatrix` count per `mma.sync` on top of that; the
   producer warp of v5 makes a 4-consumer-warp layout cheaper to try than it was.
-- **Persistent scheduling with L2-aware rasterization** (grouped tile order), which matters once
-  operands exceed the 96 MB L2: v5's L2 hit rate at 8192³ is 80% against v3's 83%, because it
-  gets through tiles faster.
+- **TMA on the Stream-K schedule.** v5 has v3's tile order, so its L2 hit rate at 8192³ is
+  80% where v4's grouped order gets 96%; a producer warp feeding v4's persistent schedule is
+  the obvious next kernel.
 - **v5 on smaller grids.** The TMA kernel only runs on grids of at least one 128×128 tile per
   SM; a 64-row TMA tile for the shapes v3 handles with its small tiles is untested.
