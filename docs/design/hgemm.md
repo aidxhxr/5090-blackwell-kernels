@@ -1031,38 +1031,37 @@ was the mma.sync/ldmatrix rung and the tail scheduling.
 ## Results (RTX 5090, sm_120, CUDA 13.2, driver 595.58)
 
 From `results/hgemm.json`, run 2026-09-26 (median of 50 iterations; cuBLAS `cublasGemmEx`
-timed identically on the same stream; for M ≤ 64 both stream B from DRAM through copies that
-exceed L2). v2 has no rows for the decode shapes (n/a): it requires M % 128 == 0. v5 takes
-grids of at least one 128×128 tile per SM, so it has no rows below 2048³ or on the decode
-shapes. Bold marks the fastest rung per row. A GB10 (sm_121) table is added when the Spark
-has been benchmarked.
+timed identically on the same stream, next to each variant; for M ≤ 64 both stream B from DRAM
+through copies that exceed L2). v2 has no rows for the decode shapes (n/a): it requires
+M % 128 == 0. v5 takes grids of at least one 128×128 tile per SM, so it has no rows below
+2048³ or on the decode shapes. Bold marks the fastest rung per row. A GB10 (sm_121) table is
+added when the Spark has been benchmarked.
 
-| shape (M×N×K) | cuBLAS ms / TFLOPS | v0 ms / TFLOPS / % | v1 | v2 | v3 | v4 | v5 |
-|---|---|---|---|---|---|---|---|
-| 1024³ | 0.0177 / 121.6 | 0.0708 / 30.3 / 24.9% | 0.0442 / 48.6 / 39.9% | 0.0399 / 53.8 / 44.2% | 0.0175 / 122.9 / 101.1% | **0.0174 / 123.1 / 101.5%** | n/a |
-| 2048³ | 0.0996 / 172.6 | 0.6562 / 26.2 / 15.2% | 0.1343 / 127.9 / 74.1% | 0.1036 / 165.9 / 96.1% | 0.1035 / 166.1 / 96.2% | **0.0828 / 207.4 / 120.2%** | 0.0951 / 180.6 / 104.6% |
-| 4096³ | 0.6090 / 225.7 | 5.4195 / 25.4 / 11.2% | 0.8916 / 154.2 / 68.3% | 0.7584 / 181.2 / 80.3% | 0.5988 / 229.5 / 101.7% | 0.5946 / 231.1 / 102.4% | **0.5601 / 245.4 / 108.7%** |
-| 8192³ | 4.7364 / 232.1 | 45.7723 / 24.0 / 10.3% | 6.5244 / 168.5 / 72.6% | 5.4218 / 202.8 / 87.3% | 4.9299 / 223.0 / 96.1% | 4.8338 / 227.5 / 97.9% | **4.6619 / 235.9 / 101.6%** |
-| 4096×4096×11008 | 1.6266 / 227.1 | 15.7547 / 23.4 / 10.3% | 2.3969 / 154.1 / 67.9% | 2.0446 / 180.7 / 79.6% | 1.6187 / 228.2 / 100.5% | 1.6145 / 228.8 / 100.8% | **1.5120 / 244.3 / 107.6%** |
-| 4096×11008×4096 | 1.5449 / 239.1 | 15.2531 / 24.2 / 10.1% | 2.2094 / 167.2 / 69.9% | 1.8521 / 199.4 / 83.4% | 1.6113 / 229.2 / 95.9% | 1.6248 / 227.3 / 95.0% | **1.5387 / 240.1 / 100.3%** |
-| 1×4096×4096 | 0.0401 / 0.8 | n/a | n/a | n/a | **0.0235 / 1.4 / 170.8%** | 0.0235 / 1.4 / 170.8% | n/a |
-| 16×4096×4096 | 0.0287 / 18.7 | 0.1034 / 5.2 / 27.9% | 0.1792 / 3.0 / 16.6% | n/a | **0.0235 / 22.9 / 122.2%** | 0.0235 / 22.9 / 127.3% | n/a |
-| 32×4096×4096 | 0.0289 / 37.2 | 0.1074 / 10.0 / 27.7% | 0.1792 / 6.0 / 16.1% | n/a | 0.0235 / 45.8 / 123.1% | **0.0234 / 45.8 / 127.5%** | n/a |
-| 64×4096×4096 | 0.0299 / 71.8 | 0.1057 / 20.3 / 29.0% | 0.1814 / 11.8 / 16.5% | n/a | 0.0253 / 84.8 / 118.2% | **0.0246 / 87.2 / 125.2%** | n/a |
-| 16×11008×4096 | 0.0606 / 23.8 | 0.1156 / 12.5 / 52.4% | 0.1812 / 8.0 / 33.4% | n/a | **0.0563 / 25.6 / 107.7%** | 0.0563 / 25.6 / 107.7% | n/a |
-| 64×4096×11008 | 0.0645 / 89.5 | 0.2814 / 20.5 / 22.6% | 0.4799 / 12.0 / 13.2% | n/a | **0.0584 / 98.8 / 110.4%** | 0.0585 / 98.7 / 108.9% | n/a |
+| shape (M×N×K) | cuBLAS ms / TFLOPS | v0 ms / TFLOPS / % | v1 | v2 | v3 | v4 | v5 | v6 |
+|---|---|---|---|---|---|---|---|---|
+| 1024³ | 0.0176 / 122.0 | 0.0707 / 30.4 / 25.0% | 0.0442 / 48.6 / 39.9% | 0.0399 / 53.8 / 44.3% | 0.0175 / 122.9 / 101.3% | 0.0175 / 122.7 / 101.3% | n/a | **0.0173 / 124.3 / 101.9%** |
+| 2048³ | 0.0994 / 172.8 | 0.6562 / 26.2 / 15.2% | 0.1355 / 126.8 / 73.4% | 0.1035 / 166.0 / 96.1% | 0.1034 / 166.1 / 96.2% | 0.0828 / 207.4 / 120.1% | 0.0951 / 180.7 / 104.6% | **0.0767 / 224.0 / 129.6%** |
+| 4096³ | 0.6093 / 225.6 | 5.4156 / 25.4 / 11.2% | 0.8992 / 152.9 / 67.7% | 0.7544 / 182.2 / 80.7% | 0.5946 / 231.1 / 102.4% | 0.5925 / 232.0 / 102.8% | 0.5597 / 245.6 / 108.9% | **0.5493 / 250.2 / 110.9%** |
+| 8192³ | 4.7224 / 232.8 | 45.7109 / 24.1 / 10.3% | 6.5051 / 169.0 / 72.6% | 5.4146 / 203.1 / 87.2% | 4.9057 / 224.1 / 96.2% | 4.8217 / 228.0 / 98.0% | 4.6394 / 237.0 / 101.7% | **4.5117 / 243.7 / 104.7%** |
+| 4096×4096×11008 | 1.6187 / 228.2 | 15.7507 / 23.5 / 10.3% | 2.3938 / 154.3 / 67.9% | 2.0384 / 181.2 / 79.4% | 1.6002 / 230.8 / 101.2% | 1.6043 / 230.2 / 100.9% | 1.5040 / 245.6 / 107.6% | **1.4997 / 246.3 / 107.9%** |
+| 4096×11008×4096 | 1.5368 / 240.4 | 15.2532 / 24.2 / 10.1% | 2.1890 / 168.7 / 70.2% | 1.8439 / 200.3 / 83.6% | 1.6043 / 230.2 / 95.8% | 1.6104 / 229.4 / 95.5% | 1.5335 / 240.9 / 100.2% | **1.4978 / 246.6 / 102.6%** |
+| 1×4096×4096 | 0.0401 / 0.8 | n/a | n/a | n/a | **0.0235 / 1.4 / 170.4%** | 0.0236 / 1.4 / 169.8% | n/a | 0.0235 / 1.4 / 170.7% |
+| 16×4096×4096 | 0.0288 / 18.6 | 0.1053 / 5.1 / 27.4% | 0.1771 / 3.0 / 16.8% | n/a | 0.0235 / 22.9 / 122.1% | **0.0234 / 22.9 / 126.5%** | n/a | 0.0235 / 22.9 / 122.8% |
+| 32×4096×4096 | 0.0289 / 37.2 | 0.1075 / 10.0 / 26.9% | 0.1771 / 6.1 / 16.8% | n/a | 0.0235 / 45.8 / 127.0% | 0.0235 / 45.8 / 122.4% | n/a | **0.0234 / 45.8 / 123.2%** |
+| 64×4096×4096 | 0.0299 / 71.8 | 0.1076 / 20.0 / 28.6% | 0.1792 / 12.0 / 16.7% | n/a | 0.0237 / 90.7 / 126.2% | **0.0236 / 90.8 / 129.6%** | n/a | 0.0250 / 85.8 / 119.6% |
+| 16×11008×4096 | 0.0606 / 23.8 | 0.1157 / 12.5 / 52.4% | 0.1810 / 8.0 / 33.5% | n/a | **0.0563 / 25.6 / 107.6%** | 0.0563 / 25.6 / 107.6% | n/a | 0.0563 / 25.6 / 107.7% |
+| 64×4096×11008 | 0.0645 / 89.5 | 0.2838 / 20.3 / 22.6% | 0.4779 / 12.1 / 13.3% | n/a | 0.0585 / 98.7 / 109.0% | **0.0584 / 98.9 / 108.9%** | n/a | 0.0584 / 98.8 / 110.4% |
 
 "%" is cuBLAS time ÷ our time, against the cuBLAS loop timed next to that variant (the
-cuBLAS medians of the decode rows moved by up to 4% between variants within the run, which
-is why v3 and v4 read the same 23.5 µs as 122% and 127%). The decode rows run the same
-weight-streaming kernel under v3 and v4, in GB/s (2(MK + KN + MN) ÷ time): 1,429, 1,442,
-1,453, 1,404, 1,612 and 1,577, against 1,532 GB/s for `cudaMemcpy`. The first run's
-64×64×64 tile had 1,220, 1,163, 1,449 and 1,469 on the four shapes it ran. The PyTorch eager
-comparison (`torch.matmul` in bf16, which calls cuBLAS/cuBLASLt through its own heuristics)
-is in `results/torch_comparison.json` and `docs/RESULTS.md`: with the default variant (v5,
-stepping down to v4) 1.11× at 4096³, 1.04× at 8192³, 1.10× at 4096×4096×11008, 1.24× on the
-16-row decode shape, and 0.84× at 1024³, where the 17 µs kernel is timed through the
-extension's host path and torch's is not.
+cuBLAS medians of the decode rows move by a few percent between variants within a run). The
+decode rows run the same weight-streaming kernel under v3, v4 and v6, in GB/s
+(2(MK + KN + MN) ÷ time) for v6: 1,429, 1,440, 1,455, 1,383, 1,611 and 1,576, against
+1,532 GB/s for `cudaMemcpy`. The PyTorch eager comparison (`torch.matmul` in bf16, which
+calls cuBLAS/cuBLASLt through its own heuristics) is in `results/torch_comparison.json` and
+`docs/RESULTS.md`: with the default variant (v6) 1.12× at 4096³,
+1.07× at 8192³, 1.28× at 2048³,
+1.25× on the 16-row decode shape, and 0.87× at 1024³, where
+the 17 µs kernel is timed through the extension's host path and torch's is not.
 
 ## What was done and what remains
 

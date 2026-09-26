@@ -571,40 +571,38 @@ defaults. Nsight Compute runs at a fixed 2.53 GHz; the timed runs boost higher.
 
 ## Results (RTX 5090, sm_120, CUDA 13.2, driver 595.58)
 
-From the default `bench_attention` sweep (median of 50). TFLOPS by the halved causal count;
-the decode rows in GB/s of Q, K, V and O once (K and V once per K/V head). The decode rows
-of variants 0 to 2 read each K/V head once per query head, so under GQA they land at a
-quarter of their MHA figure; variant 3 is the flash-decoding kernel. Variant 4's rows are the later sweep
-the same day (its v3 rows agreed with the morning's to within 1%); on the decode rows
-variant 4 runs variant 3's paths, so it has no row of its own.
+From the default `bench_attention` sweep, run 2026-09-26 (median of 50). TFLOPS by the
+halved causal count; the decode rows in GB/s of Q, K, V and O once (K and V once per K/V
+head). The decode rows of variants 0 to 2 read each K/V head once per query head, so under
+GQA they land at a quarter of their MHA figure; variants 3 and 4 both run the flash-decoding
+kernel there, so their decode rows are the same kernel timed twice. Bold marks the fastest
+rung per row.
 
 | shape | v0 ms / TFLOPS | v1 | v2 | v3 | v4 |
 |---|---|---|---|---|---|
-| b1 h4 s512 d128 | 0.0810 / 6.6 | 0.0851 / 6.3 | 0.0298 / 18.0 | **0.0124 / 43.5** | 0.0131 / 41.1 |
-| b1 h4 s512 d128 causal | 0.0788 / 3.4 | 0.0850 / 3.2 | 0.0298 / 9.0 | **0.0185 / 14.5** | 0.0191 / 14.1 |
-| b1 h4 s512 d64 | 0.0564 / 4.8 | 0.0441 / 6.1 | 0.0155 / 17.4 | **0.0084 / 31.8** | 0.0090 / 30.0 |
-| b1 h4 s200 d128 causal | 0.0298 / 1.4 | 0.0441 / 0.9 | 0.0155 / 2.7 | **0.0124 / 3.3** | 0.0130 / 3.1 |
-| b1 h32 s4096 d128 | 26.28 / 10.5 | 5.096 / 53.9 | 1.414 / 194.5 | 1.224 / 224.5 | **1.149 / 239.3** |
-| b1 h32 s4096 d128 causal | 13.76 / 10.0 | 2.799 / 49.1 | 0.639 / 215.2 | 0.640 / 214.8 | **0.601 / 228.7** |
-| b1 h32 s8192 d128 causal | 57.06 / 9.6 | 11.24 / 48.9 | 2.486 / 221.1 | 2.487 / 221.1 | **2.337 / 235.2** |
-| b4 h32 s2048 d128 causal | 13.10 / 10.5 | 2.897 / 47.4 | 0.687 / 200.1 | 0.686 / 200.4 | **0.646 / 212.9** |
-| b1 h32 s4096 d64 causal | 9.389 / 7.3 | 1.150 / 59.8 | 0.329 / 209.1 | 0.331 / 207.8 | **0.316 / 217.3** |
-| b1 hq8 hkv2 s512 d128 causal | 0.0850 / 6.3 | 0.0830 / 6.5 | 0.0297 / 18.1 | **0.0192 / 28.0** | (final run) |
-| b1 hq32 hkv8 s4096 d128 causal | 13.82 / 9.9 | 2.453 / 56.0 | 0.636 / 216.1 | **0.636 / 216.0** | (final run) |
-| b1 h32 sq1 skv4096 d128 | 1.260 / 53 GB/s | 0.648 / 104 GB/s | 0.200 / 336 GB/s | **0.046 / 1,459 GB/s** | 0.050 / 1,346 GB/s |
-| b1 hq32 hkv8 sq1 skv4096 d128 | 1.250 / 13 GB/s | 0.646 / 26 GB/s | 0.200 / 84 GB/s | **0.017 / 970 GB/s** | n/a |
-| b1 h32 sq1 skv131072 d128 | 40.16 / 53 GB/s | 20.60 / 104 GB/s | 6.280 / 342 GB/s | **1.269 / 1,693 GB/s** | n/a |
-| b1 hq32 hkv8 sq1 skv131072 d128 | 39.71 / 14 GB/s | 20.56 / 26 GB/s | 6.274 / 86 GB/s | **0.324 / 1,655 GB/s** | n/a |
-| b8 hq32 hkv8 sq1 skv4096 d128 | 1.215 / 111 GB/s | 1.336 / 101 GB/s | 0.400 / 336 GB/s | **0.087 / 1,548 GB/s** | n/a |
+| b1 h4 s512 d128 | 0.0809 / 6.6 | 0.0828 / 6.5 | 0.0295 / 18.2 | **0.0123 / 43.7** | 0.0131 / 41.0 |
+| b1 h4 s512 d128 causal | 0.0788 / 3.4 | 0.0811 / 3.3 | 0.0295 / 9.1 | **0.0185 / 14.5** | 0.0191 / 14.1 |
+| b1 h4 s512 d64 | 0.0563 / 4.8 | 0.0460 / 5.8 | 0.0153 / 17.5 | **0.0089 / 30.3** | 0.0090 / 30.0 |
+| b1 h4 s512 d64 causal | 0.0542 / 2.5 | 0.0460 / 2.9 | 0.0154 / 8.7 | **0.0122 / 11.0** | 0.0123 / 10.9 |
+| b1 h4 s200 d128 | 0.0317 / 2.6 | 0.0420 / 1.9 | 0.0173 / 4.7 | 0.0102 / 8.1 | **0.0094 / 8.7** |
+| b1 h4 s200 d128 causal | 0.0297 / 1.4 | 0.0420 / 1.0 | 0.0170 / 2.4 | **0.0124 / 3.3** | 0.0131 / 3.1 |
+| b1 hq8 hkv2 s512 d128 causal | 0.0849 / 6.3 | 0.0828 / 6.5 | 0.0296 / 18.1 | 0.0193 / 27.8 | **0.0192 / 28.0** |
+| b1 h32 s4096 d128 | 26.2228 / 10.5 | 5.4236 / 50.7 | 1.4114 / 194.8 | 1.2335 / 222.8 | **1.1627 / 236.4** |
+| b1 h32 s4096 d128 causal | 13.8347 / 9.9 | 2.4653 / 55.7 | 0.6436 / 213.6 | 0.6406 / 214.5 | **0.6007 / 228.8** |
+| b1 h32 s8192 d128 causal | 56.8125 / 9.7 | 10.9835 / 50.1 | 2.4839 / 221.3 | 2.4859 / 221.2 | **2.3345 / 235.5** |
+| b4 h32 s2048 d128 causal | 13.3309 / 10.3 | 2.5285 / 54.4 | 0.6873 / 200.0 | 0.6858 / 200.4 | **0.6448 / 213.1** |
+| b1 h32 s4096 d64 causal | 9.6466 / 7.1 | 1.4996 / 45.8 | 0.3304 / 208.0 | 0.3307 / 207.8 | **0.3171 / 216.7** |
+| b1 h32 sq1 skv4096 d128 | 1.2604 / 53 GB/s | 0.6479 / 104 GB/s | 0.1996 / 336 GB/s | **0.0460 / 1,461 GB/s** | 0.0460 / 1,461 GB/s |
+| b1 hq32 hkv8 s4096 d128 causal | 13.9147 / 9.9 | 2.4531 / 56.0 | 0.6356 / 216.2 | 0.6357 / 216.2 | **0.5977 / 229.9** |
+| b1 hq32 hkv8 sq1 skv4096 d128 | 1.2499 / 13 GB/s | 0.6460 / 26 GB/s | 0.1996 / 84 GB/s | 0.0173 / 970 GB/s | **0.0173 / 972 GB/s** |
+| b1 h32 sq1 skv131072 d128 | 40.2034 / 53 GB/s | 20.5798 / 104 GB/s | 6.2716 / 342 GB/s | **1.2664 / 1,696 GB/s** | 1.2671 / 1,695 GB/s |
+| b1 hq32 hkv8 sq1 skv131072 d128 | 39.6479 / 14 GB/s | 20.5698 / 26 GB/s | 6.2712 / 86 GB/s | 0.3283 / 1,635 GB/s | **0.3283 / 1,636 GB/s** |
+| b8 hq32 hkv8 sq1 skv4096 d128 | 1.2172 / 110 GB/s | 1.3378 / 100 GB/s | 0.3980 / 338 GB/s | **0.0865 / 1,553 GB/s** | 0.0865 / 1,553 GB/s |
 
 The small shapes are where the tail split matters most: 16 tiles on 170 SMs become 128
-slices, 2.4x on the 512-token shape. The 4096-token decode row moved from 49 µs on the 64-row
-tile to 46 µs on the flash-decoding kernel; the GQA and 128K rows are its real work. Variant 1's D = 64 time moved between 1.15 and 1.57 ms
-across runs on a card other jobs were also heating; the other rows repeat to within 1%.
-Variant 4 is 6.2 to 6.6% faster than variant 3 on every prefill shape and within a
-microsecond of it on the 512-token shapes, where a slice is one to four KV tiles and the
-prologue (barrier init, the Q box, the first K/V box) is most of the launch; the decode row
-is the same kernel. The default is variant 4 for every shape.
+slices, 2.4× on the 512-token shape; variant 4's block prologue costs it a microsecond there.
+On every 4096-token-and-up prefill shape variant 4 is 4 to 6% ahead of variant 3, and the
+GQA prefill row matches its MHA twin, as it should (same math, a stride on the K/V pointer).
 
 ## What remains
 
