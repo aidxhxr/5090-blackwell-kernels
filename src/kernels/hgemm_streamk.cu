@@ -32,12 +32,14 @@
 // is resident because the grid never exceeds the resident block count. Chains end at the
 // piece that starts the tile, which never waits, so there is no cycle.
 //
+// The schedule (parameters, raster, passes, ranges, slot layout, the host plan) lives in
+// hgemm_streamk.cuh, shared with variant 6, which runs it with the TMA tile.
+//
 // Requires N % 64 == 0, K % 64 == 0, any M >= 1 (the same rules as variant 3: rows past M
 // are zero-filled by the tile and skipped by the epilogue).
 
-#include <algorithm>
-
 #include "hgemm_internal.cuh"
+#include "hgemm_streamk.cuh"
 #include "hgemm_tile.cuh"
 #include "spark/common.cuh"
 #include "spark/kernels.h"
@@ -48,66 +50,14 @@ namespace {
 
 namespace sk {
 
+using hgemm_sk::ld_acquire_gpu;
+using hgemm_sk::Params;
+using hgemm_sk::pass_range;
+using hgemm_sk::range_start;
+using hgemm_sk::raster;
+using hgemm_sk::slot_idx;
+using hgemm_sk::st_release_gpu;
 using hgemm_tile::THREADS;
-
-struct Params {
-    int tiles_m, tiles_n, tiles;
-    int KT;        // k-steps per tile
-    int group;     // tile rows per raster group (1: plain row-major over N)
-    int dp_tiles;  // queue mode: tiles [0, dp_tiles) in raster order are whole; the rest are
-                   // the Stream-K region. Static mode: 0.
-    int passes;    // queue mode: K-passes per Stream-K tile; 0 = static ranges
-    int sk_iters;  // static mode: tiles * KT, cut into `grid` equal ranges
-    int grid;      // blocks in the launch, all resident at once
-    float* slots;  // (tiles - dp_tiles) x BM x BN fp32, one per Stream-K tile
-    unsigned long long* flags;  // per Stream-K tile: (epoch << 32) | k-steps accumulated
-    unsigned* queue;            // [0]: next work item, [1]: blocks done
-    unsigned epoch;
-};
-
-__device__ __forceinline__ void st_release_gpu(unsigned long long* p, unsigned long long v) {
-    asm volatile("st.release.gpu.global.u64 [%0], %1;\n" ::"l"(p), "l"(v) : "memory");
-}
-__device__ __forceinline__ unsigned long long ld_acquire_gpu(const unsigned long long* p) {
-    unsigned long long v;
-    asm volatile("ld.acquire.gpu.global.u64 %0, [%1];\n" : "=l"(v) : "l"(p) : "memory");
-    return v;
-}
-
-// Grouped rasterization: tile indices walk G tile rows column-major before moving to the
-// next G rows. Consecutive indices then share B columns (same tn) across G tiles and A
-// rows across the tiles of one group, instead of sharing A only along a whole tile row.
-__device__ __forceinline__ void raster(const Params& p, int tile, int& tm, int& tn) {
-    const int per_group = p.group * p.tiles_n;
-    const int g = tile / per_group;
-    const int first = g * p.group;
-    const int gsz = min(p.group, p.tiles_m - first);
-    const int r = tile - g * per_group;
-    tm = first + r % gsz;
-    tn = r / gsz;
-}
-
-// Queue mode, pass j of a Stream-K tile: k-steps [KT - KT/2^j, KT - KT/2^(j+1)), the last
-// pass running to KT. Half the tile, then a quarter, ... so the last passes are short (the
-// kernel ends within one of them on every SM) while a tile has only `passes` chain links,
-// 4 at K = 4096, 5 at 8192, 6 at 11008.
-__device__ __forceinline__ void pass_range(const Params& p, int j, int& kb, int& ke) {
-    kb = j == 0 ? 0 : p.KT - (p.KT >> j);
-    ke = j + 1 == p.passes ? p.KT : p.KT - (p.KT >> (j + 1));
-}
-
-// Static mode: first iteration owned by block c; ranges are [start(c), start(c+1)).
-__device__ __forceinline__ int range_start(const Params& p, int c) {
-    return static_cast<int>(static_cast<long long>(c) * p.sk_iters / p.grid);
-}
-
-// A partial tile in its slot, in fragment order: lane-contiguous float4s, so every warp
-// writes and reads 512-byte runs and a lane finds its own accumulator elements at the same
-// place whichever block wrote them. Rows past M are skipped on both sides.
-template <class Cfg>
-__device__ __forceinline__ int slot_idx(int warp, int lane, int mi, int nj) {
-    return ((warp * Cfg::MT + mi) * Cfg::NT + nj) * 32 + lane;
-}
 
 template <int BM, int BN, int BK, int STAGES>
 __global__ void __launch_bounds__(THREADS)
@@ -151,7 +101,7 @@ __global__ void __launch_bounds__(THREADS)
                     if (wm * WM + mi * 16 >= m_valid) continue;  // the whole m16 tile is past M
 #pragma unroll
                     for (int nj = 0; nj < NT; ++nj) {
-                        const float4 v = __ldcg(slot + slot_idx<Cfg>(warp, lane, mi, nj));
+                        const float4 v = __ldcg(slot + slot_idx<MT, NT>(warp, lane, mi, nj));
                         acc[mi][nj][0] += v.x;
                         acc[mi][nj][1] += v.y;
                         acc[mi][nj][2] += v.z;
@@ -166,7 +116,7 @@ __global__ void __launch_bounds__(THREADS)
                     if (wm * WM + mi * 16 >= m_valid) continue;
 #pragma unroll
                     for (int nj = 0; nj < NT; ++nj)
-                        slot[slot_idx<Cfg>(warp, lane, mi, nj)] = make_float4(
+                        slot[slot_idx<MT, NT>(warp, lane, mi, nj)] = make_float4(
                             acc[mi][nj][0], acc[mi][nj][1], acc[mi][nj][2], acc[mi][nj][3]);
                 }
                 __threadfence();
@@ -232,32 +182,6 @@ __global__ void __launch_bounds__(THREADS)
     }
 }
 
-// Schedule constants (swept on the RTX 5090, see docs/design/hgemm.md).
-constexpr int kMinShare = 32;      // static mode: least k-steps per block; tile choice threshold
-constexpr int kMinPass = 8;        // queue mode: no pass shorter than this; the last is 9 to 16
-constexpr int kStaticWaves = 2;    // static ranges up to this many waves ...
-constexpr int kStaticWavesL2 = 4;  // ... or this many when A and B fit in L2 together
-constexpr double kL2Share = 0.75;  // "fit": A + B <= this share of the L2
-
-inline size_t l2_bytes() {
-    static size_t bytes = 0;
-    if (bytes == 0) {
-        int dev = 0, l2 = 0;
-        SPARK_CUDA_CHECK(cudaGetDevice(&dev));
-        SPARK_CUDA_CHECK(cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, dev));
-        bytes = l2 > 0 ? static_cast<size_t>(l2) : size_t{96} << 20;
-    }
-    return bytes;
-}
-
-struct Workspace {
-    float* slots = nullptr;
-    unsigned long long* flags = nullptr;
-    unsigned* queue = nullptr;
-    size_t tiles = 0;  // Stream-K tiles the slots and flags can hold
-    unsigned epoch = 0;
-};
-
 template <int BM, int BN, int BK, int STAGES>
 int resident_blocks() {
     constexpr int bytes = hgemm_tile::smem_bytes<BM, BN, BK, STAGES>();
@@ -277,64 +201,9 @@ template <int BM, int BN, int BK, int STAGES>
 void launch(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N, int K,
             cudaStream_t stream) {
     constexpr int bytes = hgemm_tile::smem_bytes<BM, BN, BK, STAGES>();
-    const int resident = resident_blocks<BM, BN, BK, STAGES>();
-
+    static hgemm_sk::Workspace w;  // one per tile configuration
     Params p;
-    p.tiles_m = cdiv(M, BM);
-    p.tiles_n = N / BN;
-    p.tiles = p.tiles_m * p.tiles_n;
-    p.KT = K / BK;
-    const long long total = static_cast<long long>(p.tiles) * p.KT;
-    const double operands = 2.0 * (static_cast<double>(M) * K + static_cast<double>(K) * N);
-    const int static_waves = operands <= kL2Share * l2_bytes() ? kStaticWavesL2 : kStaticWaves;
-
-    int sk_tiles;
-    if (p.tiles <= static_cast<long long>(resident) * static_waves) {
-        // Static ranges. Never more blocks than there are pieces of kMinShare k-steps (a
-        // shorter piece costs more in fixup traffic than it does in mma work), but never
-        // fewer than there are tiles: with one block per tile there are no partials at all.
-        p.grid = static_cast<int>(
-            std::min<long long>(resident, std::max<long long>(p.tiles, total / kMinShare)));
-        p.dp_tiles = 0;
-        p.passes = 0;
-        p.sk_iters = p.tiles * p.KT;
-        sk_tiles = p.tiles;
-    } else {
-        // Queue: whole tiles, then the tail and one full wave in geometric passes.
-        p.grid = resident;
-        const int tail = p.tiles % p.grid;
-        sk_tiles = tail + (tail > 0 ? p.grid : 0);
-        p.dp_tiles = p.tiles - sk_tiles;
-        p.passes = 1;
-        while ((p.KT >> p.passes) > kMinPass) ++p.passes;
-        p.sk_iters = 0;
-    }
-
-    // Raster group: G tile rows per group, about the square root of the blocks in flight,
-    // so a wave touches G rows of A and grid/G columns of B.
-    int g = 1;
-    while ((g * 2) * (g * 2) <= p.grid) g *= 2;
-    p.group = std::max(1, std::min(g, p.tiles_m));
-
-    static Workspace w;
-    if (w.tiles < static_cast<size_t>(sk_tiles)) {
-        if (w.slots) SPARK_CUDA_CHECK(cudaFree(w.slots));
-        if (w.flags) SPARK_CUDA_CHECK(cudaFree(w.flags));
-        w.tiles = std::max<size_t>(sk_tiles, 2 * static_cast<size_t>(resident));
-        SPARK_CUDA_CHECK(cudaMalloc(&w.slots, w.tiles * BM * BN * sizeof(float)));
-        SPARK_CUDA_CHECK(cudaMalloc(&w.flags, w.tiles * sizeof(unsigned long long)));
-        SPARK_CUDA_CHECK(cudaMemset(w.flags, 0, w.tiles * sizeof(unsigned long long)));  // once
-    }
-    if (!w.queue) {
-        SPARK_CUDA_CHECK(cudaMalloc(&w.queue, 2 * sizeof(unsigned)));
-        SPARK_CUDA_CHECK(cudaMemset(w.queue, 0, 2 * sizeof(unsigned)));  // once
-    }
-    if (++w.epoch == 0) w.epoch = 1;
-    p.slots = w.slots;
-    p.flags = w.flags;
-    p.queue = w.queue;
-    p.epoch = w.epoch;
-
+    hgemm_sk::plan(p, w, M, N, K, BM, BN, BK, resident_blocks<BM, BN, BK, STAGES>());
     hgemm_v4_kernel<BM, BN, BK, STAGES><<<p.grid, THREADS, bytes, stream>>>(A, B, C, M, N, K, p);
 }
 
@@ -356,11 +225,11 @@ void launch_auto(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* 
         hgemm_decode::launch(A, B, C, M, N, K, stream);
     } else if (M <= 64) {
         launch<64, 64, 64, 4>(A, B, C, M, N, K, stream);
-    } else if (N % 128 == 0 &&
-               share(128, 128, BK, resident_blocks<128, 128, BK, STAGES>()) >= kMinShare) {
+    } else if (N % 128 == 0 && share(128, 128, BK, resident_blocks<128, 128, BK, STAGES>()) >=
+                                   hgemm_sk::kMinShare) {
         launch<128, 128, BK, STAGES>(A, B, C, M, N, K, stream);
     } else if (N % 128 == 0 &&
-               share(64, 128, BK, resident_blocks<64, 128, BK, STAGES>()) >= kMinShare) {
+               share(64, 128, BK, resident_blocks<64, 128, BK, STAGES>()) >= hgemm_sk::kMinShare) {
         launch<64, 128, BK, STAGES>(A, B, C, M, N, K, stream);
     } else {
         launch<64, 64, 64, 3>(A, B, C, M, N, K, stream);

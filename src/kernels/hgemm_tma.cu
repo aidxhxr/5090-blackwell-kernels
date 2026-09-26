@@ -16,11 +16,14 @@
 //     the k-loop;
 //   * the consumer warps' instruction stream holds ldmatrix, mma.sync and one arrive per
 //     stage: no cp.async, no address arithmetic for the copies.
+// The stage geometry, the swizzle, the producer's issue and the consumer's stage body are in
+// hgemm_tma_tile.cuh, shared with variant 6, which runs them on the Stream-K schedule.
 // Host guarantees M % 128 == 0, N % 128 == 0, K % 64 == 0 and a grid of at least one wave.
 
 #include <algorithm>
 #include <cstdlib>
 
+#include "hgemm_tma_tile.cuh"
 #include "spark/common.cuh"
 #include "spark/kernels.h"
 
@@ -30,50 +33,17 @@ namespace {
 
 namespace v5 {
 
-constexpr int BM = 128, BN = 128;
-constexpr int WARPS_M = 2, WARPS_N = 4;  // consumer warp grid, as in variant 3
-constexpr int CONSUMER_WARPS = WARPS_M * WARPS_N;
-constexpr int CONSUMERS = CONSUMER_WARPS * 32;  // 256 threads
-constexpr int THREADS = CONSUMERS + 32;         // plus the producer warp
-constexpr int WM = BM / WARPS_M;                // 64
-constexpr int WN = BN / WARPS_N;                // 32
-constexpr int MT = WM / 16;                     // m16 tiles per warp
-constexpr int NT = WN / 8;                      // n8 tiles per warp
-constexpr int B_BOX_N = 64;                     // columns per TMA box of B: 128 B, one swizzle span
-constexpr int TAIL_BARRIER = 1;                 // named barrier id for the 256 consumer threads
-static_assert(BN == 2 * B_BOX_N, "B is loaded as two 64-column boxes");
+using namespace hgemm_tma_tile;
 
-// Bytes of A + B per stage. The swizzle is a function of the shared-memory address (bits
-// [4:7) XOR bits [7:10)), so a stage must start on a 1 KB boundary. Stage sizes are multiples
-// of 1 KB and the stages sit at the start of the dynamic region, which starts 1 KB-aligned
-// when the kernel declares no static shared memory (checked in the kernel); the barriers go
-// after the stages. The 5090 allows 101,376 B per block and 102,400 B per SM with 1 KB of it
-// reserved per block, so two blocks per SM need at most 49 KB each.
-template <int BK>
-constexpr int stage_bytes() {
-    return (BM * BK + BK * BN) * static_cast<int>(sizeof(__nv_bfloat16));
-}
-// The total is rounded up to a whole KB so that with two blocks on an SM the second block's
-// allocation (this plus the reserved KB) also starts on a 1 KB boundary, whichever address
-// the swizzle is keyed on.
+constexpr int TAIL_BARRIER = 1;  // named barrier id for the 256 consumer threads
+
+// The stages sit at the start of the dynamic region (which starts 1 KB-aligned when the kernel
+// declares no static shared memory; checked in the kernel), the barriers go after them. The
+// 5090 allows 101,376 B per block and 102,400 B per SM with 1 KB of it reserved per block, so
+// two blocks per SM need at most 49 KB each.
 template <int BK, int STAGES>
 constexpr int smem_bytes() {
-    return (STAGES * stage_bytes<BK>() + 2 * STAGES * 8 + 16 + 1023) / 1024 * 1024;
-}
-
-// Physical 16-byte chunk for logical (row, chunk) of an A row of BK bf16, as the copy engine
-// wrote it: the 64-byte swizzle (BK=32) XORs the chunk with (row/2)%4, the 128-byte one
-// (BK=64) with row%8. Same function as variant 3's swz_a.
-template <int BK>
-__device__ __forceinline__ int swz_a(int row, int chunk) {
-    if constexpr (BK == 32)
-        return chunk ^ ((row >> 1) & 3);
-    else
-        return chunk ^ (row & 7);
-}
-// A B box row is 128 B (8 chunks) and the 128-byte swizzle XORs its chunk with row%8.
-__device__ __forceinline__ int swz_b(int row, int chunk) {
-    return chunk ^ (row & 7);
+    return round_kb(STAGES * stage_bytes<BK>() + 2 * STAGES * 8 + 16);
 }
 
 // Work assignment, identical to variant 3's: blocks [0, dp_tiles) own one output tile each;
@@ -93,8 +63,6 @@ __global__ void __launch_bounds__(THREADS, MIN_BLOCKS)
                     const __grid_constant__ CUtensorMap tmB, __nv_bfloat16* __restrict__ C, int M,
                     int N, int K, Sched sched) {
     static_assert(BK == 32 || BK == 64, "the swizzle helpers assume 64 B or 128 B rows of A");
-    constexpr int A_STAGE = BM * BK;     // elements
-    constexpr int B_BOX = BK * B_BOX_N;  // elements per B box
     constexpr int STAGE_BYTES = stage_bytes<BK>();
 
     extern __shared__ __align__(1024) unsigned char smem[];
@@ -147,14 +115,8 @@ __global__ void __launch_bounds__(THREADS, MIN_BLOCKS)
                 const int s = kt % STAGES;
                 const unsigned use = kt / STAGES;
                 if (kt >= STAGES) mbar_wait(&empty_bar[s], (use - 1) & 1);
-                mbar_arrive_expect_tx(&full_bar[s], STAGE_BYTES);
-                const int k0 = (kt_begin + kt) * BK;
-                unsigned char* as = smem + s * STAGE_BYTES;
-                unsigned char* bs = as + A_STAGE * sizeof(__nv_bfloat16);
-                tma_load_2d(as, &tmA, &full_bar[s], k0, bm);  // (k, m): 128 rows x BK
-                tma_load_2d(bs, &tmB, &full_bar[s], bn, k0);  // (n, k): BK rows x 64
-                tma_load_2d(bs + B_BOX * sizeof(__nv_bfloat16), &tmB, &full_bar[s], bn + B_BOX_N,
-                            k0);
+                issue_stage<BK>(smem + s * STAGE_BYTES, &tmA, &tmB, &full_bar[s],
+                                (kt_begin + kt) * BK, bm, bn);
             }
         }
         return;
@@ -163,53 +125,14 @@ __global__ void __launch_bounds__(THREADS, MIN_BLOCKS)
     // Consumer warps: variant 3's k-loop body on the stage the producer has filled.
     const int wm = warp / WARPS_N;
     const int wn = warp % WARPS_N;
-    const int b_box = wn >> 1;  // the 64-column box that holds this warp's 32 columns
 
-    float acc[MT][NT][4];
-#pragma unroll
-    for (int i = 0; i < MT; ++i)
-#pragma unroll
-        for (int j = 0; j < NT; ++j)
-#pragma unroll
-            for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.f;
-
-    const int a_row_in_tile = lane & 15;
-    const int a_kchunk = lane >> 4;
-    const int b_krow_in_step = lane & 15;
-    const int b_nchunk = lane >> 4;
+    Acc acc;
+    zero_acc(acc);
 
     for (int kt = 0; kt < nkt; ++kt) {
         const int s = kt % STAGES;
         mbar_wait(&full_bar[s], (kt / STAGES) & 1);
-        const __nv_bfloat16* as = reinterpret_cast<const __nv_bfloat16*>(smem + s * STAGE_BYTES);
-        const __nv_bfloat16* bs = as + A_STAGE + b_box * B_BOX;
-
-#pragma unroll
-        for (int kk = 0; kk < BK; kk += 16) {
-            unsigned afrag[MT][4];
-            unsigned bfrag[NT][2];
-#pragma unroll
-            for (int mi = 0; mi < MT; ++mi) {
-                const int row = wm * WM + mi * 16 + a_row_in_tile;
-                const int ch = kk / 8 + a_kchunk;
-                ldmatrix_x4(afrag[mi], as + row * BK + swz_a<BK>(row, ch) * 8);
-            }
-#pragma unroll
-            for (int nj = 0; nj < NT; nj += 2) {
-                const int krow = kk + b_krow_in_step;
-                const int ch = ((wn & 1) * WN + nj * 8) / 8 + b_nchunk;  // chunk within the box
-                unsigned r[4];
-                ldmatrix_x4_trans(r, bs + krow * B_BOX_N + swz_b(krow, ch) * 8);
-                bfrag[nj][0] = r[0];
-                bfrag[nj][1] = r[1];
-                bfrag[nj + 1][0] = r[2];
-                bfrag[nj + 1][1] = r[3];
-            }
-#pragma unroll
-            for (int mi = 0; mi < MT; ++mi)
-#pragma unroll
-                for (int nj = 0; nj < NT; ++nj) mma_bf16_16816(acc[mi][nj], afrag[mi], bfrag[nj]);
-        }
+        consume_stage<BK>(acc, smem + s * STAGE_BYTES, wm, wn, lane);
         // The ldmatrix reads of this stage went through the generic proxy and the refill will
         // come through the async proxy; the proxy fence orders the reads before anything the
         // copy engine does after the release, then one arrive per warp hands the stage back.
@@ -300,15 +223,8 @@ void launch(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, in
     constexpr int bytes = smem_bytes<BK, STAGES>();
     const int resident = resident_blocks<BK, STAGES, MIN_BLOCKS>();
 
-    // A box: BM rows x BK columns (BK*2 bytes wide, swizzled over that width). B box: BK rows
-    // x 64 columns (128 bytes, the 128-byte swizzle).
-    constexpr CUtensorMapSwizzle a_swz =
-        BK == 32 ? CU_TENSOR_MAP_SWIZZLE_64B : CU_TENSOR_MAP_SWIZZLE_128B;
-    // Encoding a map is host-side arithmetic on 128 bytes, measured at 27 ns per call, so
-    // both are rebuilt on every call instead of cached.
-    const CUtensorMap tmA = make_tensor_map_2d_bf16(A, M, K, BM, BK, a_swz);
-    const CUtensorMap tmB =
-        make_tensor_map_2d_bf16(B, K, N, BK, B_BOX_N, CU_TENSOR_MAP_SWIZZLE_128B);
+    CUtensorMap tmA, tmB;
+    make_maps<BK>(A, B, M, N, K, tmA, tmB);
 
     Sched s;
     s.tiles_n = N / BN;
