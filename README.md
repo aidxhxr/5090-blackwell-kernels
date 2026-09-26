@@ -22,16 +22,16 @@ Best rung of each ladder on its largest shape:
 
 | kernel | shape | best | time | achieved | vs cuBLAS or naive | vs PyTorch |
 |---|---|---|---|---|---|---|
-| bf16 GEMM | 4096 x 4096 x 4096 | v5 | 0.560 ms | 245 TFLOPS | 108.7% of cuBLAS | 1.11x |
-| bf16 GEMM | 8192 x 8192 x 8192 | v5 | 4.66 ms | 236 TFLOPS | 101.6% of cuBLAS | 1.04x |
-| bf16 GEMM, decode | 16 x 4096 x 4096 | v4 | 23.5 us | 1,442 GB/s | 122% of cuBLAS | 1.24x |
-| fp8 GEMM | 4096 x 4096 x 4096 | v2 | 0.195 ms | 704 TFLOPS | 99.5% of cuBLASLt | 1.29x |
-| fp8 GEMM | 8192 x 8192 x 8192 | v2 | 1.62 ms | 679 TFLOPS | 92.0% of cuBLASLt | 1.12x |
-| fp8 GEMM, decode | 16 x 4096 x 4096 | v1 | 13.2 us | 1,291 GB/s | 125% of cuBLASLt | 1.64x |
-| attention | 32 heads, 4096 x 128, causal | v3 | 0.640 ms | 215 TFLOPS | | 1.21x over flash |
-| attention | 32 heads, 8192 x 128, causal | v3 | 2.49 ms | 221 TFLOPS | | 1.11x over flash |
-| attention, decode | 1 query, 4096 keys, 32 x 128 | v3 | 46 us | 1,459 GB/s | | 1.35x over flash |
-| attention, GQA decode | 1 query, 128K keys, 32 query / 8 K/V heads x 128 | v3 | 324 us | 1,655 GB/s | | 1.09x over flash |
+| bf16 GEMM | 4096 x 4096 x 4096 | v6 | 0.549 ms | 250 TFLOPS | 110.9% of cuBLAS | 1.12x |
+| bf16 GEMM | 8192 x 8192 x 8192 | v6 | 4.51 ms | 244 TFLOPS | 104.7% of cuBLAS | 1.07x |
+| bf16 GEMM, decode | 16 x 4096 x 4096 | v6 | 23.5 us | 1,440 GB/s | 123% of cuBLAS | 1.25x |
+| fp8 GEMM | 4096 x 4096 x 4096 | v2 | 0.195 ms | 704 TFLOPS | 100.1% of cuBLASLt | 1.36x |
+| fp8 GEMM | 8192 x 8192 x 8192 | v2 | 1.62 ms | 678 TFLOPS | 91.5% of cuBLASLt | 1.03x |
+| fp8 GEMM, decode | 16 x 4096 x 4096 | v1 | 13.2 us | 1,284 GB/s | 125% of cuBLASLt | 1.64x |
+| attention | 32 heads, 4096 x 128, causal | v4 | 0.601 ms | 229 TFLOPS | | 1.29x over flash |
+| attention | 32 heads, 8192 x 128, causal | v4 | 2.33 ms | 235 TFLOPS | | 1.18x over flash |
+| attention, decode | 1 query, 4096 keys, 32 x 128 | v3 | 46 us | 1,461 GB/s | | 1.43x over flash |
+| attention, GQA decode | 1 query, 128K keys, 32 query / 8 K/V heads x 128 | v3 | 328 us | 1,635 GB/s | | 1.09x over flash |
 | fp32 GEMM | 4096 x 11008 x 4096 | v5 | 6.48 ms | 57 TFLOPS | 84.3% of cuBLAS | 0.86x |
 | rmsnorm bf16 | 16384 x 8192 | v4 | 0.351 ms | 1,529 GB/s | 10.4x over naive | 1.05x |
 | add + rmsnorm bf16 | 16384 x 8192 | fused | 0.713 ms | 1,506 GB/s | | 1.25x |
@@ -61,14 +61,14 @@ already loading the next piece while the consumers finish the last one's epilogu
 
 | M x N x K | v3 | v4 Stream-K | v5 TMA | v6 TMA + Stream-K | cuBLAS | best / cuBLAS |
 |---|---|---|---|---|---|---|
-| 1024 x 1024 x 1024 | 122.9 | 123.1 | | 124.1 | 122.0 | 101.7% |
-| 2048 x 2048 x 2048 | 166.1 | 207.3 | 180.7 | 224.4 | 172.7 | 129.9% |
-| 4096 x 4096 x 4096 | 229.5 | 231.1 | 242.9 | 249.1 | 225.7 | 110.4% |
-| 8192 x 8192 x 8192 | 223.0 | 227.8 | 236.3 | 243.5 | 232.5 | 104.6% |
-| 4096 x 4096 x 11008 | 228.2 | 229.9 | 244.4 | 245.7 | 227.1 | 108.1% |
-| 4096 x 11008 x 4096 | 229.2 | 229.7 | 239.1 | 246.0 | 239.4 | 102.8% |
+| 1024 x 1024 x 1024 | 122.9 | 122.7 |  | 124.3 | 122.0 | 101.9% |
+| 2048 x 2048 x 2048 | 166.1 | 207.4 | 180.7 | 224.0 | 172.8 | 129.6% |
+| 4096 x 4096 x 4096 | 231.1 | 232.0 | 245.6 | 250.2 | 225.6 | 110.9% |
+| 8192 x 8192 x 8192 | 224.1 | 228.0 | 237.0 | 243.7 | 232.8 | 104.7% |
+| 4096 x 4096 x 11008 | 230.8 | 230.2 | 245.6 | 246.3 | 228.2 | 107.9% |
+| 4096 x 11008 x 4096 | 230.2 | 229.4 | 240.9 | 246.6 | 240.4 | 102.6% |
 
-TFLOPS, variants 4 to 6 and cuBLAS from one session. Variant 5 only runs on grids of at least
+TFLOPS, every variant and cuBLAS from the same run. Variant 5 only runs on grids of at least
 one 128x128 tile per SM. Variant 6 takes variant 4's shapes: at 1024 cubed and on the decode
 shapes it runs variant 4's tiles and the decode kernel. The Python default is the highest
 variant that takes the shape, which is now variant 6 everywhere N and K are multiples of 64.
@@ -87,18 +87,18 @@ comes from, 0.40 TFLOPS per watt against 0.39.
 
 Decode shapes, where the whole thing is streaming the weight matrix once. The bench rotates
 through enough copies of B to get past the 96 MB L2, otherwise both sides read out of cache
-and report numbers above what the memory can do. Variants 3 and 4 both run a dedicated kernel
+and report numbers above what the memory can do. Variants 3, 4 and 6 all run a dedicated kernel
 here: one CTA per column strip of B, a 16, 32 or 64-row tile picked from M, no split-K and no
 memsets, so a call is one launch and nothing waits on a reduction at the end.
 
 | M x N x K | ours | cuBLAS | ours / cuBLAS |
 |---|---|---|---|
-| 1 x 4096 x 4096 | 1,429 GB/s | 837 GB/s | 170.8% |
-| 16 x 4096 x 4096 | 1,442 GB/s | 1,180 GB/s | 122.2% |
-| 32 x 4096 x 4096 | 1,453 GB/s | 1,180 GB/s | 123.1% |
-| 64 x 4096 x 4096 | 1,404 GB/s | 1,121 GB/s | 125.2% |
-| 16 x 11008 x 4096 | 1,612 GB/s | 1,497 GB/s | 107.7% |
-| 64 x 4096 x 11008 | 1,577 GB/s | 1,428 GB/s | 110.4% |
+| 1 x 4096 x 4096 | 1,429 GB/s | 837 GB/s | 170.7% |
+| 16 x 4096 x 4096 | 1,440 GB/s | 1,173 GB/s | 122.8% |
+| 32 x 4096 x 4096 | 1,455 GB/s | 1,181 GB/s | 123.2% |
+| 64 x 4096 x 4096 | 1,383 GB/s | 1,157 GB/s | 119.6% |
+| 16 x 11008 x 4096 | 1,611 GB/s | 1,496 GB/s | 107.7% |
+| 64 x 4096 x 11008 | 1,576 GB/s | 1,428 GB/s | 110.4% |
 
 A read-only kernel that streams 32 MB and does nothing else takes 23.6 us timed the same way,
 so the 4096-wide rows are at the floor of a single launch. Queued back to back the same
@@ -135,17 +135,17 @@ the kernels use.
 
 | M x N x K | v1 | v2 TMA | cuBLASLt | best / cuBLASLt |
 |---|---|---|---|---|
-| 1024 x 1024 x 1024 | 233.8 | | 205.2 | 114.1% |
-| 2048 x 2048 x 2048 | 409.2 | 580.4 | 416.8 | 139.2% |
-| 4096 x 4096 x 4096 | 642.0 | 703.8 | 706.2 | 99.5% |
-| 8192 x 8192 x 8192 | 639.7 | 679.4 | 739.2 | 92.0% |
-| 4096 x 4096 x 11008 | 664.8 | 724.1 | 581.2 | 124.9% |
-| 4096 x 11008 x 4096 | 652.7 | 674.8 | 670.8 | 100.7% |
+| 1024 x 1024 x 1024 | 235.5 |  | 205.9 | 114.4% |
+| 2048 x 2048 x 2048 | 410.8 | 581.7 | 417.8 | 139.2% |
+| 4096 x 4096 x 4096 | 642.3 | 703.7 | 702.7 | 100.1% |
+| 8192 x 8192 x 8192 | 636.7 | 677.7 | 740.4 | 91.5% |
+| 4096 x 4096 x 11008 | 667.3 | 721.6 | 581.1 | 124.2% |
+| 4096 x 11008 x 4096 | 655.1 | 695.3 | 670.9 | 103.6% |
 
 TFLOPS. At 8192 cubed Nsight has variant 2 and cuBLASLt at the same cycle count and the same
 89% tensor-pipe activity; the gap is clock. Both sit at 600 W, cuBLASLt at 2.3 GHz and variant
 2 at 2.15 GHz, because it issues 341 M instructions to cuBLASLt's 233 M for the same 134 M
-`QMMA`. Decode: 16 x 4096 x 4096 in 13.2 us, 1,291 GB/s, against a 13.3 us read-only floor for
+`QMMA`. Decode: 16 x 4096 x 4096 in 13.2 us, 1,284 GB/s, against a 13.3 us read-only floor for
 a lone 16 MB launch; 125% of cuBLASLt, 141% at M = 1.
 
 ### attention
@@ -170,22 +170,23 @@ what shipped. The comparison is `F.scaled_dot_product_attention`
 (`enable_gqa=True` for the grouped shapes), which picks its FlashAttention-2 kernel on every
 shape, and cuDNN's SDPA forced through `sdpa_kernel`.
 
-| shape | ours (v4) | TFLOPS | torch flash | ours / flash | torch cuDNN | ours / cuDNN |
-|---|---|---|---|---|---|---|
-| 1 x 32 x 4096 x 128 | 1.15 ms | 239 | 1.45 ms | 1.24x | 1.35 ms | 1.16x |
-| 1 x 32 x 4096 x 128, causal | 0.601 ms | 229 | 0.791 ms | 1.30x | 0.774 ms | 1.28x |
-| 1 x 32 x 8192 x 128, causal | 2.34 ms | 235 | 2.78 ms | 1.17x | 2.72 ms | 1.15x |
-| 4 x 32 x 2048 x 128, causal | 0.646 ms | 213 | 0.762 ms | 1.15x | 0.752 ms | 1.13x |
-| 1 x 32 x 4096 x 64, causal | 0.316 ms | 217 | 0.416 ms | 1.27x | 0.394 ms | 1.21x |
-| decode: 1 query, 4096 keys, 32 x 128 | 50 us | 1,346 GB/s | 71 us | 1.31x | 69 us | 1.29x |
-| 1 x 32/8 x 4096 x 128, causal (GQA) | 0.636 ms | 216 | 0.786 ms | 1.21x | | |
-| decode: 1 query, 4096 keys, 32/8 x 128 (GQA) | 17 us | 970 GB/s | 37 us | 1.80x | | |
-| decode: 1 query, 128K keys, 32 x 128 | 1.27 ms | 1,693 GB/s | 1.30 ms | 1.02x | | |
-| decode: 1 query, 128K keys, 32/8 x 128 (GQA) | 324 us | 1,655 GB/s | 357 us | 1.09x | | |
-| decode: batch 8, 4096 keys, 32/8 x 128 (GQA) | 87 us | 1,548 GB/s | 104 us | 1.15x | | |
+| shape | ours | TFLOPS | torch flash | ours / flash |
+|---|---|---|---|---|
+| 1 x 32 x 4096 x 128 | 1.163 ms | 236 | 1.458 ms | 1.25x |
+| 1 x 32 x 4096 x 128, causal | 0.601 ms | 229 | 0.792 ms | 1.29x |
+| 1 x 32 x 8192 x 128, causal | 2.334 ms | 235 | 2.777 ms | 1.18x |
+| 4 x 32 x 2048 x 128, causal | 0.645 ms | 213 | 0.763 ms | 1.15x |
+| 1 x 32 x 4096 x 64, causal | 0.317 ms | 217 | 0.419 ms | 1.28x |
+| 1 x 32/8 x 4096 x 128, causal (GQA) | 0.598 ms | 230 | 0.788 ms | 1.29x |
+| decode: 1 query, 4096 keys, 32 x 128 | 46 us | 1,461 GB/s | 71 us | 1.43x |
+| decode: 1 query, 4096 keys, 32/8 x 128 (GQA) | 17 us | 970 GB/s | 38 us | 1.83x |
+| decode: 1 query, 128K keys, 32 x 128 | 1266 us | 1,696 GB/s | 1297 us | 1.02x |
+| decode: 1 query, 128K keys, 32/8 x 128 (GQA) | 328 us | 1,635 GB/s | 358 us | 1.09x |
+| decode: batch 8, 4096 keys, 32/8 x 128 (GQA) | 87 us | 1,553 GB/s | 105 us | 1.16x |
 
 Causal TFLOPS use the halved FLOP count FlashAttention reports; times are the C++ bench's
-medians, ratios are `scripts/bench_torch.py`'s. Nsight puts variant 4's tensor pipe at 93 to
+medians, ratios are `scripts/bench_torch.py`'s. cuDNN's attention, forced through
+`sdpa_kernel`, is 2 to 7% faster than flash on the prefill shapes and still 13 to 28% behind. Nsight puts variant 4's tensor pipe at 93 to
 94% active (variant 3: 87 to 90%) with `math_pipe_throttle` on top; what is left is the block
 prologue and the tiles where both warps of a scheduler still meet in their softmaxes. Decode is K and V streamed once per K/V head: GB/s counts each K/V head once for its whole
 group of query heads. Past 16K tokens both layouts run at 1,600 to 1,700 GB/s, above the
