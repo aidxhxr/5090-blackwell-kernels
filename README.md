@@ -1,11 +1,12 @@
 # spark-kernels
 
 CUDA kernels I wrote by hand for the parts of a Llama-style decoder block, run on an RTX 5090.
-RMSNorm, SwiGLU, softmax, an fp32 GEMM, a bf16 tensor-core GEMM and fused attention. Each one
-is a ladder: a naive version first, then one change at a time, with every rung benchmarked
-against cuBLAS or PyTorch and profiled in Nsight Compute. The bf16 GEMM ends up ahead of cuBLAS
-on every shape from 2048 cubed up and at the memory floor on the decode shapes, and the
-attention kernel ahead of PyTorch's FlashAttention-2.
+RMSNorm, SwiGLU, softmax, an fp32 GEMM, a bf16 tensor-core GEMM, an fp8 (e4m3) tensor-core
+GEMM and fused attention. Each one is a ladder: a naive version first, then one change at a
+time, with every rung benchmarked against cuBLAS, cuBLASLt or PyTorch and profiled in Nsight
+Compute. The bf16 GEMM ends up ahead of cuBLAS on every shape from 2048 cubed up and at the
+memory floor on the decode shapes, the fp8 GEMM level with cuBLASLt at 4096 cubed and ahead of
+`torch._scaled_mm` everywhere, and the attention kernel ahead of PyTorch's FlashAttention-2.
 
 The name is left over from when this was going to run on a DGX Spark. The Spark hasn't shipped,
 the 5090 has, so the numbers below are from the 5090. The same source builds for the GB10 with
@@ -24,6 +25,9 @@ Best rung of each ladder on its largest shape:
 | bf16 GEMM | 4096 x 4096 x 4096 | v5 | 0.560 ms | 245 TFLOPS | 108.7% of cuBLAS | 1.11x |
 | bf16 GEMM | 8192 x 8192 x 8192 | v5 | 4.66 ms | 236 TFLOPS | 101.6% of cuBLAS | 1.04x |
 | bf16 GEMM, decode | 16 x 4096 x 4096 | v4 | 23.5 us | 1,442 GB/s | 122% of cuBLAS | 1.24x |
+| fp8 GEMM | 4096 x 4096 x 4096 | v2 | 0.195 ms | 704 TFLOPS | 99.5% of cuBLASLt | 1.29x |
+| fp8 GEMM | 8192 x 8192 x 8192 | v2 | 1.62 ms | 679 TFLOPS | 92.0% of cuBLASLt | 1.12x |
+| fp8 GEMM, decode | 16 x 4096 x 4096 | v1 | 13.2 us | 1,291 GB/s | 125% of cuBLASLt | 1.64x |
 | attention | 32 heads, 4096 x 128, causal | v3 | 0.640 ms | 215 TFLOPS | | 1.21x over flash |
 | attention | 32 heads, 8192 x 128, causal | v3 | 2.49 ms | 221 TFLOPS | | 1.11x over flash |
 | attention, decode | 1 query, 4096 keys, 32 x 128 | v3 | 46 us | 1,459 GB/s | | 1.35x over flash |
@@ -111,6 +115,39 @@ output has 1,024 tiles for 340 resident blocks, 3.01 waves, and the last four ti
 alone for as long as a full wave. Splitting the tail along K took 4096 cubed from 88% to 100%
 of cuBLAS; Stream-K is the general form of that fix.
 
+### the fp8 GEMM against cuBLASLt
+
+`C = scale_a * scale_b * A * Bt^T` with A `[M, K]` and Bt `[N, K]` in e4m3, both K-contiguous
+(the layout cuBLASLt's fp8 path requires and the one `nn.Linear` stores its weight in),
+per-tensor fp32 scales, bf16 out, fp32 accumulation on `mma.sync.m16n8k32`. The trick that
+makes the bf16 tile carry over is that `ldmatrix` moves 16-bit elements: a word of two adjacent
+k in e4m3 is exactly the fragment word `m16n8k32` wants, so both operands load with a plain
+`ldmatrix` and nothing is repacked. Variant 1 is the bf16 variant 3 design on 8-bit rows with a
+64x64 warp tile; variant 2 is the TMA and mbarrier pipeline of bf16 variant 5.
+
+The number that mattered most was not in the kernel. The plain fp8 `mma.sync` with fp32
+accumulation runs at half rate on this card, 517 TFLOPS measured, twice bf16 and half of the
+fp16-accumulate rate, as on the GeForce Ada parts. cuBLASLt beat that ceiling with bit-exact
+fp32 results, and its SASS said how: the block-scaled MXFP8 instruction
+(`mma.sync.kind::mxf8f6f4`, `sm_120a` only) with the scale factors set to one runs fp32
+accumulation at the full rate. `bench_peak` measures it at **1,014 TFLOPS**, and it is what
+the kernels use.
+
+| M x N x K | v1 | v2 TMA | cuBLASLt | best / cuBLASLt |
+|---|---|---|---|---|
+| 1024 x 1024 x 1024 | 233.8 | | 205.2 | 114.1% |
+| 2048 x 2048 x 2048 | 409.2 | 580.4 | 416.8 | 139.2% |
+| 4096 x 4096 x 4096 | 642.0 | 703.8 | 706.2 | 99.5% |
+| 8192 x 8192 x 8192 | 639.7 | 679.4 | 739.2 | 92.0% |
+| 4096 x 4096 x 11008 | 664.8 | 724.1 | 581.2 | 124.9% |
+| 4096 x 11008 x 4096 | 652.7 | 674.8 | 670.8 | 100.7% |
+
+TFLOPS. At 8192 cubed Nsight has variant 2 and cuBLASLt at the same cycle count and the same
+89% tensor-pipe activity; the gap is clock. Both sit at 600 W, cuBLASLt at 2.3 GHz and variant
+2 at 2.15 GHz, because it issues 341 M instructions to cuBLASLt's 233 M for the same 134 M
+`QMMA`. Decode: 16 x 4096 x 4096 in 13.2 us, 1,291 GB/s, against a 13.3 us read-only floor for
+a lone 16 MB launch; 125% of cuBLASLt, 141% at M = 1.
+
 ### attention
 
 Fused scaled-dot-product attention, forward, bf16 in and out, fp32 math, head sizes 64 and
@@ -179,8 +216,9 @@ numbers are quoted in each design note.
 | `softmax` | three pass, warp online softmax, block online softmax, single pass with the row in registers | `torch.softmax` |
 | `sgemm` fp32 | naive, smem tile, 8x8 register tile, cp.async, register prefetch with swizzle, 256x128 tile | cuBLAS SGEMM |
 | `hgemm` bf16 | WMMA, smem tile, cp.async, `mma.sync` + `ldmatrix` with swizzle, 3 stages and split-K, persistent Stream-K, TMA with a producer warp, a weight-streaming kernel for decode | cuBLAS GemmEx |
+| `fp8gemm` e4m3 | naive `mma.sync.m16n8k32` from global memory, the swizzled cp.async tile on 8-bit rows with a 64x64 warp tile and strip-per-CTA decode configs, TMA with a producer warp; all on the block-scaled full-rate instruction | cuBLASLt, `torch._scaled_mm` |
 | `attention` bf16 | warp per query row, CUDA-core flash attention, `mma.sync` + `ldmatrix` flash attention, split-KV tail, TMA mbarrier pipeline, GQA and a flash-decoding kernel for long caches | `F.scaled_dot_product_attention` |
-| `bench_peak` | | measures the card's real `mma.sync` and FMA peaks and the clock they run at |
+| `bench_peak` | | measures the card's real `mma.sync` (bf16, fp8 plain and block-scaled) and FMA peaks and the clock they run at |
 
 Every kernel takes a `variant` argument so each rung can be run, timed and tested on its own.
 They're all exposed to PyTorch through a C++ extension, with parity tests for every variant.
@@ -191,7 +229,7 @@ You need CUDA 13, CMake 3.24 and, for the extension, a PyTorch with cu130 wheels
 newer). The extension builds as C++20 because the torch headers ask for it.
 
 ```bash
-make build            # sm_120 by default; ARCH=121 for the GB10
+make build            # sm_120 by default (the fp8 kernels as sm_120a); ARCH=121 for the GB10
 make bench            # every bench_* binary, validates each variant, writes results/*.json
 make results          # docs/RESULTS.md, results/headline.md, results/roofline.png
 
@@ -227,6 +265,7 @@ out = sk.add_rmsnorm_(x, resid, w)         # resid += x, then norm, in place
 h = sk.swiglu(gate, up)
 p = sk.softmax(scores)
 c = sk.hgemm(a_bf16, b_bf16)               # tensor-core GEMM
+c = sk.fp8gemm(a_e4m3, w_e4m3, sa, sb)     # sa * sb * a @ w.T, w is [N, K] as nn.Linear stores it
 o = sk.attention(q, k, v, causal=True)     # fused attention, q/k/v are [B, H, S, D] bf16;
                                            # k and v may have fewer heads (GQA)
 ```
@@ -242,11 +281,11 @@ numbers, and which Nsight metric moved:
 - [bandwidth](docs/design/bandwidth.md), [rmsnorm](docs/design/rmsnorm.md),
   [swiglu](docs/design/swiglu.md), [softmax](docs/design/softmax.md),
   [sgemm](docs/design/sgemm.md), [hgemm](docs/design/hgemm.md),
-  [attention](docs/design/attention.md)
+  [fp8gemm](docs/design/fp8gemm.md), [attention](docs/design/attention.md)
 
-Things I'd still like to do: a TMA producer warp on the Stream-K schedule, a persistent grid
-for attention's block prologue, CUDA graphs for the 2 us a lone decode launch pays over the
-back-to-back rate, and a GB10 run when the Spark arrives. Both cards
+Things I'd still like to do: a persistent grid for attention's block prologue, per-block scales
+on the fp8 GEMM (the instruction already takes them), CUDA graphs for the 2 us a lone decode
+launch pays over the back-to-back rate, and a GB10 run when the Spark arrives. Both cards
 are consumer Blackwell, so `mma.sync`, `cp.async` and TMA are available and `tcgen05` isn't.
 
 ```
