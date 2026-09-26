@@ -124,33 +124,36 @@ keys and merges them in a combine kernel, runs a 64-row tile for short queries, 
 shapes runs a flash-decoding kernel: the query heads that share a K/V head go into one 16-row
 tile so the cache is read once per group, the keys of each head are split over about 128
 blocks whose four warps each stream their own slice, and the last block to finish merges the
-partials, so a step is one launch. The comparison is `F.scaled_dot_product_attention`
-(`enable_gqa=True` for the grouped shapes), which picked its FlashAttention-2 kernel on every
-shape.
+partials, so a step is one launch. Variant 4 feeds the same tile with
+TMA: K and V land in mbarrier-guarded stages issued by one lane, so the KV loop has no
+block-wide barrier and the two warps of a scheduler drift apart, one in its softmax while the
+other issues `mma`. I built FlashAttention-3's ping-pong on top of that and measured it slower
+every way (one `mma.sync` warp does not fill the pipe alone); the pipeline without the turns is
+what shipped. The comparison is `F.scaled_dot_product_attention`
+(`enable_gqa=True` for the grouped shapes), which picks its FlashAttention-2 kernel on every
+shape, and cuDNN's SDPA forced through `sdpa_kernel`.
 
-| shape | ours | TFLOPS | torch flash | ours / torch |
-|---|---|---|---|---|
-| 1 x 32 x 4096 x 128 | 1.22 ms | 225 | 1.46 ms | 1.17x |
-| 1 x 32 x 4096 x 128, causal | 0.640 ms | 215 | 0.792 ms | 1.21x |
-| 1 x 32 x 8192 x 128, causal | 2.49 ms | 221 | 2.78 ms | 1.11x |
-| 4 x 32 x 2048 x 128, causal | 0.685 ms | 201 | 0.763 ms | 1.08x |
-| 1 x 32 x 4096 x 64, causal | 0.331 ms | 208 | 0.420 ms | 1.23x |
-| 1 x 32/8 x 4096 x 128, causal (GQA) | 0.636 ms | 216 | 0.786 ms | 1.21x |
-| decode: 1 query, 4096 keys, 32 x 128 | 46 us | 1,459 GB/s | 64 us | 1.35x |
-| decode: 1 query, 4096 keys, 32/8 x 128 (GQA) | 17 us | 970 GB/s | 37 us | 1.80x |
-| decode: 1 query, 128K keys, 32 x 128 | 1.27 ms | 1,693 GB/s | 1.30 ms | 1.02x |
-| decode: 1 query, 128K keys, 32/8 x 128 (GQA) | 324 us | 1,655 GB/s | 357 us | 1.09x |
-| decode: batch 8, 4096 keys, 32/8 x 128 (GQA) | 87 us | 1,548 GB/s | 104 us | 1.15x |
+| shape | ours (v4) | TFLOPS | torch flash | ours / flash | torch cuDNN | ours / cuDNN |
+|---|---|---|---|---|---|---|
+| 1 x 32 x 4096 x 128 | 1.15 ms | 239 | 1.45 ms | 1.24x | 1.35 ms | 1.16x |
+| 1 x 32 x 4096 x 128, causal | 0.601 ms | 229 | 0.791 ms | 1.30x | 0.774 ms | 1.28x |
+| 1 x 32 x 8192 x 128, causal | 2.34 ms | 235 | 2.78 ms | 1.17x | 2.72 ms | 1.15x |
+| 4 x 32 x 2048 x 128, causal | 0.646 ms | 213 | 0.762 ms | 1.15x | 0.752 ms | 1.13x |
+| 1 x 32 x 4096 x 64, causal | 0.316 ms | 217 | 0.416 ms | 1.27x | 0.394 ms | 1.21x |
+| decode: 1 query, 4096 keys, 32 x 128 | 50 us | 1,346 GB/s | 71 us | 1.31x | 69 us | 1.29x |
+| 1 x 32/8 x 4096 x 128, causal (GQA) | 0.636 ms | 216 | 0.786 ms | 1.21x | | |
+| decode: 1 query, 4096 keys, 32/8 x 128 (GQA) | 17 us | 970 GB/s | 37 us | 1.80x | | |
+| decode: 1 query, 128K keys, 32 x 128 | 1.27 ms | 1,693 GB/s | 1.30 ms | 1.02x | | |
+| decode: 1 query, 128K keys, 32/8 x 128 (GQA) | 324 us | 1,655 GB/s | 357 us | 1.09x | | |
+| decode: batch 8, 4096 keys, 32/8 x 128 (GQA) | 87 us | 1,548 GB/s | 104 us | 1.15x | | |
 
-Causal TFLOPS use the halved FLOP count FlashAttention reports. Nsight puts the tensor pipe at
-89 to 90% active with `math_pipe_throttle` on top; the rest is the softmax between the two
-products, which is what warp specialization would take next. Decode is K and V streamed once
-per K/V head: GB/s counts each K/V head once for its whole group of query heads, so the GQA
-rows read a quarter of the bytes the same query heads would in MHA. Past 16K tokens both
-layouts run at 1,600 to 1,700 GB/s, above the 1,532 GB/s of `cudaMemcpy` (a read-only stream
-does not pay the copy's write turnaround; Nsight puts the DRAM at 93 to 95% of its 1,792 GB/s
-peak there). At 4K tokens a step is 17 to 46 us and launch plus pipeline fill are a visible
-share of it.
+Causal TFLOPS use the halved FLOP count FlashAttention reports; times are the C++ bench's
+medians, ratios are `scripts/bench_torch.py`'s. Nsight puts variant 4's tensor pipe at 93 to
+94% active (variant 3: 87 to 90%) with `math_pipe_throttle` on top; what is left is the block
+prologue and the tiles where both warps of a scheduler still meet in their softmaxes. Decode is K and V streamed once per K/V head: GB/s counts each K/V head once for its whole
+group of query heads. Past 16K tokens both layouts run at 1,600 to 1,700 GB/s, above the
+1,532 GB/s of `cudaMemcpy` (a read-only stream does not pay the copy's write turnaround; Nsight
+puts the DRAM at 93 to 95% of its 1,792 GB/s peak there).
 
 ### fp32 GEMM
 
@@ -176,7 +179,7 @@ numbers are quoted in each design note.
 | `softmax` | three pass, warp online softmax, block online softmax, single pass with the row in registers | `torch.softmax` |
 | `sgemm` fp32 | naive, smem tile, 8x8 register tile, cp.async, register prefetch with swizzle, 256x128 tile | cuBLAS SGEMM |
 | `hgemm` bf16 | WMMA, smem tile, cp.async, `mma.sync` + `ldmatrix` with swizzle, 3 stages and split-K, persistent Stream-K, TMA with a producer warp, a weight-streaming kernel for decode | cuBLAS GemmEx |
-| `attention` bf16 | warp per query row, CUDA-core flash attention, `mma.sync` + `ldmatrix` flash attention, split-KV tail, GQA and a flash-decoding kernel for long caches | `F.scaled_dot_product_attention` |
+| `attention` bf16 | warp per query row, CUDA-core flash attention, `mma.sync` + `ldmatrix` flash attention, split-KV tail, TMA mbarrier pipeline, GQA and a flash-decoding kernel for long caches | `F.scaled_dot_product_attention` |
 | `bench_peak` | | measures the card's real `mma.sync` and FMA peaks and the clock they run at |
 
 Every kernel takes a `variant` argument so each rung can be run, timed and tested on its own.
@@ -204,7 +207,7 @@ make ncu              # Nsight Compute on the top two rungs of every ladder, nee
 ```bash
 ./build/bench_hgemm --m=16 --n=4096 --k=4096 --variant=3
 ./build/bench_rmsnorm --rows=16384 --cols=8192
-./build/bench_attention --b=1 --h=32 --s=4096 --d=128 --causal=1 --variant=3
+./build/bench_attention --b=1 --h=32 --s=4096 --d=128 --causal=1 --variant=4
 ```
 
 Each bench checks every variant against a reference, CPU double precision for the row kernels
@@ -241,8 +244,8 @@ numbers, and which Nsight metric moved:
   [sgemm](docs/design/sgemm.md), [hgemm](docs/design/hgemm.md),
   [attention](docs/design/attention.md)
 
-Things I'd still like to do: a TMA producer warp on the Stream-K schedule, warp specialization
-for the softmax gap in attention, CUDA graphs for the 2 us a lone decode launch pays over the
+Things I'd still like to do: a TMA producer warp on the Stream-K schedule, a persistent grid
+for attention's block prologue, CUDA graphs for the 2 us a lone decode launch pays over the
 back-to-back rate, and a GB10 run when the Spark arrives. Both cards
 are consumer Blackwell, so `mma.sync`, `cp.async` and TMA are available and `tcgen05` isn't.
 

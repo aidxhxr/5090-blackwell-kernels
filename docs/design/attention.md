@@ -82,6 +82,7 @@ rows past `S_q` in a zero-filled tile go through the same code.
 | 1 | 128-row Q tile, 64-key K/V tiles converted to fp32 in shared memory, 8 warps x 16 rows, CUDA-core FMAs on 4x8 (scores) and 4xD/8 (output) register tiles, the next tile prefetched into registers | every K/V element loaded once per 128 rows; FlashAttention-2 without tensor cores |
 | 2 | `mma.sync.m16n8k16` + `ldmatrix`: Q fragments in registers for the whole KV loop, S and PV on the tensor cores, P repacked from the S accumulators, 3-stage `cp.async` pipeline on K and V | the tensor cores, and no shared-memory round trip for P |
 | 3 | variant 2's kernel with a schedule: the tiles of the last partial wave are split along the keys over the idle SMs and merged by a combine kernel; `S_q <= 64` runs a 64-row tile; decode shapes (the query rows sharing a K/V head fit 16 rows) run the flash-decoding kernel of the "Long-context decode" section | wave quantization on 170 SMs, a short query that no longer pays for 128 rows, and a decode step that streams each K/V head once for its whole group of query heads |
+| 4 | variant 3's tile with K and V fed by TMA into full / empty mbarrier stages issued by one lane, no block-wide barrier in the KV loop | the per-tile `__syncthreads` that kept both warps of a scheduler in the same phase, so their softmaxes were a hole in the tensor pipe |
 
 ### Variant 0
 
@@ -380,6 +381,125 @@ the count from 107 K to 41 K), 0.1 µs per block. The tensor pipe at 16% and iss
 6% say the kernel is waiting on DRAM and nothing else, which is what a decode kernel should
 be doing.
 
+### Variant 4: the mbarrier pipeline
+
+The plan for this rung was FlashAttention-3's ping-pong: two groups of four warps taking turns
+on the tensor pipe through named barriers, so that one group's softmax always runs under the
+other group's `mma`. Building it needed the K/V pipeline to stop using `__syncthreads`, because
+a block-wide barrier once per tile would put the two groups back in phase. So the first step
+was the pipeline, the second the turns. The pipeline alone gave the whole gain, and every
+version of the turns gave some of it back. Both halves are below, with the numbers.
+
+**The pipeline.** K and V tiles arrive by TMA (`cp.async.bulk.tensor`, the same machinery as
+`hgemm` v5) into three 32 KB stages, each with a "full" mbarrier the copy engine completes and
+an "empty" mbarrier every warp arrives on after its `P V`. The Q tile comes the same way
+through stage 0 before the loop, and the bookkeeping counts it as load 0 and KV tile `t` as
+load `t + 1`, so load `u` sits in stage `u mod 3` and is that stage's `u / 3`-th use: the
+producer waits on "empty" with parity `(u/3 - 1) & 1` before refilling, a warp waits on "full"
+with parity `(u/3) & 1` before reading. The tensor maps are 3-D, `[B·H][S][D]` with a box of
+`1 x rows x 64` (128 bytes, one swizzle span; 128 rows for Q, 64 for K and V), so a box that
+hangs off the end of a head is zero-filled by the copy engine instead of reading the next head,
+and a `D = 128` tile is two boxes side by side. The 128-byte swizzle puts logical chunk `c` of
+row `r` at `c XOR (r mod 8)` within the row's 128 bytes, and `ldmatrix` addresses go through
+one function, `box_off(row, chunk)`, that adds the box offset and the XOR.
+
+The loads are issued by lane 0 of warp 0, not by a producer warp. A ninth warp would have cut
+the register budget to 224 per thread (65,536 / 288), and there is nowhere in this kernel for
+a load to wait: at the top of iteration `it` the stage being refilled held tile `it - 1`, whose
+`P V` every warp finished before it could reach this tile's "full" wait, so the producer's
+"empty" wait completes at once and the cost is four TMA instructions on one lane per tile. The
+prefetch distance is two tiles, about 16,000 cycles at the rate the pipe consumes them; a 32 KB
+tile from L2 needs a few hundred.
+
+What the pipeline changes for the warps: no `cp.async` addresses to compute (the instruction
+count for the 4096 causal shape drops from 175.6 M to 164.5 M), no `__syncthreads` per tile,
+and, the part that matters, no moment when all eight warps are at the same point. In variant 3
+the two warps of each scheduler leave the barrier together, issue their 64 `Q K^T` `mma`
+together, and then sit in their softmaxes together while the pipe has nothing queued. Without
+the barrier the two warps drift apart within a few tiles, and while one is in its softmax the
+other is usually in one of its two products. Nsight (below) puts the pipe at 92.8% active on
+the causal shape and 94.1% non-causal, from 87.4% and 90.1%.
+
+**The turns.** With the pipeline in place I added the ping-pong as compile-time schedules
+(`-DSPARK_ATTN_V4_EXPERIMENTS`, `SPARK_ATTN_V4_MODE`), and measured them on the 4096 shapes
+with `--iters=20`. Registers and shared memory are `ptxas -v` and the dynamic allocation; all
+of them run one block per SM. Times are from the same session as the variant 3 row, which was
+4 TFLOPS under the morning's full run on a card the other agents were also heating.
+
+| schedule | regs | smem | causal TFLOPS | non-causal TFLOPS |
+|---|---|---|---|---|
+| variant 3 (`cp.async`, `__syncthreads` per tile) | 248 | 96 KB | 211.8 | 221.5 |
+| **TMA + mbarrier pipeline, no turns (variant 4)** | **204** | **99.3 KB** | **225.0** | **235.4** |
+| ping-pong, two turns per tile (`Q K^T`, then `P V`), groups = warps 0-3 / 4-7 | 206 | 99.3 KB | 198.6 | 207.5 |
+| ping-pong, one turn per tile (`Q K^T` of t+1 with `P V` of t, FlashAttention-3's order) | 216 | 99.3 KB | 206.7 | 216.1 |
+| ping-pong, two turns, groups = even / odd warps | 206 | 99.3 KB | 114.0 | 118.7 |
+| ping-pong, one turn, groups = even / odd warps | 216 | 99.3 KB | 117.4 | 122.2 |
+| pipeline + a warp skips a causal tile whose keys all follow its rows | 212 | 99.3 KB | 225.1 | 235.4 |
+| pipeline + the O rescale skipped on a warp-uniform "no max moved" vote | 190 | 99.3 KB | 220.9 | 231.5 |
+| pipeline + both | 214 | 99.3 KB | 227.6 | not measured |
+
+Two things the table says. The even/odd rows are the proof of where warps live: at half speed,
+every turn had one group's four warps on two of the four schedulers and nothing on the other
+two, which is only possible if warps `w` and `w + 4` share a scheduler. So the 0-3 / 4-7
+grouping is the right one, and it still lost 8% to the pipeline without turns. The reason is
+`mma.sync` itself. A turn hands the pipe of each scheduler to one warp, and one warp does not
+keep it full: each `ldmatrix` it needs has a 30-cycle shared-memory latency, each `mma`
+depends on the one before it on the same accumulator, and every such gap idles the pipe, where
+a second warp in the same phase would have an `mma` ready. Nsight on the one-turn schedule
+(same shape, same session) shows the pipe at 84.4% against the pipeline's 92.8%, with
+`math_pipe_throttle` down from 9.91 to 4.07 cycles per issue, `barrier` up from nothing to
+6.53, `short_scoreboard` doubled to 0.38 and 15.14 cycles between a warp's issues: the group
+holding the turn was not blocked by a busy pipe, it was waiting on its own `ldmatrix` results,
+and the other group was waiting on it. FlashAttention-3 gets its ping-pong gain on Hopper because `wgmma` reads its operands
+from shared memory asynchronously and one warpgroup's instruction stream does saturate the
+pipe; `mma.sync` on this card wants two warps issuing at once, and the schedule that lets them
+drift gives it that.
+
+The two micro-optimizations are neutral or worse. Skipping the fully masked half of the second
+diagonal tile removes 1.5% of the causal tile products but does not move the time: the tile
+is the block's last, the warp that skips it frees the pipe for the warp it shares a scheduler
+with, and that warp alone cannot use it. The rescale skip trades 64 `FMUL` that were hidden
+under the pipe for a `__any_sync` vote and a branch that are not. The row with both is a real
+1% on one shape and a loss on `D = 64` (210.7 against 213.0), so neither shipped.
+
+**Two blocks per SM** was the other route to overlapping softmax with `mma`, and the arithmetic
+says no at `D = 128`: 128 registers per thread with O (64), Q (32) and S (32) alone at 128, and
+49 KB of shared memory per block against a 32 KB Q tile plus at least two 16 KB K/V stages.
+Moving Q to shared memory frees the 32 registers but costs 32 KB of the 49. `D = 64` would fit
+(Q 16 KB, two 16 KB stages, about 110 registers); it is the minor shape and was not tried.
+
+**Nsight, 4096 causal, same session** (`--set full`, one launch, 2.51 to 2.53 GHz under the
+profiler):
+
+| | variant 3 | variant 4 |
+|---|---|---|
+| tensor pipe active | 87.4% | 92.8% (94.1% non-causal) |
+| issue slots busy | 13.6% | 13.7% |
+| cycles per issued instruction | 14.41 | 14.24 |
+| of which `math_pipe_throttle` | 9.63 | 9.91 |
+| `wait` | 2.04 | 2.25 |
+| `not_selected` | 0.40 | 0.33 |
+| `mio_throttle` | 0.31 | 0.03 |
+| `long_scoreboard` | 0.28 | 0.20 |
+| `short_scoreboard` | 0.19 | 0.19 |
+| instructions executed | 175.6 M | 164.5 M |
+| registers | 248 | 204 |
+| dynamic shared memory | 96 KB | 99.3 KB |
+| L2 hit rate | 90.5% | 88.7% |
+| DRAM throughput | 8.4% | 9.0% |
+| shared bank conflicts | 6 | 34,730 (34 per block, the barrier words) |
+
+The stall mix barely moves: the kernel was and is throttled by the tensor pipe, and what
+changed is how often the pipe had nothing queued. `mio_throttle` is the `cp.async` issue queue,
+gone with the copies. The bank conflicts are the mbarrier arrivals and polls on the same eight
+bytes, 34 per block, nothing in the tiles.
+
+**What variant 4 is for.** `S_q <= 64` still runs variant 3's 64-row tile with the split,
+which is bound by streaming the cache and gains nothing from the pipe. Everything else runs the
+TMA kernel, including the tail split and the combine kernel, which are shared with variant 3
+(`v2::split_tail_tiles`, `v2::launch_combine`). Every launch encodes three tensor maps on the
+host, 27 ns each.
+
 ## Correctness
 
 `bench_attention` checks every output row of the small shapes against a CPU double-precision
@@ -400,20 +520,28 @@ Driver 595.58, CUDA 13.2, medians of 50 launches after the clock ramp, `bench_at
 defaults. Nsight Compute runs at a fixed 2.53 GHz; the timed runs boost higher.
 
 - **The roof.** 258.7 TFLOPS of dense bf16 `mma.sync` at 2,976 MHz (`bench_peak`), 239 at the
-  2.75 GHz a sustained GEMM throttles to. Variant 3 reaches 224.5 TFLOPS on the non-causal
-  4096 shape with the tensor pipe 90.1% active in Nsight, which puts the clock during the timed
-  run at about 2.86 GHz: attention throttles less than a GEMM at the same pipe utilization.
-  87% of the measured peak, 94% of the throttled roof.
+  2.75 GHz a sustained GEMM throttles to. Variant 4 reaches 239.3 TFLOPS on the non-causal
+  4096 shape with the tensor pipe 94.1% active in Nsight, which puts the clock during the timed
+  run at about 2.92 GHz: attention throttles less than a GEMM at the same pipe utilization
+  (variant 3, at 224.5 TFLOPS and 90.1%, ran at about 2.86 GHz). 92.5% of the measured peak,
+  and above the throttled GEMM roof.
 - **What limits variant 2 / 3.** Nsight on 4096 causal: tensor pipe **89.3% active** (90.1%
-  non-causal), issue slots 13.6% busy, 0.55 instructions per cycle, dominant stall
-  `math_pipe_throttle` at 9.7 of the 14.5 cycles between a warp's issues, then `wait` (2.1,
-  fixed-latency dependencies), `barrier` 0.3, `long_scoreboard` 0.3, `mio_throttle` 0.3.
-  Shared-memory bank conflicts: 0 (16 on the non-causal run). Shared load wavefronts 22% of
-  peak. L2 hit rate 90.4% (94.7% non-causal), DRAM throughput 8.5% of peak. So the kernel is
-  issuing to the tensor pipe as fast as it takes work, the loads are hidden, and the 10% of
-  idle pipe is the softmax gaps where both warps of a scheduler are between products, plus
-  the per-block prologue and epilogue. Occupancy is 16.7% (8 warps), fixed by the 248
-  registers and the 96 KB tile; a second block per SM would need both halved.
+  non-causal; 87.4% in the later session that profiled variant 4), issue slots 13.6% busy,
+  0.55 instructions per cycle, dominant stall `math_pipe_throttle` at 9.7 of the 14.5 cycles
+  between a warp's issues, then `wait` (2.1, fixed-latency dependencies), `barrier` 0.3,
+  `long_scoreboard` 0.3, `mio_throttle` 0.3. Shared-memory bank conflicts: 0 (16 on the
+  non-causal run). Shared load wavefronts 22% of peak. L2 hit rate 90.4% (94.7% non-causal),
+  DRAM throughput 8.5% of peak. So the kernel is issuing to the tensor pipe as fast as it takes
+  work, the loads are hidden, and the 10% of idle pipe is the softmax gaps where both warps of
+  a scheduler are between products, plus the per-block prologue and epilogue. Occupancy is
+  16.7% (8 warps), fixed by the 248 registers and the 96 KB tile; a second block per SM would
+  need both halved.
+- **What limits variant 4.** Tensor pipe 92.8% active causal, 94.1% non-causal, the same
+  stall mix as variant 3 (the table in the variant 4 section). The remaining 6 to 7% is the
+  per-block prologue (barrier init, the Q tile and the first K/V tile arriving before any `mma`
+  can issue, 1,028 blocks of 33 tiles on the causal shape) plus the tiles where both warps of a
+  scheduler still land in their softmaxes together. Forcing them apart with named barriers
+  measured slower every way it was tried; the numbers and the reason are in that section.
 - **The causal diagonal.** 215 TFLOPS by the halved count is 220 by the tiles actually
   computed. A 64-row Q tile would waste half as much on the diagonal at twice the K/V traffic
   per FLOP; not tried.
@@ -421,61 +549,77 @@ defaults. Nsight Compute runs at a fixed 2.53 GHz; the timed runs boost higher.
   peak, 8.6x the instruction count of variant 3 for the same work. The fp32 staging of K and
   V in shared memory (32 KB each) is what keeps conversions out of the loop; register
   prefetch of the next tile costs 32 registers and takes it to 255.
-- **Against torch** (`F.scaled_dot_product_attention`, which picked its FlashAttention-2
-  kernel on every shape; cuDNN's SDPA forced through `sdpa_kernel` is 3 to 7% faster than
-  that on the prefill shapes and still behind variant 3):
+- **Against torch** (`F.scaled_dot_product_attention`, which picks its FlashAttention-2
+  kernel on every shape when left to choose; the cuDNN column forces cuDNN's SDPA with
+  `scripts/bench_torch.py --only attention --sdpa-backend cudnn`, and it is 2 to 7% faster
+  than flash on the prefill shapes):
 
-| shape | v3 ms | v3 TFLOPS | torch ms | torch TFLOPS | v3 / torch |
-|---|---|---|---|---|---|
-| b1 h32 s4096 d128 | 1.246 | 220.5 | 1.458 | 188.6 | 1.17x |
-| b1 h32 s4096 d128 causal | 0.644 | 213.3 | 0.789 | 174.1 | 1.23x |
-| b1 h32 s8192 d128 causal | 2.498 | 220.1 | 2.776 | 198.0 | 1.11x |
-| b4 h32 s2048 d128 causal | 0.705 | 194.9 | 0.762 | 180.3 | 1.08x |
-| b1 h32 s4096 d64 causal | 0.341 | 201.4 | 0.417 | 165.0 | 1.22x |
-| b1 h32 sq1 skv4096 d128 (decode) | 0.048 | 1,414 GB/s | 0.064 | 1,047 GB/s | 1.35x |
+| shape | v4 ms | v4 TFLOPS | flash ms | v4 / flash | cuDNN ms | v4 / cuDNN |
+|---|---|---|---|---|---|---|
+| b1 h32 s4096 d128 | 1.171 | 234.8 | 1.453 | 1.24x | 1.354 | 1.16x |
+| b1 h32 s4096 d128 causal | 0.609 | 225.8 | 0.791 | 1.30x | 0.774 | 1.28x |
+| b1 h32 s8192 d128 causal | 2.363 | 232.7 | 2.776 | 1.17x | 2.716 | 1.15x |
+| b4 h32 s2048 d128 causal | 0.664 | 207.1 | 0.762 | 1.15x | 0.752 | 1.13x |
+| b1 h32 s4096 d64 causal | 0.328 | 209.7 | 0.416 | 1.27x | 0.394 | 1.21x |
+| b1 h32 sq1 skv4096 d128 (decode) | 0.054 | 1,247 GB/s | 0.071 | 1.31x | 0.069 | 1.29x |
 
-  (`scripts/bench_torch.py` timings, 50 iterations, K and V rotated past L2 for the decode
-  row; the C++ bench, which allocates less between launches, gets 46 µs there. The GQA and
-  long-context decode rows are in the "Long-context decode" section.)
+  (`scripts/bench_torch.py` timings, 100 iterations, K and V rotated past L2 for the decode
+  row, where variant 4 runs variant 3's kernel; the C++ bench, which allocates less between
+  launches, gets 50 µs there. Variant 3 on the same script was 1.17x, 1.23x, 1.11x, 1.08x,
+  1.22x and 1.38x over flash. The GQA and long-context decode rows are in the "Long-context
+  decode" section.)
 
 ## Results (RTX 5090, sm_120, CUDA 13.2, driver 595.58)
 
 From the default `bench_attention` sweep (median of 50). TFLOPS by the halved causal count;
 the decode rows in GB/s of Q, K, V and O once (K and V once per K/V head). The decode rows
 of variants 0 to 2 read each K/V head once per query head, so under GQA they land at a
-quarter of their MHA figure; variant 3 is the flash-decoding kernel.
+quarter of their MHA figure; variant 3 is the flash-decoding kernel. Variant 4's rows are the later sweep
+the same day (its v3 rows agreed with the morning's to within 1%); on the decode rows
+variant 4 runs variant 3's paths, so it has no row of its own.
 
-| shape | v0 ms / TFLOPS | v1 | v2 | v3 |
-|---|---|---|---|---|
-| b1 h4 s512 d128 | 0.0810 / 6.6 | 0.0851 / 6.3 | 0.0298 / 18.0 | **0.0124 / 43.5** |
-| b1 h4 s512 d128 causal | 0.0788 / 3.4 | 0.0850 / 3.2 | 0.0298 / 9.0 | **0.0185 / 14.5** |
-| b1 h4 s512 d64 | 0.0564 / 4.8 | 0.0441 / 6.1 | 0.0155 / 17.4 | **0.0084 / 31.8** |
-| b1 h4 s200 d128 causal | 0.0298 / 1.4 | 0.0441 / 0.9 | 0.0155 / 2.7 | **0.0124 / 3.3** |
-| b1 h32 s4096 d128 | 26.28 / 10.5 | 5.096 / 53.9 | 1.414 / 194.5 | **1.224 / 224.5** |
-| b1 h32 s4096 d128 causal | 13.76 / 10.0 | 2.799 / 49.1 | **0.639 / 215.2** | 0.640 / 214.8 |
-| b1 h32 s8192 d128 causal | 57.06 / 9.6 | 11.24 / 48.9 | **2.486 / 221.1** | 2.487 / 221.1 |
-| b4 h32 s2048 d128 causal | 13.10 / 10.5 | 2.897 / 47.4 | 0.687 / 200.1 | **0.686 / 200.4** |
-| b1 h32 s4096 d64 causal | 9.389 / 7.3 | 1.150 / 59.8 | **0.329 / 209.1** | 0.331 / 207.8 |
-| b1 hq8 hkv2 s512 d128 causal | 0.0850 / 6.3 | 0.0830 / 6.5 | 0.0297 / 18.1 | **0.0192 / 28.0** |
-| b1 hq32 hkv8 s4096 d128 causal | 13.82 / 9.9 | 2.453 / 56.0 | 0.636 / 216.1 | **0.636 / 216.0** |
-| b1 h32 sq1 skv4096 d128 | 1.260 / 53 GB/s | 0.648 / 104 GB/s | 0.200 / 336 GB/s | **0.046 / 1,459 GB/s** |
-| b1 hq32 hkv8 sq1 skv4096 d128 | 1.250 / 13 GB/s | 0.646 / 26 GB/s | 0.200 / 84 GB/s | **0.017 / 970 GB/s** |
-| b1 h32 sq1 skv131072 d128 | 40.16 / 53 GB/s | 20.60 / 104 GB/s | 6.280 / 342 GB/s | **1.269 / 1,693 GB/s** |
-| b1 hq32 hkv8 sq1 skv131072 d128 | 39.71 / 14 GB/s | 20.56 / 26 GB/s | 6.274 / 86 GB/s | **0.324 / 1,655 GB/s** |
-| b8 hq32 hkv8 sq1 skv4096 d128 | 1.215 / 111 GB/s | 1.336 / 101 GB/s | 0.400 / 336 GB/s | **0.087 / 1,548 GB/s** |
+| shape | v0 ms / TFLOPS | v1 | v2 | v3 | v4 |
+|---|---|---|---|---|---|
+| b1 h4 s512 d128 | 0.0810 / 6.6 | 0.0851 / 6.3 | 0.0298 / 18.0 | **0.0124 / 43.5** | 0.0131 / 41.1 |
+| b1 h4 s512 d128 causal | 0.0788 / 3.4 | 0.0850 / 3.2 | 0.0298 / 9.0 | **0.0185 / 14.5** | 0.0191 / 14.1 |
+| b1 h4 s512 d64 | 0.0564 / 4.8 | 0.0441 / 6.1 | 0.0155 / 17.4 | **0.0084 / 31.8** | 0.0090 / 30.0 |
+| b1 h4 s200 d128 causal | 0.0298 / 1.4 | 0.0441 / 0.9 | 0.0155 / 2.7 | **0.0124 / 3.3** | 0.0130 / 3.1 |
+| b1 h32 s4096 d128 | 26.28 / 10.5 | 5.096 / 53.9 | 1.414 / 194.5 | 1.224 / 224.5 | **1.149 / 239.3** |
+| b1 h32 s4096 d128 causal | 13.76 / 10.0 | 2.799 / 49.1 | 0.639 / 215.2 | 0.640 / 214.8 | **0.601 / 228.7** |
+| b1 h32 s8192 d128 causal | 57.06 / 9.6 | 11.24 / 48.9 | 2.486 / 221.1 | 2.487 / 221.1 | **2.337 / 235.2** |
+| b4 h32 s2048 d128 causal | 13.10 / 10.5 | 2.897 / 47.4 | 0.687 / 200.1 | 0.686 / 200.4 | **0.646 / 212.9** |
+| b1 h32 s4096 d64 causal | 9.389 / 7.3 | 1.150 / 59.8 | 0.329 / 209.1 | 0.331 / 207.8 | **0.316 / 217.3** |
+| b1 hq8 hkv2 s512 d128 causal | 0.0850 / 6.3 | 0.0830 / 6.5 | 0.0297 / 18.1 | **0.0192 / 28.0** | (final run) |
+| b1 hq32 hkv8 s4096 d128 causal | 13.82 / 9.9 | 2.453 / 56.0 | 0.636 / 216.1 | **0.636 / 216.0** | (final run) |
+| b1 h32 sq1 skv4096 d128 | 1.260 / 53 GB/s | 0.648 / 104 GB/s | 0.200 / 336 GB/s | **0.046 / 1,459 GB/s** | 0.050 / 1,346 GB/s |
+| b1 hq32 hkv8 sq1 skv4096 d128 | 1.250 / 13 GB/s | 0.646 / 26 GB/s | 0.200 / 84 GB/s | **0.017 / 970 GB/s** | n/a |
+| b1 h32 sq1 skv131072 d128 | 40.16 / 53 GB/s | 20.60 / 104 GB/s | 6.280 / 342 GB/s | **1.269 / 1,693 GB/s** | n/a |
+| b1 hq32 hkv8 sq1 skv131072 d128 | 39.71 / 14 GB/s | 20.56 / 26 GB/s | 6.274 / 86 GB/s | **0.324 / 1,655 GB/s** | n/a |
+| b8 hq32 hkv8 sq1 skv4096 d128 | 1.215 / 111 GB/s | 1.336 / 101 GB/s | 0.400 / 336 GB/s | **0.087 / 1,548 GB/s** | n/a |
 
 The small shapes are where the tail split matters most: 16 tiles on 170 SMs become 128
 slices, 2.4x on the 512-token shape. The 4096-token decode row moved from 49 µs on the 64-row
 tile to 46 µs on the flash-decoding kernel; the GQA and 128K rows are its real work. Variant 1's D = 64 time moved between 1.15 and 1.57 ms
 across runs on a card other jobs were also heating; the other rows repeat to within 1%.
+Variant 4 is 6.2 to 6.6% faster than variant 3 on every prefill shape and within a
+microsecond of it on the 512-token shapes, where a slice is one to four KV tiles and the
+prologue (barrier init, the Q box, the first K/V box) is most of the launch; the decode row
+is the same kernel. The default is variant 4 for every shape.
 
 ## What remains
 
-- **Warp specialization.** The 10% of idle tensor pipe is the softmax. FlashAttention-3's
-  answer is producer/consumer warps, or two consumer warp groups that ping-pong so one is in
-  its softmax while the other issues `mma`. On this card that means fitting two blocks per
-  SM (registers under 128, tiles under 48 KB) or a 16-warp block with a hand-scheduled
-  barrier pattern.
+- **The last 6%.** The tensor pipe is 93 to 94% active in variant 4. Part of the rest is the
+  block prologue: every one of the 1,028 blocks on the causal 4096 shape initializes its
+  barriers, waits for its Q box and its first K/V box, and only then issues an `mma`. A
+  persistent grid (one block per SM walking a tile queue, as `hgemm` v4 does) would pay that
+  once per SM and could prefetch the next tile's Q during the current tile's last products.
+  The other part is the tiles where both warps of a scheduler still meet in their softmaxes;
+  a 128-key tile would halve how often that can happen per FLOP, at 32 more registers for S
+  (204 today) and 64 KB per stage.
+- **Ping-pong, revisited.** The named-barrier schedules lost because one `mma.sync` warp
+  does not fill the pipe alone. A version that keeps two warps per scheduler in the `mma`
+  phase and only forbids two softmaxes at once (a barrier a warp takes before its softmax and
+  releases after, with one slot per scheduler) has not been tried.
 - **Backward**, which needs the log-sum-exp saved from the forward (`m + log2(l)` per row,
   free here) and two more kernels.
 - **GQA prefill with grouped tiles.** The prefill kernels read a K/V head once per query head
