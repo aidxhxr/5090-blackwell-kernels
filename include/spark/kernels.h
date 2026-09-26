@@ -100,4 +100,25 @@ int hgemm_num_variants();
 // Lets a caller pick the fastest variant that fits instead of catching the exception.
 bool hgemm_supports(int M, int N, int K, int variant);
 
+// ---- Fused attention (scaled dot product, forward) ----------------------------------------
+// O = softmax(Q K^T / sqrt(D)) V per (b, h), for Q, O = [B, H, S_q, D] and K, V = [B, H, S_kv, D],
+// row-major contiguous, bf16 in/out, fp32 scores / softmax / accumulation. MHA only (the same
+// H for Q and K/V), D in {64, 128}, no dropout, no bias. `causal` masks key j from query i
+// when j > i (top-left alignment, as torch's is_causal). Any S_q, S_kv >= 1; 16-byte aligned
+// pointers.
+// variant 0: one warp per query row, lanes own D/32 columns, online softmax key by key
+// variant 1: 128-row Q tile, 64-row K/V tiles as fp32 in shared memory, CUDA-core FMAs,
+//            online softmax per row with the O accumulator rescaled when the row max moves
+// variant 2: mma.sync.m16n8k16 + ldmatrix flash attention: Q fragments in registers, S and
+//            P V on the tensor cores, P repacked from the S accumulators without touching
+//            shared memory, 3-stage cp.async pipeline on K and V
+// variant 3: variant 2 scheduled: the tiles of the last partial wave are split along the keys
+//            over the idle SMs and merged by a combine kernel (fp32 partials in a per-device
+//            workspace shared by every stream), and S_q <= 64 (decode) runs a 64-row tile
+void attention_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_bfloat16* V,
+                    __nv_bfloat16* O, int B, int H, int S_q, int S_kv, int D, bool causal,
+                    int variant, cudaStream_t stream);
+int attention_num_variants();
+bool attention_supports(int S_q, int S_kv, int D, int variant);
+
 }  // namespace spark

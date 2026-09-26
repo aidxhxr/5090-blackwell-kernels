@@ -34,6 +34,8 @@ profile() {
   echo "    -> $RESULTS/ncu_$name.ncu-rep, $RESULTS/ncu_$name.txt" >&2
 }
 
+profile attention_v3 'attention_v2_kernel' "$BUILD_DIR/bench_attention" --variant=3 --b=1 --h=32 --s=4096 --d=128 --causal=1 --iters=1 --warmup=0
+profile attention_v1 'attention_v1_kernel' "$BUILD_DIR/bench_attention" --variant=1 --b=1 --h=32 --s=4096 --d=128 --causal=1 --iters=1 --warmup=0
 profile hgemm_v3   'hgemm_v3' "$BUILD_DIR/bench_hgemm" --variant=3 --m=8192 --n=8192 --k=8192 --iters=1 --warmup=0
 profile hgemm_v2   'hgemm_v2' "$BUILD_DIR/bench_hgemm" --variant=2 --m=8192 --n=8192 --k=8192 --iters=1 --warmup=0
 profile hgemm_v0   'hgemm_v0' "$BUILD_DIR/bench_hgemm" --variant=0 --m=4096 --n=4096 --k=4096 --iters=1 --warmup=0
