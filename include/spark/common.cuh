@@ -279,6 +279,17 @@ __device__ __forceinline__ void tma_load_2d(void* smem_dst, const CUtensorMap* m
         "l"(reinterpret_cast<uint64_t>(map)), "r"(smem_u32(bar)), "r"(c0), "r"(c1)
         : "memory");
 }
+// 3-D form: coordinates (c0, c1, c2) with c0 along the innermost dimension. Used by the
+// attention kernel, whose tensors are [B*H][S][D] and whose tiles must not run from one head
+// into the next: a box that hangs off the end of the S dimension is zero-filled instead.
+__device__ __forceinline__ void tma_load_3d(void* smem_dst, const CUtensorMap* map, uint64_t* bar,
+                                            int c0, int c1, int c2) {
+    asm volatile(
+        "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes"
+        " [%0], [%1, {%3, %4, %5}], [%2];\n" ::"r"(smem_u32(smem_dst)),
+        "l"(reinterpret_cast<uint64_t>(map)), "r"(smem_u32(bar)), "r"(c0), "r"(c1), "r"(c2)
+        : "memory");
+}
 // Pull the descriptor into the TMA unit's cache ahead of the first load.
 __device__ __forceinline__ void prefetch_tensormap(const CUtensorMap* map) {
     asm volatile("prefetch.tensormap [%0];\n" ::"l"(reinterpret_cast<uint64_t>(map)) : "memory");
@@ -287,6 +298,13 @@ __device__ __forceinline__ void prefetch_tensormap(const CUtensorMap* map) {
 // warps of a warp-specialized kernel) synchronize without the rest of it.
 __device__ __forceinline__ void named_barrier_sync(int id, int nthreads) {
     asm volatile("bar.sync %0, %1;\n" ::"r"(id), "r"(nthreads) : "memory");
+}
+// bar.arrive: counts toward the same barrier without waiting on it. A barrier of `nthreads`
+// completes once syncs plus arrives reach that count, so 128 threads that arrive and 128 that
+// sync on a 256-thread barrier release the 128 that sync: the hand-off between the two
+// consumer groups of the ping-pong attention kernel.
+__device__ __forceinline__ void named_barrier_arrive(int id, int nthreads) {
+    asm volatile("bar.arrive %0, %1;\n" ::"r"(id), "r"(nthreads) : "memory");
 }
 
 // Host side: encode a tensor map for a row-major 2-D bf16 matrix (rows x cols, cols
@@ -325,6 +343,28 @@ inline CUtensorMap make_tensor_map_2d_bf16(const void* base, uint64_t rows, uint
         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
     if (r != CUDA_SUCCESS) {
         throw std::runtime_error("cuTensorMapEncodeTiled failed with CUresult " +
+                                 std::to_string(static_cast<int>(r)));
+    }
+    return map;
+}
+
+// 3-D map for a [d2][d1][d0] bf16 tensor (d0 contiguous) with a box of box1 x box0 in the two
+// inner dimensions and 1 in the outer one, so a box never crosses from one d2 slice into the
+// next and rows past d1 are zero-filled.
+inline CUtensorMap make_tensor_map_3d_bf16(const void* base, uint64_t d0, uint64_t d1, uint64_t d2,
+                                           uint32_t box0, uint32_t box1,
+                                           CUtensorMapSwizzle swizzle) {
+    CUtensorMap map;
+    const cuuint64_t dims[3] = {d0, d1, d2};
+    const cuuint64_t strides[2] = {d0 * sizeof(__nv_bfloat16), d1 * d0 * sizeof(__nv_bfloat16)};
+    const cuuint32_t box[3] = {box0, box1, 1};
+    const cuuint32_t elem_strides[3] = {1, 1, 1};
+    const CUresult r = tensor_map_encoder()(
+        &map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, const_cast<void*>(base), dims, strides, box,
+        elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    if (r != CUDA_SUCCESS) {
+        throw std::runtime_error("cuTensorMapEncodeTiled (3-D) failed with CUresult " +
                                  std::to_string(static_cast<int>(r)));
     }
     return map;
