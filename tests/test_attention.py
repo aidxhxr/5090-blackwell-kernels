@@ -1,0 +1,78 @@
+"""Parity of every attention variant against torch's scaled_dot_product_attention (in fp32,
+from the same bf16 inputs), on shapes that cover both head sizes, both masks, a sequence that
+is not a multiple of the 128 x 64 tile, a decode step, and the split-KV tail of variant 3."""
+
+import pytest
+import torch
+import torch.nn.functional as F
+
+# (B, H, S_q, S_kv, D)
+SHAPES = [(1, 2, 128, 128, 64), (1, 2, 200, 200, 128), (2, 3, 512, 512, 64),
+          (1, 1, 1000, 1000, 128), (1, 4, 1, 512, 128), (1, 3, 64, 1000, 128),
+          (1, 2, 7, 300, 64)]
+TOL = dict(atol=2e-2, rtol=2e-2)  # one bf16 rounding of an fp32 result, P in bf16 for v2/v3
+
+
+def _variants():
+    try:
+        import spark_kernels
+
+        return list(range(spark_kernels.num_variants("attention")))
+    except Exception:
+        return [0]
+
+
+def _inputs(B, H, Sq, Skv, D):
+    torch.manual_seed(0)
+    q = torch.randn(B, H, Sq, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, H, Skv, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(B, H, Skv, D, device="cuda", dtype=torch.bfloat16)
+    return q, k, v
+
+
+def _reference(q, k, v, causal):
+    return F.scaled_dot_product_attention(q.float(), k.float(), v.float(), is_causal=causal)
+
+
+@pytest.mark.parametrize("variant", _variants())
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+@pytest.mark.parametrize("shape", SHAPES, ids=lambda s: "b{}_h{}_sq{}_skv{}_d{}".format(*s))
+def test_attention_matches_sdpa(sk, shape, causal, variant):
+    B, H, Sq, Skv, D = shape
+    q, k, v = _inputs(B, H, Sq, Skv, D)
+    got = sk.attention(q, k, v, causal=causal, variant=variant)
+    assert got.shape == q.shape and got.dtype == torch.bfloat16
+    torch.testing.assert_close(got.float(), _reference(q, k, v, causal), **TOL)
+
+
+def test_attention_default_is_the_top_rung(sk):
+    q, k, v = _inputs(1, 2, 256, 256, 128)
+    top = sk.num_variants("attention") - 1
+    torch.testing.assert_close(sk.attention(q, k, v, causal=True),
+                               sk.attention(q, k, v, causal=True, variant=top), atol=0, rtol=0)
+
+
+def test_attention_split_tail_is_stable_across_calls(sk):
+    # variant 3 reuses a workspace for the split tiles; repeated calls must agree
+    q, k, v = _inputs(1, 4, 512, 512, 128)
+    a = sk.attention(q, k, v, variant=3)
+    b = sk.attention(q, k, v, variant=3)
+    torch.testing.assert_close(a, b, atol=0, rtol=0)
+    torch.testing.assert_close(a.float(), _reference(q, k, v, False), **TOL)
+
+
+def test_attention_rejects_bad_inputs(sk):
+    q, k, v = _inputs(1, 2, 64, 64, 64)
+    with pytest.raises(RuntimeError):
+        sk.attention(q.float(), k.float(), v.float())  # bf16 only
+    with pytest.raises(RuntimeError):
+        sk.attention(q, k[:, :, :32], v)  # k and v disagree on S_kv
+    with pytest.raises(RuntimeError):
+        sk.attention(q, k[:, :1], v[:, :1])  # H_q != H_kv (no GQA)
+    q96, k96, v96 = _inputs(1, 2, 64, 64, 96)
+    with pytest.raises(RuntimeError):
+        sk.attention(q96, k96, v96)  # D not in {64, 128}
+    with pytest.raises(RuntimeError):
+        sk.attention(q[0], k[0], v[0])  # 3-D
+    with pytest.raises(RuntimeError):
+        sk.attention(q.transpose(2, 3).contiguous().transpose(2, 3), k, v)  # not contiguous

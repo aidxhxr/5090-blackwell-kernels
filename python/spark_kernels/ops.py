@@ -17,7 +17,7 @@ import torch
 
 from . import _C
 
-KERNELS = ("bandwidth", "rmsnorm", "swiglu", "softmax", "sgemm", "hgemm")
+KERNELS = ("bandwidth", "rmsnorm", "swiglu", "softmax", "sgemm", "hgemm", "attention")
 
 
 def num_variants(name: str) -> int:
@@ -79,3 +79,16 @@ def hgemm(a: torch.Tensor, b: torch.Tensor, variant: int = -1) -> torch.Tensor:
     and K a multiple of 32; the default variant uses variant 1 on shapes that do not qualify.
     """
     return _C.hgemm(a, b, variant)
+
+
+def attention(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool = False, variant: int = -1
+) -> torch.Tensor:
+    """Fused attention forward: softmax(q @ k^T / sqrt(D)) @ v, fp32 math, bf16 out.
+
+    q is [B, H, S_q, D], k and v are [B, H, S_kv, D], all bfloat16, contiguous, with D 64 or 128
+    (MHA only: one K/V head per Q head). `causal` hides key j from query i when j > i, the
+    same top-left convention as `F.scaled_dot_product_attention(is_causal=True)`. Any S_q and
+    S_kv; a decode step is S_q = 1 against the cache. Returns [B, H, S_q, D] bfloat16.
+    """
+    return _C.attention(q, k, v, causal, variant)
