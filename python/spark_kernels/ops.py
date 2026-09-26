@@ -7,8 +7,8 @@ exist for the docstrings and type hints.
 `variant=-1` (the default) runs the fastest implementation that accepts the input. Two
 ladders have a top rung with extra requirements, and there the default steps down one rung
 instead of failing: `swiglu` needs 16-byte aligned storage for its vectorized variant, and
-`hgemm` variant 2 needs M, N multiples of 128 and K a multiple of 32. An explicit variant is
-never substituted; it raises ValueError if it cannot take the input.
+`hgemm` needs N and K multiples of 64 for its top rungs (variants 3, 4 and 6). An explicit
+variant is never substituted; it raises ValueError if it cannot take the input.
 """
 
 from __future__ import annotations
@@ -75,10 +75,12 @@ def sgemm(a: torch.Tensor, b: torch.Tensor, variant: int = -1) -> torch.Tensor:
 def hgemm(a: torch.Tensor, b: torch.Tensor, variant: int = -1) -> torch.Tensor:
     """bf16 tensor-core GEMM with fp32 accumulation: a[M,K] @ b[K,N] -> [M,N] (bf16).
 
-    Requires N and K multiples of 16. Variant 3 (the default) takes any M >= 1 when N and K
-    are multiples of 64, and runs a dedicated weight-streaming kernel for M <= 64; variants 0
-    to 2 need M a multiple of 16, and variant 2 M, N multiples of 128 and K a multiple of 32.
-    The default steps down to the highest variant that accepts the shape.
+    Requires N and K multiples of 16. Variant 6 (the default: the TMA mainloop on the
+    Stream-K schedule) takes any M >= 1 when N and K are multiples of 64, like variants 3 and
+    4, and runs a dedicated weight-streaming kernel for M <= 64; variant 5 needs M, N
+    multiples of 128 and a grid of at least one 128x128 tile per SM; variants 0 to 2 need M a
+    multiple of 16, and variant 2 M, N multiples of 128 and K a multiple of 32. The default
+    steps down to the highest variant that accepts the shape.
     """
     return _C.hgemm(a, b, variant)
 

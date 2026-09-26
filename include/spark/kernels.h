@@ -84,8 +84,8 @@ int sgemm_num_variants();
 
 // ---- HGEMM (bf16 tensor cores) ------------------------------------------------------------
 // C = A * B, bf16 in/out, fp32 accumulate, via mma.sync tensor-core instructions (WMMA API).
-// Requires N % 16 == 0, K % 16 == 0, and M % 16 == 0 for variants 0 to 2 (variant 3 takes
-// any M >= 1).
+// Requires N % 16 == 0, K % 16 == 0, and M % 16 == 0 for variants 0 to 2 (variants 3, 4 and 6
+// take any M >= 1).
 // variant 0: one warp per 16x16 output tile straight from global memory (WMMA baseline)
 // variant 1: block tile 128x128x32, 8 warps, shared-memory staged, padded to avoid bank conflicts
 // variant 2: variant 1 + cp.async double-buffered pipeline (requires M,N % 128 == 0, K % 32 == 0)
@@ -108,6 +108,14 @@ int sgemm_num_variants();
 //            per SM; smaller and decode shapes step down to variant 4. On the RTX 5090 it is
 //            7 to 9% faster than variant 3 on every shape it takes (2048^3 and up), 102 to
 //            109% of cuBLAS
+// variant 6: variant 5's TMA mainloop on variant 4's Stream-K schedule
+//            (src/kernels/hgemm_tma_sk.cu): a persistent grid, the grouped tile order, static
+//            ranges or the tile queue with geometric K-passes, and the deterministic chain
+//            fixup, with the producer lane owning the schedule and publishing each piece to
+//            the consumer warps through a shared-memory ring so the pipeline stays full
+//            across pieces. Same shape rules as variant 4 (N % 64 == 0, K % 64 == 0, any
+//            M >= 1); shapes the 128x128 TMA tile cannot fill run variant 4's tiles, and
+//            M <= 64 the decode kernel
 void hgemm_bf16(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N,
                 int K, int variant, cudaStream_t stream);
 int hgemm_num_variants();

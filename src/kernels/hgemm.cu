@@ -15,6 +15,8 @@
 //   variant 4: the same tile on a persistent Stream-K schedule (hgemm_streamk.cu).
 //   variant 5: variant 3's tile and k-loop fed by TMA loads through a warp-specialized
 //              mbarrier pipeline (src/kernels/hgemm_tma.cu).
+//   variant 6: variant 5's TMA mainloop on variant 4's Stream-K schedule
+//              (src/kernels/hgemm_tma_sk.cu).
 //
 // Tile sizes come from the GB10 analysis (48 SMs, 273 GB/s, 24 MB L2) in
 // docs/design/hgemm.md; re-tune on the RTX 5090 (170 SMs, 1,792 GB/s GDDR7).
@@ -535,23 +537,27 @@ void launch_auto(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* 
 
 }  // namespace
 
-// Variant 5 lives in hgemm_tma.cu.
+// Variant 5 lives in hgemm_tma.cu, variant 6 in hgemm_tma_sk.cu.
 bool hgemm_tma_supports(int M, int N, int K);
 void hgemm_tma(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N,
                int K, cudaStream_t stream);
+bool hgemm_tma_sk_supports(int M, int N, int K);
+void hgemm_tma_sk(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N,
+                  int K, cudaStream_t stream);
 
 int hgemm_num_variants() {
-    return 6;
+    return 7;
 }
 
 bool hgemm_supports(int M, int N, int K, int variant) {
     if (variant < 0 || variant >= hgemm_num_variants()) return false;
     if (M <= 0 || N <= 0 || K <= 0) return false;
     if (N % WMMA_N != 0 || K % WMMA_K != 0) return false;
-    if (M % WMMA_M != 0 && variant < 3) return false;  // variants 3 and 4 zero-fill rows past M
+    if (M % WMMA_M != 0 && variant < 3) return false;  // variants 3, 4 and 6 zero-fill rows past M
     if (variant == 2) return M % BM == 0 && N % BN == 0 && K % BK == 0;
     if (variant == 3 || variant == 4) return N % 64 == 0 && K % 64 == 0;  // any M >= 1
     if (variant == 5) return hgemm_tma_supports(M, N, K);
+    if (variant == 6) return hgemm_tma_sk_supports(M, N, K);
     return true;
 }
 
@@ -560,7 +566,7 @@ void hgemm_bf16(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C
     SPARK_REQUIRE(A != nullptr && B != nullptr && C != nullptr, "hgemm: null pointer");
     SPARK_REQUIRE(M > 0 && N > 0 && K > 0, "hgemm: M, N, K must be positive");
     SPARK_REQUIRE(N % WMMA_N == 0 && K % WMMA_K == 0, "hgemm: N, K must be multiples of 16");
-    SPARK_REQUIRE(M % WMMA_M == 0 || variant == 3 || variant == 4,
+    SPARK_REQUIRE(M % WMMA_M == 0 || variant == 3 || variant == 4 || variant == 6,
                   "hgemm: M must be a multiple of 16");
     SPARK_REQUIRE(variant >= 0 && variant < hgemm_num_variants(), "hgemm: unknown variant");
 
@@ -596,6 +602,9 @@ void hgemm_bf16(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C
         }
         case 5:
             hgemm_tma(A, B, C, M, N, K, stream);
+            break;
+        case 6:
+            hgemm_tma_sk(A, B, C, M, N, K, stream);
             break;
         default:
             break;
