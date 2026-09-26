@@ -21,6 +21,15 @@ HGEMM_SHAPES_DECODE = [(16, 4096, 4096), (16, 11008, 4096), (16, 4096, 11008), (
 # odd counts inside the 16, 32 and 64 row tiles, and one above 64 for the general tiles.
 HGEMM_SHAPES_ANY_M = [(1, 4096, 4096), (5, 4096, 256), (17, 1024, 1024), (33, 256, 4096),
                       (63, 4096, 1024), (100, 1024, 1024)]
+# variant 5 (TMA + mbarrier pipeline): M % 128 == 0, N % 128 == 0, K % 64 == 0 and at least
+# one 128x128 tile per SM (170 on the RTX 5090). The shapes cover exactly one wave with a
+# single K-tile, a two-K-tile grid with a split-K tail, a deep K, and both pipeline configs
+# (operands within L2 and beyond it, see hgemm_tma.cu).
+HGEMM_SHAPES_V5 = [(128, 21760, 64), (1792, 1792, 128), (256, 11008, 4096), (2048, 2048, 2048),
+                   (2560, 2560, 4096), (1024, 16384, 3072)]
+# Shapes variant 5 refuses: a grid under one wave, a decode shape, and misaligned N and K.
+HGEMM_SHAPES_NOT_V5 = [(1024, 1024, 1024), (16, 4096, 4096), (2048, 2112, 2048),
+                       (2048, 2048, 2080)]
 HGEMM_TOL = dict(atol=3e-2, rtol=3e-2)
 
 
@@ -64,7 +73,7 @@ def test_hgemm_multiples_of_16(sk, shape, variant):
     _hgemm_case(sk, shape, variant)
 
 
-@pytest.mark.parametrize("variant", _variants("hgemm"))
+@pytest.mark.parametrize("variant", [v for v in _variants("hgemm") if v < 4])
 @pytest.mark.parametrize("shape", HGEMM_SHAPES_128, ids=lambda s: f"M{s[0]}_N{s[1]}_K{s[2]}")
 def test_hgemm_multiples_of_128(sk, shape, variant):
     if variant == 3 and shape[2] % 64 != 0:
@@ -100,6 +109,30 @@ def test_hgemm_variant3_any_row_count(sk, shape):
     a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
     b = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
     got = sk.hgemm(a, b)  # the default variant is 3 on these shapes, no step-down needed
+    ref = (a.float() @ b.float()).to(torch.bfloat16)
+    torch.testing.assert_close(got.float(), ref.float(), **HGEMM_TOL)
+
+
+@pytest.mark.parametrize("shape", HGEMM_SHAPES_V5, ids=lambda s: f"M{s[0]}_N{s[1]}_K{s[2]}")
+def test_hgemm_variant5_full_waves(sk, shape):
+    if 5 not in _variants("hgemm"):
+        pytest.skip("variant 5 not built")
+    _hgemm_case(sk, shape, 5)
+    # Again: the tensor maps are rebuilt per call and the split-K tail reuses a workspace.
+    _hgemm_case(sk, shape, 5)
+
+
+@pytest.mark.parametrize("shape", HGEMM_SHAPES_NOT_V5, ids=lambda s: f"M{s[0]}_N{s[1]}_K{s[2]}")
+def test_hgemm_variant5_steps_down(sk, shape):
+    if 5 not in _variants("hgemm"):
+        pytest.skip("variant 5 not built")
+    M, N, K = shape
+    torch.manual_seed(0)
+    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError):  # an explicit variant is never substituted
+        sk.hgemm(a, b, 5)
+    got = sk.hgemm(a, b)  # the default steps down to variant 3
     ref = (a.float() @ b.float()).to(torch.bfloat16)
     torch.testing.assert_close(got.float(), ref.float(), **HGEMM_TOL)
 

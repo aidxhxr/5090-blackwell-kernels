@@ -12,6 +12,8 @@
 //   variant 2: variant 1 + two-stage cp.async pipeline (load tile k+1 while computing tile k).
 //   variant 3: raw mma.sync + ldmatrix, XOR-swizzled smem, 3-stage cp.async pipeline,
 //              register-direct epilogue, split-K on the last partial wave of tiles.
+//   variant 5: variant 3's tile and k-loop fed by TMA loads through a warp-specialized
+//              mbarrier pipeline (src/kernels/hgemm_tma.cu).
 //
 // Tile sizes come from the GB10 analysis (48 SMs, 273 GB/s, 24 MB L2) in
 // docs/design/hgemm.md; re-tune on the RTX 5090 (170 SMs, 1,792 GB/s GDDR7).
@@ -667,8 +669,13 @@ void launch_auto(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* 
 
 }  // namespace
 
+// Variant 5 lives in hgemm_tma.cu.
+bool hgemm_tma_supports(int M, int N, int K);
+void hgemm_tma(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N,
+               int K, cudaStream_t stream);
+
 int hgemm_num_variants() {
-    return 4;
+    return 6;
 }
 
 bool hgemm_supports(int M, int N, int K, int variant) {
@@ -678,6 +685,8 @@ bool hgemm_supports(int M, int N, int K, int variant) {
     if (M % WMMA_M != 0 && variant != 3) return false;  // variant 3 zero-fills rows past M
     if (variant == 2) return M % BM == 0 && N % BN == 0 && K % BK == 0;
     if (variant == 3) return N % 64 == 0 && K % 64 == 0;  // any M >= 1
+    if (variant == 4) return false;  // Stream-K, built on its own branch; takes no shape here
+    if (variant == 5) return hgemm_tma_supports(M, N, K);
     return true;
 }
 
@@ -713,6 +722,12 @@ void hgemm_bf16(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C
             v3::launch_auto(A, B, C, M, N, K, stream);
             break;
         }
+        case 4:
+            SPARK_REQUIRE(false, "hgemm variant 4: not built in this tree");
+            break;
+        case 5:
+            hgemm_tma(A, B, C, M, N, K, stream);
+            break;
         default:
             break;
     }
