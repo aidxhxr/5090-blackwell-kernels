@@ -17,7 +17,7 @@ import torch
 
 from . import _C
 
-KERNELS = ("bandwidth", "rmsnorm", "swiglu", "softmax", "sgemm", "hgemm", "attention")
+KERNELS = ("bandwidth", "rmsnorm", "swiglu", "softmax", "sgemm", "hgemm", "fp8gemm", "attention")
 
 
 def num_variants(name: str) -> int:
@@ -83,6 +83,27 @@ def hgemm(a: torch.Tensor, b: torch.Tensor, variant: int = -1) -> torch.Tensor:
     steps down to the highest variant that accepts the shape.
     """
     return _C.hgemm(a, b, variant)
+
+
+def fp8gemm(
+    a: torch.Tensor,
+    b_t: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    variant: int = -1,
+) -> torch.Tensor:
+    """fp8 tensor-core GEMM: (scale_a * scale_b) * (a @ b_t.T) -> [M, N] bfloat16, fp32 accumulate.
+
+    a is [M, K] and b_t is [N, K], both float8_e4m3fn, both K-contiguous: b_t is the weight
+    as nn.Linear stores it ([out_features, in_features]), and the same layout torch._scaled_mm
+    wants for its second operand as b_t.t(). scale_a and scale_b are per-tensor float32 CUDA
+    scalars (0-dim or one element), applied in fp32 before the single rounding to bf16.
+    Requires N and K multiples of 64 and 16-byte aligned storage. Variant 1 (the default for
+    most shapes) takes any M >= 1; variant 0 needs M a multiple of 16; variant 2 (TMA) needs
+    M, N multiples of 128, K a multiple of 128 and at least one 128x128 tile per SM. The default
+    steps down to the highest variant that accepts the shape.
+    """
+    return _C.fp8gemm(a, b_t, scale_a, scale_b, variant)
 
 
 def attention(

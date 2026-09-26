@@ -10,6 +10,7 @@ Ops (all run on the current CUDA stream, all accept float32 or bfloat16 unless n
     softmax(x, variant=-1)                   softmax over the last dim, fp32 math
     sgemm(a, b, variant=-1)                  fp32 GEMM (a @ b)
     hgemm(a, b, variant=-1)                  bf16 tensor-core GEMM (a @ b), fp32 accumulate
+    fp8gemm(a, b_t, scale_a, scale_b, variant=-1)  e4m3 GEMM (a @ b_t.T, scaled), bf16 out
     attention(q, k, v, causal=False, variant=-1)  fused attention over [B, H, S, D] (bf16)
     num_variants(name)                       how many implementations exist for `name`
 
@@ -24,6 +25,7 @@ from . import reference
 from .ops import (
     add_rmsnorm_,
     attention,
+    fp8gemm,
     hgemm,
     num_variants,
     rmsnorm,
@@ -35,6 +37,7 @@ from .ops import (
 __all__ = [
     "add_rmsnorm_",
     "attention",
+    "fp8gemm",
     "hgemm",
     "num_variants",
     "reference",

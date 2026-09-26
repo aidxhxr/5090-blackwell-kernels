@@ -13,6 +13,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <torch/extension.h>
 
 #include <cstdint>
@@ -195,6 +196,39 @@ Tensor hgemm(const Tensor& a, const Tensor& b, int variant) {
     return c;
 }
 
+// C = scale_a * scale_b * a @ b_t^T with a [M, K] and b_t [N, K] both float8_e4m3fn and K
+// contiguous (the layout torch._scaled_mm and cuBLASLt take), per-tensor fp32 scales on the
+// device, bf16 out. The default variant is the highest that accepts the shape.
+Tensor fp8gemm(const Tensor& a, const Tensor& b_t, const Tensor& scale_a, const Tensor& scale_b,
+               int variant) {
+    check_cuda_contig(a, "a");
+    check_cuda_contig(b_t, "b_t");
+    TORCH_CHECK(a.scalar_type() == at::kFloat8_e4m3fn && b_t.scalar_type() == at::kFloat8_e4m3fn,
+                "fp8gemm expects float8_e4m3fn inputs");
+    TORCH_CHECK(a.dim() == 2 && b_t.dim() == 2, "fp8gemm expects 2-D tensors");
+    TORCH_CHECK(a.size(1) == b_t.size(1), "inner dimensions mismatch: a is ", a.size(0), "x",
+                a.size(1), ", b_t is ", b_t.size(0), "x", b_t.size(1), " (b_t is [N, K])");
+    TORCH_CHECK(a.size(0) <= INT32_MAX && b_t.size(0) <= INT32_MAX && a.size(1) <= INT32_MAX,
+                "fp8gemm dims too large for int32");
+    for (const auto* sp : {&scale_a, &scale_b}) {
+        const Tensor& sc = *sp;
+        TORCH_CHECK(sc.is_cuda() && sc.scalar_type() == at::kFloat && sc.numel() == 1,
+                    "scale_a and scale_b must be float32 CUDA tensors with one element");
+        TORCH_CHECK(sc.device() == a.device(), "scales must be on a's device");
+    }
+    TORCH_CHECK(aligned16(a) && aligned16(b_t), "fp8gemm needs 16-byte aligned a and b_t storage");
+    const int M = static_cast<int>(a.size(0)), N = static_cast<int>(b_t.size(0)),
+              K = static_cast<int>(a.size(1));
+    const c10::cuda::CUDAGuard guard(a.device());
+    Tensor c = at::empty({M, N}, a.options().dtype(at::kBFloat16));
+    int v = resolve_variant(variant, spark::fp8gemm_num_variants());
+    while (variant < 0 && v > 0 && !spark::fp8gemm_supports(M, N, K, v)) --v;
+    spark::fp8gemm(reinterpret_cast<const __nv_fp8_e4m3*>(a.data_ptr()),
+                   reinterpret_cast<const __nv_fp8_e4m3*>(b_t.data_ptr()), bf16_ptr_mut(c), M, N, K,
+                   scale_a.data_ptr<float>(), scale_b.data_ptr<float>(), v, current_stream(a));
+    return c;
+}
+
 // O = softmax(q k^T / sqrt(D)) v for q = [B, H_q, S_q, D] and k, v = [B, H_kv, S_kv, D] bf16
 // tensors, H_q a multiple of H_kv (grouped-query attention: query head h reads k/v head
 // h / (H_q / H_kv)); every variant takes any S_q, S_kv >= 1 and D in {64, 128}. The default
@@ -240,6 +274,7 @@ int num_variants(const std::string& name) {
     if (name == "softmax") return spark::softmax_num_variants();
     if (name == "sgemm") return spark::sgemm_num_variants();
     if (name == "hgemm") return spark::hgemm_num_variants();
+    if (name == "fp8gemm") return spark::fp8gemm_num_variants();
     if (name == "attention") return spark::attention_num_variants();
     if (name == "bandwidth") return spark::bandwidth_num_variants();
     throw std::invalid_argument("unknown kernel: " + name);
@@ -259,6 +294,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("variant") = -1);
     m.def("sgemm", &sgemm, "fp32 GEMM: a @ b", py::arg("a"), py::arg("b"), py::arg("variant") = -1);
     m.def("hgemm", &hgemm, "bf16 tensor-core GEMM: a @ b", py::arg("a"), py::arg("b"),
+          py::arg("variant") = -1);
+    m.def("fp8gemm", &fp8gemm,
+          "fp8 (e4m3) tensor-core GEMM: scale_a * scale_b * a @ b_t^T, b_t is [N, K], bf16 out",
+          py::arg("a"), py::arg("b_t"), py::arg("scale_a"), py::arg("scale_b"),
           py::arg("variant") = -1);
     m.def("attention", &attention,
           "softmax(q k^T / sqrt(D)) v over [B, H, S, D] bf16 tensors (k, v may have fewer heads)",
