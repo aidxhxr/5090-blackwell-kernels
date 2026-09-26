@@ -22,9 +22,13 @@ import shape_utils as su  # noqa: E402
         ("bandwidth", "n=64M", {"n": 64 << 20}),
         ("bandwidth", "", {"n": 0}),
         ("attention", "b1_h32_s4096_d128_causal",
-         {"B": 1, "H": 32, "S_q": 4096, "S_kv": 4096, "D": 128, "causal": True}),
+         {"B": 1, "H": 32, "H_kv": 32, "S_q": 4096, "S_kv": 4096, "D": 128, "causal": True}),
         ("attention", "b1_h32_sq1_skv4096_d128",
-         {"B": 1, "H": 32, "S_q": 1, "S_kv": 4096, "D": 128, "causal": False}),
+         {"B": 1, "H": 32, "H_kv": 32, "S_q": 1, "S_kv": 4096, "D": 128, "causal": False}),
+        ("attention", "b1_hq32_hkv8_sq1_skv131072_d128",
+         {"B": 1, "H": 32, "H_kv": 8, "S_q": 1, "S_kv": 131072, "D": 128, "causal": False}),
+        ("attention", "b1_hq32_hkv8_s4096_d128_causal",
+         {"B": 1, "H": 32, "H_kv": 8, "S_q": 4096, "S_kv": 4096, "D": 128, "causal": True}),
     ],
 )
 def test_parse_shape(kernel, shape, expected):
@@ -36,13 +40,31 @@ def test_attention_shape_round_trips_and_counts_flops_and_bytes():
     assert su.attention_shape(1, 32, 4096, 4096, 128, True) == "b1_h32_s4096_d128_causal"
     assert su.attention_shape(1, 32, 1, 4096, 128, False) == "b1_h32_sq1_skv4096_d128"
     dims = su.parse_shape("attention", su.attention_shape(4, 32, 2048, 2048, 128, True))
-    assert dims == {"B": 4, "H": 32, "S_q": 2048, "S_kv": 2048, "D": 128, "causal": True}
+    assert dims == {"B": 4, "H": 32, "H_kv": 32, "S_q": 2048, "S_kv": 2048, "D": 128,
+                    "causal": True}
     # 4 B H S_q S_kv D, halved under the causal mask; Q, K, V, O each once in bf16
     assert su.flops("attention", dims) == 2 * 4 * 32 * 2048 * 2048 * 128
     assert su.traffic_bytes("attention", "bf16", dims) == 4 * 32 * (2048 + 2048) * 128 * 2 * 2
     assert su.is_compute_bound_kernel("attention") and su.uses_tensor_cores("attention")
     with pytest.raises(ValueError):
         su.parse_shape("attention", "4096x4096")
+
+
+def test_attention_gqa_shape_keeps_mha_keys_and_scales_kv_bytes_with_kv_heads():
+    # an equal K/V head count keeps the old spelling, so existing result rows keep their keys
+    assert su.attention_shape(1, 32, 1, 4096, 128, False, H_kv=32) == "b1_h32_sq1_skv4096_d128"
+    s = su.attention_shape(1, 32, 1, 131072, 128, False, H_kv=8)
+    assert s == "b1_hq32_hkv8_sq1_skv131072_d128"
+    dims = su.parse_shape("attention", s)
+    assert dims["H"] == 32 and dims["H_kv"] == 8
+    # FLOPs follow the query heads; K and V bytes follow the K/V heads (the traffic floor
+    # when the kernel reads each K/V head once for the whole group)
+    assert su.flops("attention", dims) == 4 * 32 * 1 * 131072 * 128
+    q_bytes = 2 * (1 * 32 * 1 * 128) * 2
+    kv_bytes = 2 * (1 * 8 * 131072 * 128) * 2
+    assert su.traffic_bytes("attention", "bf16", dims) == q_bytes + kv_bytes
+    with pytest.raises(ValueError):
+        su.parse_shape("attention", "b1_hq32_s4096_d128")  # hq without hkv
 
 
 def test_shape_strings_match_the_cpp_benches_and_round_trip():

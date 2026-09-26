@@ -37,11 +37,15 @@ HGEMM_SHAPES = [(1024, 1024, 1024), (2048, 2048, 2048), (4096, 4096, 4096), (819
                 (4096, 4096, 11008), (4096, 11008, 4096),
                 (1, 4096, 4096), (16, 4096, 4096), (32, 4096, 4096), (64, 4096, 4096),
                 (16, 11008, 4096), (64, 4096, 11008)]
-# (B, H, S_q, S_kv, D, causal): the timed shapes of bench_attention.cu (its small validation
-# shapes are timed there too but are not worth a torch line)
-ATTENTION_SHAPES = [(1, 32, 4096, 4096, 128, 0), (1, 32, 4096, 4096, 128, 1),
-                    (1, 32, 8192, 8192, 128, 1), (4, 32, 2048, 2048, 128, 1),
-                    (1, 32, 4096, 4096, 64, 1), (1, 32, 1, 4096, 128, 0)]
+# (B, H_q, H_kv, S_q, S_kv, D, causal): the timed shapes of bench_attention.cu (its small
+# validation shapes are timed there too but are not worth a torch line). H_kv < H_q is
+# grouped-query attention (Llama-3-8B is 32/8), which torch's SDPA takes with enable_gqa=True.
+ATTENTION_SHAPES = [(1, 32, 32, 4096, 4096, 128, 0), (1, 32, 32, 4096, 4096, 128, 1),
+                    (1, 32, 32, 8192, 8192, 128, 1), (4, 32, 32, 2048, 2048, 128, 1),
+                    (1, 32, 32, 4096, 4096, 64, 1), (1, 32, 32, 1, 4096, 128, 0),
+                    (1, 32, 8, 4096, 4096, 128, 1), (1, 32, 8, 1, 4096, 128, 0),
+                    (1, 32, 32, 1, 131072, 128, 0), (1, 32, 8, 1, 131072, 128, 0),
+                    (8, 32, 8, 1, 4096, 128, 0)]
 WARMUP, ITERS = 10, 100
 
 
@@ -177,14 +181,17 @@ def sdpa_backend(fn) -> str:
     return "math" if names else ""
 
 
-def bench_attention(sk, add, B, H, Sq, Skv, D, causal):
-    q = torch.randn(B, H, Sq, D, device="cuda", dtype=torch.bfloat16)
+def bench_attention(sk, add, B, Hq, Hkv, Sq, Skv, D, causal):
+    q = torch.randn(B, Hq, Sq, D, device="cuda", dtype=torch.bfloat16)
     # A decode step (S_q <= 64) streams K and V, and one layer's cache fits the RTX 5090's
     # 96 MB L2, so the loop rotates through copies that exceed it, as bench_attention does.
-    copies = (256 << 20) // (2 * B * H * Skv * D * 2) + 1 if Sq <= 64 else 1
-    kvs = [(torch.randn(B, H, Skv, D, device="cuda", dtype=torch.bfloat16),
-            torch.randn(B, H, Skv, D, device="cuda", dtype=torch.bfloat16)) for _ in range(copies)]
+    kv_bytes = 2 * B * Hkv * Skv * D * 2
+    copies = (256 << 20) // kv_bytes + 1 if Sq <= 64 else 1
+    kvs = [(torch.randn(B, Hkv, Skv, D, device="cuda", dtype=torch.bfloat16),
+            torch.randn(B, Hkv, Skv, D, device="cuda", dtype=torch.bfloat16))
+           for _ in range(copies)]
     turn = [0]
+    gqa = Hkv != Hq  # torch >= 2.5 broadcasts the K/V heads itself with enable_gqa=True
 
     def next_kv():
         kv = kvs[turn[0] % copies]
@@ -197,13 +204,15 @@ def bench_attention(sk, add, B, H, Sq, Skv, D, causal):
 
     def theirs():
         k, v = next_kv()
-        return F.scaled_dot_product_attention(q, k, v, is_causal=bool(causal))
+        return F.scaled_dot_product_attention(q, k, v, is_causal=bool(causal), enable_gqa=gqa)
 
     ours_ms = time_ms(ours)
     ref = time_ms(theirs)
-    flops = 4.0 * B * H * Sq * Skv * D * (0.5 if causal else 1.0)
-    add("attention", "bf16", attention_shape(B, H, Sq, Skv, D, bool(causal)), ours_ms, ref,
-        tflops=flops / ours_ms / 1e9, backend=sdpa_backend(theirs))
+    flops = 4.0 * B * Hq * Sq * Skv * D * (0.5 if causal else 1.0)
+    # GB/s of the traffic floor: Q and O once, K and V once per K/V head (not per query head)
+    gbps = (2 * B * Hq * Sq * D * 2 + kv_bytes) / ours_ms / 1e6
+    add("attention", "bf16", attention_shape(B, Hq, Sq, Skv, D, bool(causal), H_kv=Hkv), ours_ms,
+        ref, gbps=gbps, tflops=flops / ours_ms / 1e9, backend=sdpa_backend(theirs))
 
 
 def positive_int(text: str) -> int:
@@ -273,8 +282,8 @@ def main() -> int:
         bench_sgemm(sk, add, M, N, K)
     for M, N, K in HGEMM_SHAPES:
         bench_hgemm(sk, add, M, N, K)
-    for B, H, Sq, Skv, D, causal in ATTENTION_SHAPES:
-        bench_attention(sk, add, B, H, Sq, Skv, D, causal)
+    for B, Hq, Hkv, Sq, Skv, D, causal in ATTENTION_SHAPES:
+        bench_attention(sk, add, B, Hq, Hkv, Sq, Skv, D, causal)
 
     OUT.parent.mkdir(exist_ok=True)
     with OUT.open("w") as f:

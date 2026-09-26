@@ -145,14 +145,20 @@ def gemm_shape(M: int, N: int, K: int) -> str:
     return f"{M}x{N}x{K}"
 
 
-def attention_shape(B: int, H: int, S_q: int, S_kv: int, D: int, causal: bool) -> str:
+def attention_shape(B: int, H: int, S_q: int, S_kv: int, D: int, causal: bool,
+                    H_kv: int | None = None) -> str:
     """Shape string of bench_attention: "b1_h32_s4096_d128_causal", or sq/skv when the query
-    and key lengths differ ("b1_h32_sq1_skv4096_d128", a decode step)."""
-    s = f"b{B}_h{H}_s{S_q}" if S_q == S_kv else f"b{B}_h{H}_sq{S_q}_skv{S_kv}"
+    and key lengths differ ("b1_h32_sq1_skv4096_d128", a decode step), and hq/hkv when the
+    K/V head count differs from the query head count ("b1_hq32_hkv8_sq1_skv4096_d128", GQA).
+    `H` is the query head count; `H_kv` defaults to it (MHA), and an equal value keeps the
+    old "h32" spelling so existing rows keep their keys."""
+    heads = f"h{H}" if H_kv is None or H_kv == H else f"hq{H}_hkv{H_kv}"
+    s = f"b{B}_{heads}_s{S_q}" if S_q == S_kv else f"b{B}_{heads}_sq{S_q}_skv{S_kv}"
     return f"{s}_d{D}" + ("_causal" if causal else "")
 
 
-ATTENTION_SHAPE = re.compile(r"^b(\d+)_h(\d+)_(?:s(\d+)|sq(\d+)_skv(\d+))_d(\d+)(_causal)?$")
+ATTENTION_SHAPE = re.compile(
+    r"^b(\d+)_(?:h(\d+)|hq(\d+)_hkv(\d+))_(?:s(\d+)|sq(\d+)_skv(\d+))_d(\d+)(_causal)?$")
 
 
 def ints_in(s: str) -> list[int]:
@@ -195,9 +201,11 @@ def parse_shape(kernel: str, shape: str) -> dict:
         m = ATTENTION_SHAPE.match(shape)
         if not m:
             raise ValueError(f"not an attention shape string: {shape!r}")
-        B, H, S, Sq, Skv, D, causal = m.groups()
-        return {"B": int(B), "H": int(H), "S_q": int(Sq or S), "S_kv": int(Skv or S), "D": int(D),
-                "causal": causal is not None}
+        B, H, Hq, Hkv, S, Sq, Skv, D, causal = m.groups()
+        # "H" is the query head count (what the FLOPs and the Q/O bytes scale with); "H_kv"
+        # the K/V head count, equal to it unless the string spells them apart (GQA).
+        return {"B": int(B), "H": int(Hq or H), "H_kv": int(Hkv or H), "S_q": int(Sq or S),
+                "S_kv": int(Skv or S), "D": int(D), "causal": causal is not None}
     return {"raw": v}
 
 
@@ -216,9 +224,10 @@ def traffic_bytes(kernel: str, dtype: str, dims: dict) -> float:
     if k in ("sgemm", "hgemm", "gemm"):
         M, N, K = dims["M"], dims["N"], dims["K"]
         return float(M * K + K * N + M * N) * isz
-    if k == "attention":  # Q and O once, K and V once
-        bh = dims["B"] * dims["H"]
-        return 2.0 * bh * (dims["S_q"] + dims["S_kv"]) * dims["D"] * isz
+    if k == "attention":  # Q and O once (H_q heads), K and V once (H_kv heads under GQA)
+        q_rows = dims["B"] * dims["H"] * dims["S_q"]
+        kv_rows = dims["B"] * dims.get("H_kv", dims["H"]) * dims["S_kv"]
+        return 2.0 * (q_rows + kv_rows) * dims["D"] * isz
     return 0.0
 
 
