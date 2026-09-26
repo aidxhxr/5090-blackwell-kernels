@@ -1,13 +1,15 @@
 # Attention: fused scaled-dot-product forward
 
-`O = softmax(Q K^T / sqrt(D)) V` per (batch, head), for `Q, O = [B, H, S_q, D]` and
-`K, V = [B, H, S_kv, D]`, row-major with `D` contiguous. bf16 in and out, fp32 for every score,
-exponential and accumulator. MHA only (one K/V head per Q head), `D` in {64, 128}, optional
-causal mask, no dropout, no bias, forward only. Source: `src/kernels/attention.cu`. Bench:
-`bench_attention` (validates every variant against a CPU double-precision reference). The
-library comparison is `torch.nn.functional.scaled_dot_product_attention` in
-`scripts/bench_torch.py`, which on this card and this torch picks the FlashAttention-2 kernel
-for every shape below.
+`O = softmax(Q K^T / sqrt(D)) V` per (batch, head), for `Q, O = [B, H_q, S_q, D]` and
+`K, V = [B, H_kv, S_kv, D]`, row-major with `D` contiguous. bf16 in and out, fp32 for every
+score, exponential and accumulator. `H_q % H_kv == 0`: query head `h` reads K/V head
+`h / (H_q / H_kv)`, grouped-query attention, with `H_kv == H_q` the plain multi-head case.
+`D` in {64, 128}, optional causal mask, no dropout, no bias, forward only. Source:
+`src/kernels/attention.cu` (the ladder) and `src/kernels/attention_decode.cu` (the
+flash-decoding kernel variant 3 runs on decode shapes). Bench: `bench_attention` (validates
+every variant against a CPU double-precision reference). The library comparison is
+`torch.nn.functional.scaled_dot_product_attention` in `scripts/bench_torch.py`, which on this
+card and this torch picks the FlashAttention-2 kernel for every shape below.
 
 The causal mask hides key `j` from query `i` when `j > i`, the top-left alignment
 `is_causal=True` uses in torch. A decode step is `S_q = 1` against a cache of `S_kv` keys with
@@ -34,10 +36,11 @@ The halving is the convention, not what the kernel does: with a 128-row Q tile a
 tiles, the tiles on the diagonal are computed whole and masked, so at `S = 4096` the kernel
 does 1,056 of 2,048 tile products, 51.6%. The TFLOPS column undercounts causal work by 3%.
 
-Bytes, the traffic floor: `2 · (Q + O + K + V)` bf16 elements,
+Bytes, the traffic floor: `2 · (Q + O + K + V)` bf16 elements, with K and V counted once per
+K/V head,
 
 ```
-bytes = 2 · 2 · B · H · (S_q + S_kv) · D
+bytes = 2 · 2 · B · (H_q · S_q + H_kv · S_kv) · D
 ```
 
 At `B = 1, H = 32, S = 4096, D = 128` that is 128 MB against 275 GFLOP: 2,048 FLOP/byte,
@@ -78,7 +81,7 @@ rows past `S_q` in a zero-filled tile go through the same code.
 | 0 | one warp per query row, lanes own `D/32` columns of q, k, v and o, keys one at a time with a shuffle reduction per score | baseline: correct online softmax, no reuse of K or V between rows |
 | 1 | 128-row Q tile, 64-key K/V tiles converted to fp32 in shared memory, 8 warps x 16 rows, CUDA-core FMAs on 4x8 (scores) and 4xD/8 (output) register tiles, the next tile prefetched into registers | every K/V element loaded once per 128 rows; FlashAttention-2 without tensor cores |
 | 2 | `mma.sync.m16n8k16` + `ldmatrix`: Q fragments in registers for the whole KV loop, S and PV on the tensor cores, P repacked from the S accumulators, 3-stage `cp.async` pipeline on K and V | the tensor cores, and no shared-memory round trip for P |
-| 3 | variant 2's kernel with a schedule: the tiles of the last partial wave are split along the keys over the idle SMs and merged by a combine kernel; `S_q <= 64` runs a 64-row tile | wave quantization on 170 SMs, and a decode step that no longer pays for 128 rows |
+| 3 | variant 2's kernel with a schedule: the tiles of the last partial wave are split along the keys over the idle SMs and merged by a combine kernel; `S_q <= 64` runs a 64-row tile; decode shapes (the query rows sharing a K/V head fit 16 rows) run the flash-decoding kernel of the "Long-context decode" section | wave quantization on 170 SMs, a short query that no longer pays for 128 rows, and a decode step that streams each K/V head once for its whole group of query heads |
 
 ### Variant 0
 
@@ -191,8 +194,191 @@ could stream in 43 µs. `S_q <= 64` therefore runs the same kernel instantiated 
 (32 heads x 5 slices of 13 tiles) so the whole card streams the cache. Measured with K and V
 rotated through copies that exceed the 96 MB L2, as `bench_hgemm` does for the weights of a
 decode GEMM: 49 µs, 1,369 GB/s, 89% of the 1,532 GB/s `cudaMemcpy` roof, against 74 µs for
-torch's split-KV flash kernel under the same rotation. A 16-row tile would cut the remaining
-compute four times more; the number says it is not needed at this cache size.
+torch's split-KV flash kernel under the same rotation. That was the decode path until the
+flash-decoding kernel below replaced it for every shape whose rows fit its 16-row tile; the
+64-row tile still takes `S_q <= 64` queries that do not (`S_q = 32` in MHA, say).
+
+## GQA
+
+Grouped-query attention shares one K/V head between `group = H_q / H_kv` query heads:
+Llama-3-8B is 32 query heads over 8 K/V heads, Llama-3-70B 64 over 8, Qwen2-7B 28 over 4.
+The math per query head is unchanged; what changes is which K/V head it reads and, in decode,
+how many times the cache is read.
+
+**Pointer arithmetic.** The kernels index Q and O by the flattened `bh = b · H_q + h` and K
+and V by
+
+```
+kv_index(bh) = (bh / H_q) · H_kv + (bh mod H_q) / group
+```
+
+(`kv_index` in `attention_internal.cuh`). In variants 0 to 3 that is the only change: the
+block for query head `h` sets its K/V base pointer to head `h / group` and runs as before, so
+the four variants take GQA with the same code and give the same bits as before on MHA inputs
+(except the decode shapes variant 3 now hands to the flash-decoding kernel). In prefill the `group` blocks that share a K/V head are adjacent in the tile order (tiles are
+numbered `q_rank · B · H_q + bh`), run in the same wave and pull the head through L2 once
+from DRAM; prefill is compute-bound, so the extra L2 traffic costs nothing measurable:
+
+| shape (v3, RTX 5090) | ms | TFLOPS |
+|---|---|---|
+| b1 h32 s4096 d128 causal | 0.649 | 211.8 |
+| b1 hq32 hkv8 s4096 d128 causal | 0.646 | 212.8 |
+| b1 h32 s4096 d128 | 1.241 | 221.6 |
+| b1 hq32 hkv8 s4096 d128 | 1.236 | 222.5 |
+| b1 hq28 hkv4 s4096 d128 causal | 0.579 | 207.6 |
+
+(The 28-head shape has 28 x 32 = 896 tiles, 5.27 waves of 170: a tail of 46 tiles split 3
+ways, where 1,024 tiles are 6.02 waves with a 4-tile tail split 42 ways. The longer tail is
+the 2%.)
+
+**Head grouping in decode.** A decode step reads the whole cache for a few query rows, and
+with the per-head layout above each of the `group` query heads would stream the same K/V
+head: 4x the DRAM traffic at 32/8 if L2 does not catch the sharing, and it only partly does
+(the 64-row path measures 772 GB/s of floor traffic at 128K tokens, below). The decode kernel
+of the next section instead puts the `group` heads of one K/V head into the rows of one
+16-row Q tile, rows `hg · S_q + t` for head `hg` of the group and token `t`. Because the
+query heads of a group are consecutive in Q, those rows are one contiguous
+`[group · S_q, D]` slab starting at `Q + (b · H_q + kv · group) · S_q · D`, and so are the
+output rows. K and V are read once per K/V head, and a single MHA query (one live row) pays
+for 16 rows instead of 64.
+
+**Traffic.** The bench and the results scripts count the floor as Q and O once per query
+head and K and V once per K/V head, `2 · 2 · B · (H_q · S_q + H_kv · S_kv) · D` bytes, so a
+GB/s figure under GQA says how close the kernel gets to reading each K/V head once for the
+whole group. FLOPs follow the query heads. The shape string spells the heads apart only when
+they differ (`b1_hq32_hkv8_sq1_skv4096_d128`), so the MHA rows keep their old keys.
+
+**Torch.** `F.scaled_dot_product_attention(..., enable_gqa=True)` (torch 2.5+) takes the
+same `[B, H_kv, S_kv, D]` K and V; its dispatcher picked the FlashAttention-2 kernel for
+every GQA shape here, prefill and decode, as it does for MHA.
+
+## Long-context decode
+
+Source: `src/kernels/attention_decode.cu`, reached from variant 3 whenever
+`group · S_q <= 16` (`decode_fits`). The job at `S_q = 1` against 4K to 128K keys is
+streaming K and V once per K/V head at the DRAM roof: at 128K tokens, 8 K/V heads and
+`D = 128` that is 512 MB per step, 350 µs at 1,532 GB/s, against 34 MFLOP of tensor work per
+head.
+
+**The kernel.** One block per (b, kv head, key slice). The Q tile is 16 rows (the group's
+heads x tokens, above); its A fragments are loaded once and stay in registers. The block's
+keys are divided among its four warps in contiguous ranges of 16-key slabs (32 keys at
+`D = 64`), and each warp runs its own three-stage `cp.async` pipeline in a private 24 KB of
+shared memory: 8 KB of K plus V per slab, two slabs in flight while the third is consumed,
+`__syncwarp` where variant 2 has `__syncthreads`, and no block barrier in the loop. Per slab
+a warp does 8 `ldmatrix.x4` and 16 `mma.sync` for `S = Q K^T` (2 n8 key tiles x 8 k-steps),
+the online softmax on 4 scores per lane, 8 `ldmatrix.x4.trans` and 16 `mma.sync` for
+`O += P V`, with P repacked from the S accumulators exactly as in variant 2. 190 registers,
+96 KB of shared memory, one block per SM.
+
+**Why this shape.** Two numbers from the design docs set it. Bandwidth is bytes in flight
+over latency: the hgemm decode kernel needs about 1.5 MB in flight across the card (64 CTAs x
+24 KB), and this kernel has 64 KB per SM (4 warps x 2 slabs), 8 MB at 128 blocks, so the
+DRAM queue is never the limit. And the tensor work must hide under the stream: an `mma.sync`
+holds a scheduler's tensor pipe for 32 cycles, so a warp spends 32 x 32 = 1,024 cycles per
+8 KB slab; at the roof an SM's share of DRAM is 9 GB/s, 3.2 bytes per cycle at 2.8 GHz, so
+the four warps' slabs arrive every 2,560 cycles each while they are consumed in 1,024
+across four schedulers: the tensor pipe is 16% busy (Nsight, below) and the softmax, at 4
+scores per lane per slab, is not on the critical path. The 64-row tile of variant 3 has the
+same 4 warps each doing 128 `mma` per 32 KB tile, 4,096 cycles per tile per SM against
+10,240 cycles of DRAM time: 40% of the pipe, which shows up as the 89% of roof it reached and
+as its 2x loss under GQA, where it also reads each K/V head four times.
+
+**The split.** The keys of every (b, kv head) are cut into `split` slices so the grid has
+work for the card at any cache length: `split = min(128 / (B · H_kv), nslab / 8)`, so about
+128 blocks with at least two slabs per warp (the constants from the sweep below; forced with
+`SPARK_ATTENTION_SPLIT=n` for the sweep). Each block merges its four warps' partials
+(unnormalized O rows, `m`, `l`) in shared memory, then either normalizes and writes O
+(`split = 1`) or writes the block partial, 16 x (D + 2) floats, to a workspace and
+increments a per-head counter. The last block to arrive merges the `split` partials with the
+online-softmax rule, `M = max m_i`, `L = Σ l_i · 2^(m_i − M)`, `O = Σ O_i · 2^(m_i − M) / L`,
+writes O and resets the counter, so a step is one launch: no combine kernel and no memset
+(the pattern of `hgemm_decode.cu`). The merge is three passes with independent loads in
+each: every slice's `(m, l)` into shared memory, per-row `M`, `L` and slice weights, then the
+O rows eight loads ahead of the FMAs; at `split = 32` one block reads 256 KB of partials from
+L2 here, and the first version, which chained those reads per element four at a time, was
+1 µs slower on the 28/4-head shape (30.5 to 29.6 µs).
+
+**Split sweep** (GB/s of the K+V floor, `SPARK_ATTENTION_SPLIT`, `bench_attention` medians
+of 30, K and V rotated past L2; the last column is the 64-row tile of variant 3 on the same
+inputs, `SPARK_ATTENTION_DECODE=0`):
+
+| shape | split 1 | 2 | 4 / 5 | 8 | 16 | 21 | 32 | 43 | 64 | 128 | 64-row tile |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| b1 hq32 hkv8 sq1 skv4096 | 420 | 712 | 941 | 986 | 886 | 963 | 866 | 782 | 735 | 498 | 569 |
+| b1 h32 sq1 skv4096 | 1,459 | 1,455 | 1,456 | 1,457 | 1,451 | 1,395 | 1,394 | 1,342 | 1,337 | 950 | 1,337 |
+| b1 hq32 hkv8 sq1 skv16384 | 459 | 874 | 1,454 | 1,456 | 1,452 | 1,395 | 1,348 | 1,286 | 1,285 | 1,154 | 719 |
+| b1 h32 sq1 skv16384 | 1,610 | 1,609 | 1,630 | 1,611 | 1,590 | 1,575 | 1,572 | 1,536 | 1,508 | 1,403 | 1,518 |
+| b1 hq32 hkv8 sq1 skv65536 | | 927 | 1,575 | 1,591 | 1,592 | 1,572 | 1,571 | 1,434 | 1,499 | 1,404 | 763 |
+| b1 h32 sq1 skv65536 | | 1,667 | 1,684 | 1,668 | 1,648 | 1,648 | 1,663 | 1,636 | 1,647 | 1,612 | 1,619 |
+| b1 hq32 hkv8 sq1 skv131072 | | 939 | 1,626 | 1,633 | 1,645 | 1,644 | 1,629 | 1,556 | 1,570 | 1,539 | 772 |
+| b1 h32 sq1 skv131072 | | 1,682 | 1,693 | 1,685 | 1,677 | 1,675 | 1,682 | 1,627 | 1,671 | 1,658 | 1,636 |
+| b8 hq32 hkv8 sq1 skv4096 | 1,583 | 1,546 | 1,546 | 1,521 | 1,478 | 1,445 | 1,413 | 1,327 | 1,253 | 806 | 611 |
+
+(The 4 / 5 column is split 4 for the shapes up to 16K and 5 beyond.) What it says: at 8 K/V
+heads the kernel needs 32 or more blocks (split 4 and up) to pull the full rate, and 64 to
+128 blocks (split 8 to 16) are the plateau; one block per SM (split 21, 168 blocks) is 1 to
+4% slower and finer splits pay for the partials. The MHA rows are flat from 32 blocks on,
+and the batch-of-eight row is fastest with no split at all, 64 blocks. The 64-row tile loses
+half its bandwidth under GQA at every length and 2 to 3% on MHA past 16K; on the 4K shapes
+the plateau is 40 to 63% of roof because a 16 MB (GQA) or 67 MB (MHA) stream is short next
+to the fixed costs: about 2 µs of launch, a DRAM round trip before the first slab is
+consumed (Q and the first two slabs are requested together), and the drain and merge at the
+end, 5 to 6 µs in all that a longer cache amortizes.
+
+**Measured** (`bench_attention --variant=3`, medians of 50, K and V rotated past L2 where a
+copy fits it; torch is `F.scaled_dot_product_attention` with `enable_gqa` from
+`scripts/bench_torch.py`, whose loop adds 2 to 4 µs of Python per launch to both sides; the
+roof is the 1,532 GB/s of `cudaMemcpy`):
+
+| shape | K+V MB | v3 µs | GB/s | % roof | torch µs | torch GB/s | ours / torch |
+|---|---|---|---|---|---|---|---|
+| b1 hq32 hkv8 sq1 skv4096 | 16.8 | 17.3 | 968 | 63% | 37.3 | 451 | 1.80x |
+| b1 h32 sq1 skv4096 | 67.1 | 46.1 | 1,456 | 95% | 64.1 | 1,047 | 1.35x |
+| b1 hq32 hkv8 sq1 skv16384 | 67.1 | 46.1 | 1,457 | 95% | 67.8 | 990 | 1.33x |
+| b1 h32 sq1 skv16384 | 268 | 164.7 | 1,630 | 106% | 187.2 | 1,434 | 1.11x |
+| b1 hq32 hkv8 sq1 skv65536 | 268 | 168.4 | 1,594 | 104% | 194.1 | 1,383 | 1.14x |
+| b1 h32 sq1 skv65536 | 1,074 | 639.6 | 1,679 | 110% | 665.2 | 1,614 | 1.03x |
+| b1 hq32 hkv8 sq1 skv131072 | 537 | 324.4 | 1,655 | 108% | 357.3 | 1,503 | 1.09x |
+| b1 h32 sq1 skv131072 | 2,147 | 1,268 | 1,693 | 111% | 1,298 | 1,655 | 1.02x |
+| b8 hq32 hkv8 sq1 skv4096 | 134 | 86.8 | 1,548 | 101% | 103.6 | 1,297 | 1.15x |
+| b8 h32 sq1 skv4096 | 537 | 320.5 | 1,675 | 109% | | | |
+| b1 hq64 hkv8 sq1 skv16384 | 67.1 | 48.0 | 1,399 | 91% | | | |
+| b1 hq28 hkv4 sq1 skv16384 | 33.6 | 29.6 | 1,133 | 74% | | | |
+| b1 hq32 hkv8 sq4 skv16384 | 67.1 | 50.1 | 1,340 | 87% | | | |
+| b1 hq32 hkv8 sq8 skv16384 (64-row tile) | 67.1 | 93.3 | 721 | 47% | | | |
+
+(The ratio is the Python harness's own, ours against torch in the same loop; the C++ bench
+times in the v3 column are 2 to 4 µs lower than what that loop sees for us.)
+
+Above 100% of the copy roof is real: a read-only stream does not pay the read/write
+turnaround `cudaMemcpy` does (the hgemm decode note measured a bare read stream at 1,581 to
+1,614 GB/s), and Nsight puts the DRAM at 92 to 95% of its 1,792 GB/s peak on the 128K
+shapes, so the read roof on this card is about 1,700 GB/s and the 128K rows are at it. From
+16K tokens up both head layouts are within 5% of that, GQA at 32/8 reads each K/V head once
+(the L2 sector count below), and torch's split-KV flash kernel, which is also at the roof by
+128K, is 1.3x behind at 4K to 16K where its fixed costs are larger than ours. The 64-row
+shape in the last row (8 tokens x 4 heads = 32 rows per K/V head, over the 16-row tile) is
+what the second m16 tile per warp in "What remains" would fix.
+
+**Nsight Compute** on the decode kernel (`--metrics`, one launch after warmup, fixed 2.53 GHz;
+`dram__bytes_read` is not exposed on this card, so the bytes are L2 read sectors x 32 B):
+
+| shape | DRAM % of peak | L2 read | K+V floor | duration | tensor pipe | issue active | warps active | conflicts |
+|---|---|---|---|---|---|---|---|---|
+| b1 hq32 hkv8 sq1 skv131072 | 92.6% | 538 MB | 537 MB | 333 µs | 16.5% | 5.8% | 8.33% | 41 K |
+| b1 h32 sq1 skv131072 | 94.6% | 2,148 MB | 2,147 MB | 1.29 ms | 16.8% | 5.8% | 8.33% | 41 K |
+| b1 hq32 hkv8 sq1 skv4096 | 53.7% | 18.2 MB | 16.8 MB | 17.8 µs | 12.8% | 6.5% | 8.25% | 41 K |
+| b1 h32 sq1 skv4096 | 83.9% | 67.7 MB | 67.1 MB | 45.4 µs | 15.5% | 5.9% | 8.30% | 41 K |
+
+128 blocks of 4 warps, 190 registers, 98.3 KB of dynamic shared memory, occupancy limited to
+one block per SM by the shared memory (8.33% warps active is 4 of 48). The L2 read bytes
+equal the K+V floor to within the Q, partials and the 1.4 MB the 4K GQA shape spends on its
+partials: each K/V head crosses L2 once for its four query heads. The bank conflicts are
+constant per block and sit in the epilogue (the parked partials; the swizzle on them took
+the count from 107 K to 41 K), 0.1 µs per block. The tensor pipe at 16% and issue slots at
+6% say the kernel is waiting on DRAM and nothing else, which is what a decode kernel should
+be doing.
 
 ## Correctness
 
@@ -246,15 +432,18 @@ defaults. Nsight Compute runs at a fixed 2.53 GHz; the timed runs boost higher.
 | b1 h32 s8192 d128 causal | 2.498 | 220.1 | 2.776 | 198.0 | 1.11x |
 | b4 h32 s2048 d128 causal | 0.705 | 194.9 | 0.762 | 180.3 | 1.08x |
 | b1 h32 s4096 d64 causal | 0.341 | 201.4 | 0.417 | 165.0 | 1.22x |
-| b1 h32 sq1 skv4096 d128 (decode) | 0.054 | 1,250 GB/s | 0.074 | 907 GB/s | 1.38x |
+| b1 h32 sq1 skv4096 d128 (decode) | 0.048 | 1,414 GB/s | 0.064 | 1,047 GB/s | 1.35x |
 
   (`scripts/bench_torch.py` timings, 50 iterations, K and V rotated past L2 for the decode
-  row; the C++ bench, which allocates less between launches, gets 49 µs there.)
+  row; the C++ bench, which allocates less between launches, gets 46 µs there. The GQA and
+  long-context decode rows are in the "Long-context decode" section.)
 
 ## Results (RTX 5090, sm_120, CUDA 13.2, driver 595.58)
 
 From the default `bench_attention` sweep (median of 50). TFLOPS by the halved causal count;
-the decode row in GB/s of Q, K, V and O once.
+the decode rows in GB/s of Q, K, V and O once (K and V once per K/V head). The decode rows
+of variants 0 to 2 read each K/V head once per query head, so under GQA they land at a
+quarter of their MHA figure; variant 3 is the flash-decoding kernel.
 
 | shape | v0 ms / TFLOPS | v1 | v2 | v3 |
 |---|---|---|---|---|
@@ -267,10 +456,17 @@ the decode row in GB/s of Q, K, V and O once.
 | b1 h32 s8192 d128 causal | 57.06 / 9.6 | 11.24 / 48.9 | **2.486 / 221.1** | 2.487 / 221.1 |
 | b4 h32 s2048 d128 causal | 13.10 / 10.5 | 2.897 / 47.4 | 0.687 / 200.1 | **0.686 / 200.4** |
 | b1 h32 s4096 d64 causal | 9.389 / 7.3 | 1.150 / 59.8 | **0.329 / 209.1** | 0.331 / 207.8 |
-| b1 h32 sq1 skv4096 d128 | 1.258 / 53 GB/s | 0.668 / 100 GB/s | 0.200 / 335 GB/s | **0.049 / 1,369 GB/s** |
+| b1 hq8 hkv2 s512 d128 causal | 0.0850 / 6.3 | 0.0830 / 6.5 | 0.0297 / 18.1 | **0.0192 / 28.0** |
+| b1 hq32 hkv8 s4096 d128 causal | 13.82 / 9.9 | 2.453 / 56.0 | 0.636 / 216.1 | **0.636 / 216.0** |
+| b1 h32 sq1 skv4096 d128 | 1.260 / 53 GB/s | 0.648 / 104 GB/s | 0.200 / 336 GB/s | **0.046 / 1,459 GB/s** |
+| b1 hq32 hkv8 sq1 skv4096 d128 | 1.250 / 13 GB/s | 0.646 / 26 GB/s | 0.200 / 84 GB/s | **0.017 / 970 GB/s** |
+| b1 h32 sq1 skv131072 d128 | 40.16 / 53 GB/s | 20.60 / 104 GB/s | 6.280 / 342 GB/s | **1.269 / 1,693 GB/s** |
+| b1 hq32 hkv8 sq1 skv131072 d128 | 39.71 / 14 GB/s | 20.56 / 26 GB/s | 6.274 / 86 GB/s | **0.324 / 1,655 GB/s** |
+| b8 hq32 hkv8 sq1 skv4096 d128 | 1.215 / 111 GB/s | 1.336 / 101 GB/s | 0.400 / 336 GB/s | **0.087 / 1,548 GB/s** |
 
 The small shapes are where the tail split matters most: 16 tiles on 170 SMs become 128
-slices, 2.4x on the 512-token shape. Variant 1's D = 64 time moved between 1.15 and 1.57 ms
+slices, 2.4x on the 512-token shape. The 4096-token decode row moved from 49 µs on the 64-row
+tile to 46 µs on the flash-decoding kernel; the GQA and 128K rows are its real work. Variant 1's D = 64 time moved between 1.15 and 1.57 ms
 across runs on a card other jobs were also heating; the other rows repeat to within 1%.
 
 ## What remains
@@ -280,9 +476,11 @@ across runs on a card other jobs were also heating; the other rows repeat to wit
   its softmax while the other issues `mma`. On this card that means fitting two blocks per
   SM (registers under 128, tiles under 48 KB) or a 16-warp block with a hand-scheduled
   barrier pattern.
-- **GQA.** `H_kv < H_q` is a stride on the K/V pointer and a change to the parity test; the
-  kernel does not care.
 - **Backward**, which needs the log-sum-exp saved from the forward (`m + log2(l)` per row,
   free here) and two more kernels.
-- **A 16-row decode tile** for caches past 16K tokens, where the 64-row tile's compute would
-  start to show against the DRAM time again.
+- **GQA prefill with grouped tiles.** The prefill kernels read a K/V head once per query head
+  and let L2 serve the group; a 128-row tile holding 4 heads x 32 tokens would read it once
+  from L2 too. Prefill is compute-bound, so this is a few percent at most.
+- **Decode with more rows per K/V head** (8 heads x 8 tokens, speculative decoding) on the
+  flash-decoding kernel: two or four m16 tiles per warp instead of one, which the register
+  budget (64 accumulators per m16 tile at `D = 128`) allows twice over.

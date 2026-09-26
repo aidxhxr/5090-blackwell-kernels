@@ -26,7 +26,8 @@ Best rung of each ladder on its largest shape:
 | bf16 GEMM, decode | 16 x 4096 x 4096 | v4 | 23.5 us | 1,442 GB/s | 122% of cuBLAS | 1.24x |
 | attention | 32 heads, 4096 x 128, causal | v3 | 0.640 ms | 215 TFLOPS | | 1.21x over flash |
 | attention | 32 heads, 8192 x 128, causal | v3 | 2.49 ms | 221 TFLOPS | | 1.11x over flash |
-| attention, decode | 1 query, 4096 keys, 32 x 128 | v3 | 49 us | 1,366 GB/s | | 1.30x over flash |
+| attention, decode | 1 query, 4096 keys, 32 x 128 | v3 | 46 us | 1,459 GB/s | | 1.35x over flash |
+| attention, GQA decode | 1 query, 128K keys, 32 query / 8 K/V heads x 128 | v3 | 324 us | 1,655 GB/s | | 1.09x over flash |
 | fp32 GEMM | 4096 x 11008 x 4096 | v5 | 6.48 ms | 57 TFLOPS | 84.3% of cuBLAS | 0.86x |
 | rmsnorm bf16 | 16384 x 8192 | v4 | 0.351 ms | 1,529 GB/s | 10.4x over naive | 1.05x |
 | add + rmsnorm bf16 | 16384 x 8192 | fused | 0.713 ms | 1,506 GB/s | | 1.25x |
@@ -113,13 +114,19 @@ of cuBLAS; Stream-K is the general form of that fix.
 ### attention
 
 Fused scaled-dot-product attention, forward, bf16 in and out, fp32 math, head sizes 64 and
-128, optional causal mask, any sequence length. Variant 2 is the tensor-core flash attention:
-Q fragments stay in registers for the whole KV loop, `S = Q K^T` and `O += P V` run on
-`mma.sync`, and P is repacked from the S accumulators straight into the next `mma`'s A
-operand without touching shared memory, with a three-stage `cp.async` pipeline on K and V.
-Variant 3 splits the tiles of the last partial wave along the keys and merges them in a
-combine kernel, and runs a 64-row tile for short queries. The comparison is
-`F.scaled_dot_product_attention`, which picked its FlashAttention-2 kernel on every shape.
+128, optional causal mask, any sequence length, multi-head or grouped-query (K and V with
+fewer heads than Q, as in Llama-3's 32 query heads over 8 K/V heads). Variant 2 is the
+tensor-core flash attention: Q fragments stay in registers for the whole KV loop,
+`S = Q K^T` and `O += P V` run on `mma.sync`, and P is repacked from the S accumulators
+straight into the next `mma`'s A operand without touching shared memory, with a three-stage
+`cp.async` pipeline on K and V. Variant 3 splits the tiles of the last partial wave along the
+keys and merges them in a combine kernel, runs a 64-row tile for short queries, and on decode
+shapes runs a flash-decoding kernel: the query heads that share a K/V head go into one 16-row
+tile so the cache is read once per group, the keys of each head are split over about 128
+blocks whose four warps each stream their own slice, and the last block to finish merges the
+partials, so a step is one launch. The comparison is `F.scaled_dot_product_attention`
+(`enable_gqa=True` for the grouped shapes), which picked its FlashAttention-2 kernel on every
+shape.
 
 | shape | ours | TFLOPS | torch flash | ours / torch |
 |---|---|---|---|---|
@@ -128,12 +135,22 @@ combine kernel, and runs a 64-row tile for short queries. The comparison is
 | 1 x 32 x 8192 x 128, causal | 2.49 ms | 221 | 2.78 ms | 1.11x |
 | 4 x 32 x 2048 x 128, causal | 0.685 ms | 201 | 0.763 ms | 1.08x |
 | 1 x 32 x 4096 x 64, causal | 0.331 ms | 208 | 0.420 ms | 1.23x |
-| decode: 1 query, 4096 keys, 32 x 128 | 49 us | 1,366 GB/s | 71 us | 1.30x |
+| 1 x 32/8 x 4096 x 128, causal (GQA) | 0.636 ms | 216 | 0.786 ms | 1.21x |
+| decode: 1 query, 4096 keys, 32 x 128 | 46 us | 1,459 GB/s | 64 us | 1.35x |
+| decode: 1 query, 4096 keys, 32/8 x 128 (GQA) | 17 us | 970 GB/s | 37 us | 1.80x |
+| decode: 1 query, 128K keys, 32 x 128 | 1.27 ms | 1,693 GB/s | 1.30 ms | 1.02x |
+| decode: 1 query, 128K keys, 32/8 x 128 (GQA) | 324 us | 1,655 GB/s | 357 us | 1.09x |
+| decode: batch 8, 4096 keys, 32/8 x 128 (GQA) | 87 us | 1,548 GB/s | 104 us | 1.15x |
 
 Causal TFLOPS use the halved FLOP count FlashAttention reports. Nsight puts the tensor pipe at
 89 to 90% active with `math_pipe_throttle` on top; the rest is the softmax between the two
-products, which is what warp specialization would take next. Decode is K and V streamed once,
-at 89% of the copy roof.
+products, which is what warp specialization would take next. Decode is K and V streamed once
+per K/V head: GB/s counts each K/V head once for its whole group of query heads, so the GQA
+rows read a quarter of the bytes the same query heads would in MHA. Past 16K tokens both
+layouts run at 1,600 to 1,700 GB/s, above the 1,532 GB/s of `cudaMemcpy` (a read-only stream
+does not pay the copy's write turnaround; Nsight puts the DRAM at 93 to 95% of its 1,792 GB/s
+peak there). At 4K tokens a step is 17 to 46 us and launch plus pipeline fill are a visible
+share of it.
 
 ### fp32 GEMM
 
@@ -159,7 +176,7 @@ numbers are quoted in each design note.
 | `softmax` | three pass, warp online softmax, block online softmax, single pass with the row in registers | `torch.softmax` |
 | `sgemm` fp32 | naive, smem tile, 8x8 register tile, cp.async, register prefetch with swizzle, 256x128 tile | cuBLAS SGEMM |
 | `hgemm` bf16 | WMMA, smem tile, cp.async, `mma.sync` + `ldmatrix` with swizzle, 3 stages and split-K, persistent Stream-K, TMA with a producer warp, a weight-streaming kernel for decode | cuBLAS GemmEx |
-| `attention` bf16 | warp per query row, CUDA-core flash attention, `mma.sync` + `ldmatrix` flash attention, split-KV tail and decode | `F.scaled_dot_product_attention` |
+| `attention` bf16 | warp per query row, CUDA-core flash attention, `mma.sync` + `ldmatrix` flash attention, split-KV tail, GQA and a flash-decoding kernel for long caches | `F.scaled_dot_product_attention` |
 | `bench_peak` | | measures the card's real `mma.sync` and FMA peaks and the clock they run at |
 
 Every kernel takes a `variant` argument so each rung can be run, timed and tested on its own.
@@ -207,7 +224,8 @@ out = sk.add_rmsnorm_(x, resid, w)         # resid += x, then norm, in place
 h = sk.swiglu(gate, up)
 p = sk.softmax(scores)
 c = sk.hgemm(a_bf16, b_bf16)               # tensor-core GEMM
-o = sk.attention(q, k, v, causal=True)     # fused attention, q/k/v are [B, H, S, D] bf16
+o = sk.attention(q, k, v, causal=True)     # fused attention, q/k/v are [B, H, S, D] bf16;
+                                           # k and v may have fewer heads (GQA)
 ```
 
 ## notes
