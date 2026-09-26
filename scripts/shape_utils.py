@@ -145,6 +145,16 @@ def gemm_shape(M: int, N: int, K: int) -> str:
     return f"{M}x{N}x{K}"
 
 
+def attention_shape(B: int, H: int, S_q: int, S_kv: int, D: int, causal: bool) -> str:
+    """Shape string of bench_attention: "b1_h32_s4096_d128_causal", or sq/skv when the query
+    and key lengths differ ("b1_h32_sq1_skv4096_d128", a decode step)."""
+    s = f"b{B}_h{H}_s{S_q}" if S_q == S_kv else f"b{B}_h{H}_sq{S_q}_skv{S_kv}"
+    return f"{s}_d{D}" + ("_causal" if causal else "")
+
+
+ATTENTION_SHAPE = re.compile(r"^b(\d+)_h(\d+)_(?:s(\d+)|sq(\d+)_skv(\d+))_d(\d+)(_causal)?$")
+
+
 def ints_in(s: str) -> list[int]:
     return [int(t) for t in re.findall(r"\d+", s)]
 
@@ -181,6 +191,13 @@ def parse_shape(kernel: str, shape: str) -> dict:
             return {"rows": 1, "cols": v[0]}
     if k == "bandwidth":
         return {"n": element_count(shape)}
+    if k == "attention":
+        m = ATTENTION_SHAPE.match(shape)
+        if not m:
+            raise ValueError(f"not an attention shape string: {shape!r}")
+        B, H, S, Sq, Skv, D, causal = m.groups()
+        return {"B": int(B), "H": int(H), "S_q": int(Sq or S), "S_kv": int(Skv or S), "D": int(D),
+                "causal": causal is not None}
     return {"raw": v}
 
 
@@ -199,6 +216,9 @@ def traffic_bytes(kernel: str, dtype: str, dims: dict) -> float:
     if k in ("sgemm", "hgemm", "gemm"):
         M, N, K = dims["M"], dims["N"], dims["K"]
         return float(M * K + K * N + M * N) * isz
+    if k == "attention":  # Q and O once, K and V once
+        bh = dims["B"] * dims["H"]
+        return 2.0 * bh * (dims["S_q"] + dims["S_kv"]) * dims["D"] * isz
     return 0.0
 
 
@@ -206,6 +226,9 @@ def flops(kernel: str, dims: dict) -> float:
     k = kernel.lower()
     if k in ("sgemm", "hgemm", "gemm"):
         return 2.0 * dims["M"] * dims["N"] * dims["K"]
+    if k == "attention":  # Q K^T and P V, halved under the causal mask as FlashAttention counts it
+        fl = 4.0 * dims["B"] * dims["H"] * dims["S_q"] * dims["S_kv"] * dims["D"]
+        return fl / 2 if dims["causal"] else fl
     if k in ("rmsnorm", "add_rmsnorm"):
         return 4.0 * dims["rows"] * dims["cols"]
     if k == "softmax":
@@ -222,4 +245,9 @@ def arithmetic_intensity(kernel: str, dtype: str, shape: str) -> float:
 
 
 def is_compute_bound_kernel(kernel: str) -> bool:
-    return kernel.lower() in ("sgemm", "hgemm", "gemm")
+    return kernel.lower() in ("sgemm", "hgemm", "gemm", "attention")
+
+
+def uses_tensor_cores(kernel: str) -> bool:
+    """Kernels judged against the bf16 tensor-core peak rather than the fp32 one."""
+    return kernel.lower() in ("hgemm", "attention")

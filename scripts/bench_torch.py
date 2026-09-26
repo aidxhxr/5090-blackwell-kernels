@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from shape_utils import gemm_shape, row_shape  # noqa: E402
+from shape_utils import attention_shape, gemm_shape, row_shape  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "results" / "torch_comparison.json"
@@ -36,6 +36,11 @@ SGEMM_SHAPES = [(512, 512, 512), (1024, 1024, 1024), (2048, 2048, 2048), (4096, 
 HGEMM_SHAPES = [(1024, 1024, 1024), (2048, 2048, 2048), (4096, 4096, 4096), (8192, 8192, 8192),
                 (4096, 4096, 11008), (4096, 11008, 4096),
                 (16, 4096, 4096), (64, 4096, 4096), (16, 11008, 4096), (64, 4096, 11008)]
+# (B, H, S_q, S_kv, D, causal): the timed shapes of bench_attention.cu (its small validation
+# shapes are timed there too but are not worth a torch line)
+ATTENTION_SHAPES = [(1, 32, 4096, 4096, 128, 0), (1, 32, 4096, 4096, 128, 1),
+                    (1, 32, 8192, 8192, 128, 1), (4, 32, 2048, 2048, 128, 1),
+                    (1, 32, 4096, 4096, 64, 1), (1, 32, 1, 4096, 128, 0)]
 WARMUP, ITERS = 10, 100
 
 
@@ -152,6 +157,54 @@ def bench_hgemm(sk, add, M, N, K):
     add("hgemm", "bf16", gemm_shape(M, N, K), ours, ref, tflops=2.0 * M * N * K / ours / 1e9)
 
 
+def sdpa_backend(fn) -> str:
+    """Which kernel torch's SDPA dispatcher picked for `fn`, from the profiler's kernel names:
+    "flash" (FlashAttention-2), "cudnn", "efficient" (the CUTLASS memory-efficient kernel) or
+    "math". Empty if the profiler is unavailable."""
+    try:
+        from torch.profiler import ProfilerActivity, profile
+
+        with profile(activities=[ProfilerActivity.CUDA]) as p:
+            fn()
+            torch.cuda.synchronize()
+        names = " ".join(e.name for e in p.events() if e.device_type.name == "CUDA")
+    except Exception:
+        return ""
+    for tag, key in (("flash", "flash_fwd"), ("cudnn", "cudnn"), ("efficient", "fmha_cutlass")):
+        if key in names:
+            return tag
+    return "math" if names else ""
+
+
+def bench_attention(sk, add, B, H, Sq, Skv, D, causal):
+    q = torch.randn(B, H, Sq, D, device="cuda", dtype=torch.bfloat16)
+    # A decode step (S_q <= 64) streams K and V, and one layer's cache fits the RTX 5090's
+    # 96 MB L2, so the loop rotates through copies that exceed it, as bench_attention does.
+    copies = (256 << 20) // (2 * B * H * Skv * D * 2) + 1 if Sq <= 64 else 1
+    kvs = [(torch.randn(B, H, Skv, D, device="cuda", dtype=torch.bfloat16),
+            torch.randn(B, H, Skv, D, device="cuda", dtype=torch.bfloat16)) for _ in range(copies)]
+    turn = [0]
+
+    def next_kv():
+        kv = kvs[turn[0] % copies]
+        turn[0] += 1
+        return kv
+
+    def ours():
+        k, v = next_kv()
+        return sk.attention(q, k, v, causal=bool(causal))
+
+    def theirs():
+        k, v = next_kv()
+        return F.scaled_dot_product_attention(q, k, v, is_causal=bool(causal))
+
+    ours_ms = time_ms(ours)
+    ref = time_ms(theirs)
+    flops = 4.0 * B * H * Sq * Skv * D * (0.5 if causal else 1.0)
+    add("attention", "bf16", attention_shape(B, H, Sq, Skv, D, bool(causal)), ours_ms, ref,
+        tflops=flops / ours_ms / 1e9, backend=sdpa_backend(theirs))
+
+
 def positive_int(text: str) -> int:
     n = int(text)
     if n < 1:
@@ -185,7 +238,7 @@ def main() -> int:
     device = torch.cuda.get_device_name()
     print(f"device: {device} | cc {torch.cuda.get_device_capability()}", file=sys.stderr)
 
-    def add(kernel, dtype, shape, ours_ms, torch_ms, gbps=None, tflops=None):
+    def add(kernel, dtype, shape, ours_ms, torch_ms, gbps=None, tflops=None, backend=None):
         r = {
             "device": device,
             "kernel": kernel,
@@ -199,10 +252,12 @@ def main() -> int:
             r["gbps"] = gbps
         if tflops is not None:
             r["tflops"] = tflops
+        if backend:
+            r["torch_backend"] = backend  # which SDPA kernel torch picked for this shape
         rows_out.append(r)
         print(
-            f"{kernel:12s} {dtype:5s} {shape:22s} spark {ours_ms:9.4f} ms  torch {torch_ms:9.4f} ms"
-            f"  x{r['speedup']:.2f}",
+            f"{kernel:12s} {dtype:5s} {shape:26s} spark {ours_ms:9.4f} ms  torch {torch_ms:9.4f} ms"
+            f"  x{r['speedup']:.2f}" + (f"  ({backend})" if backend else ""),
             file=sys.stderr,
         )
 
@@ -217,6 +272,8 @@ def main() -> int:
         bench_sgemm(sk, add, M, N, K)
     for M, N, K in HGEMM_SHAPES:
         bench_hgemm(sk, add, M, N, K)
+    for B, H, Sq, Skv, D, causal in ATTENTION_SHAPES:
+        bench_attention(sk, add, B, H, Sq, Skv, D, causal)
 
     OUT.parent.mkdir(exist_ok=True)
     with OUT.open("w") as f:

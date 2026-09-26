@@ -21,10 +21,28 @@ import shape_utils as su  # noqa: E402
         ("bandwidth", "n=256M", {"n": 256 << 20}),  # what bench_bandwidth.cu writes
         ("bandwidth", "n=64M", {"n": 64 << 20}),
         ("bandwidth", "", {"n": 0}),
+        ("attention", "b1_h32_s4096_d128_causal",
+         {"B": 1, "H": 32, "S_q": 4096, "S_kv": 4096, "D": 128, "causal": True}),
+        ("attention", "b1_h32_sq1_skv4096_d128",
+         {"B": 1, "H": 32, "S_q": 1, "S_kv": 4096, "D": 128, "causal": False}),
     ],
 )
 def test_parse_shape(kernel, shape, expected):
     assert su.parse_shape(kernel, shape) == expected
+
+
+def test_attention_shape_round_trips_and_counts_flops_and_bytes():
+    # bench_attention.cu: b{B}_h{H}_s{S}_d{D}[_causal], sq/skv when the lengths differ
+    assert su.attention_shape(1, 32, 4096, 4096, 128, True) == "b1_h32_s4096_d128_causal"
+    assert su.attention_shape(1, 32, 1, 4096, 128, False) == "b1_h32_sq1_skv4096_d128"
+    dims = su.parse_shape("attention", su.attention_shape(4, 32, 2048, 2048, 128, True))
+    assert dims == {"B": 4, "H": 32, "S_q": 2048, "S_kv": 2048, "D": 128, "causal": True}
+    # 4 B H S_q S_kv D, halved under the causal mask; Q, K, V, O each once in bf16
+    assert su.flops("attention", dims) == 2 * 4 * 32 * 2048 * 2048 * 128
+    assert su.traffic_bytes("attention", "bf16", dims) == 4 * 32 * (2048 + 2048) * 128 * 2 * 2
+    assert su.is_compute_bound_kernel("attention") and su.uses_tensor_cores("attention")
+    with pytest.raises(ValueError):
+        su.parse_shape("attention", "4096x4096")
 
 
 def test_shape_strings_match_the_cpp_benches_and_round_trip():

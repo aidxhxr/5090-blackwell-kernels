@@ -44,3 +44,11 @@ def test_clock_ramp_spins_once_for_the_whole_process(monkeypatch):
     n = len(calls)
     bench_torch.ramp_clocks(lambda: calls.append(1))  # later ops are not ramped again
     assert len(calls) == n
+
+
+def test_attention_shapes_match_the_cpp_defaults():
+    flat = ints_after("bench_attention", r"shapes =")
+    cpp = [tuple(flat[i:i + 6]) for i in range(0, len(flat), 6)]
+    # bench_torch times the large shapes only; every one of them must be in the C++ list
+    for shape in bench_torch.ATTENTION_SHAPES:
+        assert shape in cpp, f"{shape} is timed by bench_torch.py but not by bench_attention.cu"

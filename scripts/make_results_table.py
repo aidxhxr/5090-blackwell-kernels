@@ -21,6 +21,7 @@ from shape_utils import (  # noqa: E402
     measured_peaks,
     parse_shape,
     peaks_for_rows,
+    uses_tensor_cores,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -29,7 +30,8 @@ OUT_MD = ROOT / "docs" / "RESULTS.md"
 OUT_HEADLINE = RESULTS / "headline.md"
 
 SHEETS = {"RTX 5090": "RTX5090.md", "GB10": "GB10.md"}
-KERNEL_ORDER = ["bandwidth", "rmsnorm", "add_rmsnorm", "swiglu", "softmax", "sgemm", "hgemm"]
+KERNEL_ORDER = ["bandwidth", "rmsnorm", "add_rmsnorm", "swiglu", "softmax", "sgemm", "hgemm",
+                "attention"]
 
 
 def on_device(r: dict, device: str) -> bool:
@@ -57,6 +59,8 @@ def shape_size(kernel: str, shape: str) -> float:
     d = parse_shape(kernel, shape)
     if "M" in d:
         return d["M"] * d["N"] * d["K"]
+    if "S_q" in d:
+        return d["B"] * d["H"] * d["S_q"] * d["S_kv"] * d["D"]
     if "rows" in d:
         return d["rows"] * d["cols"]
     return d.get("n", 0)
@@ -72,7 +76,8 @@ def fmt(x: float, nd=3) -> str:
 
 def vs_ref(kernel: str, r: dict) -> str:
     """ref_ms is cuBLAS for the GEMMs (shown as % of cuBLAS throughput) and the naive variant
-    or cudaMemcpy for everything else (shown as a speedup)."""
+    or cudaMemcpy for everything else (shown as a speedup). Attention has no library
+    reference in the C++ bench (ref_ms = 0); its comparison is the torch column."""
     ref_ms, ms = r.get("ref_ms", 0), r["median_ms"]
     if ref_ms <= 0 or ms <= 0:
         return "—"
@@ -82,7 +87,7 @@ def vs_ref(kernel: str, r: dict) -> str:
 def peak_for(kernel: str, peaks: dict) -> tuple[str, float | None]:
     """(unit, ceiling) for a kernel; the ceiling is None when it is not known for the device."""
     if is_compute_bound_kernel(kernel):
-        if kernel == "hgemm":
+        if uses_tensor_cores(kernel):
             return "TFLOPS", peaks["bf16_tflops"]
         return "TFLOPS", peaks["fp32_tflops"]
     return "GB/s", peaks["bw_gbps"]

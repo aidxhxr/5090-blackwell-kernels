@@ -88,3 +88,25 @@ def test_the_copy_is_not_given_an_arithmetic_intensity(results):
     assert "0.00 FLOP/byte" not in md and "a pure copy" in md
     assert "| f32 | n=256M | cudaMemcpy | 1.5000 |" in md
     assert "| bandwidth | f32 | n=256M | v2 |" in (out / "headline.md").read_text()
+
+
+def test_attention_rows_use_the_tensor_peak_and_the_torch_backend_column(results):
+    out, write = results
+    shape = "b1_h32_s4096_d128_causal"
+    write("attention.json", [
+        bench_row("attention", "bf16", 2, shape, 0.65, tflops=211.7),
+        bench_row("attention", "bf16", 3, shape, 0.64, tflops=214.5),
+        bench_row("attention", "bf16", 3, "b1_h32_sq1_skv4096_d128", 0.05, gbps=1367.0,
+                  tflops=1.4),
+    ])
+    write("peak.json", [{"device": DEVICE, "kernel": "peak_bf16_mma", "tflops": 258.7}])
+    write("torch_comparison.json", [{"device": DEVICE, "kernel": "attention", "dtype": "bf16",
+                                     "shape": shape, "speedup": 1.22, "torch_backend": "flash"}])
+    assert mrt.main() == 0
+    md = (out / "RESULTS.md").read_text()
+    assert "## attention\n" in md and "% of peak (258.7 TFLOPS)" in md
+    assert "% of cuBLAS" not in md.split("## attention")[1]  # no library reference in the bench
+    row = "| bf16 | b1_h32_s4096_d128_causal | 3 | 0.6400 | 0.6272 | 214.50 | 82.9% | 1.22× |"
+    assert row in md
+    headline = (out / "headline.md").read_text()
+    assert "| attention | bf16 | b1_h32_s4096_d128_causal | v3 |" in headline  # the largest shape

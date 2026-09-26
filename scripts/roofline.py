@@ -31,7 +31,7 @@ RESULTS = ROOT / "results"
 OUT = RESULTS / "roofline.png"
 
 MARKERS = {"bandwidth": "P", "rmsnorm": "o", "add_rmsnorm": "D", "swiglu": "s", "softmax": "^",
-           "sgemm": "v", "hgemm": "*"}
+           "sgemm": "v", "hgemm": "*", "attention": "X"}
 
 
 def achieved_tflops(r: dict) -> float:
