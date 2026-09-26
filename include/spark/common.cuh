@@ -211,6 +211,52 @@ __device__ __forceinline__ void mma_bf16_16816(float (&d)[4], const unsigned (&a
         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
+// D[16x8] (+)= A[16x32] * B[32x8], e4m3 inputs, fp32 accumulate (the fp8gemm variants).
+// Fragment layouts are the PTX ISA ones for m16n8k32 with 8-bit types, four elements per
+// register with the lowest k in the low byte: a[4] = (row g / g+8) x (k 4c..4c+3 / 16+4c..
+// 16+4c+3), b[2] = (k 4c..4c+3 / 16+4c..16+4c+3) x col g, d[4] as for m16n8k16. Read as
+// 16-bit pairs of adjacent k, a[] is the m16n8k16 A fragment of the same bytes and b[] the
+// m16n8k16 B fragment, which is what lets ldmatrix (a b16 instruction) load both.
+//
+// Two instructions compute this. The plain one (mma.sync...f32.e4m3.e4m3.f32, sm_89+) runs
+// at half the fp16-accumulate rate on the RTX 5090, 517 TFLOPS measured, as on the GeForce
+// Ada parts. The block-scaled one (.kind::mxf8f6f4, the MXFP8 instruction, sm_120a) scales
+// each row of A and column of B by a ue8m0 factor (a power of two) before the same fp32
+// accumulation, and with every factor 2^0 it computes the same bits at the full rate, 1,027
+// TFLOPS measured; it is the instruction cuBLASLt's fp8 kernels issue on this card
+// (QMMA.SF...E8 in the SASS). It is only exposed on the architecture-specific targets, so
+// the fp8 kernels are compiled for sm_120a / sm_121a and fall back to the plain instruction
+// on a plain sm_120 build (docs/design/fp8gemm.md).
+__device__ __forceinline__ void mma_e4m3_16832_plain(float (&d)[4], const unsigned (&a)[4],
+                                                     const unsigned (&b)[2]) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+#if defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_FEAT_SM121_ALL)
+#define SPARK_HAS_MX_MMA 1
+// The scale operands: a .b32 register of four ue8m0 bytes per lane, and {byte, thread}
+// immediates that pick which byte of which lanes' registers the hardware reads for each row
+// and column. With 0x7F (2^0) in every byte of every lane the selection does not matter.
+__device__ __forceinline__ void mma_e4m3_16832(float (&d)[4], const unsigned (&a)[4],
+                                               const unsigned (&b)[2]) {
+    const unsigned one = 0x7F7F7F7Fu;
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X"
+        ".f32.e4m3.e4m3.f32.ue8m0 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, %10, {0, 0}, %10, {0, 0};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(one));
+}
+#else
+#define SPARK_HAS_MX_MMA 0
+__device__ __forceinline__ void mma_e4m3_16832(float (&d)[4], const unsigned (&a)[4],
+                                               const unsigned (&b)[2]) {
+    mma_e4m3_16832_plain(d, a, b);
+}
+#endif
 
 // ---------------------------------------------------------------------------
 // TMA / mbarrier (sm_90+; available on sm_120 / sm_121). Used by the hgemm TMA variant.
@@ -329,23 +375,36 @@ inline TensorMapEncodeFn tensor_map_encoder() {
     }
     return fn;
 }
-inline CUtensorMap make_tensor_map_2d_bf16(const void* base, uint64_t rows, uint64_t cols,
-                                           uint32_t box_rows, uint32_t box_cols,
-                                           CUtensorMapSwizzle swizzle) {
+inline CUtensorMap make_tensor_map_2d(CUtensorMapDataType type, size_t elem_bytes, const void* base,
+                                      uint64_t rows, uint64_t cols, uint32_t box_rows,
+                                      uint32_t box_cols, CUtensorMapSwizzle swizzle) {
     CUtensorMap map;
     const cuuint64_t dims[2] = {cols, rows};
-    const cuuint64_t strides[1] = {cols * sizeof(__nv_bfloat16)};  // bytes, outer dim only
+    const cuuint64_t strides[1] = {cols * elem_bytes};  // bytes, outer dim only
     const cuuint32_t box[2] = {box_cols, box_rows};
     const cuuint32_t elem_strides[2] = {1, 1};
-    const CUresult r = tensor_map_encoder()(
-        &map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, const_cast<void*>(base), dims, strides, box,
-        elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    const CUresult r =
+        tensor_map_encoder()(&map, type, 2, const_cast<void*>(base), dims, strides, box,
+                             elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle,
+                             CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
     if (r != CUDA_SUCCESS) {
         throw std::runtime_error("cuTensorMapEncodeTiled failed with CUresult " +
                                  std::to_string(static_cast<int>(r)));
     }
     return map;
+}
+inline CUtensorMap make_tensor_map_2d_bf16(const void* base, uint64_t rows, uint64_t cols,
+                                           uint32_t box_rows, uint32_t box_cols,
+                                           CUtensorMapSwizzle swizzle) {
+    return make_tensor_map_2d(CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, sizeof(__nv_bfloat16), base, rows,
+                              cols, box_rows, box_cols, swizzle);
+}
+// Same for a matrix of 8-bit elements (the fp8gemm TMA variant moves e4m3 as raw bytes).
+inline CUtensorMap make_tensor_map_2d_u8(const void* base, uint64_t rows, uint64_t cols,
+                                         uint32_t box_rows, uint32_t box_cols,
+                                         CUtensorMapSwizzle swizzle) {
+    return make_tensor_map_2d(CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, base, rows, cols, box_rows,
+                              box_cols, swizzle);
 }
 
 // 3-D map for a [d2][d1][d0] bf16 tensor (d0 contiguous) with a box of box1 x box0 in the two
