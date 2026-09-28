@@ -83,6 +83,7 @@ rows past `S_q` in a zero-filled tile go through the same code.
 | 2 | `mma.sync.m16n8k16` + `ldmatrix`: Q fragments in registers for the whole KV loop, S and PV on the tensor cores, P repacked from the S accumulators, 3-stage `cp.async` pipeline on K and V | the tensor cores, and no shared-memory round trip for P |
 | 3 | variant 2's kernel with a schedule: the tiles of the last partial wave are split along the keys over the idle SMs and merged by a combine kernel; `S_q <= 64` runs a 64-row tile; decode shapes (the query rows sharing a K/V head fit 16 rows) run the flash-decoding kernel of the "Long-context decode" section | wave quantization on 170 SMs, a short query that no longer pays for 128 rows, and a decode step that streams each K/V head once for its whole group of query heads |
 | 4 | variant 3's tile with K and V fed by TMA into full / empty mbarrier stages issued by one lane, no block-wide barrier in the KV loop | the per-tile `__syncthreads` that kept both warps of a scheduler in the same phase, so their softmaxes were a hole in the tensor pipe |
+| 5 | variant 4's tile and pipeline on a persistent grid: 170 resident blocks take (b, h, q-tile) items from a queue in the heaviest-first order, a producer warp publishes each item to the consumer warps through a shared-memory ring and keeps the TMA loads running across items; the split-KV tail stays on for the non-causal shapes | the per-block prologue (barrier init, the Q box and the first K/V box before any `mma`), 1,028 times on the causal 4096 shape, and the per-SM spread a static assignment of six blocks per SM leaves |
 
 ### Variant 0
 
@@ -500,6 +501,151 @@ TMA kernel, including the tail split and the combine kernel, which are shared wi
 (`v2::split_tail_tiles`, `v2::launch_combine`). Every launch encodes three tensor maps on the
 host, 27 ns each.
 
+### Variant 5: the persistent grid
+
+Variant 4 launches one block per Q tile: 1,028 of them on the causal 4096 shape, six per SM one
+after the other, and each starts from nothing. It initializes its barriers, prefetches three
+tensor maps, waits for its Q box and its first K/V box, and only then issues an `mma`; at the
+other end its warps write their rows and exit, and the SM waits for the block scheduler to
+put the next one in. Variant 5 launches 170 blocks that stay resident and walk a queue of
+tiles, so the prologue is paid once per SM and the loads of one tile are in flight while the
+warps finish the last one. The kernel is variant 4's tile, pipeline and epilogue with three
+things added: a work queue, an item ring, and a producer warp.
+
+**The queue.** The items are variant 4's tiles in variant 4's order, `tile = q_rank · B·H_q +
+bh` with `q_rank` walking the Q tiles heaviest first under the causal mask (the last Q tile
+of the sequence needs 64 KV tiles at 4096 tokens, the first needs 2), the `group` query heads
+of a K/V head adjacent so they run together and pull the head through L2 once. A block takes
+the next item with one `atomicAdd` on a counter in global memory, one atomic per 2 to 64 KV
+tiles of work, and the last block to find the counter exhausted resets it for the next launch
+(the `hgemm` v6 pattern, no memset). The counter is one per stream, handed out on first sight,
+so a launch on a second stream cannot take items from one still running on the first. Greedy
+heaviest-first on a queue is the LPT rule, and it evens the blocks out to within one small
+item: simulated on the causal shapes, the longest block's share of KV tiles against the mean
+is 200 against 198.8 at 4096 (1,024 items), 786 against 783.1 at 8192 (2,048 items) and 206
+against 204.8 for the batch of four 2048-token sequences, so the causal tail is 0.4 to 0.6%
+with no split at all. The split-KV tail of variant 3 stays as an option: the last `tiles mod
+170` items become `split` slices each, merged by the combine kernel. It is on for the
+non-causal shapes, where 1,024 equal tiles on 170 blocks are still 6.02 waves and four blocks
+would otherwise run a seventh item (the table below), and for any shape with fewer tiles than
+blocks, where the slices are the only work the idle SMs can get; it is off under the causal
+mask once there is a full wave to balance.
+
+**The item ring.** The producer publishes each item to the eight consumer warps through two
+`int4` slots in shared memory with a full / empty mbarrier pair each, exactly like a pipeline
+stage: it waits on the slot's "empty" (one arrive per warp, made once the warp has read the
+slot), writes the item, arrives on "full"; a warp waits on "full" with the parity of the slot's
+use count, reads, and arrives on "empty". Item `-1` ends the block. Both sides then run
+variant 4's bookkeeping on one running load counter that never resets: load `u` is the Q
+tile of an item or one of its KV tiles, lives in stage `u mod 3` and is that stage's
+`u / 3`-th use, whichever item it belongs to. The producer issues the Q box of item `i + 1`
+as soon as the stage that held the third-to-last tile of item `i` is released, so the Q wait
+that opened every block of variant 4 is over before the warps get there, and item `i + 1`'s
+first two K/V tiles land while they run item `i`'s epilogue. Per item a warp now pays a ring
+read, one `mbar_wait` on a Q box that has already landed, eight `ldmatrix`, and the
+epilogue stores.
+
+**The producer warp.** Variant 4 issues its loads from lane 0 of warp 0 because a ninth warp
+would cost registers. I built variant 5 both ways (`SPARK_ATTN_V5_PWARP`) and the ninth warp
+won:
+
+| producer | regs | causal TFLOPS | non-causal TFLOPS (tail split on) |
+|---|---|---|---|
+| lane 0 of warp 0, one load issued before each load consumed | 228 | 226.7 | 234.9 |
+| **lane 0 of a ninth warp, runs ahead until the empty barriers stop it** | **168** | **230.4** | **239.4** |
+| variant 4, same session | 204 | 224.7 | 235.7 |
+
+(`--iters=30`, 4096 tokens, `D = 128`, before the dead-tile skip below.) The inline lane's
+wait on "empty" is warp 0's wait: at the top of tile `t` it refills the stage of tile `t - 1`,
+and whenever warp 0 is not the slowest warp it sits there until the slowest one arrives on
+the barrier, then issues the load; variant 4 has the same wait, and the section above, which
+called it free, was only right about the warps it does not delay. The producer warp
+issues the moment a stage frees, whichever warp freed it, and warp 0 computes like the other
+seven. The price is the register file: nine warps put three on one of the four schedulers,
+whose 16,384 registers then allow 168 per thread (16,384 / 3 / 32, rounded down to a multiple
+of 8; `ptxas` applies exactly this), so the kernel that needed 204 in variant 4 is compiled
+to 168 with 40 bytes of spill, all of it in the producer's own path (the SASS of the K/V loop
+has no `LDL` / `STL`). Executed instructions rise 8.5% (165.0 M to 179.1 M on the causal
+shape), which is the producer's `try_wait` loop: one iteration per 63 cycles per SM, three
+instructions each, 5% of one scheduler's issue slots, and the stall reasons it adds
+(`branch_resolving`, `short_scoreboard`) are its own, one warp in nine of the average.
+
+**The dead tile, again.** Variant 4 tried skipping the second diagonal tile for warps 0-3
+(under the causal mask its 64 keys all follow their rows, every `p` is 0) and measured
+nothing: the tile was the block's last, and a warp that skips it frees a pipe its scheduler
+partner cannot fill alone. In the persistent kernel the warp that skips goes on to the next
+item and issues that item's `Q K^T` while its partner finishes this one, so the skip is worth
+having (`SPARK_ATTN_V5_SKIP=0` turns it off):
+
+| shape | skip off | skip on |
+|---|---|---|
+| b1 h32 s4096 d128 causal | 228.9 | 231.3 |
+| b1 h32 s8192 d128 causal | 232.9 | 234.1 |
+| b4 h32 s2048 d128 causal | 212.2 | 216.4 |
+| b1 h32 s4096 d64 causal | 226.2 | 227.2 |
+| b1 h32 s4096 d128 (no mask, the skip never fires) | 237.9 | 237.8 |
+
+(TFLOPS, `--iters=30`, a warmer card than the table above.) The batch of four gains most:
+its Q tiles are 16 KV tiles long on average, so the skipped half-tile is a larger share.
+
+**With and without the tail split** (TFLOPS, `--iters=30`, `SPARK_ATTN_V5_SPLIT`, the
+producer-warp kernel; the default rule picks the bold column):
+
+| shape | items | waves of 170 | split off | split on |
+|---|---|---|---|---|
+| b1 h32 s4096 d128 causal | 1,024 | 6.02 | **230.4** | 229.6 |
+| b1 h32 s4096 d128 | 1,024 | 6.02 | 209.3 | **239.4** |
+| b1 h4 s512 d128 causal | 16 | 0.09 | 9.8 (16 blocks) | **14.0** (128 slices) |
+
+Under the causal mask the four tail items are the four lightest (two KV tiles each), and
+splitting them in two buys nothing the queue had not already balanced, at the price of a
+combine launch. Without the mask the blocks that draw a seventh item run 7 / 6.02 = 16%
+longer than the rest, which is the 209 against 239.
+
+**Nsight Compute, 4096 tokens, `D = 128`, one launch each, 2.52 GHz under the profiler**
+(the variant 4 column is the same session, so it differs slightly from the table in the
+variant 4 section; the variant 5 columns are the shipped kernel, producer warp, dead-tile
+skip on, tail split by the default rule):
+
+| | v4 causal | v5 causal | v4 non-causal | v5 non-causal |
+|---|---|---|---|---|
+| duration | 705 µs | 683 µs | 1.34 ms | 1.32 ms |
+| grid | 1,028 blocks | 170 | 1,188 | 170 |
+| tensor pipe active, mean over SMs | 94.2% | 96.1% (96.8% before the skip) | 95.5% | 97.5% |
+| tensor pipe active, slowest SM | 92.9% | 94.7% (95.4%) | 95.1% | 97.1% |
+| issue slots busy | 14.0% | 15.9% | 13.9% | 15.5% |
+| instructions executed | 165.0 M | 180.6 M | 312.2 M | 340.0 M |
+| cycles per issued instruction | 14.17 | 14.09 | 14.39 | 14.53 |
+| of which `math_pipe_throttle` | 9.87 | 8.03 | 10.13 | 8.60 |
+| `wait` | 2.24 | 2.31 | 2.28 | 2.29 |
+| `branch_resolving` | 0.14 | 0.81 | 0.10 | 0.78 |
+| `short_scoreboard` | 0.19 | 0.77 | 0.18 | 0.67 |
+| `long_scoreboard` | 0.19 | 0.60 | 0.16 | 0.59 |
+| registers | 204 | 168 | 204 | 168 |
+| L2 hit rate | 88.6% | 88.6% | 93.7% | 93.5% |
+| shared bank conflicts | 35 K | 290 K | 15 K | 918 K |
+
+The pipe gains 2.6 points causal and 2.0 non-causal, and the slowest SM gains more than the
+mean: the queue is also evening out the per-SM spread that a static assignment of six blocks
+per SM left. The bank conflicts are the producer warp polling the barrier words while the
+consumers arrive on them, 3 K per SM over 1.7 M cycles. The prologue share, measured rather
+than estimated: at the same 2.52 GHz the causal launch went from 705 to 687 µs before the
+dead-tile skip, 18 µs, which over 1,028 blocks on 170 SMs is 3.0 µs per block of prologue
+plus drain that variant 4 paid and variant 5 does not, 2.6% of the run.
+
+**What is left** in the 3% of idle pipe: the per-item boundary (about a thousand cycles of
+ring read, `ldmatrix` and epilogue per item against 33 tiles of 8,192 cycles, 0.4%), the LPT
+tail (0.6% on the causal shapes), and the tiles where both warps of a scheduler still meet in
+their softmaxes, which is what the 96.8% is mostly made of and what a 128-key tile would
+halve.
+
+**Shapes.** Variant 5 routes exactly as variant 4 does: `S_q <= 64` to variant 3's paths
+(the flash-decoding kernel, or the 64-row tile), every 128-row shape to the persistent kernel.
+GQA is the same `kv_index` stride on the K/V head; rows past `S_q` and keys past `S_kv` are
+zero-filled by the copy engine as before. The split workspace stays one per device, shared
+with variants 3 and 4 (the same caveat about concurrent split launches on two streams); the
+queue counters are per stream.
+
 ## Correctness
 
 `bench_attention` checks every output row of the small shapes against a CPU double-precision
@@ -508,11 +654,14 @@ reference computed from the same bf16-rounded inputs, and 64 sampled `(b, h, row
 mask) on the large ones. Q and K are uniform in [-2, 2] and V in [-1, 1], so the scaled scores
 have a spread of a few units and the running max actually moves. Tolerance:
 `max|O − O_ref| <= 0.02 · max|O_ref| + 1e-3`, one bf16 rounding of an fp32 result on our side
-plus the bf16 rounding of P before the P V product in variants 2 and 3, the same form as
+plus the bf16 rounding of P before the P V product in variants 2 to 5, the same form as
 `bench_hgemm`. Measured errors are 1e-3 to 2.6e-3 against a tolerance of 2e-2 or more. The
 pytest parity test compares every variant with `F.scaled_dot_product_attention` in fp32 on
 the same bf16 inputs, including `S = 200`, `S = 1000`, `S_q = 1` and `S_q = 7` against a
-longer cache, both masks and both head sizes.
+longer cache, both masks and both head sizes. Variants 4 and 5 are also checked for K/V boxes
+that hang off the end of a head (a bleed from the next head would show), for repeated calls and
+a second stream, and variant 5 with 256 items on 170 blocks, two launches back to back and one
+on another stream, so the queue counter's reset by the last block is exercised.
 
 ## RTX 5090 notes (measured)
 
@@ -542,6 +691,11 @@ defaults. Nsight Compute runs at a fixed 2.53 GHz; the timed runs boost higher.
   can issue, 1,028 blocks of 33 tiles on the causal shape) plus the tiles where both warps of a
   scheduler still land in their softmaxes together. Forcing them apart with named barriers
   measured slower every way it was tried; the numbers and the reason are in that section.
+- **What limits variant 5.** Tensor pipe 96.1% active causal (96.8% before the dead-tile skip
+  took 1.5% of the products out), 97.5% non-causal, from 94.2% and 95.5% for variant 4 in the
+  same session. What is gone is the per-block prologue and drain, 3.0 µs per block, 2.6% of
+  the causal run; what is left is the per-item boundary (0.4%), the greedy queue's tail (0.6%)
+  and the softmax coincidences. The variant 5 section has the tables.
 - **The causal diagonal.** 215 TFLOPS by the halved count is 220 by the tiles actually
   computed. A 64-row Q tile would waste half as much on the diagonal at twice the K/V traffic
   per FLOP; not tried.
@@ -569,51 +723,73 @@ defaults. Nsight Compute runs at a fixed 2.53 GHz; the timed runs boost higher.
   1.22x and 1.38x over flash. The GQA and long-context decode rows are in the "Long-context
   decode" section.)
 
+  Variant 5 on the same script (2026-09-28, the default rung, so `sk.attention` with no
+  `variant`; the TFLOPS are the C++ sweep's medians of 50 from the same session):
+
+| shape | v5 ms | v5 TFLOPS | flash ms | v5 / flash | cuDNN ms | v5 / cuDNN |
+|---|---|---|---|---|---|---|
+| b1 h32 s4096 d128 | 1.169 | 242.2 | 1.458 | 1.25x | 1.356 | 1.16x |
+| b1 h32 s4096 d128 causal | 0.589 | 236.1 | 0.791 | 1.34x | 0.775 | 1.32x |
+| b1 h32 s8192 d128 causal | 2.356 | 239.1 | 2.776 | 1.18x | 2.723 | 1.16x |
+| b4 h32 s2048 d128 causal | 0.623 | 227.3 | 0.763 | 1.22x | 0.752 | 1.21x |
+| b1 h32 s4096 d64 causal | 0.303 | 235.3 | 0.418 | 1.38x | 0.394 | 1.30x |
+| b1 hq32 hkv8 s4096 d128 causal | 0.594 | 237.1 | 0.788 | 1.33x | 0.774 | 1.32x |
+| b1 h32 sq1 skv4096 d128 (decode, variant 3's kernel) | 0.050 | 1,462 GB/s | 0.071 | 1.43x | 0.069 | 1.39x |
+
 ## Results (RTX 5090, sm_120, CUDA 13.2, driver 595.58)
 
-From the default `bench_attention` sweep, run 2026-09-26 (median of 50). TFLOPS by the
-halved causal count; the decode rows in GB/s of Q, K, V and O once (K and V once per K/V
-head). The decode rows of variants 0 to 2 read each K/V head once per query head, so under
-GQA they land at a quarter of their MHA figure; variants 3 and 4 both run the flash-decoding
-kernel there, so their decode rows are the same kernel timed twice. Bold marks the fastest
-rung per row.
+From the default `bench_attention` sweep, run 2026-09-26 (median of 50); the variant 5 column
+is the same sweep run 2026-09-28, with variant 4 rerun in that session for the comparison in
+its section (it measured 228.9 causal and 239.8 non-causal at 4096 that day, so the two
+sessions agree to within 1%). TFLOPS by the halved causal count; the decode rows in GB/s of
+Q, K, V and O once (K and V once per K/V head). The decode rows of variants 0 to 2 read each
+K/V head once per query head, so under GQA they land at a quarter of their MHA figure;
+variants 3 to 5 all run the flash-decoding kernel there, so their decode rows are the same
+kernel timed three times. Bold marks the fastest rung per row.
 
-| shape | v0 ms / TFLOPS | v1 | v2 | v3 | v4 |
-|---|---|---|---|---|---|
-| b1 h4 s512 d128 | 0.0809 / 6.6 | 0.0828 / 6.5 | 0.0295 / 18.2 | **0.0123 / 43.7** | 0.0131 / 41.0 |
-| b1 h4 s512 d128 causal | 0.0788 / 3.4 | 0.0811 / 3.3 | 0.0295 / 9.1 | **0.0185 / 14.5** | 0.0191 / 14.1 |
-| b1 h4 s512 d64 | 0.0563 / 4.8 | 0.0460 / 5.8 | 0.0153 / 17.5 | **0.0089 / 30.3** | 0.0090 / 30.0 |
-| b1 h4 s512 d64 causal | 0.0542 / 2.5 | 0.0460 / 2.9 | 0.0154 / 8.7 | **0.0122 / 11.0** | 0.0123 / 10.9 |
-| b1 h4 s200 d128 | 0.0317 / 2.6 | 0.0420 / 1.9 | 0.0173 / 4.7 | 0.0102 / 8.1 | **0.0094 / 8.7** |
-| b1 h4 s200 d128 causal | 0.0297 / 1.4 | 0.0420 / 1.0 | 0.0170 / 2.4 | **0.0124 / 3.3** | 0.0131 / 3.1 |
-| b1 hq8 hkv2 s512 d128 causal | 0.0849 / 6.3 | 0.0828 / 6.5 | 0.0296 / 18.1 | 0.0193 / 27.8 | **0.0192 / 28.0** |
-| b1 h32 s4096 d128 | 26.2228 / 10.5 | 5.4236 / 50.7 | 1.4114 / 194.8 | 1.2335 / 222.8 | **1.1627 / 236.4** |
-| b1 h32 s4096 d128 causal | 13.8347 / 9.9 | 2.4653 / 55.7 | 0.6436 / 213.6 | 0.6406 / 214.5 | **0.6007 / 228.8** |
-| b1 h32 s8192 d128 causal | 56.8125 / 9.7 | 10.9835 / 50.1 | 2.4839 / 221.3 | 2.4859 / 221.2 | **2.3345 / 235.5** |
-| b4 h32 s2048 d128 causal | 13.3309 / 10.3 | 2.5285 / 54.4 | 0.6873 / 200.0 | 0.6858 / 200.4 | **0.6448 / 213.1** |
-| b1 h32 s4096 d64 causal | 9.6466 / 7.1 | 1.4996 / 45.8 | 0.3304 / 208.0 | 0.3307 / 207.8 | **0.3171 / 216.7** |
-| b1 h32 sq1 skv4096 d128 | 1.2604 / 53 GB/s | 0.6479 / 104 GB/s | 0.1996 / 336 GB/s | **0.0460 / 1,461 GB/s** | 0.0460 / 1,461 GB/s |
-| b1 hq32 hkv8 s4096 d128 causal | 13.9147 / 9.9 | 2.4531 / 56.0 | 0.6356 / 216.2 | 0.6357 / 216.2 | **0.5977 / 229.9** |
-| b1 hq32 hkv8 sq1 skv4096 d128 | 1.2499 / 13 GB/s | 0.6460 / 26 GB/s | 0.1996 / 84 GB/s | 0.0173 / 970 GB/s | **0.0173 / 972 GB/s** |
-| b1 h32 sq1 skv131072 d128 | 40.2034 / 53 GB/s | 20.5798 / 104 GB/s | 6.2716 / 342 GB/s | **1.2664 / 1,696 GB/s** | 1.2671 / 1,695 GB/s |
-| b1 hq32 hkv8 sq1 skv131072 d128 | 39.6479 / 14 GB/s | 20.5698 / 26 GB/s | 6.2712 / 86 GB/s | 0.3283 / 1,635 GB/s | **0.3283 / 1,636 GB/s** |
-| b8 hq32 hkv8 sq1 skv4096 d128 | 1.2172 / 110 GB/s | 1.3378 / 100 GB/s | 0.3980 / 338 GB/s | **0.0865 / 1,553 GB/s** | 0.0865 / 1,553 GB/s |
+| shape | v0 ms / TFLOPS | v1 | v2 | v3 | v4 | v5 |
+|---|---|---|---|---|---|---|
+| b1 h4 s512 d128 | 0.0809 / 6.6 | 0.0828 / 6.5 | 0.0295 / 18.2 | **0.0123 / 43.7** | 0.0131 / 41.0 | 0.0130 / 41.2 |
+| b1 h4 s512 d128 causal | 0.0788 / 3.4 | 0.0811 / 3.3 | 0.0295 / 9.1 | **0.0185 / 14.5** | 0.0191 / 14.1 | 0.0191 / 14.0 |
+| b1 h4 s512 d64 | 0.0563 / 4.8 | 0.0460 / 5.8 | 0.0153 / 17.5 | **0.0089 / 30.3** | 0.0090 / 30.0 | 0.0089 / 30.1 |
+| b1 h4 s512 d64 causal | 0.0542 / 2.5 | 0.0460 / 2.9 | 0.0154 / 8.7 | **0.0122 / 11.0** | 0.0123 / 10.9 | 0.0110 / 12.2 |
+| b1 h4 s200 d128 | 0.0317 / 2.6 | 0.0420 / 1.9 | 0.0173 / 4.7 | 0.0102 / 8.1 | **0.0094 / 8.7** | 0.0108 / 7.6 |
+| b1 h4 s200 d128 causal | 0.0297 / 1.4 | 0.0420 / 1.0 | 0.0170 / 2.4 | **0.0124 / 3.3** | 0.0131 / 3.1 | 0.0131 / 3.1 |
+| b1 hq8 hkv2 s512 d128 causal | 0.0849 / 6.3 | 0.0828 / 6.5 | 0.0296 / 18.1 | 0.0193 / 27.8 | **0.0192 / 28.0** | 0.0191 / 28.1 |
+| b1 h32 s4096 d128 | 26.2228 / 10.5 | 5.4236 / 50.7 | 1.4114 / 194.8 | 1.2335 / 222.8 | 1.1627 / 236.4 | **1.1350 / 242.2** |
+| b1 h32 s4096 d128 causal | 13.8347 / 9.9 | 2.4653 / 55.7 | 0.6436 / 213.6 | 0.6406 / 214.5 | 0.6007 / 228.8 | **0.5821 / 236.1** |
+| b1 h32 s8192 d128 causal | 56.8125 / 9.7 | 10.9835 / 50.1 | 2.4839 / 221.3 | 2.4859 / 221.2 | 2.3345 / 235.5 | **2.2994 / 239.1** |
+| b4 h32 s2048 d128 causal | 13.3309 / 10.3 | 2.5285 / 54.4 | 0.6873 / 200.0 | 0.6858 / 200.4 | 0.6448 / 213.1 | **0.6048 / 227.3** |
+| b1 h32 s4096 d64 causal | 9.6466 / 7.1 | 1.4996 / 45.8 | 0.3304 / 208.0 | 0.3307 / 207.8 | 0.3171 / 216.7 | **0.2920 / 235.3** |
+| b1 h32 sq1 skv4096 d128 | 1.2604 / 53 GB/s | 0.6479 / 104 GB/s | 0.1996 / 336 GB/s | **0.0460 / 1,461 GB/s** | 0.0460 / 1,461 GB/s | 0.0459 / 1,462 GB/s |
+| b1 hq32 hkv8 s4096 d128 causal | 13.9147 / 9.9 | 2.4531 / 56.0 | 0.6356 / 216.2 | 0.6357 / 216.2 | 0.5977 / 229.9 | **0.5797 / 237.1** |
+| b1 hq32 hkv8 sq1 skv4096 d128 | 1.2499 / 13 GB/s | 0.6460 / 26 GB/s | 0.1996 / 84 GB/s | 0.0173 / 970 GB/s | **0.0173 / 972 GB/s** | 0.0173 / 972 GB/s |
+| b1 h32 sq1 skv131072 d128 | 40.2034 / 53 GB/s | 20.5798 / 104 GB/s | 6.2716 / 342 GB/s | **1.2664 / 1,696 GB/s** | 1.2671 / 1,695 GB/s | 1.2682 / 1,693 GB/s |
+| b1 hq32 hkv8 sq1 skv131072 d128 | 39.6479 / 14 GB/s | 20.5698 / 26 GB/s | 6.2712 / 86 GB/s | 0.3283 / 1,635 GB/s | **0.3283 / 1,636 GB/s** | 0.3282 / 1,636 GB/s |
+| b8 hq32 hkv8 sq1 skv4096 d128 | 1.2172 / 110 GB/s | 1.3378 / 100 GB/s | 0.3980 / 338 GB/s | **0.0865 / 1,553 GB/s** | 0.0865 / 1,553 GB/s | 0.0864 / 1,554 GB/s |
 
 The small shapes are where the tail split matters most: 16 tiles on 170 SMs become 128
-slices, 2.4× on the 512-token shape; variant 4's block prologue costs it a microsecond there.
-On every 4096-token-and-up prefill shape variant 4 is 4 to 6% ahead of variant 3, and the
-GQA prefill row matches its MHA twin, as it should (same math, a stride on the K/V pointer).
+slices, 2.4× on the 512-token shape; variant 4's block prologue costs it a microsecond there,
+and variant 5, which keeps the split on those shapes, matches it. On every 4096-token-and-up
+prefill shape variant 4 is 4 to 6% ahead of variant 3 and variant 5 another 1 to 9% ahead of
+variant 4 (most on the batch of four and on `D = 64`, whose tiles are shortest and whose
+prologue share was therefore largest), and the GQA prefill row matches its MHA twin, as it
+should (same math, a stride on the K/V pointer).
 
 ## What remains
 
-- **The last 6%.** The tensor pipe is 93 to 94% active in variant 4. Part of the rest is the
-  block prologue: every one of the 1,028 blocks on the causal 4096 shape initializes its
-  barriers, waits for its Q box and its first K/V box, and only then issues an `mma`. A
-  persistent grid (one block per SM walking a tile queue, as `hgemm` v4 does) would pay that
-  once per SM and could prefetch the next tile's Q during the current tile's last products.
-  The other part is the tiles where both warps of a scheduler still meet in their softmaxes;
-  a 128-key tile would halve how often that can happen per FLOP, at 32 more registers for S
-  (204 today) and 64 KB per stage.
+- **The last 3%.** The tensor pipe is 96 to 97.5% active in variant 5; the block prologue
+  is gone. What is left is mostly the tiles where both warps of a scheduler meet in their
+  softmaxes. A 128-key tile would halve how often that can happen per FLOP, at 32 more
+  registers for S and 64 KB per stage, which the 168-register budget of the nine-warp block
+  and the 99 KB of shared memory do not have; it would need the producer back on a consumer
+  lane (the inline scheme, 1.6% slower here) or a two-stage pipeline.
+- **The producer's register cost.** Nine warps cap the kernel at 168 registers per thread
+  because three warps share one scheduler's 16 K registers. The inline producer keeps 8 warps
+  and 228 registers but stalls warp 0 on the slowest warp's release. A producer that polls the
+  barriers without blocking (`mbarrier.test_wait`) from lane 0 of warp 0, issuing whenever a
+  stage happens to be free and blocking only when the load is about to be needed, has not
+  been tried; it would give the persistent kernel variant 4's register budget back.
 - **Ping-pong, revisited.** The named-barrier schedules lost because one `mma.sync` warp
   does not fill the pipe alone. A version that keeps two warps per scheduler in the `mma`
   phase and only forbids two softmaxes at once (a barrier a warp takes before its softmax and
