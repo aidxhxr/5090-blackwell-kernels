@@ -6,7 +6,8 @@ Source: `src/kernels/fp8gemm.cu` (variants 0 and 1), `src/kernels/fp8gemm_tma.cu
 the block tile they share in `src/kernels/fp8gemm_tile.cuh`, the two mma helpers in
 `include/spark/common.cuh`. Bench: `bench_fp8gemm` (validates every variant against cuBLASLt
 and a CPU sample). Python: `sk.fp8gemm(a, b_t, scale_a, scale_b)`, parity test against
-`torch._scaled_mm` in `tests/test_fp8gemm.py`.
+`torch._scaled_mm` in `tests/test_fp8gemm.py`. The same kernels take MXFP8 block scales
+(`sfa`, `sfb`; the "MX scales" section).
 
 ## Why fp8, and what the card does with it
 
@@ -268,13 +269,228 @@ the same rounded values checks 4,096 sampled outputs, both with `max|C − C_ref
 repeated calls and the variant 2 step-down against `torch._scaled_mm`, and checks the bf16 bits
 are identical to it at K = 64, where every partial sum is exact.
 
+## MX scales
+
+MXFP8 (the OCP Microscaling format) keeps e4m3 elements and adds one E8M0 scale, a power of
+two stored as exponent + 127 in a byte, per 32 consecutive elements. The block-scaled
+instruction takes exactly that: a ue8m0 factor per row of A and per column of B per 32 k.
+The per-tensor kernels feed it 2^0 everywhere; MX mode feeds it the real scales, so the
+whole difference between the two modes is where the scale bytes come from. The API is the
+same call with two more tensors, `fp8gemm_mx(A, Bt, C, M, N, K, scale_a, scale_b, sfa, sfb,
+variant, stream)` with `sfa[M][K/32]` and `sfb[N][K/32]` row-major uint8, and
+`sk.fp8gemm(a, b_t, sfa=sfa, sfb=sfb)` from Python (the per-tensor scales are optional on
+top). Every variant takes it; the bench reports it as dtype `mxfp8`. The reference is the
+OCP recipe in `spark_kernels.reference.quantize_mx`: a block's exponent is
+floor(log2(max|x|)) - 8, so its largest element lands in e4m3's top binade, the elements are
+x / 2^e rounded to e4m3 with saturation at 448, and the fp32 product of the dequantized
+values is what the kernel must reproduce (a power of two times an e4m3 value is exact in
+fp32, so only the summation order differs).
+
+### The operand layout, as measured
+
+The ISA says the scale operands are one `.b32` register per lane per operand plus two
+immediates, byte-id and thread-id, and describes the mapping in a figure. I measured it
+instead: a probe kernel put distinct ue8m0 bytes in every lane's register (63 + lane + 32 x
+byte), ran the instruction on all-ones fragments and decoded log2 of each output. For
+`m16n8k32` with `.scale_vec::1X`:
+
+| operand | thread-id 0 | thread-id 1 | byte |
+|---|---|---|---|
+| A row g (g = lane / 4) | lane 4g | lane 4g + 2 | byte-id of that lane's register |
+| A row g + 8 | lane 4g + 1 | lane 4g + 3 | same |
+| B column g | lane 4g | lane 4g + 1 | same |
+
+Thread-id is 0 or 1 (ptxas rejects 2 and 3), and the lanes not named are ignored. So with
+thread-id 0, lane (g, c) supplies row g + 8 (c & 1) of A and column g of B, and lanes with
+c = 2, 3 can hold anything: the kernels give them copies. A row's scales lie along k in
+memory, so the 4-byte word at byte 4w of row r holds k-blocks 4w .. 4w+3, which is one
+128-byte stage (or two 64-byte ones), and byte-id = kk / 32 selects the k32 step inside the
+stage without any repacking: the word goes into the instruction as loaded. Variant 0 reads
+its two bytes per k32 step straight from the tensors and is bit-identical to cuBLASLt's
+MXFP8 kernel on every shape (max |difference| 0 in the bench), which pins the mapping down
+independently of anything the tiled variants do.
+
+### Staging
+
+The tiles come through shared memory; the scales do not. Three stages of 128-byte tiles are
+97 KB of the 99 KB a block may take on this card, and the decode configurations fill their
+SM at two to four blocks of 24 to 48 KB, so there is no room for a scale ring next to the
+tiles without dropping a stage or a block. Instead each consumer warp fetches its own scales
+from global memory, one group of stages ahead of the mma, and the question is how.
+
+1. *One 4-byte word per row per lane per stage.* Lane (g, c) loads the word of row g + 8
+   (c & 1) of each of its MT A tiles and of column g of each NT Bt tile, one stage ahead.
+   Twelve loads per warp per stage, each touching 8 to 16 distinct 32-byte sectors of which
+   4 bytes are used: Nsight at 4096³ measured 12 sectors per request, a 61% L1 hit rate, 29%
+   more L2 sectors than the tiles themselves, `long_scoreboard` at 6.3 cycles per issue and
+   the tensor pipe at 52%. 492 TFLOPS on variant 2 against 704 per-tensor.
+2. *One 16-byte chunk per row per 32 lanes, then shuffles.* A 16-byte chunk holds a row's
+   scales for four 128-byte stages, and the warp needs the chunks of its 64 rows of A and 32
+   columns of Bt: two `uint4` loads for A and one for Bt per lane per group of four stages
+   (8-byte chunks and groups of two stages when K % 512 != 0, so that every row stride stays
+   aligned; K = 11008 is that case). Each stage then takes its eight words out of the chunks
+   with one `__shfl_sync` per tile: lane (g, c) reads word i of the chunk that lane
+   (16 mi + g + 8 (c & 1)) % 32 loaded for A tile mi, and of the chunk lane 8 nj + g loaded
+   for Bt tile nj. Sector requests drop four times; the four warps that share A rows and the
+   two that share Bt columns hit L1 on each other's sectors inside a group (L1 keeps a
+   sector for a group, not across groups: 256 lines per group are the whole 32 KB L1 that
+   remains next to 97 KB of smem). This is the shipped design.
+3. *One chunk per row per lane, no shuffles.* Every lane fetches the chunks of the rows its
+   own words stand for (MT + NT `uint4` loads per group). Same sectors, no shuffle traffic,
+   but two register sets of (MT + NT) x 4 words: 64 registers for the 2x4 warp grid, 96 for
+   the 2x2 one, and the two-blocks-per-SM configurations, whose launch bound caps them at 96
+   registers, spill. In one session, both on the 3-stage 128-byte configuration: 631 / 592
+   TFLOPS on variant 2 at 4096³ / 8192³ against 582 / 560 for design 2, but 571 against 580
+   on variant 1, 15.6 against 15.2 µs on the 16-row decode shape and 37.6 against 34.0 µs on
+   64x4096x11008. I kept design 2 and moved variant 2 to the four-stage configuration below,
+   which took it to 626 / 627; design 3 on that configuration is the next thing to try.
+
+Two orderings of design 2's loop lost as well, measured back to back (v2, 4096³ / 8192³,
+TFLOPS, the card in a slower state that session: per-tensor v2 read 678): copy the next
+group's chunks over the current ones, shuffle each stage's words just before its mma, **582 /
+560**; the same with the words shuffled one stage ahead, 552 / 513; two register sets used
+alternately so nothing is copied, 577 / 538; alternate sets and words ahead, 547 / 515. The
+copy is 12 moves per group and the compiler schedules the plain form best, so that is what
+ships.
+
+The v2 pipeline configuration is not the per-tensor one either. With the consumers
+carrying the fetches and shuffles, a deeper pipeline of 64-byte stages hides more than three
+128-byte stages do (`SPARK_FP8GEMM_V2_CONFIG` sweep in MX mode, same slow session, TFLOPS at
+4096³ / 8192³ / 4096x11008x4096 / 2048³):
+
+| config | BK, stages, warps, blocks/SM | 4096³ | 8192³ | 4096x11008x4096 | 2048³ |
+|---|---|---|---|---|---|
+| 0 | 128, 2, 2x4, 1 | 567 | 540 | 518 | 478 |
+| 1 (per-tensor default) | 128, 3, 2x4, 1 | 592 | 558 | 526 | 477 |
+| 3 (per-tensor small grids) | 64, 2, 2x4, 2 | 475 | 457 | 439 | 389 |
+| **4 (MX default)** | 64, 4, 2x4, 1 | **614** | **617** | **563** | **478** |
+| 5 | 128, 3, 2x2, 1 | 572 | 557 | 514 | 454 |
+| 6 | 128, 2, 2x2, 1 | 572 | 549 | 519 | 477 |
+
+| 9 | 64, 5, 2x4, 1 | 608 | 605 | 566 | 477 |
+| 10 | 64, 6, 2x4, 1 | 604 | 604 | 564 | 477 |
+
+(Configurations 9 and 10 were added and measured in a later session, where 4 read 608 /
+617 / 564 / 478 and 1 read 582 / 567 / 530 / 477.) Four 64-byte stages is where the curve
+flattens, and it is the MX default for every grid: at 2048³ the two-block configuration 3
+that the per-tensor mode picks there loses 19% in MX mode.
+
+The two-block configurations (2, 3, 7, 8) lose 20 to 45% in MX mode: their launch bound
+caps the kernel at 96 registers and the chunk sets push it into local memory. Variant 1
+keeps its 2x2-warp 64x64 tile (`SPARK_FP8GEMM_V1_CONFIG` 0: 571 / 544 / 524 against 443 to
+539 for the others).
+
+### Split-K on chunk boundaries
+
+A chunk group is SPC = SFW x 128 / BK stages, and the loop is unrolled by SPC so that the
+chunk word and the byte-id are immediates. A split-K slice must therefore start on a group
+boundary: the kernels round every slice start down to a multiple of SPC (the last slice
+runs to K) and the launchers cap `split` at KT / SPC, so no slice is empty. Everything else
+about the schedule, the tail atomics and the decode strips is unchanged.
+
+### Measured
+
+`bench_fp8gemm --iters=50`, the full run, MX rows (dtype `mxfp8`): Gaussian inputs
+quantized with the OCP recipe on the CPU, cuBLASLt's MXFP8 kernel (scale mode
+`CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0` on both operands, its scales in the 32x4x4 tiled
+layout the bench builds from the row-major ones) timed the same way on the same stream and
+checked whole-output against, plus the 4,096-sample CPU check of the dequantized products.
+"%" is cuBLASLt MXFP8 time ÷ our time; the last column is the fastest MX rung against the
+fastest per-tensor rung of the same run. The fp8 kernels' per-tensor rows in this run: v2
+at 703 / 682 / 738 / 699 TFLOPS on the four largest square and Llama shapes.
+
+| M x N x K | cuBLASLt MXFP8 ms / TFLOPS | v0 ms / TFLOPS / % | v1 | v2 | best MX / best per-tensor |
+|---|---|---|---|---|---|
+| 1024³ | 0.0145 / 148.1 | 0.0418 / 51.4 / 34.7% | **0.0089 / 240.5 / 165.6%** | n/a | 102.9% |
+| 2048³ | 0.0379 / 453.4 | 0.3263 / 52.7 / 11.6% | 0.0438 / 392.4 / 84.6% | **0.0340 / 506.0 / 110.7%** | 86.8% |
+| 4096³ | 0.1997 / 688.2 | 5.1818 / 26.5 / 3.9% | 0.2199 / 624.9 / 90.8% | **0.2196 / 625.7 / 90.9%** | 89.0% |
+| 8192³ | 1.6736 / 657.0 | 42.920 / 25.6 / 3.9% | 1.7855 / 615.8 / 93.0% | **1.7544 / 626.7 / 95.2%** | 91.9% |
+| 4096x4096x11008 | 0.5390 / 685.2 | 15.152 / 24.4 / 3.6% | **0.6416 / 575.7 / 83.9%** | 0.6477 / 570.3 / 83.2% | 78.0% |
+| 4096x11008x4096 | 0.5205 / 709.7 | 14.456 / 25.6 / 3.6% | **0.6252 / 590.8 / 83.3%** | 0.6413 / 576.0 / 80.9% | 84.5% |
+| 1x4096x4096 | 0.0298 / 1.1 | n/a | **0.0149 / 2.3 / 200.4%** | n/a | 88.4% |
+| 16x4096x4096 | 0.0278 / 19.3 | 0.0500 / 10.7 / 55.6% | **0.0150 / 35.8 / 184.4%** | n/a | 87.8% |
+| 32x4096x4096 | 0.0255 / 42.0 | 0.0500 / 21.5 / 51.1% | **0.0151 / 71.2 / 170.9%** | n/a | 87.7% |
+| 64x4096x4096 | 0.0338 / 63.6 | 0.0541 / 39.7 / 62.4% | **0.0151 / 141.9 / 223.9%** | n/a | 87.3% |
+| 16x11008x4096 | 0.0503 / 28.7 | 0.0897 / 16.1 / 56.1% | **0.0325 / 44.4 / 154.0%** | n/a | 91.0% |
+| 64x4096x11008 | 0.0463 / 124.7 | 0.1463 / 39.4 / 31.6% | **0.0339 / 170.1 / 136.3%** | n/a | 93.4% |
+
+Variant 0 is bit-identical to cuBLASLt on every shape (max |difference| 0); the tiled
+variants differ from it by at most one bf16 ulp where the split-K order differs. cuBLASLt's
+MXFP8 kernel runs 3% under its per-tensor one on the square shapes and 10 to 20% over it
+on the Llama ones (685 and 710 against 636 and 671 TFLOPS: a different kernel, with the
+tiled scales). Ours costs 8 to 11% on the large shapes and 7 to 14% on the decode rows
+(15.0 µs against 13.2 for the 16 MB weight, 1,170 GB/s counting the scale bytes), where
+cuBLASLt's MXFP8 decode kernel takes 26 to 50 µs. The 11008-deep shapes (SFW = 2, 8-byte
+chunks, groups of two stages) lose the most: twice the fetch instructions per stage of
+the 16-byte path.
+
+### Nsight Compute at 8192³ (one launch, clocks locked by ncu)
+
+| metric | v2 per-tensor (128, 3, 2x4) | v2 MX (64, 4, 2x4) |
+|---|---|---|
+| duration, SM clock | 1.57 ms at 2.23 GHz | 1.72 ms at 2.12 GHz |
+| SM cycles | 3.51 M | 3.65 M |
+| tensor pipe active | 90.8% | 87.9% |
+| executed instructions | 323 M | 402 M |
+| issue slots busy | 14.1% | 16.9% |
+| global load requests / sectors | 72 K / 101 K | 1.64 M / 50.4 M |
+| L1 hit rate | 76.8% | 61.8% |
+| L2 sectors, L2 throughput | 277 M, 81% | 298 M, 87% |
+| shared-memory wavefronts | 214 M | 263 M |
+| stall: `math_pipe_throttle` (cycles per issue) | 6.6 | 3.7 |
+| stall: `wait` | 4.8 | 4.8 |
+| stall: `long_scoreboard` | 1.1 | 1.1 |
+| stall: `mio_throttle` / `short_scoreboard` | 0.1 / 0.3 | 0.6 / 0.6 |
+| registers | 128 | 160 |
+
+At a fixed clock the MX kernel takes 3.8% more cycles than the per-tensor one, and the
+bench's 9.5% gap is that plus the clock: 24% more instructions (the fetches, the shuffles
+and the copy, 79 M over 134 M `QMMA`) at the same 600 W is 5% less clock. The scale traffic
+itself is small once the chunks are 16 bytes: 21 M extra L2 sectors on 277 M (7.7%, of
+which the scale bytes themselves are 3%), `long_scoreboard` unchanged at 1.1, and the
+tensor pipe 3 points lower where design 1 had it at 52%. What remains is on the MIO side:
+the shuffles are 49 M more shared-memory wavefronts (23%) and `mio_throttle` plus
+`short_scoreboard` rise from 0.4 to 1.2 cycles per issue, which is the cost the tiled scale
+layout would remove.
+
+### Accuracy
+
+`scripts/mx_accuracy.py` at 4096³: the fp32 product of the bf16 inputs is the reference,
+each scheme quantizes A and B and runs `sk.fp8gemm`, and the table gives the largest error
+relative to the largest |C| and the Frobenius norm of the error relative to that of C.
+"Floor" is the OCP recipe (block exponent floor(log2(max|x|)) - 8, a block maximum in the
+top eighth of its binade saturates at 448); "ceil" is ceil(log2(max|x| / 448)), the
+smallest exponent under which nothing saturates. Per-tensor is max|x| / 448.
+
+| input | per-tensor max / Frobenius | MX floor | MX ceil |
+|---|---|---|---|
+| Gaussian | 4.3e-2 / 3.75e-2 | 4.5e-2 / 4.16e-2 | 4.0e-2 / 3.77e-2 |
+| Gaussian, 0.1% of entries x 100 | 4.2e-2 / 3.76e-2 | 9.9e-2 / 5.73e-2 | 4.0e-2 / 3.74e-2 |
+| Gaussian, 8 channels of A x 50 | 5.5e-2 / 3.73e-2 | 9.9e-2 / 4.86e-2 | 5.1e-2 / 3.78e-2 |
+| Gaussian, 8 channels of A x 2000 | 6.0e-2 / 3.75e-2 | 1.07e-1 / 5.06e-2 | 6.0e-2 / 3.78e-2 |
+
+The honest reading: on these inputs the block scales buy nothing over a per-tensor scale.
+e4m3 has three mantissa bits, so every scheme lands at 3.7 to 3.8% relative Frobenius
+error, and a per-tensor scale keeps even a 2000x outlier inside e4m3's 2^14.8 of dynamic
+range (the Gaussian body of the x2000 tensor sits 2^13 below its maximum, still in e4m3's
+normal range after the per-tensor scale). The floor recipe is measurably worse (the block maxima that fall in [448, 512)
+saturate), which is why the quantizer takes a `mode` and the bench uses floor as the spec
+says. Where MX earns its keep is a tensor whose range exceeds
+2^15, or a per-channel range that a per-tensor scale cannot follow at all (activations
+with a few 10^4-sized channels next to 10^-2 ones), and in not needing a calibration pass
+over the tensor; neither shows up in a Gaussian test. `tests/test_fp8gemm.py` pins the
+ceil mode to within 3% of per-tensor and the floor mode between 1x and 1.6x of it, on
+Gaussian and on the x2000 input.
+
 ## What was done and what remains
 
 Done: the fragment layout and the b16-pair `ldmatrix` for both operands with no transposing
 load; the TN layout that matches cuBLASLt and the weight's own storage; the block-scaled
 instruction that doubles the fp32-accumulate rate, found in cuBLASLt's SASS and measured at
 1,014 TFLOPS; the three rungs, with v2 at 99 to 139% of cuBLASLt on the shapes it takes and
-the decode shapes at the 16 MB single-launch floor, 112 to 141% of cuBLASLt.
+the decode shapes at the 16 MB single-launch floor, 112 to 141% of cuBLASLt; MX mode on
+every rung, with the scale operand layout measured and the scales fetched by the consumer
+warps.
 
 Open:
 
@@ -285,9 +501,13 @@ Open:
   the 2x2 configurations.
 - **Stream-K.** Variant 1 has v3's tail split, not v4's persistent schedule; 4096x11008x4096
   (2,752 tiles, 8.1 waves) and the grouped tile order are the shapes it would help.
-- **Real scales.** Per-tensor scales are what the API takes. The block-scaled instruction takes
-  a ue8m0 factor per row of A and column of B per 32 k for free, which is MXFP8; a `[N][K/32]`
-  scale operand and its smem staging is the next rung, and per-channel bf16 scales in the
-  epilogue are a smaller one.
+- **MX at 90%.** The MX mode costs 8 to 10% on the large shapes against the per-tensor
+  kernel where cuBLASLt's MXFP8 kernel costs it 3%: eight shuffles per stage on the MIO
+  queue the `ldmatrix` traffic already fills, and the chunk loads. cuBLASLt takes its scales
+  in a tiled layout (128 rows by 4 k-blocks in 512 contiguous bytes, the layout torch calls
+  `SWIZZLE_32_4_4`) that one TMA box or two `ldmatrix`-shaped shared loads serve; a
+  row-major `[rows][K/32]` operand cannot be moved that way. Taking the tiled layout as an
+  input option, or repacking the scales once per call, is the way past 90%, and per-channel
+  bf16 scales in the epilogue are a smaller rung.
 - **The decode launch.** 13.2 µs single launch against 11.3 back to back for 16 MB: the 2 µs
   that CUDA graphs or a persistent decoder kernel would take back.

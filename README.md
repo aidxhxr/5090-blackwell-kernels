@@ -235,6 +235,33 @@ path lands well under a direct cuBLASLt call.
 fp8 weights are half the bytes, so a 16 MB launch has a 13.3 us read-only floor and the
 4096-wide rows sit on it.
 
+The same kernels run MXFP8: a ue8m0 scale per 32 consecutive k of every row of A and of
+B^T (`sfa[M, K/32]`, `sfb[N, K/32]`, uint8), fed to the block-scaled instruction through the
+scale operands it already had at 2^0. I measured the operand layout with a probe (with
+thread-id 0 the instruction reads row g of A from lane 4g, row g+8 from lane 4g+1 and
+column g of B from lane 4g, byte-id selecting the k32 step inside a 4-byte word of a row's
+scales), so a row-major scale tensor feeds it with no repacking. The scales do not fit in
+shared memory next to the tiles (the 3-stage pipeline is at 97 of 99 KB), so the consumer
+warps fetch 16-byte chunks of them, four stages' worth, a group ahead and shuffle each
+stage's words into place. `sk.fp8gemm(a, b_t, sfa=sfa, sfb=sfb)`, and
+`sk.reference.quantize_mx` produces the inputs.
+
+| M x N x K | MX v1 | MX v2 | cuBLASLt MXFP8 | best / cuBLASLt | MX / per-tensor |
+|---|---|---|---|---|---|
+| 2048 x 2048 x 2048 | 392 | 506 | 453 | 110.7% | 86.8% |
+| 4096 x 4096 x 4096 | 625 | 626 | 688 | 90.9% | 89.0% |
+| 8192 x 8192 x 8192 | 616 | 627 | 657 | 95.2% | 91.9% |
+| 4096 x 4096 x 11008 | 576 | 570 | 685 | 83.9% | 78.0% |
+| 4096 x 11008 x 4096 | 591 | 576 | 710 | 83.3% | 84.5% |
+| 16 x 4096 x 4096 | 15.0 us, 1,169 GB/s | | 27.8 us | 184% | 87.8% |
+
+TFLOPS. Variant 0 is bit-identical to cuBLASLt's MXFP8 kernel. The MX mode costs 8 to 11%
+against the per-tensor kernel on the large shapes: at a fixed clock it is 3.8% more cycles
+(the shuffles on the MIO queue, 23% more shared-memory wavefronts) and the rest is clock, 24%
+more instructions at the same 600 W. On the outlier inputs where MX is supposed to help, the
+GEMM error of both schemes is the 3-bit mantissa, 3.7 to 3.8% relative; the table and the
+reasons are in the design note.
+
 ## attention
 
 Fused scaled-dot-product attention, forward, bf16 in and out, fp32 math. Head sizes 64 and
@@ -400,7 +427,7 @@ default stays on the CUDA cores.
 | `softmax` | three pass, warp online softmax, block online softmax, row in registers | `torch.softmax` |
 | `sgemm` fp32 | naive, smem tile, 8x8 register tile, cp.async, register prefetch with swizzle, 256x128 tile; TF32 and 3xTF32 on the tensor cores (opt-in) | cuBLAS SGEMM, in fp32 and in TF32 math mode |
 | `hgemm` bf16 | WMMA, smem tile, cp.async, `mma.sync` + `ldmatrix` with swizzle and split-K, Stream-K, TMA, TMA on Stream-K; a weight-streaming kernel for decode; fused bias / activation / residual / SwiGLU epilogues | cuBLAS GemmEx; eager `addmm`, `F.gelu`, `F.silu * up` |
-| `fp8gemm` e4m3 | naive `mma.sync.m16n8k32`, the swizzled cp.async tile with a 64x64 warp tile and decode configs, TMA; all on the block-scaled instruction | cuBLASLt, `torch._scaled_mm` |
+| `fp8gemm` e4m3 | naive `mma.sync.m16n8k32`, the swizzled cp.async tile with a 64x64 warp tile and decode configs, TMA; all on the block-scaled instruction, with per-tensor scales or MXFP8 block scales | cuBLASLt, `torch._scaled_mm`, `F.scaled_mm` |
 | `attention` bf16 | warp per row, CUDA-core flash attention, `mma.sync` flash attention, split-KV tail, TMA mbarrier pipeline, persistent tile queue with a producer warp; GQA and a flash-decoding kernel | `F.scaled_dot_product_attention` |
 | `rope_append` bf16 | RoPE on q and k plus the K/V cache append from a fused q\|k\|v projection, one launch | the torch spelling, ten kernels |
 | `layer` | one Llama-3-8B decoder layer from the kernels above, prefill and decode with a K/V cache, our decode step as a CUDA graph | the same layer in PyTorch, eager and `torch.compile` |
@@ -454,6 +481,8 @@ c = sk.hgemm(a_bf16, b_bf16, bias=bias, act="gelu", residual=r)  # fused epilogu
 w = sk.interleave_gate_up(w_gate, w_up)    # [K, 2N], once at load time
 h = sk.hgemm_swiglu(a_bf16, w)             # silu(a @ w_gate) * (a @ w_up), one GEMM, A read once
 c = sk.fp8gemm(a_e4m3, w_e4m3, sa, sb)     # sa * sb * a @ w.T, w is [N, K] as nn.Linear stores it
+a_mx, sfa = sk.reference.quantize_mx(a_bf16)   # MXFP8: e4m3 plus a ue8m0 scale per 32 elements
+c = sk.fp8gemm(a_mx, w_mx, sfa=sfa, sfb=sfw)   # the scales go into the tensor-core instruction
 o = sk.attention(q, k, v, causal=True)     # q is [B, H, S, D] bf16; k and v may have fewer heads
 q = sk.rope_append_(qkv, cos, sin, k_cache, v_cache, pos, 32, 8)  # RoPE; q head-major; k, v into the cache
 
@@ -480,9 +509,10 @@ numbers, the sweeps that picked the constants, and which Nsight metric moved:
 
 Things I'd still like to do: a 128-key tile for attention, which would halve how often the
 two warps of a scheduler land in their softmaxes together (the 3% of tensor pipe still idle);
-per-block scales on the fp8 GEMM, which the instruction already takes; a K/V head stride in the
-attention kernels so a growing cache is read where it is; and a GB10 run when the Spark
-arrives. Both
+the MX GEMM's last 10%, which is the scale operand's layout (cuBLASLt takes its scales in a
+tiled layout that one TMA box serves; a row-major one costs the consumer warps eight shuffles
+per stage); a K/V head stride in the attention kernels so a growing cache is read where it is;
+and a GB10 run when the Spark arrives. Both
 cards are consumer Blackwell, so `mma.sync`, `cp.async` and TMA are there and `tcgen05` isn't.
 
 ```
