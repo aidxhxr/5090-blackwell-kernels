@@ -28,7 +28,7 @@ COMPUTE_PEAK_KEYS = ("bf16_tflops", "fp8_tflops", "tf32_tflops", "fp32_tflops")
 DEFAULT_DEVICE = "RTX 5090"  # rows written before the benches recorded a device name
 
 ITEMSIZE = {"f32": 4, "bf16": 2, "fp32": 4, "float32": 4, "bfloat16": 2, "e4m3": 1, "fp8": 1,
-            "tf32": 4, "3xtf32": 4}
+            "tf32": 4, "3xtf32": 4, "mxfp8": 1}
 # The dtypes of sgemm's tensor-core rows: fp32 in and out, computed in TF32 with one mma per
 # product (variant 6) or three (3xTF32, variant 7). Keyed to the tf32 tensor-core peak.
 TF32_DTYPES = ("tf32", "3xtf32")
@@ -254,9 +254,10 @@ def traffic_bytes(kernel: str, dtype: str, dims: dict) -> float:
         return 3.0 * dims["rows"] * dims["cols"] * isz
     if k == "bandwidth":
         return 2.0 * dims["n"] * isz
-    if k == "fp8gemm":  # e4m3 operands (one byte each), bf16 output
-        M, N, K = dims["M"], dims["N"], dims["K"]
-        return float(M * K + K * N) + 2.0 * M * N
+    if k == "fp8gemm":  # e4m3 operands (one byte each), bf16 output; MX mode adds a scale
+        M, N, K = dims["M"], dims["N"], dims["K"]  # byte per 32 elements of each operand
+        sf = (M * K + K * N) / 32.0 if dtype.lower() == "mxfp8" else 0.0
+        return float(M * K + K * N) + 2.0 * M * N + sf
     if k in GEMM_KERNELS:
         M, N, K = dims["M"], dims["N"], dims["K"]
         return float(M * K + K * N + M * N) * isz

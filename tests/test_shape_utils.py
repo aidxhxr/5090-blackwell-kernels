@@ -99,6 +99,10 @@ def test_fp8gemm_counts_bytes_per_operand_and_uses_the_fp8_peak():
     dims = {"M": 16, "N": 4096, "K": 4096}
     # e4m3 operands are one byte each, the bf16 output two: half the bytes of the bf16 GEMM
     assert su.traffic_bytes("fp8gemm", "e4m3", dims) == 16 * 4096 + 4096 * 4096 + 2 * 16 * 4096
+    # MX mode: one ue8m0 scale byte per 32 elements of each operand on top
+    assert su.traffic_bytes("fp8gemm", "mxfp8", dims) == (
+        16 * 4096 + 4096 * 4096 + 2 * 16 * 4096 + (16 * 4096 + 4096 * 4096) / 32
+    )
     assert su.traffic_bytes("hgemm", "bf16", dims) == 2 * (16 * 4096 + 4096 * 4096 + 16 * 4096)
     assert su.flops("fp8gemm", dims) == 2 * 16 * 4096 * 4096
     assert su.is_compute_bound_kernel("fp8gemm") and su.uses_tensor_cores("fp8gemm")
