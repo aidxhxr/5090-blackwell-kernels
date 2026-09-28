@@ -41,6 +41,7 @@ if [ "$SKIP_PYTHON" -eq 0 ]; then
   pytest -q tests
   step "torch comparison"
   python3 scripts/bench_torch.py
+  python3 scripts/bench_layer.py
   make results
 fi
 

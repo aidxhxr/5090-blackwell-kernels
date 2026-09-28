@@ -11,6 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from shape_utils import (  # noqa: E402
+    LAYER_FILE,
     TORCH_COMPARISON,
     arithmetic_intensity,
     compute_peak_key,
@@ -31,7 +32,7 @@ OUT_HEADLINE = RESULTS / "headline.md"
 
 SHEETS = {"RTX 5090": "RTX5090.md", "GB10": "GB10.md"}
 KERNEL_ORDER = ["bandwidth", "rmsnorm", "add_rmsnorm", "swiglu", "softmax", "sgemm", "hgemm",
-                "fp8gemm", "attention"]
+                "fp8gemm", "attention", "rope"]
 # The GEMM benches time a library reference next to every variant (ref_ms).
 REFERENCE_NAME = {"sgemm": "cuBLAS", "hgemm": "cuBLAS", "fp8gemm": "cuBLASLt"}
 
@@ -57,12 +58,94 @@ def load_torch_rows(device: str) -> dict[tuple, dict]:
     return {(r["kernel"], r["dtype"], r["shape"]): r for r in kept}
 
 
+def load_layer_rows(device: str) -> list[dict]:
+    """Rows of results/layer.json (scripts/bench_layer.py) measured on `device`."""
+    p = RESULTS / LAYER_FILE
+    if not p.exists():
+        return []
+    rows = load_jsonl(p)
+    kept = [r for r in rows if on_device(r, device)]
+    if len(kept) < len(rows):
+        print(f"ignoring {len(rows) - len(kept)} rows of {p.name} that were not measured on the "
+              f"{device}; rerun scripts/bench_layer.py on this machine", file=sys.stderr)
+    return kept
+
+
+def speedup(ref_ms: float, ms: float) -> str:
+    return f"{ref_ms / ms:.2f}×" if ref_ms > 0 and ms > 0 else "—"
+
+
+LAYER_STAGES = [("norm1", "norm 1"), ("qkv_gemm", "qkv GEMM"),
+                ("rope_append", "RoPE + cache append"), ("attention", "attention"),
+                ("o_transpose", "o transpose"),
+                ("o_gemm", "o GEMM"), ("norm2", "norm 2"), ("gate_up_gemm", "gate/up GEMM"),
+                ("swiglu", "swiglu"), ("down_gemm", "down GEMM"), ("other", "other")]
+
+
+def layer_section(rows: list[dict]) -> list[str]:
+    """The "layer" tables: prefill and decode of one Llama-3-8B decoder layer, ours against
+    PyTorch eager and compiled (and our forward as a CUDA graph for decode), the tokens/s a
+    32-layer model would get from each decode row, and the per-stage kernel breakdown of our
+    decode step where the bench recorded one."""
+    out = ["## layer", "",
+           "One Llama-3-8B decoder layer (hidden 4096, 32 query heads over 8 K/V heads of 128, "
+           "MLP 14336) built from the kernels, against the same layer in PyTorch: eager, and "
+           "`torch.compile` (`max-autotune-no-cudagraphs` for prefill, `reduce-overhead` for "
+           "decode). Times are ms per layer; a decode row is one token per sequence against a "
+           "cache of L - 1 tokens, appended in place. \"graph\" is our forward replayed from "
+           "a `torch.cuda.CUDAGraph`. tokens/s is what 32 such layers would do, nothing else "
+           "counted.", ""]
+    prefill = sorted((r for r in rows if r.get("mode") == "prefill"),
+                     key=lambda r: (r.get("B", 0), r.get("S", 0)))
+    decode = sorted((r for r in rows if r.get("mode") == "decode"),
+                    key=lambda r: (r.get("B", 0), r.get("L", 0)))
+    if prefill:
+        out += ["| shape | ours ms | torch eager ms | torch compiled ms | vs eager | "
+                "vs compiled | tokens/s (32 layers) |", "|---|---|---|---|---|---|---|"]
+        for r in prefill:
+            out.append(f"| {r['shape']} | {fmt(r['spark_ms'])} | {fmt(r['torch_ms'])} | "
+                       f"{fmt(r.get('torch_compiled_ms', 0))} | "
+                       f"{speedup(r['torch_ms'], r['spark_ms'])} | "
+                       f"{speedup(r.get('torch_compiled_ms', 0), r['spark_ms'])} | "
+                       f"{r.get('tokens_per_s_32_layers', 0):,.0f} |")
+        out.append("")
+    if decode:
+        out += ["| shape | ours ms | ours, graph ms | torch eager ms | torch compiled ms | "
+                "graph vs eager (ours) | graph vs torch compiled | tokens/s (32 layers, graph) |",
+                "|---|---|---|---|---|---|---|---|"]
+        for r in decode:
+            g = r.get("spark_graph_ms", 0)
+            out.append(f"| {r['shape']} | {fmt(r['spark_ms'])} | {fmt(g)} | "
+                       f"{fmt(r['torch_ms'])} | {fmt(r.get('torch_compiled_ms', 0))} | "
+                       f"{speedup(r['spark_ms'], g)} | "
+                       f"{speedup(r.get('torch_compiled_ms', 0), g)} | "
+                       f"{r.get('tokens_per_s_32_layers_graph', 0):,.0f} |")
+        out.append("")
+        with_bd = [r for r in decode if r.get("breakdown_us")]
+        if with_bd:
+            out += ["Kernel time per stage of our decode step (us, from the torch profiler; "
+                    "the sum is the GPU-busy time of one step):", "",
+                    "| stage | " + " | ".join(r["shape"] for r in with_bd) + " |",
+                    "|---|" + "---|" * len(with_bd)]
+            for key, label in LAYER_STAGES:
+                vals = [r["breakdown_us"].get(key, 0.0) for r in with_bd]
+                if not any(vals):
+                    continue
+                out.append(f"| {label} | " + " | ".join(f"{v:.1f}" for v in vals) + " |")
+            out.append("| total | " + " | ".join(
+                f"{sum(r['breakdown_us'].values()):.1f}" for r in with_bd) + " |")
+            out.append("")
+    return out
+
+
 def shape_size(kernel: str, shape: str) -> float:
     d = parse_shape(kernel, shape)
     if "M" in d:
         return d["M"] * d["N"] * d["K"]
     if "S_q" in d:
         return d["B"] * d["H"] * d["S_q"] * d["S_kv"] * d["D"]
+    if "pos0" in d:  # rope: the qkv rows
+        return d["B"] * d["S"] * (d["H"] + 2 * d["H_kv"]) * d["D"]
     if "rows" in d:
         return d["rows"] * d["cols"]
     return d.get("n", 0)
@@ -225,6 +308,9 @@ def main() -> int:
                           "for the row-wise kernels below.")
             md.append("")
         md += [table_for(kernel, krows, torch_rows, peaks), ""]
+    layer_rows = load_layer_rows(device)
+    if layer_rows:
+        md += layer_section(layer_rows)
     OUT_MD.parent.mkdir(exist_ok=True)
     OUT_MD.write_text("\n".join(md))
     OUT_HEADLINE.write_text(headline(by_kernel, torch_rows, peaks) + "\n")

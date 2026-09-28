@@ -138,3 +138,55 @@ def test_attention_rows_use_the_tensor_peak_and_the_torch_backend_column(results
     assert row in md
     headline = (out / "headline.md").read_text()
     assert "| attention | bf16 | b1_h32_s4096_d128_causal | v3 |" in headline  # the largest shape
+
+
+def test_layer_rows_get_their_own_section_and_stay_out_of_the_kernel_tables(results):
+    out, write = results
+    write("hgemm.json", [
+        bench_row("hgemm_bf16", "bf16", 6, "4096x4096x4096", 0.55, tflops=250.0, ref_ms=0.6),
+    ])
+    write("layer.json", [
+        {"device": DEVICE, "kernel": "layer", "dtype": "bf16", "mode": "prefill", "B": 1,
+         "S": 4096, "shape": "prefill_b1_s4096", "spark_ms": 4.0, "torch_ms": 5.0,
+         "torch_compiled_ms": 4.5, "tokens_per_s_32_layers": 32000.0},
+        {"device": DEVICE, "kernel": "layer", "dtype": "bf16", "mode": "decode", "B": 1,
+         "L": 4096, "shape": "decode_b1_L4096", "spark_ms": 0.5, "spark_graph_ms": 0.25,
+         "torch_ms": 0.6, "torch_compiled_ms": 0.3, "tokens_per_s_32_layers": 62.5,
+         "tokens_per_s_32_layers_graph": 125.0,
+         "breakdown_us": {"qkv_gemm": 40.0, "attention": 17.0, "rope": 5.0, "other": 1.0}},
+        {"device": "NVIDIA GB10", "kernel": "layer", "dtype": "bf16", "mode": "decode", "B": 1,
+         "L": 16384, "shape": "decode_b1_L16384", "spark_ms": 9.0, "torch_ms": 9.0},
+    ])
+    assert mrt.main() == 0
+    md = (out / "RESULTS.md").read_text()
+    assert "## layer" in md and md.index("## hgemm") < md.index("## layer")
+    assert "decode_b1_L16384" not in md  # measured on the other machine
+    assert "| prefill_b1_s4096 | 4.000 | 5.000 | 4.500 | 1.25× | 1.12× | 32,000 |" in md
+    assert "| decode_b1_L4096 | 0.500 | 0.250 | 0.600 | 0.300 | 2.00× | 1.20× | 125 |" in md
+    assert "| qkv GEMM | 40.0 |" in md and "| attention | 17.0 |" in md
+    assert "| total | 63.0 |" in md
+    assert "| norm 1 |" not in md  # stages without kernels are left out
+    hgemm = md.split("## hgemm")[1].split("## layer")[0]
+    assert "prefill_b1_s4096" not in hgemm  # layer rows are not bench rows
+    assert "layer" not in (out / "headline.md").read_text()
+
+
+def test_results_without_a_layer_file_have_no_layer_section(results):
+    out, write = results
+    write("rmsnorm.json", [bench_row("rmsnorm", "bf16", 4, "4096x8192", 0.1, gbps=1300.0)])
+    assert mrt.main() == 0
+    assert "## layer" not in (out / "RESULTS.md").read_text()
+
+
+def test_rope_rows_are_memory_bound_and_the_largest_shape_is_the_headline(results):
+    out, write = results
+    write("rope.json", [
+        bench_row("rope", "bf16", 0, "b1_s1_hq32_hkv8_d128_pos4095", 0.003, gbps=8.0),
+        bench_row("rope", "bf16", 0, "b1_s8192_hq32_hkv8_d128_pos0", 0.138, gbps=1458.0),
+    ])
+    assert mrt.main() == 0
+    md = (out / "RESULTS.md").read_text()
+    assert "## rope" in md and "GB/s" in md.split("## rope")[1]
+    assert "| bf16 | b1_s8192_hq32_hkv8_d128_pos0 | 0 | 0.1380 |" in md
+    headline = (out / "headline.md").read_text()
+    assert "| rope | bf16 | b1_s8192_hq32_hkv8_d128_pos0 | v0 |" in headline

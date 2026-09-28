@@ -32,6 +32,10 @@ TORCH_COMPARISON = "torch_comparison.json"
 # clock they were measured at. When present it overrides the spec-sheet compute peaks above
 # (the memory bandwidth stays the spec figure, which cudaMemcpy never reaches).
 PEAK_FILE = "peak.json"
+# Written by scripts/bench_layer.py: one Llama-3-8B decoder layer built from the kernels
+# against the same layer in PyTorch, prefill and decode. Its rows have their own columns
+# (spark_ms, torch_ms, torch_compiled_ms, spark_graph_ms) and their own section in the table.
+LAYER_FILE = "layer.json"
 
 # The C++ benches name some rows after the entry point they time rather than the kernel family
 # everything here keys on (tables, peaks, traffic, FLOPs, the torch comparison).
@@ -134,7 +138,7 @@ def load_bench_rows(results_dir: Path) -> list[dict]:
     """Every row written by the C++ benches (results/*.json minus the torch comparison)."""
     rows: list[dict] = []
     for p in sorted(results_dir.glob("*.json")):
-        if p.name not in (TORCH_COMPARISON, PEAK_FILE):
+        if p.name not in (TORCH_COMPARISON, PEAK_FILE, LAYER_FILE):
             rows.extend(normalize_row(r) for r in load_jsonl(p))
     return rows
 
@@ -165,6 +169,8 @@ def attention_shape(B: int, H: int, S_q: int, S_kv: int, D: int, causal: bool,
     s = f"b{B}_{heads}_s{S_q}" if S_q == S_kv else f"b{B}_{heads}_sq{S_q}_skv{S_kv}"
     return f"{s}_d{D}" + ("_causal" if causal else "")
 
+
+ROPE_SHAPE = re.compile(r"^b(\d+)_s(\d+)_hq(\d+)_hkv(\d+)_d(\d+)_pos(\d+)$")
 
 ATTENTION_SHAPE = re.compile(
     r"^b(\d+)_(?:h(\d+)|hq(\d+)_hkv(\d+))_(?:s(\d+)|sq(\d+)_skv(\d+))_d(\d+)(_causal)?$")
@@ -206,6 +212,12 @@ def parse_shape(kernel: str, shape: str) -> dict:
             return {"rows": 1, "cols": v[0]}
     if k == "bandwidth":
         return {"n": element_count(shape)}
+    if k == "rope":  # bench_rope: "b1_s4096_hq32_hkv8_d128_pos0"
+        m = ROPE_SHAPE.match(shape)
+        if not m:
+            raise ValueError(f"not a rope shape string: {shape!r}")
+        B, S, Hq, Hkv, D, pos = (int(g) for g in m.groups())
+        return {"B": B, "S": S, "H": Hq, "H_kv": Hkv, "D": D, "pos0": pos}
     if k == "attention":
         m = ATTENTION_SHAPE.match(shape)
         if not m:
@@ -236,6 +248,8 @@ def traffic_bytes(kernel: str, dtype: str, dims: dict) -> float:
     if k in GEMM_KERNELS:
         M, N, K = dims["M"], dims["N"], dims["K"]
         return float(M * K + K * N + M * N) * isz
+    if k == "rope":  # the qkv rows read once, q and the k / v cache slots written once
+        return 2.0 * dims["B"] * dims["S"] * (dims["H"] + 2 * dims["H_kv"]) * dims["D"] * isz
     if k == "attention":  # Q and O once (H_q heads), K and V once (H_kv heads under GQA)
         q_rows = dims["B"] * dims["H"] * dims["S_q"]
         kv_rows = dims["B"] * dims.get("H_kv", dims["H"]) * dims["S_kv"]
@@ -250,6 +264,8 @@ def flops(kernel: str, dims: dict) -> float:
     if k == "attention":  # Q K^T and P V, halved under the causal mask as FlashAttention counts it
         fl = 4.0 * dims["B"] * dims["H"] * dims["S_q"] * dims["S_kv"] * dims["D"]
         return fl / 2 if dims["causal"] else fl
+    if k == "rope":  # two muls and an add per rotated element, on the q and k heads
+        return 3.0 * dims["B"] * dims["S"] * (dims["H"] + dims["H_kv"]) * dims["D"]
     if k in ("rmsnorm", "add_rmsnorm"):
         return 4.0 * dims["rows"] * dims["cols"]
     if k == "softmax":
