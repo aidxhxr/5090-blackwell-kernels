@@ -1,6 +1,7 @@
 """5090-blackwell-kernels: hand-written CUDA kernels for LLM inference on the RTX 5090 (sm_120).
 
-Also builds for the NVIDIA DGX Spark (GB10, sm_121) with TORCH_CUDA_ARCH_LIST="12.1".
+Also builds for the NVIDIA DGX Spark (GB10, sm_121) with TORCH_CUDA_ARCH_LIST="12.1a"; the "a"
+is where the block-scaled fp8 mma.sync lives (see setup.py).
 
 Ops (all run on the current CUDA stream, all accept float32 or bfloat16 unless noted):
 
