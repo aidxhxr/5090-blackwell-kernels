@@ -24,7 +24,8 @@ jobs:
           ruff --version && clang-format --version
       - run: make lint
 
-  # Compile-only check for both targets, sm_120 (RTX 5090) and sm_121 (DGX Spark); there is no
+  # Compile-only check for both targets, sm_120 (RTX 5090) and sm_121 (DGX Spark), with the fp8
+  # kernels built for the matching sm_12xa; there is no
   # GPU on GitHub runners. Catches syntax/type errors in the kernels and benches. If NVIDIA's
   # apt repo ever drops the 13.0 packages, either bump the version in the package names below
   # or set `continue-on-error: true` on this job.
@@ -38,13 +39,14 @@ jobs:
     name: cuda-compile (sm_${{ matrix.arch }})
     steps:
       - uses: actions/checkout@v4
-      - name: install CUDA 13.0 toolkit (nvcc + cudart + cuBLAS headers) from NVIDIA's apt repo
+      - name: install CUDA 13.0 toolkit (nvcc, cudart, cuda.h for the TMA tensor maps, cuBLAS and cuBLASLt headers)
         run: |
           wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends \
-            cuda-compiler-13-0 cuda-cudart-dev-13-0 cuda-cccl-13-0 libcublas-dev-13-0
+            cuda-compiler-13-0 cuda-cudart-dev-13-0 cuda-driver-dev-13-0 cuda-cccl-13-0 \
+            libcublas-dev-13-0
           echo "/usr/local/cuda-13.0/bin" >> "$GITHUB_PATH"
           echo "CUDACXX=/usr/local/cuda-13.0/bin/nvcc" >> "$GITHUB_ENV"
           echo "CUDAToolkit_ROOT=/usr/local/cuda-13.0" >> "$GITHUB_ENV"
