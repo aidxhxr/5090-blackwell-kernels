@@ -1,4 +1,4 @@
-"""spark-kernels: hand-written CUDA kernels for LLM inference on Blackwell RTX 5090 (sm_120).
+"""5090-blackwell-kernels: hand-written CUDA kernels for LLM inference on the RTX 5090 (sm_120).
 
 Also builds for the NVIDIA DGX Spark (GB10, sm_121) with TORCH_CUDA_ARCH_LIST="12.1".
 
@@ -48,6 +48,6 @@ __all__ = [
 ]
 
 try:
-    __version__ = version("spark-kernels")  # the one copy lives in pyproject.toml
+    __version__ = version("5090-blackwell-kernels")  # the one copy lives in pyproject.toml
 except PackageNotFoundError:  # imported from a checkout that was never pip-installed
     __version__ = "0.0.0+unknown"

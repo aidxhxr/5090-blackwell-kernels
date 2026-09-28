@@ -2,9 +2,9 @@
 # time, so we intentionally do not use an isolated PEP 517 build):
 #     pip install -e . --no-build-isolation
 [project]
-name = "spark-kernels"
+name = "5090-blackwell-kernels"
 version = "0.1.0"
-description = "Hand-written CUDA kernels for LLM inference on Blackwell: RTX 5090 (sm_120) and DGX Spark (GB10, sm_121)"
+description = "Hand-written CUDA kernels for LLM inference on the RTX 5090 (sm_120), with a GB10 (sm_121) build"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
