@@ -34,9 +34,16 @@
 // zero-filled by the copy engine (an out-of-range box row) and skipped by the epilogue.
 // Decode shapes (M <= 64) go to hgemm_decode.cu and everything else to variant 4's 64-row
 // tiles, the same routing variant 4 does itself.
+//
+// The fused epilogue (hgemm_epilogue.cuh) is applied by whichever piece stores a tile: a
+// whole tile, or the piece that ends a Stream-K chain after it has added the slot. The
+// partials that pass through the slot are plain fp32 sums of A B, so bias, activation,
+// residual and the gate/up product all happen once, on the finished sum. The FUSED
+// instantiation is separate from the plain one so the plain kernel is unchanged.
 
 #include <cstdlib>
 
+#include "hgemm_epilogue.cuh"
 #include "hgemm_internal.cuh"
 #include "hgemm_streamk.cuh"
 #include "hgemm_tile.cuh"  // declares hgemm_streamk_bf16
@@ -71,11 +78,11 @@ constexpr int smem_bytes() {
                     (2 * STAGES + 2 * ITEM_DEPTH + 1) * 8);
 }
 
-template <int BK, int STAGES, int MIN_BLOCKS>
+template <int BK, int STAGES, int MIN_BLOCKS, bool FUSED>
 __global__ void __launch_bounds__(THREADS, MIN_BLOCKS)
     hgemm_v6_kernel(const __grid_constant__ CUtensorMap tmA,
                     const __grid_constant__ CUtensorMap tmB, __nv_bfloat16* __restrict__ C, int M,
-                    int N, int K, Params p, int serial) {
+                    int N, int K, Params p, int serial, hgemm_epi::Ep ep) {
     static_assert(BK == 32 || BK == 64, "the swizzle helpers assume 64 B or 128 B rows of A");
     constexpr int STAGE_BYTES = stage_bytes<BK>();
 
@@ -211,6 +218,15 @@ __global__ void __launch_bounds__(THREADS, MIN_BLOCKS)
         const int bm = tm * BM, bn = tn * BN;
         const int m_valid = M - bm;
 
+        // A piece that ends its tile applies the epilogue; its bias and residual are loaded
+        // now, before the k-loop, so their DRAM round trip hides under the mma work (40
+        // registers, dead again after the store).
+        const hgemm_epi::Geo geo{M, N, bm + wm * WM + g, bn + wn * WN + c2};
+        hgemm_epi::Pre<MT, NT> pre;
+        if constexpr (FUSED) {
+            if (ke == p.KT) hgemm_epi::prefetch(pre, ep, geo);
+        }
+
         zero_acc(acc);
         for (int kt = kb; kt < ke; ++kt, ++g_kt) {
             const int s = g_kt % STAGES;
@@ -270,23 +286,12 @@ __global__ void __launch_bounds__(THREADS, MIN_BLOCKS)
         }
         if (finish) {
             // Epilogue from registers: each lane owns (row g, cols 2c..2c+1) and (row g+8,
-            // same). M % 16 == 0 is not required: row and row + 8 are checked one by one.
-#pragma unroll
-            for (int mi = 0; mi < MT; ++mi) {
-#pragma unroll
-                for (int nj = 0; nj < NT; ++nj) {
-                    const int row = bm + wm * WM + mi * 16 + g;
-                    const int col = bn + wn * WN + nj * 8 + c2;
-                    __nv_bfloat16* p0 = C + static_cast<size_t>(row) * N + col;
-                    __nv_bfloat16* p1 = p0 + static_cast<size_t>(8) * N;
-                    if (row < M)
-                        *reinterpret_cast<__nv_bfloat162*>(p0) =
-                            __floats2bfloat162_rn(acc[mi][nj][0], acc[mi][nj][1]);
-                    if (row + 8 < M)
-                        *reinterpret_cast<__nv_bfloat162*>(p1) =
-                            __floats2bfloat162_rn(acc[mi][nj][2], acc[mi][nj][3]);
-                }
-            }
+            // same) of every m16n8 fragment. M % 16 == 0 is not required: row and row + 8
+            // are checked one by one. The fused form (hgemm_epilogue.cuh) is warp-uniform.
+            if constexpr (FUSED)
+                hgemm_epi::store_warp_tile_fused(acc, pre, C, geo, ep);
+            else
+                hgemm_epi::store_warp_tile<false, MT, NT>(acc, C, M, N, geo.row0, geo.col0, ep);
         }
         if (serial) {
             __syncwarp();
@@ -336,62 +341,72 @@ const Env& env() {
     return e;
 }
 
-template <int BK, int STAGES, int MIN_BLOCKS>
+template <int BK, int STAGES, int MIN_BLOCKS, bool FUSED>
 int resident_blocks() {
     constexpr int bytes = smem_bytes<BK, STAGES>();
     static int resident = 0;
     if (resident == 0) {
-        SPARK_CUDA_CHECK(cudaFuncSetAttribute(hgemm_v6_kernel<BK, STAGES, MIN_BLOCKS>,
+        SPARK_CUDA_CHECK(cudaFuncSetAttribute(hgemm_v6_kernel<BK, STAGES, MIN_BLOCKS, FUSED>,
                                               cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
         int per_sm = 0;
         SPARK_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &per_sm, hgemm_v6_kernel<BK, STAGES, MIN_BLOCKS>, THREADS, bytes));
+            &per_sm, hgemm_v6_kernel<BK, STAGES, MIN_BLOCKS, FUSED>, THREADS, bytes));
         resident = (per_sm > 0 ? per_sm : 1) * num_sms();
     }
     return resident;
 }
 
-template <int BK, int STAGES, int MIN_BLOCKS>
+template <int BK, int STAGES, int MIN_BLOCKS, bool FUSED>
 void launch(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N, int K,
-            cudaStream_t stream) {
+            cudaStream_t stream, const HgemmEpilogue& ep) {
     constexpr int bytes = smem_bytes<BK, STAGES>();
     CUtensorMap tmA, tmB;
     make_maps<BK>(A, B, M, N, K, tmA, tmB);
-    static hgemm_sk::Workspace w;  // one per pipeline configuration
+    static hgemm_sk::Workspace w;  // one per pipeline configuration and epilogue instantiation
     Params p;
-    hgemm_sk::plan(p, w, M, N, K, BM, BN, BK, resident_blocks<BK, STAGES, MIN_BLOCKS>(),
+    hgemm_sk::plan(p, w, M, N, K, BM, BN, BK, resident_blocks<BK, STAGES, MIN_BLOCKS, FUSED>(),
                    env().knobs);
-    hgemm_v6_kernel<BK, STAGES, MIN_BLOCKS>
-        <<<p.grid, THREADS, bytes, stream>>>(tmA, tmB, C, M, N, K, p, env().serial);
+    hgemm_v6_kernel<BK, STAGES, MIN_BLOCKS, FUSED><<<p.grid, THREADS, bytes, stream>>>(
+        tmA, tmB, C, M, N, K, p, env().serial, hgemm_epi::make(ep));
 }
 
 // Pipeline configurations (BK, stages, blocks per SM), the same six as variant 5. Index 0
 // wins or ties on every shape (docs/design/hgemm.md, "Variant 6"): the two-block
 // configurations spill inside the k-loop at the 96 registers the ninth warp leaves them.
+// Each configuration has a plain and a fused instantiation; the plain one's residency is
+// what the tile choice below is made from (the two agree: smem sets it).
 struct Config {
     void (*launch)(const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, int, int,
-                   cudaStream_t);
+                   cudaStream_t, const HgemmEpilogue&);
+    void (*launch_fused)(const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, int, int,
+                         cudaStream_t, const HgemmEpilogue&);
     int (*resident)();
     int bk;
 };
 constexpr Config CONFIGS[] = {
-    {launch<64, 2, 1>, resident_blocks<64, 2, 1>, 64},  // 0: 64 KB of smem, one block per SM
-    {launch<64, 3, 1>, resident_blocks<64, 3, 1>, 64},  // 1: 96 KB, one block per SM
-    {launch<32, 3, 2>, resident_blocks<32, 3, 2>, 32},  // 2: 48 KB, two blocks per SM
-    {launch<32, 2, 2>, resident_blocks<32, 2, 2>, 32},  // 3: 32 KB, two blocks per SM
-    {launch<32, 3, 1>, resident_blocks<32, 3, 1>, 32},  // 4: like 2 without the register cap
-    {launch<32, 6, 1>, resident_blocks<32, 6, 1>, 32},  // 5: 96 KB, one block per SM
+    // 0: 64 KB of smem, one block per SM
+    {launch<64, 2, 1, false>, launch<64, 2, 1, true>, resident_blocks<64, 2, 1, false>, 64},
+    // 1: 96 KB, one block per SM
+    {launch<64, 3, 1, false>, launch<64, 3, 1, true>, resident_blocks<64, 3, 1, false>, 64},
+    // 2: 48 KB, two blocks per SM
+    {launch<32, 3, 2, false>, launch<32, 3, 2, true>, resident_blocks<32, 3, 2, false>, 32},
+    // 3: 32 KB, two blocks per SM
+    {launch<32, 2, 2, false>, launch<32, 2, 2, true>, resident_blocks<32, 2, 2, false>, 32},
+    // 4: like 2 without the register cap
+    {launch<32, 3, 1, false>, launch<32, 3, 1, true>, resident_blocks<32, 3, 1, false>, 32},
+    // 5: 96 KB, one block per SM
+    {launch<32, 6, 1, false>, launch<32, 6, 1, true>, resident_blocks<32, 6, 1, false>, 32},
 };
 constexpr int NUM_CONFIGS = static_cast<int>(sizeof(CONFIGS) / sizeof(CONFIGS[0]));
 constexpr int CONFIG_DEFAULT = 0;
 
 void launch_auto(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N,
-                 int K, cudaStream_t stream) {
+                 int K, cudaStream_t stream, const HgemmEpilogue& ep) {
     if (M <= 64) {  // decode: stream B (hgemm_decode.cu), or variant 4's 64-row tile
         if (hgemm_decode::supports(M, N, K))
-            hgemm_decode::launch(A, B, C, M, N, K, stream);
+            hgemm_decode::launch(A, B, C, M, N, K, stream, ep);
         else
-            hgemm_streamk_bf16(A, B, C, M, N, K, stream);
+            hgemm_streamk_bf16(A, B, C, M, N, K, stream, ep);
         return;
     }
     int cfg = env().cfg;
@@ -402,10 +417,13 @@ void launch_auto(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* 
     const long long share =
         static_cast<long long>(cdiv(M, BM)) * (N / BN) * (K / c.bk) / c.resident();
     if (N % BN != 0 || share < env().knobs.min_share) {
-        hgemm_streamk_bf16(A, B, C, M, N, K, stream);
+        hgemm_streamk_bf16(A, B, C, M, N, K, stream, ep);
         return;
     }
-    c.launch(A, B, C, M, N, K, stream);
+    if (hgemm_epi::is_plain(ep))
+        c.launch(A, B, C, M, N, K, stream, ep);
+    else
+        c.launch_fused(A, B, C, M, N, K, stream, ep);
 }
 
 }  // namespace v6
@@ -417,12 +435,12 @@ bool hgemm_tma_sk_supports(int M, int N, int K) {
 }
 
 void hgemm_tma_sk(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N,
-                  int K, cudaStream_t stream) {
+                  int K, cudaStream_t stream, const HgemmEpilogue& ep) {
     SPARK_REQUIRE(hgemm_tma_sk_supports(M, N, K),
                   "hgemm variant 6: requires N % 64 == 0 and K % 64 == 0");
     SPARK_REQUIRE(is_aligned16(A) && is_aligned16(B),
                   "hgemm variant 6: A and B must be 16-byte aligned");
-    v6::launch_auto(A, B, C, M, N, K, stream);
+    v6::launch_auto(A, B, C, M, N, K, stream, ep);
 }
 
 }  // namespace spark

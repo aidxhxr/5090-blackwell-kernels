@@ -8,6 +8,7 @@
 // N % BN == 0 and K % BK == 0 are the caller's job.
 #pragma once
 
+#include "hgemm_epilogue.cuh"
 #include "spark/common.cuh"
 
 namespace spark::hgemm_tile {
@@ -167,11 +168,13 @@ __device__ __forceinline__ void mainloop(const __nv_bfloat16* __restrict__ A,
 }
 
 // Epilogue: each lane owns (row g, cols 2c..2c+1) and (row g+8, same cols) of every 16x8
-// tile; two bf16 per store, straight from registers. Rows past M are skipped.
-template <class C>
+// tile; two bf16 per store, straight from registers. Rows past M are skipped. FUSED applies
+// the epilogue options of `ep` (hgemm_epilogue.cuh) on the way; the default is the plain
+// store.
+template <class C, bool FUSED = false>
 __device__ __forceinline__ void store_bf16(const typename C::Acc& acc,
                                            __nv_bfloat16* __restrict__ C_, int M, int N, int bm,
-                                           int bn) {
+                                           int bn, const hgemm_epi::Ep& ep = hgemm_epi::Ep()) {
     constexpr int WM = C::WM, WN = C::WN, MT = C::MT, NT = C::NT;
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
@@ -179,29 +182,17 @@ __device__ __forceinline__ void store_bf16(const typename C::Acc& acc,
     const int wn = warp % WARPS_N;
     const int g = lane >> 2;
     const int c2 = (lane & 3) * 2;
-#pragma unroll
-    for (int mi = 0; mi < MT; ++mi) {
-#pragma unroll
-        for (int nj = 0; nj < NT; ++nj) {
-            const int row = bm + wm * WM + mi * 16 + g;
-            const int col = bn + wn * WN + nj * 8 + c2;
-            __nv_bfloat16* p0 = C_ + static_cast<size_t>(row) * N + col;
-            __nv_bfloat16* p1 = p0 + static_cast<size_t>(8) * N;
-            if (row < M)  // M % 16 == 0: row and row + 8 are in or out together
-                *reinterpret_cast<__nv_bfloat162*>(p0) =
-                    __floats2bfloat162_rn(acc[mi][nj][0], acc[mi][nj][1]);
-            if (row + 8 < M)
-                *reinterpret_cast<__nv_bfloat162*>(p1) =
-                    __floats2bfloat162_rn(acc[mi][nj][2], acc[mi][nj][3]);
-        }
-    }
+    hgemm_epi::store_warp_tile<FUSED, MT, NT>(acc, C_, M, N, bm + wm * WM + g, bn + wn * WN + c2,
+                                              ep);
 }
 
 }  // namespace spark::hgemm_tile
 
 namespace spark {
-// Variant 4 (hgemm_streamk.cu); dispatched to by hgemm_bf16. The caller has validated the
-// shape with hgemm_supports(M, N, K, 4).
+// Variant 4 (hgemm_streamk.cu); dispatched to by hgemm_bf16 and, for the shapes its TMA tile
+// does not take, by variant 6. The caller has validated the shape with
+// hgemm_supports(M, N, K, 4).
 void hgemm_streamk_bf16(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M,
-                        int N, int K, cudaStream_t stream);
+                        int N, int K, cudaStream_t stream,
+                        const HgemmEpilogue& ep = HgemmEpilogue());
 }  // namespace spark

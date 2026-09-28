@@ -126,8 +126,28 @@ int sgemm_num_variants();
 //            across pieces. Same shape rules as variant 4 (N % 64 == 0, K % 64 == 0, any
 //            M >= 1); shapes the 128x128 TMA tile cannot fill run variant 4's tiles, and
 //            M <= 64 the decode kernel
+//
+// Fused epilogue (variants 4 and 6 only, every route inside them: the TMA tile, the Stream-K
+// finishing piece, variant 4's tiles and the decode kernel). Applied in fp32 before the one
+// rounding to bf16, in this order:
+//   C = act(A B + bias) + residual         bias [N] bf16 per column, residual [M][N] bf16
+//   residual == C is the in-place accumulate C += act(A B + bias).
+//   swiglu: B is [K][N] with column 2j = gate_j and 2j+1 = up_j (interleaved gate/up, see
+//   docs/design/hgemm.md, "Fused epilogues"); C is [M][N/2] with
+//   C[i][j] = silu(x[i][2j]) * x[i][2j+1] (+ residual[i][j]), x = A B + bias. `act` is
+//   ignored. N is still the width of B and keeps the N % 64 == 0 rule.
+// The default HgemmEpilogue is the plain store, and every existing call is unchanged. A
+// non-default epilogue on variants 0 to 3 or 5 throws std::invalid_argument.
+enum HgemmAct { HGEMM_ACT_NONE = 0, HGEMM_ACT_SILU = 1, HGEMM_ACT_GELU = 2, HGEMM_ACT_RELU = 3 };
+struct HgemmEpilogue {
+    const __nv_bfloat16* bias = nullptr;      // [N], or nullptr
+    int act = HGEMM_ACT_NONE;                 // HgemmAct; gelu is the tanh form
+    const __nv_bfloat16* residual = nullptr;  // [M][N] ([M][N/2] with swiglu), or nullptr; may be C
+    bool swiglu = false;                      // interleaved gate/up columns, N/2 output columns
+};
 void hgemm_bf16(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N,
-                int K, int variant, cudaStream_t stream);
+                int K, int variant, cudaStream_t stream,
+                const HgemmEpilogue& epilogue = HgemmEpilogue());
 int hgemm_num_variants();
 // True if `variant` accepts this shape (the rules above); hgemm_bf16 throws when it is false.
 // Lets a caller pick the fastest variant that fits instead of catching the exception.

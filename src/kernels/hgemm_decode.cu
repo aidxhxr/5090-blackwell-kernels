@@ -19,6 +19,7 @@
 //     what limits a CTA, so the 64-row tile runs 8 warps on a 64x32 strip, 128 CTAs wide.
 #include <algorithm>
 
+#include "hgemm_epilogue.cuh"
 #include "hgemm_internal.cuh"
 #include "spark/common.cuh"
 
@@ -40,18 +41,15 @@ __device__ __forceinline__ int swz(int row, int chunk) {
         return chunk ^ (row & 7);
 }
 
-__device__ __forceinline__ __nv_bfloat16* C_at(__nv_bfloat16* C, int row, int col, int N) {
-    return C + static_cast<size_t>(row) * N + col;
-}
-
 struct Params {
     const __nv_bfloat16* A;
     const __nv_bfloat16* B;
     __nv_bfloat16* C;
     int M, N, K;
-    int split;      // K-slices per column strip; block = slice * strips + strip
-    float* ws;      // BM x N fp32 partial sums, zero between launches (split > 1 only)
-    int* counters;  // one arrival counter per strip, zero between launches
+    int split;         // K-slices per column strip; block = slice * strips + strip
+    float* ws;         // BM x N fp32 partial sums, zero between launches (split > 1 only)
+    int* counters;     // one arrival counter per strip, zero between launches
+    hgemm_epi::Ep ep;  // the fused epilogue (FUSED kernels only)
 };
 
 template <int BM, int BN, int BK, int STAGES>
@@ -60,7 +58,9 @@ constexpr int smem_bytes() {
 }
 
 // Warps tile the block WM (rows) x WN (columns); each warp owns BM/WM rows by BN/WN columns.
-template <int BM, int BN, int BK, int STAGES, int WM, int WN>
+// FUSED applies p.ep (hgemm_epilogue.cuh) wherever bf16 is stored: by the block itself when K
+// is not split, by the last K-slice to arrive at a strip when it is.
+template <int BM, int BN, int BK, int STAGES, int WM, int WN, bool FUSED>
 __global__ void __launch_bounds__(WM * WN * 32) decode_kernel(Params p) {
     constexpr int THREADS = WM * WN * 32;
     constexpr int WROWS = BM / WM;  // rows per warp
@@ -198,19 +198,7 @@ __global__ void __launch_bounds__(WM * WN * 32) decode_kernel(Params p) {
     const int row0 = wm * WROWS + g;
     const int col0 = strip * BN + wn * WCOLS + c2;
     if (p.split == 1) {
-#pragma unroll
-        for (int mi = 0; mi < MT; ++mi)
-#pragma unroll
-            for (int nj = 0; nj < NT; ++nj) {
-                const int row = row0 + mi * 16;
-                const int col = col0 + nj * 8;
-                if (row < M)
-                    *reinterpret_cast<__nv_bfloat162*>(C_at(p.C, row, col, N)) =
-                        __floats2bfloat162_rn(acc[mi][nj][0], acc[mi][nj][1]);
-                if (row + 8 < M)
-                    *reinterpret_cast<__nv_bfloat162*>(C_at(p.C, row + 8, col, N)) =
-                        __floats2bfloat162_rn(acc[mi][nj][2], acc[mi][nj][3]);
-            }
+        hgemm_epi::store_warp_tile<FUSED, MT, NT>(acc, p.C, M, N, row0, col0, p.ep);
         return;
     }
 
@@ -239,18 +227,23 @@ __global__ void __launch_bounds__(WM * WN * 32) decode_kernel(Params p) {
     if (!s_last) return;
     __threadfence();
     const int rows = M < BM ? M : BM;
-    for (int i = tid; i < rows * (BN / 4); i += THREADS) {
-        const int r = i / (BN / 4);
-        const int c = strip * BN + (i % (BN / 4)) * 4;
-        float4* w = reinterpret_cast<float4*>(p.ws + static_cast<size_t>(r) * N + c);
-        const float4 v = __ldcg(w);  // from L2, where the atomics landed
-        const __nv_bfloat162 lo = __floats2bfloat162_rn(v.x, v.y);
-        const __nv_bfloat162 hi = __floats2bfloat162_rn(v.z, v.w);
-        uint2 packed;
-        packed.x = *reinterpret_cast<const unsigned*>(&lo);
-        packed.y = *reinterpret_cast<const unsigned*>(&hi);
-        *reinterpret_cast<uint2*>(C_at(p.C, r, c, N)) = packed;
-        __stcg(w, make_float4(0.f, 0.f, 0.f, 0.f));
+    auto finish = [&](auto store) {
+        for (int i = tid; i < rows * (BN / 4); i += THREADS) {
+            const int r = i / (BN / 4);
+            const int c = strip * BN + (i % (BN / 4)) * 4;
+            float4* w = reinterpret_cast<float4*>(p.ws + static_cast<size_t>(r) * N + c);
+            store(__ldcg(w), r, c);  // from L2, where the atomics landed
+            __stcg(w, make_float4(0.f, 0.f, 0.f, 0.f));
+        }
+    };
+    if constexpr (FUSED) {
+        hgemm_epi::dispatch(p.ep, [&](auto mode) {
+            finish([&](float4 v, int r, int c) {
+                hgemm_epi::store_vec4_mode<decltype(mode)>(v, p.C, N, r, c, p.ep);
+            });
+        });
+    } else {
+        finish([&](float4 v, int r, int c) { hgemm_epi::store_vec4_plain(v, p.C, N, r, c); });
     }
     if (tid == 0) atomicExch(p.counters + strip, 0);
 }
@@ -284,16 +277,16 @@ Workspace& workspace(size_t floats, size_t strips) {
 }
 
 // Resident CTAs per GPU for one configuration; also the > 48 KB smem opt-in.
-template <int BM, int BN, int BK, int STAGES, int WM, int WN>
+template <int BM, int BN, int BK, int STAGES, int WM, int WN, bool FUSED>
 int slots() {
     constexpr int bytes = smem_bytes<BM, BN, BK, STAGES>();
     static int resident = 0;
     if (resident == 0) {
-        SPARK_CUDA_CHECK(cudaFuncSetAttribute(decode_kernel<BM, BN, BK, STAGES, WM, WN>,
+        SPARK_CUDA_CHECK(cudaFuncSetAttribute(decode_kernel<BM, BN, BK, STAGES, WM, WN, FUSED>,
                                               cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
         int per_sm = 0;
         SPARK_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &per_sm, decode_kernel<BM, BN, BK, STAGES, WM, WN>, WM * WN * 32, bytes));
+            &per_sm, decode_kernel<BM, BN, BK, STAGES, WM, WN, FUSED>, WM * WN * 32, bytes));
         resident = (per_sm > 0 ? per_sm : 1) * num_sms();
     }
     return resident;
@@ -305,11 +298,11 @@ int slots() {
 // strips alone would leave fewer than 64 CTAs.
 constexpr int kMinCtas = 64;
 
-template <int BM, int BN, int BK, int STAGES, int WM, int WN>
+template <int BM, int BN, int BK, int STAGES, int WM, int WN, bool FUSED>
 void launch_cfg(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N,
-                int K, cudaStream_t stream) {
+                int K, cudaStream_t stream, const HgemmEpilogue& ep) {
     constexpr int bytes = smem_bytes<BM, BN, BK, STAGES>();
-    (void)slots<BM, BN, BK, STAGES, WM, WN>();  // the smem opt-in, if not done by fits()
+    (void)slots<BM, BN, BK, STAGES, WM, WN, FUSED>();  // the smem opt-in, if not done by fits()
     Params p;
     p.A = A;
     p.B = B;
@@ -317,6 +310,7 @@ void launch_cfg(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C
     p.M = M;
     p.N = N;
     p.K = K;
+    p.ep = hgemm_epi::make(ep);
     const int strips = N / BN;
     p.split = std::min(K / BK, std::max(1, cdiv(kMinCtas, strips)));
     p.ws = nullptr;
@@ -326,15 +320,41 @@ void launch_cfg(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C
         p.ws = w.ws;
         p.counters = w.counters;
     }
-    decode_kernel<BM, BN, BK, STAGES, WM, WN><<<strips * p.split, WM * WN * 32, bytes, stream>>>(p);
+    decode_kernel<BM, BN, BK, STAGES, WM, WN, FUSED>
+        <<<strips * p.split, WM * WN * 32, bytes, stream>>>(p);
 }
 
 // Two configurations per row tile, in order of preference: the first whose strips fit in one
 // wave of resident CTAs runs (172 strips on 170 slots would be a full wave plus two stragglers
 // that take as long again), otherwise the second, which has more slots.
-template <int BM, int BN, int BK, int STAGES, int WM, int WN>
+template <int BM, int BN, int BK, int STAGES, int WM, int WN, bool FUSED>
 bool fits(int N, int K) {
-    return N % BN == 0 && K % BK == 0 && N / BN <= slots<BM, BN, BK, STAGES, WM, WN>();
+    return N % BN == 0 && K % BK == 0 && N / BN <= slots<BM, BN, BK, STAGES, WM, WN, FUSED>();
+}
+
+template <bool FUSED>
+void launch_impl(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N,
+                 int K, cudaStream_t stream, const HgemmEpilogue& ep) {
+    if (M <= 16) {
+        // 16x64x64, 4 stages, 4 warps along N, 40 KB: 2 CTAs per SM, 340 slots.
+        if (fits<16, 64, 64, 4, 1, 4, FUSED>(N, K))
+            launch_cfg<16, 64, 64, 4, 1, 4, FUSED>(A, B, C, M, N, K, stream, ep);
+        else  // 16x32x64, 24 KB: 4 per SM, 680 slots
+            launch_cfg<16, 32, 64, 4, 1, 2, FUSED>(A, B, C, M, N, K, stream, ep);
+    } else if (M <= 32) {
+        // 32x32x64, 4 stages, 2x2 warps, 32 KB: 3 per SM, 510 slots.
+        if (fits<32, 32, 64, 4, 2, 2, FUSED>(N, K))
+            launch_cfg<32, 32, 64, 4, 2, 2, FUSED>(A, B, C, M, N, K, stream, ep);
+        else  // 32x64x64, 2x4 warps, 40 KB: 2 per SM, 340 slots, half the strips
+            launch_cfg<32, 64, 64, 4, 2, 4, FUSED>(A, B, C, M, N, K, stream, ep);
+    } else {
+        // 64x32x128, 4 stages, 4x2 warps, 96 KB: 1 per SM, 170 slots. The tensor work of a
+        // 64-row strip is what limits the CTA, so the tile is narrow and the warps many.
+        if (fits<64, 32, 128, 4, 4, 2, FUSED>(N, K))
+            launch_cfg<64, 32, 128, 4, 4, 2, FUSED>(A, B, C, M, N, K, stream, ep);
+        else  // 64x64x64, 3 stages, 2x4 warps, 48 KB: 2 per SM, 340 slots
+            launch_cfg<64, 64, 64, 3, 2, 4, FUSED>(A, B, C, M, N, K, stream, ep);
+    }
 }
 
 }  // namespace
@@ -344,27 +364,11 @@ bool supports(int M, int N, int K) {
 }
 
 void launch(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N, int K,
-            cudaStream_t stream) {
-    if (M <= 16) {
-        // 16x64x64, 4 stages, 4 warps along N, 40 KB: 2 CTAs per SM, 340 slots.
-        if (fits<16, 64, 64, 4, 1, 4>(N, K))
-            launch_cfg<16, 64, 64, 4, 1, 4>(A, B, C, M, N, K, stream);
-        else  // 16x32x64, 24 KB: 4 per SM, 680 slots
-            launch_cfg<16, 32, 64, 4, 1, 2>(A, B, C, M, N, K, stream);
-    } else if (M <= 32) {
-        // 32x32x64, 4 stages, 2x2 warps, 32 KB: 3 per SM, 510 slots.
-        if (fits<32, 32, 64, 4, 2, 2>(N, K))
-            launch_cfg<32, 32, 64, 4, 2, 2>(A, B, C, M, N, K, stream);
-        else  // 32x64x64, 2x4 warps, 40 KB: 2 per SM, 340 slots, half the strips
-            launch_cfg<32, 64, 64, 4, 2, 4>(A, B, C, M, N, K, stream);
-    } else {
-        // 64x32x128, 4 stages, 4x2 warps, 96 KB: 1 per SM, 170 slots. The tensor work of a
-        // 64-row strip is what limits the CTA, so the tile is narrow and the warps many.
-        if (fits<64, 32, 128, 4, 4, 2>(N, K))
-            launch_cfg<64, 32, 128, 4, 4, 2>(A, B, C, M, N, K, stream);
-        else  // 64x64x64, 3 stages, 2x4 warps, 48 KB: 2 per SM, 340 slots
-            launch_cfg<64, 64, 64, 3, 2, 4>(A, B, C, M, N, K, stream);
-    }
+            cudaStream_t stream, const HgemmEpilogue& ep) {
+    if (hgemm_epi::is_plain(ep))
+        launch_impl<false>(A, B, C, M, N, K, stream, ep);
+    else
+        launch_impl<true>(A, B, C, M, N, K, stream, ep);
 }
 
 }  // namespace spark::hgemm_decode

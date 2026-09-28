@@ -59,10 +59,13 @@ using hgemm_sk::slot_idx;
 using hgemm_sk::st_release_gpu;
 using hgemm_tile::THREADS;
 
-template <int BM, int BN, int BK, int STAGES>
+// FUSED: the storing piece applies the epilogue options in `ep` (hgemm_epilogue.cuh); the
+// plain instantiation carries none of that code.
+template <int BM, int BN, int BK, int STAGES, bool FUSED>
 __global__ void __launch_bounds__(THREADS)
     hgemm_v4_kernel(const __nv_bfloat16* __restrict__ A, const __nv_bfloat16* __restrict__ B,
-                    __nv_bfloat16* __restrict__ C, int M, int N, int K, Params p) {
+                    __nv_bfloat16* __restrict__ C, int M, int N, int K, Params p,
+                    hgemm_epi::Ep ep) {
     using Cfg = hgemm_tile::Cfg<BM, BN, BK, STAGES>;
     constexpr int WM = Cfg::WM, MT = Cfg::MT, NT = Cfg::NT;
     extern __shared__ __align__(128) unsigned char smem_raw[];
@@ -125,7 +128,7 @@ __global__ void __launch_bounds__(THREADS)
                 return;
             }
         }
-        hgemm_tile::store_bf16<Cfg>(acc, C, M, N, bm, bn);
+        hgemm_tile::store_bf16<Cfg, FUSED>(acc, C, M, N, bm, bn, ep);
         __syncthreads();  // the pipeline's last stage is free before the next prologue
     };
 
@@ -160,7 +163,7 @@ __global__ void __launch_bounds__(THREADS)
             raster(p, item, tm, tn);
             const int bm = tm * BM, bn = tn * BN;
             hgemm_tile::mainloop<Cfg>(A, B, N, K, bm, bn, M - bm, 0, p.KT, smem_raw, acc);
-            hgemm_tile::store_bf16<Cfg>(acc, C, M, N, bm, bn);
+            hgemm_tile::store_bf16<Cfg, FUSED>(acc, C, M, N, bm, bn, ep);
             __syncthreads();
         } else {
             const int q = item - p.dp_tiles;
@@ -182,29 +185,30 @@ __global__ void __launch_bounds__(THREADS)
     }
 }
 
-template <int BM, int BN, int BK, int STAGES>
+template <int BM, int BN, int BK, int STAGES, bool FUSED>
 int resident_blocks() {
     constexpr int bytes = hgemm_tile::smem_bytes<BM, BN, BK, STAGES>();
     static int resident = 0;  // blocks resident per GPU; also the > 48 KB smem opt-in
     if (resident == 0) {
-        SPARK_CUDA_CHECK(cudaFuncSetAttribute(hgemm_v4_kernel<BM, BN, BK, STAGES>,
+        SPARK_CUDA_CHECK(cudaFuncSetAttribute(hgemm_v4_kernel<BM, BN, BK, STAGES, FUSED>,
                                               cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
         int per_sm = 0;
         SPARK_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &per_sm, hgemm_v4_kernel<BM, BN, BK, STAGES>, THREADS, bytes));
+            &per_sm, hgemm_v4_kernel<BM, BN, BK, STAGES, FUSED>, THREADS, bytes));
         resident = (per_sm > 0 ? per_sm : 1) * num_sms();
     }
     return resident;
 }
 
-template <int BM, int BN, int BK, int STAGES>
+template <int BM, int BN, int BK, int STAGES, bool FUSED>
 void launch(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N, int K,
-            cudaStream_t stream) {
+            cudaStream_t stream, const HgemmEpilogue& ep) {
     constexpr int bytes = hgemm_tile::smem_bytes<BM, BN, BK, STAGES>();
-    static hgemm_sk::Workspace w;  // one per tile configuration
+    static hgemm_sk::Workspace w;  // one per tile configuration and epilogue instantiation
     Params p;
-    hgemm_sk::plan(p, w, M, N, K, BM, BN, BK, resident_blocks<BM, BN, BK, STAGES>());
-    hgemm_v4_kernel<BM, BN, BK, STAGES><<<p.grid, THREADS, bytes, stream>>>(A, B, C, M, N, K, p);
+    hgemm_sk::plan(p, w, M, N, K, BM, BN, BK, resident_blocks<BM, BN, BK, STAGES, FUSED>());
+    hgemm_v4_kernel<BM, BN, BK, STAGES, FUSED>
+        <<<p.grid, THREADS, bytes, stream>>>(A, B, C, M, N, K, p, hgemm_epi::make(ep));
 }
 
 constexpr int BK = 32;
@@ -216,23 +220,25 @@ constexpr int STAGES = 3;
 // to the same weight-streaming kernel as variant 3 (hgemm_decode.cu): it streams B at the
 // single-launch floor, which the 64x64x64 tile on this schedule does not quite reach
 // (1,352 against 1,459 GB/s at 64x4096x4096).
+template <bool FUSED>
 void launch_auto(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N,
-                 int K, cudaStream_t stream) {
+                 int K, cudaStream_t stream, const HgemmEpilogue& ep) {
     auto share = [&](int bm, int bn, int bk, int resident) {  // k-steps per block
         return static_cast<long long>(cdiv(M, bm)) * (N / bn) * (K / bk) / resident;
     };
     if (M <= 64 && hgemm_decode::supports(M, N, K)) {
-        hgemm_decode::launch(A, B, C, M, N, K, stream);
+        hgemm_decode::launch(A, B, C, M, N, K, stream, ep);
     } else if (M <= 64) {
-        launch<64, 64, 64, 4>(A, B, C, M, N, K, stream);
-    } else if (N % 128 == 0 && share(128, 128, BK, resident_blocks<128, 128, BK, STAGES>()) >=
-                                   hgemm_sk::kMinShare) {
-        launch<128, 128, BK, STAGES>(A, B, C, M, N, K, stream);
+        launch<64, 64, 64, 4, FUSED>(A, B, C, M, N, K, stream, ep);
     } else if (N % 128 == 0 &&
-               share(64, 128, BK, resident_blocks<64, 128, BK, STAGES>()) >= hgemm_sk::kMinShare) {
-        launch<64, 128, BK, STAGES>(A, B, C, M, N, K, stream);
+               share(128, 128, BK, resident_blocks<128, 128, BK, STAGES, FUSED>()) >=
+                   hgemm_sk::kMinShare) {
+        launch<128, 128, BK, STAGES, FUSED>(A, B, C, M, N, K, stream, ep);
+    } else if (N % 128 == 0 && share(64, 128, BK, resident_blocks<64, 128, BK, STAGES, FUSED>()) >=
+                                   hgemm_sk::kMinShare) {
+        launch<64, 128, BK, STAGES, FUSED>(A, B, C, M, N, K, stream, ep);
     } else {
-        launch<64, 64, 64, 3>(A, B, C, M, N, K, stream);
+        launch<64, 64, 64, 3, FUSED>(A, B, C, M, N, K, stream, ep);
     }
 }
 
@@ -241,8 +247,11 @@ void launch_auto(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* 
 }  // namespace
 
 void hgemm_streamk_bf16(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M,
-                        int N, int K, cudaStream_t stream) {
-    sk::launch_auto(A, B, C, M, N, K, stream);
+                        int N, int K, cudaStream_t stream, const HgemmEpilogue& ep) {
+    if (hgemm_epi::is_plain(ep))
+        sk::launch_auto<false>(A, B, C, M, N, K, stream, ep);
+    else
+        sk::launch_auto<true>(A, B, C, M, N, K, stream, ep);
 }
 
 }  // namespace spark

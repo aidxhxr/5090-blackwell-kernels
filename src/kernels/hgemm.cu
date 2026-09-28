@@ -543,7 +543,7 @@ void hgemm_tma(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C,
                int K, cudaStream_t stream);
 bool hgemm_tma_sk_supports(int M, int N, int K);
 void hgemm_tma_sk(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N,
-                  int K, cudaStream_t stream);
+                  int K, cudaStream_t stream, const HgemmEpilogue& ep);
 
 int hgemm_num_variants() {
     return 7;
@@ -562,13 +562,25 @@ bool hgemm_supports(int M, int N, int K, int variant) {
 }
 
 void hgemm_bf16(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N,
-                int K, int variant, cudaStream_t stream) {
+                int K, int variant, cudaStream_t stream, const HgemmEpilogue& ep) {
     SPARK_REQUIRE(A != nullptr && B != nullptr && C != nullptr, "hgemm: null pointer");
     SPARK_REQUIRE(M > 0 && N > 0 && K > 0, "hgemm: M, N, K must be positive");
     SPARK_REQUIRE(N % WMMA_N == 0 && K % WMMA_K == 0, "hgemm: N, K must be multiples of 16");
     SPARK_REQUIRE(M % WMMA_M == 0 || variant == 3 || variant == 4 || variant == 6,
                   "hgemm: M must be a multiple of 16");
     SPARK_REQUIRE(variant >= 0 && variant < hgemm_num_variants(), "hgemm: unknown variant");
+    if (!hgemm_epi::is_plain(ep)) {
+        SPARK_REQUIRE(variant == 4 || variant == 6,
+                      "hgemm: the fused epilogue (bias, act, residual, swiglu) is only supported "
+                      "by variants 4 and 6, which need N % 64 == 0 and K % 64 == 0");
+        SPARK_REQUIRE(ep.act >= HGEMM_ACT_NONE && ep.act <= HGEMM_ACT_RELU,
+                      "hgemm: unknown activation");
+        SPARK_REQUIRE(!ep.swiglu || N % 2 == 0, "hgemm: swiglu needs an even N");
+        SPARK_REQUIRE(ep.bias == nullptr || is_aligned16(ep.bias),
+                      "hgemm: bias must be 16-byte aligned");
+        SPARK_REQUIRE(ep.residual == nullptr || is_aligned16(ep.residual),
+                      "hgemm: residual must be 16-byte aligned");
+    }
 
     switch (variant) {
         case 0: {
@@ -597,14 +609,14 @@ void hgemm_bf16(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C
         case 4: {
             SPARK_REQUIRE(hgemm_supports(M, N, K, 4),
                           "hgemm variant 4: requires N % 64 == 0, K % 64 == 0");
-            hgemm_streamk_bf16(A, B, C, M, N, K, stream);
+            hgemm_streamk_bf16(A, B, C, M, N, K, stream, ep);
             break;
         }
         case 5:
             hgemm_tma(A, B, C, M, N, K, stream);
             break;
         case 6:
-            hgemm_tma_sk(A, B, C, M, N, K, stream);
+            hgemm_tma_sk(A, B, C, M, N, K, stream, ep);
             break;
         default:
             break;
