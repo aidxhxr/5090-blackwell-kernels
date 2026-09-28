@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use these kernels or the measurements, please cite the repository."
+title: "5090-blackwell-kernels: hand-written CUDA kernels for LLM inference on the RTX 5090"
+type: software
+authors:
+  - family-names: Aidarkhan
+    given-names: Amirkhan
+repository-code: "https://github.com/aidxhxr/5090-blackwell-kernels"
+license: MIT
+date-released: 2026-09-26
+keywords:
+  - CUDA
+  - Blackwell
+  - GEMM
+  - fp8
+  - flash attention
+  - Stream-K
+  - TMA
