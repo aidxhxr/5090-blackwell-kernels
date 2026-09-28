@@ -15,7 +15,9 @@ Ops (all run on the current CUDA stream, all accept float32 or bfloat16 unless n
                                              with a fused act(a @ b + bias) + residual epilogue
     hgemm_swiglu(a, w_gate_up, ...)          silu(a @ w_gate) * (a @ w_up) in one GEMM from the
                                              interleaved weight of interleave_gate_up(g, u)
-    fp8gemm(a, b_t, scale_a, scale_b, variant=-1)  e4m3 GEMM (a @ b_t.T, scaled), bf16 out
+    fp8gemm(a, b_t, scale_a, scale_b, variant=-1, sfa=None, sfb=None)
+                                             e4m3 GEMM (a @ b_t.T, scaled), bf16 out; with
+                                             sfa, sfb: MXFP8 (a ue8m0 scale per 32 k)
     attention(q, k, v, causal=False, variant=-1)  fused attention over [B, H, S, D] (bf16)
     rope_append_(qkv, cos, sin, k_cache, v_cache, pos0, H_q, H_kv)
                                              RoPE on q and k, k and v into the caches; returns q

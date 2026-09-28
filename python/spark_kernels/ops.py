@@ -151,9 +151,11 @@ def hgemm_swiglu(
 def fp8gemm(
     a: torch.Tensor,
     b_t: torch.Tensor,
-    scale_a: torch.Tensor,
-    scale_b: torch.Tensor,
+    scale_a: torch.Tensor | None = None,
+    scale_b: torch.Tensor | None = None,
     variant: int = -1,
+    sfa: torch.Tensor | None = None,
+    sfb: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """fp8 tensor-core GEMM: (scale_a * scale_b) * (a @ b_t.T) -> [M, N] bfloat16, fp32 accumulate.
 
@@ -165,8 +167,15 @@ def fp8gemm(
     most shapes) takes any M >= 1; variant 0 needs M a multiple of 16; variant 2 (TMA) needs
     M, N multiples of 128, K a multiple of 128 and at least one 128x128 tile per SM. The default
     steps down to the highest variant that accepts the shape.
+
+    MX mode (MXFP8): `sfa` [M, K // 32] and `sfb` [N, K // 32] are uint8 E8M0 block scales
+    (exponent + 127, one per 32 consecutive k of a row, as `reference.quantize_mx` produces
+    them), and each product a[m, k] * b_t[n, k] is multiplied by 2**(sfa[m, k // 32] - 127) *
+    2**(sfb[n, k // 32] - 127) inside the tensor-core instruction, before the fp32 sum. The
+    per-tensor scales may then be omitted (1.0). Needs K a multiple of 256 and 16-byte
+    aligned scale storage; the same variants apply.
     """
-    return _C.fp8gemm(a, b_t, scale_a, scale_b, variant)
+    return _C.fp8gemm(a, b_t, scale_a, scale_b, variant, sfa, sfb)
 
 
 def rope_append_(

@@ -21,6 +21,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #include "spark/kernels.h"
 
@@ -288,9 +289,13 @@ Tensor hgemm(const Tensor& a, const Tensor& b, int variant, const std::optional<
 
 // C = scale_a * scale_b * a @ b_t^T with a [M, K] and b_t [N, K] both float8_e4m3fn and K
 // contiguous (the layout torch._scaled_mm and cuBLASLt take), per-tensor fp32 scales on the
-// device, bf16 out. The default variant is the highest that accepts the shape.
-Tensor fp8gemm(const Tensor& a, const Tensor& b_t, const Tensor& scale_a, const Tensor& scale_b,
-               int variant) {
+// device, bf16 out. With sfa and sfb (MX mode: uint8 ue8m0 scales, [M, K/32] and [N, K/32],
+// one per 32 consecutive k of a row) every product is also scaled by its two block scales,
+// inside the block-scaled mma; the per-tensor scales may then be None (1.0). The default
+// variant is the highest that accepts the shape.
+Tensor fp8gemm(const Tensor& a, const Tensor& b_t, const std::optional<Tensor>& scale_a,
+               const std::optional<Tensor>& scale_b, int variant, const std::optional<Tensor>& sfa,
+               const std::optional<Tensor>& sfb) {
     check_cuda_contig(a, "a");
     check_cuda_contig(b_t, "b_t");
     TORCH_CHECK(a.scalar_type() == at::kFloat8_e4m3fn && b_t.scalar_type() == at::kFloat8_e4m3fn,
@@ -300,22 +305,59 @@ Tensor fp8gemm(const Tensor& a, const Tensor& b_t, const Tensor& scale_a, const 
                 a.size(1), ", b_t is ", b_t.size(0), "x", b_t.size(1), " (b_t is [N, K])");
     TORCH_CHECK(a.size(0) <= INT32_MAX && b_t.size(0) <= INT32_MAX && a.size(1) <= INT32_MAX,
                 "fp8gemm dims too large for int32");
-    for (const auto* sp : {&scale_a, &scale_b}) {
-        const Tensor& sc = *sp;
-        TORCH_CHECK(sc.is_cuda() && sc.scalar_type() == at::kFloat && sc.numel() == 1,
-                    "scale_a and scale_b must be float32 CUDA tensors with one element");
-        TORCH_CHECK(sc.device() == a.device(), "scales must be on a's device");
+    const bool mx = sfa.has_value() || sfb.has_value();
+    TORCH_CHECK(!mx || (sfa.has_value() && sfb.has_value()),
+                "fp8gemm: sfa and sfb must both be given (MX mode) or both be None");
+    TORCH_CHECK(mx || (scale_a.has_value() && scale_b.has_value()),
+                "fp8gemm: scale_a and scale_b are required without block scales");
+    TORCH_CHECK(scale_a.has_value() == scale_b.has_value(),
+                "fp8gemm: scale_a and scale_b must both be given or both be None");
+    const float* sa = nullptr;
+    const float* sb = nullptr;
+    if (scale_a.has_value()) {
+        for (const Tensor* sp : {&*scale_a, &*scale_b}) {
+            const Tensor& sc = *sp;
+            TORCH_CHECK(sc.is_cuda() && sc.scalar_type() == at::kFloat && sc.numel() == 1,
+                        "scale_a and scale_b must be float32 CUDA tensors with one element");
+            TORCH_CHECK(sc.device() == a.device(), "scales must be on a's device");
+        }
+        sa = scale_a->data_ptr<float>();
+        sb = scale_b->data_ptr<float>();
     }
     TORCH_CHECK(aligned16(a) && aligned16(b_t), "fp8gemm needs 16-byte aligned a and b_t storage");
     const int M = static_cast<int>(a.size(0)), N = static_cast<int>(b_t.size(0)),
               K = static_cast<int>(a.size(1));
+    if (mx) {
+        TORCH_CHECK(K % 256 == 0, "fp8gemm with block scales needs K a multiple of 256, got ", K);
+        const std::pair<const Tensor*, const char*> sfs[2] = {{&*sfa, "sfa"}, {&*sfb, "sfb"}};
+        const int64_t rows[2] = {M, N};
+        for (int i = 0; i < 2; ++i) {
+            const Tensor& sf = *sfs[i].first;
+            check_cuda_contig(sf, sfs[i].second);
+            TORCH_CHECK(sf.scalar_type() == at::kByte, sfs[i].second,
+                        " must be uint8 (ue8m0: exponent + 127)");
+            TORCH_CHECK(sf.dim() == 2 && sf.size(0) == rows[i] && sf.size(1) == K / 32,
+                        sfs[i].second, " must be [", rows[i], ", ", K / 32, "], got ", sf.sizes());
+            TORCH_CHECK(sf.device() == a.device(), sfs[i].second, " must be on a's device");
+            TORCH_CHECK(aligned16(sf), sfs[i].second, " needs 16-byte aligned storage");
+        }
+    }
     const c10::cuda::CUDAGuard guard(a.device());
     Tensor c = at::empty({M, N}, a.options().dtype(at::kBFloat16));
     int v = resolve_variant(variant, spark::fp8gemm_num_variants());
-    while (variant < 0 && v > 0 && !spark::fp8gemm_supports(M, N, K, v)) --v;
-    spark::fp8gemm(reinterpret_cast<const __nv_fp8_e4m3*>(a.data_ptr()),
-                   reinterpret_cast<const __nv_fp8_e4m3*>(b_t.data_ptr()), bf16_ptr_mut(c), M, N, K,
-                   scale_a.data_ptr<float>(), scale_b.data_ptr<float>(), v, current_stream(a));
+    const auto supports = [&](int vv) {
+        return mx ? spark::fp8gemm_mx_supports(M, N, K, vv) : spark::fp8gemm_supports(M, N, K, vv);
+    };
+    while (variant < 0 && v > 0 && !supports(v)) --v;
+    const auto* pa = reinterpret_cast<const __nv_fp8_e4m3*>(a.data_ptr());
+    const auto* pb = reinterpret_cast<const __nv_fp8_e4m3*>(b_t.data_ptr());
+    if (mx) {
+        spark::fp8gemm_mx(pa, pb, bf16_ptr_mut(c), M, N, K, sa, sb,
+                          static_cast<const unsigned char*>(sfa->data_ptr()),
+                          static_cast<const unsigned char*>(sfb->data_ptr()), v, current_stream(a));
+    } else {
+        spark::fp8gemm(pa, pb, bf16_ptr_mut(c), M, N, K, sa, sb, v, current_stream(a));
+    }
     return c;
 }
 
@@ -436,9 +478,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("act") = py::none(), py::arg("residual") = py::none(), py::arg("swiglu") = false,
           py::arg("out") = py::none());
     m.def("fp8gemm", &fp8gemm,
-          "fp8 (e4m3) tensor-core GEMM: scale_a * scale_b * a @ b_t^T, b_t is [N, K], bf16 out",
-          py::arg("a"), py::arg("b_t"), py::arg("scale_a"), py::arg("scale_b"),
-          py::arg("variant") = -1);
+          "fp8 (e4m3) tensor-core GEMM: scale_a * scale_b * a @ b_t^T, b_t is [N, K], bf16 out; "
+          "sfa [M, K/32] and sfb [N, K/32] uint8 ue8m0 add a scale per 32 k (MXFP8)",
+          py::arg("a"), py::arg("b_t"), py::arg("scale_a") = py::none(),
+          py::arg("scale_b") = py::none(), py::arg("variant") = -1, py::arg("sfa") = py::none(),
+          py::arg("sfb") = py::none());
     m.def("attention", &attention,
           "softmax(q k^T / sqrt(D)) v over [B, H, S, D] bf16 tensors (k, v may have fewer heads)",
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("causal") = false,
