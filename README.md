@@ -20,7 +20,7 @@ with `ARCH=121`.
 
 ## numbers
 
-Measured 2026-09-26 on one card. Driver 595.58, CUDA 13.2, PyTorch 2.14+cu130; the GPU state
+Measured 2026-09-28 on one card. Driver 595.58, CUDA 13.2, PyTorch 2.14+cu130; the GPU state
 during the run is in `results/env.txt`. Every row is the median of 100 launches (50 for the
 GEMMs and attention) between CUDA events, after a 300 ms clock ramp, and every variant is
 checked against a reference before it is timed: CPU double precision for the row kernels,
@@ -29,16 +29,17 @@ PyTorch" column is eager PyTorch on the same shapes through the extension.
 
 | kernel | shape | best | time | achieved | vs the library | vs PyTorch |
 |---|---|---|---|---|---|---|
-| bf16 GEMM | 4096 x 4096 x 4096 | v6 | 0.549 ms | 250 TFLOPS | 110.9% of cuBLAS | 1.12x |
-| bf16 GEMM | 8192 x 8192 x 8192 | v6 | 4.51 ms | 244 TFLOPS | 104.7% of cuBLAS | 1.07x |
-| bf16 GEMM, decode | 16 x 4096 x 4096 | v6 | 23.5 us | 1,440 GB/s | 123% of cuBLAS | 1.25x |
-| fp8 GEMM | 4096 x 4096 x 4096 | v2 | 0.195 ms | 704 TFLOPS | 100.1% of cuBLASLt | 1.36x |
-| fp8 GEMM | 8192 x 8192 x 8192 | v2 | 1.62 ms | 678 TFLOPS | 91.5% of cuBLASLt | 1.03x |
-| fp8 GEMM, decode | 16 x 4096 x 4096 | v1 | 13.2 us | 1,284 GB/s | 125% of cuBLASLt | 1.64x |
-| attention | 32 heads, 4096 x 128, causal | v5 | 0.582 ms | 236 TFLOPS | | 1.34x over flash |
+| bf16 GEMM | 4096 x 4096 x 4096 | v6 | 0.550 ms | 250 TFLOPS | 110.8% of cuBLAS | 1.12x |
+| bf16 GEMM | 8192 x 8192 x 8192 | v6 | 4.52 ms | 243 TFLOPS | 104.7% of cuBLAS | 1.07x |
+| bf16 GEMM, decode | 16 x 4096 x 4096 | v6 | 23.5 us | 1,442 GB/s | 122% of cuBLAS | 1.28x |
+| fp8 GEMM | 4096 x 4096 x 4096 | v2 | 0.195 ms | 704 TFLOPS | 99.6% of cuBLASLt | 1.29x |
+| fp8 GEMM | 8192 x 8192 x 8192 | v2 | 1.61 ms | 685 TFLOPS | 92.6% of cuBLASLt | 1.02x |
+| fp8 GEMM, decode | 16 x 4096 x 4096 | v1 | 13.3 us | 1,278 GB/s | 125% of cuBLASLt | 1.63x |
+| attention | 32 heads, 4096 x 128, causal | v5 | 0.580 ms | 237 TFLOPS | | 1.33x over flash |
 | attention | 32 heads, 8192 x 128, causal | v5 | 2.30 ms | 239 TFLOPS | | 1.18x over flash |
-| attention, decode | 1 query, 4096 keys, 32 heads | v3 | 46 us | 1,461 GB/s | | 1.43x over flash |
-| attention, GQA decode | 1 query, 128K keys, 32/8 heads | v3 | 328 us | 1,635 GB/s | | 1.09x over flash |
+| attention, decode | 1 query, 4096 keys, 32 heads | v3 | 46 us | 1,462 GB/s | | 1.43x over flash |
+| attention, GQA decode | 1 query, 128K keys, 32/8 heads | v3 | 327 us | 1,640 GB/s | | 1.08x over flash |
+| fp32 GEMM, TF32 | 4096 x 4096 x 4096 | v6 | 1.29 ms | 107 TFLOPS | 101.5% of cuBLAS TF32 | 1.02x |
 | fp32 GEMM | 4096 x 11008 x 4096 | v5 | 6.45 ms | 57 TFLOPS | 84.5% of cuBLAS | 0.86x |
 | rmsnorm bf16 | 16384 x 8192 | v4 | 0.351 ms | 1,529 GB/s | 10.4x over naive | 1.07x |
 | add + rmsnorm bf16 | 16384 x 8192 | fused | 0.712 ms | 1,509 GB/s | | 1.24x |
@@ -161,12 +162,12 @@ was restructured.
 
 | M x N x K | v0 | v1 | v2 | v3 | v4 | v5 | v6 | cuBLAS | v6 / cuBLAS | vs torch |
 |---|---|---|---|---|---|---|---|---|---|---|
-| 1024 x 1024 x 1024 | 30 | 49 | 54 | 123 | 123 |  | **124** | 122 | 101.9% | 0.87x |
-| 2048 x 2048 x 2048 | 26 | 127 | 166 | 166 | 207 | 181 | **224** | 173 | 129.6% | 1.28x |
-| 4096 x 4096 x 4096 | 25 | 153 | 182 | 231 | 232 | 246 | **250** | 226 | 110.9% | 1.12x |
-| 8192 x 8192 x 8192 | 24 | 169 | 203 | 224 | 228 | 237 | **244** | 233 | 104.7% | 1.07x |
-| 4096 x 4096 x 11008 | 23 | 154 | 181 | 231 | 230 | 246 | **246** | 228 | 107.9% | 1.10x |
-| 4096 x 11008 x 4096 | 24 | 169 | 200 | 230 | 229 | 241 | **247** | 240 | 102.6% | 1.06x |
+| 1024 x 1024 x 1024 | 30 | 49 | 54 | 123 | 122 |  | **125** | 122 | 102.0% | 1.05x |
+| 2048 x 2048 x 2048 | 26 | 127 | 166 | 166 | 208 | 181 | **224** | 173 | 129.8% | 1.29x |
+| 4096 x 4096 x 4096 | 25 | 153 | 182 | 231 | 232 | 245 | **250** | 226 | 110.8% | 1.12x |
+| 8192 x 8192 x 8192 | 24 | 169 | 203 | 225 | 228 | 236 | **243** | 233 | 104.7% | 1.07x |
+| 4096 x 4096 x 11008 | 23 | 154 | 181 | 229 | 230 | 245 | **246** | 228 | 107.8% | 1.10x |
+| 4096 x 11008 x 4096 | 24 | 167 | 200 | 230 | 230 | 240 | **246** | 239 | 102.9% | 1.06x |
 
 TFLOPS, all from one run. Variant 5 only takes grids of at least one 128 x 128 tile per SM;
 at 1024 cubed variant 6 runs variant 4's smaller tiles. The 0.87x there is the extension's
@@ -183,12 +184,12 @@ launch with nothing waiting on a reduction at the end.
 
 | M x N x K | time | ours | cuBLAS | ours / cuBLAS | vs torch |
 |---|---|---|---|---|---|
-| 1 x 4096 x 4096 | 23.5 us | 1,429 GB/s | 837 GB/s | 171% | 1.69x |
-| 16 x 4096 x 4096 | 23.5 us | 1,440 GB/s | 1,173 GB/s | 123% | 1.25x |
-| 32 x 4096 x 4096 | 23.4 us | 1,455 GB/s | 1,181 GB/s | 123% | 1.28x |
-| 64 x 4096 x 4096 | 25.0 us | 1,383 GB/s | 1,157 GB/s | 120% | 1.23x |
-| 16 x 11008 x 4096 | 56.3 us | 1,611 GB/s | 1,496 GB/s | 108% | 1.08x |
-| 64 x 4096 x 11008 | 58.4 us | 1,576 GB/s | 1,428 GB/s | 110% | 1.08x |
+| 1 x 4096 x 4096 | 23.4 us | 1,433 GB/s | 839 GB/s | 171% | 1.69x |
+| 16 x 4096 x 4096 | 23.5 us | 1,442 GB/s | 1,181 GB/s | 122% | 1.28x |
+| 32 x 4096 x 4096 | 23.5 us | 1,453 GB/s | 1,144 GB/s | 127% | 1.28x |
+| 64 x 4096 x 4096 | 25.2 us | 1,372 GB/s | 1,122 GB/s | 122% | 1.23x |
+| 16 x 11008 x 4096 | 56.3 us | 1,612 GB/s | 1,497 GB/s | 108% | 1.08x |
+| 64 x 4096 x 11008 | 58.4 us | 1,578 GB/s | 1,433 GB/s | 110% | 1.09x |
 
 A read-only kernel that streams 32 MB and does nothing else takes 23.6 us timed this way, so
 the 4096-wide rows are at the floor of a single launch. Queued back to back the same launches
@@ -209,12 +210,12 @@ block-scaled instruction from the section above.
 
 | M x N x K | v0 | v1 | v2 | cuBLASLt | best / cuBLASLt | vs torch |
 |---|---|---|---|---|---|---|
-| 1024 x 1024 x 1024 | 63 | 235 |  | 206 | 114.4% | 1.50x |
-| 2048 x 2048 x 2048 | 72 | 411 | 582 | 418 | 139.2% | 1.24x |
-| 4096 x 4096 x 4096 | 66 | 642 | 704 | 703 | 100.1% | 1.36x |
-| 8192 x 8192 x 8192 | 63 | 637 | 678 | 740 | 91.5% | 1.03x |
-| 4096 x 4096 x 11008 | 49 | 667 | 722 | 581 | 124.2% | 1.28x |
-| 4096 x 11008 x 4096 | 64 | 655 | 695 | 671 | 103.6% | 1.25x |
+| 1024 x 1024 x 1024 | 63 | 235 |  | 205 | 114.3% | 1.57x |
+| 2048 x 2048 x 2048 | 73 | 410 | 583 | 418 | 139.5% | 1.24x |
+| 4096 x 4096 x 4096 | 65 | 642 | 704 | 707 | 99.6% | 1.29x |
+| 8192 x 8192 x 8192 | 63 | 638 | 685 | 739 | 92.6% | 1.02x |
+| 4096 x 4096 x 11008 | 49 | 665 | 735 | 579 | 126.9% | 1.28x |
+| 4096 x 11008 x 4096 | 64 | 653 | 688 | 670 | 102.7% | 1.21x |
 
 TFLOPS. Every row is bit-identical to cuBLASLt: e4m3 products are multiples of 2^-18 and the
 fp32 partial sums stay exact. At 8192 cubed Nsight has variant 2 and cuBLASLt at the same
@@ -225,12 +226,12 @@ path lands well under a direct cuBLASLt call.
 
 | M x N x K | time | ours | ours / cuBLASLt | vs torch |
 |---|---|---|---|---|
-| 1 x 4096 x 4096 | 13.2 us | 1,270 GB/s | 141% | 1.69x |
-| 16 x 4096 x 4096 | 13.2 us | 1,284 GB/s | 125% | 1.64x |
-| 32 x 4096 x 4096 | 13.2 us | 1,302 GB/s | 125% | 1.67x |
-| 64 x 4096 x 4096 | 13.2 us | 1,332 GB/s | 127% | 1.62x |
-| 16 x 11008 x 4096 | 29.6 us | 1,539 GB/s | 111% | 1.28x |
-| 64 x 4096 x 11008 | 31.7 us | 1,462 GB/s | 120% | 1.47x |
+| 1 x 4096 x 4096 | 13.2 us | 1,277 GB/s | 141% | 1.69x |
+| 16 x 4096 x 4096 | 13.3 us | 1,278 GB/s | 125% | 1.63x |
+| 32 x 4096 x 4096 | 13.2 us | 1,306 GB/s | 126% | 1.62x |
+| 64 x 4096 x 4096 | 13.2 us | 1,329 GB/s | 125% | 1.56x |
+| 16 x 11008 x 4096 | 29.5 us | 1,541 GB/s | 111% | 1.27x |
+| 64 x 4096 x 11008 | 31.7 us | 1,462 GB/s | 119% | 1.50x |
 
 fp8 weights are half the bytes, so a 16 MB launch has a 13.3 us read-only floor and the
 4096-wide rows sit on it.
@@ -300,12 +301,12 @@ waits for the slowest warp before every load.
 
 | shape (B x H x S x D) | v0 | v1 | v2 | v3 | v4 | v5 | flash | v5 / flash |
 |---|---|---|---|---|---|---|---|---|
-| 1 x 32 x 4096 x 128 | 10 | 51 | 195 | 223 | 236 | **242** | 189 | 1.25x |
-| 1 x 32 x 4096 x 128, causal | 10 | 56 | 214 | 215 | 229 | **236** | 174 | 1.34x |
-| 1 x 32 x 8192 x 128, causal | 10 | 50 | 221 | 221 | 235 | **239** | 198 | 1.18x |
-| 4 x 32 x 2048 x 128, causal | 10 | 54 | 200 | 200 | 213 | **227** | 180 | 1.22x |
-| 1 x 32 x 4096 x 64, causal | 7 | 46 | 208 | 208 | 217 | **235** | 164 | 1.38x |
-| 1 x 32/8 x 4096 x 128, causal | 10 | 56 | 216 | 216 | 230 | **237** | 174 | 1.33x |
+| 1 x 32 x 4096 x 128 | 10 | 55 | 194 | 223 | 237 | **239** | 189 | 1.26x |
+| 1 x 32 x 4096 x 128, causal | 10 | 54 | 216 | 215 | 228 | **237** | 174 | 1.33x |
+| 1 x 32 x 8192 x 128, causal | 10 | 50 | 221 | 221 | 236 | **239** | 198 | 1.18x |
+| 4 x 32 x 2048 x 128, causal | 11 | 54 | 198 | 200 | 213 | **227** | 180 | 1.23x |
+| 1 x 32 x 4096 x 64, causal | 7 | 52 | 208 | 208 | 216 | **235** | 164 | 1.38x |
+| 1 x 32/8 x 4096 x 128, causal | 10 | 56 | 214 | 216 | 230 | **237** | 174 | 1.34x |
 
 TFLOPS, causal counted as half the products the way FlashAttention reports it. The 32/8 row is
 grouped-query attention and matches its multi-head twin, as it should: it is the same math
@@ -322,11 +323,11 @@ past L2 when they fit in it; at 128K tokens they do not.
 
 | shape | v2 | v3 | achieved | flash | v3 / flash |
 |---|---|---|---|---|---|
-| 1 query, 4096 keys, 32 heads | 200 us | **46 us** | 1,461 GB/s | 71 us | 1.43x |
-| 1 query, 4096 keys, 32/8 heads | 200 us | **17 us** | 970 GB/s | 38 us | 1.83x |
-| 1 query, 128K keys, 32 heads | 6272 us | **1266 us** | 1,696 GB/s | 1297 us | 1.02x |
-| 1 query, 128K keys, 32/8 heads | 6271 us | **328 us** | 1,635 GB/s | 358 us | 1.09x |
-| batch 8, 4096 keys, 32/8 heads | 398 us | **87 us** | 1,553 GB/s | 105 us | 1.16x |
+| 1 query, 4096 keys, 32 heads | 199 us | **46 us** | 1,462 GB/s | 71 us | 1.43x |
+| 1 query, 4096 keys, 32/8 heads | 200 us | **17 us** | 972 GB/s | 38 us | 1.83x |
+| 1 query, 128K keys, 32 heads | 6270 us | **1267 us** | 1,695 GB/s | 1298 us | 1.02x |
+| 1 query, 128K keys, 32/8 heads | 6265 us | **327 us** | 1,640 GB/s | 357 us | 1.08x |
+| batch 8, 4096 keys, 32/8 heads | 398 us | **87 us** | 1,550 GB/s | 105 us | 1.16x |
 
 GB/s counts each K/V head once for its whole group of query heads. Past 16K tokens both
 layouts run at 1,600 to 1,700 GB/s, above the 1,532 GB/s of `cudaMemcpy`: a read-only stream
