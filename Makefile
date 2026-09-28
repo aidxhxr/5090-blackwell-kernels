@@ -1,5 +1,7 @@
 # Convenience wrapper. Real build logic lives in CMakeLists.txt / setup.py.
-# ARCH: 120 = RTX 5090 (default), 121 = DGX Spark / GB10, "120;121" = both.
+# ARCH: 120 = RTX 5090 (default), 121 = DGX Spark / GB10, "120;121" = both. The fp8 kernels and
+# bench_peak are built for the matching "a" arch (120a / 121a), where the block-scaled fp8
+# mma.sync lives; CMakeLists.txt does the mapping.
 BUILD ?= build
 ARCH  ?= 120
 
@@ -19,7 +21,7 @@ help:
 	@echo "test       install the extension, then pytest parity tests for every variant"
 	@echo "lint       ruff + clang-format --dry-run, same checks as CI"
 	@echo "format     clang-format -i on all C++/CUDA sources"
-	@echo "ncu        Nsight Compute reports for hgemm and rmsnorm"
+	@echo "ncu        Nsight Compute reports for the top rungs of every ladder (needs root on GeForce)"
 	@echo "env        GPU state that matters for a run: clocks, P-state, power limit, throttling, display"
 	@echo "clean      remove build outputs"
 
