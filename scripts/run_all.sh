@@ -3,7 +3,7 @@
 #   build C++ benches -> run them (validates every variant) -> generate tables + roofline
 #   -> build the PyTorch extension -> pytest -> torch comparison -> Nsight Compute reports.
 # Each stage is optional: pass --skip-python or --skip-ncu to leave those out.
-# On the DGX Spark: ARCH=121 TORCH_CUDA_ARCH_LIST=12.1 ./scripts/run_all.sh
+# On the DGX Spark: ARCH=121 TORCH_CUDA_ARCH_LIST=12.1a ./scripts/run_all.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
