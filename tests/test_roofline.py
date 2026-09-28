@@ -42,3 +42,17 @@ def test_fp8gemm_intensity_counts_one_byte_operands():
 def test_zero_time_rows_do_not_divide_by_zero():
     r = {"kernel": "rmsnorm", "dtype": "bf16", "shape": "4096x8192", "median_ms": 0.0}
     assert roofline.achieved_tflops(r) == 0.0
+
+
+def test_sgemm_tensor_core_rows_are_their_own_series():
+    # variants 6 and 7 write dtype "tf32" / "3xtf32"; they are plotted apart from the fp32
+    # ladder, at their useful FLOP rate, against the tf32 roof
+    f32 = {"kernel": "sgemm", "dtype": "f32", "shape": "4096x4096x4096", "median_ms": 2.0}
+    tf32 = {**f32, "dtype": "tf32", "median_ms": 1.3}
+    three = {**f32, "dtype": "3xtf32", "median_ms": 3.5}
+    assert roofline.series_of(f32) == "sgemm"
+    assert roofline.series_of(tf32) == "sgemm (tf32)"
+    assert roofline.series_of(three) == "sgemm (3xtf32)"
+    assert len({roofline.MARKERS[roofline.series_of(r)] for r in (f32, tf32, three)}) == 3
+    assert roofline.plot_intensity(tf32) == roofline.plot_intensity(f32)  # fp32 bytes both
+    assert roofline.achieved_tflops(three) == pytest.approx(2 * 4096**3 / 3.5e-3 / 1e12)

@@ -14,7 +14,7 @@ from shape_utils import (  # noqa: E402
     LAYER_FILE,
     TORCH_COMPARISON,
     arithmetic_intensity,
-    compute_peak_key,
+    compute_peak,
     device_key,
     is_compute_bound_kernel,
     is_reference,
@@ -169,11 +169,26 @@ def vs_ref(kernel: str, r: dict) -> str:
     return pct(ref_ms / ms) if is_compute_bound_kernel(kernel) else f"{ref_ms / ms:.2f}×"
 
 
-def peak_for(kernel: str, peaks: dict) -> tuple[str, float | None]:
-    """(unit, ceiling) for a kernel; the ceiling is None when it is not known for the device."""
+def peak_for(kernel: str, peaks: dict, dtype: str = "") -> tuple[str, float | None]:
+    """(unit, ceiling) for a kernel and dtype; the ceiling is None when it is not known for
+    the device. sgemm's tf32 rows are judged against the tf32 tensor-core peak (a third of
+    it for 3xTF32), its f32 rows against the fp32 FMA peak."""
     if is_compute_bound_kernel(kernel):
-        return "TFLOPS", peaks.get(compute_peak_key(kernel))
+        return "TFLOPS", compute_peak(kernel, dtype, peaks)
     return "GB/s", peaks["bw_gbps"]
+
+
+def peak_label(kernel: str, peaks: dict, dtypes: list[str]) -> str:
+    """Header text for the "% of peak" column: one figure when every dtype in the table shares
+    a ceiling, else one per dtype ("f32 123.4, tf32 129.4, 3xtf32 43.1 TFLOPS")."""
+    unit = peak_for(kernel, peaks)[0]
+    per_dtype = {d: peak_for(kernel, peaks, d)[1] for d in dtypes}
+    known = {d: p for d, p in per_dtype.items() if p}
+    if not known:
+        return "peak TBD"
+    if len(set(round(p, 3) for p in known.values())) == 1:
+        return f"{next(iter(known.values())):g} {unit}"
+    return ", ".join(f"{d} {p:.1f}" for d, p in known.items()) + f" {unit}"
 
 
 def ref_label(kernel: str) -> str:
@@ -184,12 +199,13 @@ def ref_label(kernel: str) -> str:
 
 
 def table_for(kernel: str, rows: list[dict], torch_rows: dict, peaks: dict) -> str:
-    unit, peak = peak_for(kernel, peaks)
-    peak_label = f"{peak:g} {unit}" if peak else "peak TBD"
+    unit = peak_for(kernel, peaks)[0]
+    dtypes = sorted({r["dtype"] for r in rows})
     has_ref = any(r.get("ref_ms", 0) > 0 for r in rows)
     has_torch = any((kernel, r["dtype"], r["shape"]) in torch_rows for r in rows)
 
-    hdr = ["dtype", "shape", "variant", "median ms", "min ms", unit, f"% of peak ({peak_label})"]
+    hdr = ["dtype", "shape", "variant", "median ms", "min ms", unit,
+           f"% of peak ({peak_label(kernel, peaks, dtypes)})"]
     if has_ref:
         hdr.append(ref_label(kernel))
     if has_torch:
@@ -199,6 +215,7 @@ def table_for(kernel: str, rows: list[dict], torch_rows: dict, peaks: dict) -> s
 
     rows = sorted(rows, key=lambda r: (r["dtype"], shape_size(kernel, r["shape"]), r["variant"]))
     for r in rows:
+        peak = peak_for(kernel, peaks, r["dtype"])[1]
         val = r.get("tflops", 0) if unit == "TFLOPS" else r.get("gbps", 0)
         cells = [
             r["dtype"],
@@ -233,8 +250,8 @@ def headline(by_kernel: dict[str, list[dict]], torch_rows: dict, peaks: dict) ->
         rows = by_kernel.get(kernel)
         if not rows:
             continue
-        unit, peak = peak_for(kernel, peaks)
         for dtype in sorted({r["dtype"] for r in rows}):
+            unit, peak = peak_for(kernel, peaks, dtype)
             drows = [r for r in rows
                      if r["dtype"] == dtype and r.get("ok", True) and not is_reference(r)]
             if not drows:
@@ -279,6 +296,8 @@ def main() -> int:
             else "bf16 tensor peak TBD (pass --bf16-peak)")
     if peaks.get("fp8_tflops"):
         bf16 += f", {peaks['fp8_tflops']:.1f} TFLOPS fp8 tensor"
+    if peaks.get("tf32_tflops"):
+        bf16 += f", {peaks['tf32_tflops']:.1f} TFLOPS tf32 tensor"
     if peaks.get("measured"):
         bf16 += (f"; the compute peaks were measured by bench_peak at "
                  f"{peaks.get('sm_mhz', 0):.0f} MHz (results/peak.json)")

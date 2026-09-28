@@ -48,6 +48,39 @@ def test_cublas_row_is_a_labelled_reference_and_never_the_best_variant(results):
     assert "66.7%" in headline  # 2.0 ms cuBLAS / 3.0 ms ours
 
 
+def test_sgemm_tf32_rows_are_judged_against_the_tf32_peak(results):
+    # bench_sgemm writes variant 6 as dtype "tf32" (reference: cuBLAS in TF32 math mode) and
+    # variant 7 as "3xtf32" (reference: cuBLAS fp32). They share the sgemm table with the
+    # f32 rows, so the peak column names a ceiling per dtype, the 3xTF32 one a third of the
+    # tf32 peak; the headline gets one row per dtype.
+    out, write = results
+    write("sgemm.json", [
+        bench_row("sgemm_cublas", "f32", -1, "4096x4096x4096", 2.0, tflops=68.7, ref_ms=2.0),
+        bench_row("sgemm_cublas_tf32", "tf32", -1, "4096x4096x4096", 1.3, tflops=105.7,
+                  ref_ms=1.3),
+        bench_row("sgemm", "f32", 5, "4096x4096x4096", 2.2, tflops=62.5, ref_ms=2.0),
+        bench_row("sgemm", "tf32", 6, "4096x4096x4096", 1.3, tflops=105.7, ref_ms=1.3),
+        bench_row("sgemm", "3xtf32", 7, "4096x4096x4096", 3.5, tflops=39.3, ref_ms=2.0),
+    ])
+    write("peak.json", [
+        {"device": DEVICE, "kernel": "peak_tf32_mma", "tflops": 129.4},
+        {"device": DEVICE, "kernel": "peak_fp32_fma", "tflops": 123.4},
+    ])
+    assert mrt.main() == 0
+    md = (out / "RESULTS.md").read_text()
+    sgemm = md.split("## sgemm")[1]
+    assert "% of peak (3xtf32 43.1, f32 123.4, tf32 129.4 TFLOPS)" in sgemm
+    assert "| tf32 | 4096x4096x4096 | cuBLAS TF32 | 1.3000 |" in sgemm
+    assert "| tf32 | 4096x4096x4096 | 6 | 1.3000 | 1.2740 | 105.70 | 81.7% | 100.0% |" in sgemm
+    assert "| 3xtf32 | 4096x4096x4096 | 7 | 3.5000 | 3.4300 | 39.30 | 91.1% | 57.1% |" in sgemm
+    assert "| f32 | 4096x4096x4096 | 5 | 2.2000 | 2.1560 | 62.50 | 50.6% | 90.9% |" in sgemm
+    headline = (out / "headline.md").read_text()
+    assert "| sgemm | 3xtf32 | 4096x4096x4096 | v7 | 3.5000 | 39.3 TFLOPS | 91.1% |" in headline
+    assert "| sgemm | f32 | 4096x4096x4096 | v5 |" in headline
+    assert "| sgemm | tf32 | 4096x4096x4096 | v6 | 1.3000 | 105.7 TFLOPS | 81.7% |" in headline
+    assert "129.4 TFLOPS tf32 tensor" in md
+
+
 def test_hgemm_rows_are_reported_in_tflops(results):
     out, write = results
     write("hgemm.json", [

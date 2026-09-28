@@ -4,8 +4,9 @@
 Reads results/*.json (from run_all_benches.sh) and writes results/roofline.png. The ceilings
 come from shape_utils.DEVICE_PEAKS for the device named in the rows (RTX 5090: 1792 GB/s DRAM,
 104.8 TFLOPS fp32; GB10: 273 GB/s, 31 TFLOPS fp32, 213 TFLOPS bf16), overridden by the measured
-ones in results/peak.json. The bf16 and fp8 tensor-core roofs are only drawn when they are
-known: run bench_peak, or pass --bf16-peak=<TFLOPS> for the bf16 one.
+ones in results/peak.json. The bf16, fp8 and tf32 tensor-core roofs are only drawn when they
+are known: run bench_peak, or pass --bf16-peak=<TFLOPS> for the bf16 one. sgemm's tf32 and
+3xtf32 rows (variants 6 and 7) are plotted as their own series against the tf32 roof.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from shape_utils import (  # noqa: E402
+    TF32_DTYPES,
     arithmetic_intensity,
     flops,
     is_reference,
@@ -32,7 +34,15 @@ RESULTS = ROOT / "results"
 OUT = RESULTS / "roofline.png"
 
 MARKERS = {"bandwidth": "P", "rmsnorm": "o", "add_rmsnorm": "D", "swiglu": "s", "softmax": "^",
-           "sgemm": "v", "hgemm": "*", "fp8gemm": "h", "attention": "X"}
+           "sgemm": "v", "sgemm (tf32)": "<", "sgemm (3xtf32)": ">", "hgemm": "*", "fp8gemm": "h",
+           "attention": "X"}
+
+
+def series_of(r: dict) -> str:
+    """Legend entry of a row: the kernel, except that sgemm's tensor-core rows get their own."""
+    if r["dtype"] in TF32_DTYPES:
+        return f"{r['kernel']} ({r['dtype']})"
+    return r["kernel"]
 
 
 def achieved_tflops(r: dict) -> float:
@@ -90,6 +100,7 @@ def main() -> int:
     fig, ax = plt.subplots(figsize=(9, 6), dpi=150)
     ai = [2.0**k for k in range(-4, 13)]
     roofs = [("fp32 CUDA cores", peaks["fp32_tflops"], "#444"),
+             ("tf32 tensor cores", peaks.get("tf32_tflops"), "#d62728"),
              ("bf16 tensor cores", peaks["bf16_tflops"], "#76b900"),
              ("fp8 tensor cores", peaks.get("fp8_tflops"), "#1f77b4")]
     for label, tflops, color in roofs:
@@ -101,7 +112,7 @@ def main() -> int:
 
     by_kernel: dict[str, list[dict]] = defaultdict(list)
     for r in best.values():
-        by_kernel[r["kernel"]].append(r)
+        by_kernel[series_of(r)].append(r)
     for kernel, krows in sorted(by_kernel.items()):
         xs = [plot_intensity(r) for r in krows]
         ys = [achieved_tflops(r) for r in krows]

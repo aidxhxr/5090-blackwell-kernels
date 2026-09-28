@@ -11,25 +11,34 @@ from pathlib import Path
 # the benches write into every row. Provenance in docs/RTX5090.md and docs/GB10.md:
 #   RTX 5090  1792 GB/s GDDR7 (512-bit @ 28 Gbps, NVIDIA spec)
 #             104.8 TFLOPS fp32 CUDA cores (21760 cores x 2 FLOP x 2.41 GHz, theoretical)
-#             bf16 and fp8 tensor-core peaks: not published as dense figures and not guessed
-#             here -> None; bench_peak measures them into results/peak.json, and
+#             bf16, fp8 and tf32 tensor-core peaks: not published as dense figures and not
+#             guessed here -> None; bench_peak measures them into results/peak.json, and
 #             --bf16-peak=<TFLOPS> overrides the bf16 one
 #   GB10      273 GB/s LPDDR5X (256-bit @ 8533 MT/s, NVIDIA spec)
 #             31 TFLOPS fp32 CUDA cores (6144 cores x 2 FLOP x 2.42 GHz, theoretical)
 #             213 TFLOPS bf16/fp16 tensor cores, fp32 accumulate, dense (community measurement)
-#             fp8 tensor cores: no measurement yet -> None
+#             fp8 and tf32 tensor cores: no measurement yet -> None
 DEVICE_PEAKS: dict[str, dict[str, float | None]] = {
     "RTX 5090": {"bw_gbps": 1792.0, "fp32_tflops": 104.8, "bf16_tflops": None,
-                 "fp8_tflops": None},
-    "GB10": {"bw_gbps": 273.0, "fp32_tflops": 31.0, "bf16_tflops": 213.0, "fp8_tflops": None},
+                 "fp8_tflops": None, "tf32_tflops": None},
+    "GB10": {"bw_gbps": 273.0, "fp32_tflops": 31.0, "bf16_tflops": 213.0, "fp8_tflops": None,
+             "tf32_tflops": None},
 }
+COMPUTE_PEAK_KEYS = ("bf16_tflops", "fp8_tflops", "tf32_tflops", "fp32_tflops")
 DEFAULT_DEVICE = "RTX 5090"  # rows written before the benches recorded a device name
 
-ITEMSIZE = {"f32": 4, "bf16": 2, "fp32": 4, "float32": 4, "bfloat16": 2, "e4m3": 1, "fp8": 1}
+ITEMSIZE = {"f32": 4, "bf16": 2, "fp32": 4, "float32": 4, "bfloat16": 2, "e4m3": 1, "fp8": 1,
+            "tf32": 4, "3xtf32": 4}
+# The dtypes of sgemm's tensor-core rows: fp32 in and out, computed in TF32 with one mma per
+# product (variant 6) or three (3xTF32, variant 7). Keyed to the tf32 tensor-core peak.
+TF32_DTYPES = ("tf32", "3xtf32")
+# Tensor-core work per useful FLOP: 3xTF32 issues three mmas per product, so its usable
+# ceiling is a third of the tf32 peak.
+MMAS_PER_PRODUCT = {"3xtf32": 3.0}
 
 TORCH_COMPARISON = "torch_comparison.json"
-# Written by bench_peak: measured mma.sync bf16 and fp8 peaks and the fp32 FMA peak, plus the SM
-# clock they were measured at. When present it overrides the spec-sheet compute peaks above
+# Written by bench_peak: measured mma.sync bf16, fp8 and tf32 peaks and the fp32 FMA peak, plus
+# the SM clock they were measured at. When present it overrides the spec-sheet compute peaks above
 # (the memory bandwidth stays the spec figure, which cudaMemcpy never reaches).
 PEAK_FILE = "peak.json"
 # Written by scripts/bench_layer.py: one Llama-3-8B decoder layer built from the kernels
@@ -44,6 +53,7 @@ KERNEL_ALIASES = {"hgemm_bf16": "hgemm", "bandwidth_copy": "bandwidth"}
 # bench name -> (kernel family, label shown in the variant column).
 REFERENCE_ROWS = {
     "sgemm_cublas": ("sgemm", "cuBLAS"),
+    "sgemm_cublas_tf32": ("sgemm", "cuBLAS TF32"),  # CUBLAS_TF32_TENSOR_OP_MATH, dtype tf32
     "cudaMemcpy_d2d": ("bandwidth", "cudaMemcpy"),
 }
 
@@ -88,6 +98,8 @@ def measured_peaks(results_dir: Path) -> dict:
             out["bf16_tflops"] = r["tflops"]
         elif r.get("kernel") == "peak_fp8_mma":  # the instruction fp8gemm runs; the _plain and
             out["fp8_tflops"] = r["tflops"]      # _f16acc rows are documentation, not roofs
+        elif r.get("kernel") == "peak_tf32_mma":
+            out["tf32_tflops"] = r["tflops"]
         elif r.get("kernel") == "peak_fp32_fma":
             out["fp32_tflops"] = r["tflops"]
         elif r.get("kernel") == "sm_clock":
@@ -108,7 +120,7 @@ def peaks_for_rows(rows: list[dict], bf16_peak: float | None = None,
     key = keys.pop() if keys else DEFAULT_DEVICE
     peaks = dict(DEVICE_PEAKS[key])
     if measured and device_key(measured.get("device")) == key:
-        for k in ("bf16_tflops", "fp8_tflops", "fp32_tflops", "sm_mhz"):
+        for k in COMPUTE_PEAK_KEYS + ("sm_mhz",):
             if measured.get(k):
                 peaks[k] = measured[k]
         peaks["measured"] = True
@@ -285,14 +297,27 @@ def is_compute_bound_kernel(kernel: str) -> bool:
     return kernel.lower() in GEMM_KERNELS + ("attention",)
 
 
-def uses_tensor_cores(kernel: str) -> bool:
-    """Kernels judged against a tensor-core peak (bf16 or fp8) rather than the fp32 one."""
-    return kernel.lower() in ("hgemm", "fp8gemm", "attention")
+def uses_tensor_cores(kernel: str, dtype: str = "") -> bool:
+    """Kernels judged against a tensor-core peak (bf16, fp8 or tf32) rather than the fp32 one.
+    sgemm is the CUDA-core ladder except for its tf32 / 3xtf32 rows."""
+    return kernel.lower() in ("hgemm", "fp8gemm", "attention") or dtype in TF32_DTYPES
 
 
-def compute_peak_key(kernel: str) -> str:
+def compute_peak_key(kernel: str, dtype: str = "") -> str:
     """The DEVICE_PEAKS entry a compute-bound kernel is judged against."""
     k = kernel.lower()
     if k == "fp8gemm":
         return "fp8_tflops"
+    if dtype in TF32_DTYPES:
+        return "tf32_tflops"
     return "bf16_tflops" if uses_tensor_cores(k) else "fp32_tflops"
+
+
+def compute_peak(kernel: str, dtype: str, peaks: dict) -> float | None:
+    """The usable compute ceiling of a (kernel, dtype) in TFLOPS of useful work, or None when
+    the device's peak is not known: the peak of compute_peak_key, divided by the number of
+    tensor-core passes per product (3 for 3xTF32)."""
+    peak = peaks.get(compute_peak_key(kernel, dtype))
+    if not peak:
+        return None
+    return peak / MMAS_PER_PRODUCT.get(dtype, 1.0)

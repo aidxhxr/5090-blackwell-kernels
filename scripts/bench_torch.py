@@ -8,6 +8,7 @@ Run on the GPU box (RTX 5090 or DGX Spark) after `pip install -e . --no-build-is
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import statistics
 import sys
@@ -32,7 +33,7 @@ SOFTMAX_COLS = [128, 1024, 4096, 16384]
 SWIGLU_COLS = [2048, 5632, 11008, 14336]
 # (M, N, K): C = A(MxK) @ B(KxN)
 SGEMM_SHAPES = [(512, 512, 512), (1024, 1024, 1024), (2048, 2048, 2048), (4096, 4096, 4096),
-                (4096, 4096, 11008), (4096, 11008, 4096)]
+                (8192, 8192, 8192), (4096, 4096, 11008), (4096, 11008, 4096)]
 HGEMM_SHAPES = [(1024, 1024, 1024), (2048, 2048, 2048), (4096, 4096, 4096), (8192, 8192, 8192),
                 (4096, 4096, 11008), (4096, 11008, 4096),
                 (1, 4096, 4096), (16, 4096, 4096), (32, 4096, 4096), (64, 4096, 4096),
@@ -147,12 +148,45 @@ def bench_swiglu(sk, add, dtype, rows, cols):
         gbps=row_gbps(rows, cols, dtype, 3, ours))
 
 
+@contextlib.contextmanager
+def matmul_tf32(enabled: bool):
+    """torch's fp32 matmul precision for the block: "tf32" lets cuBLAS use the tensor cores in
+    TF32 (the contract of sgemm variant 6), "ieee" keeps it on the CUDA cores. torch >= 2.9
+    spells this torch.backends.cuda.matmul.fp32_precision; older releases have allow_tf32."""
+    m = torch.backends.cuda.matmul
+    if hasattr(m, "fp32_precision"):
+        prev = m.fp32_precision
+        m.fp32_precision = "tf32" if enabled else "ieee"
+        try:
+            yield
+        finally:
+            m.fp32_precision = prev
+    else:
+        prev = m.allow_tf32
+        m.allow_tf32 = enabled
+        try:
+            yield
+        finally:
+            m.allow_tf32 = prev
+
+
 def bench_sgemm(sk, add, M, N, K):
     a = torch.randn(M, K, device="cuda")
     b = torch.randn(K, N, device="cuda")
-    ours = time_ms(lambda: sk.sgemm(a, b))
-    ref = time_ms(lambda: a @ b)
-    add("sgemm", "f32", gemm_shape(M, N, K), ours, ref, tflops=2.0 * M * N * K / ours / 1e9)
+    shape = gemm_shape(M, N, K)
+    flops = 2.0 * M * N * K
+    with matmul_tf32(False):
+        ours = time_ms(lambda: sk.sgemm(a, b))
+        ref = time_ms(lambda: a @ b)
+        add("sgemm", "f32", shape, ours, ref, tflops=flops / ours / 1e9)
+        # 3xTF32 (variant 7) claims fp32 accuracy, so its reference is torch's fp32 matmul
+        ours = time_ms(lambda: sk.sgemm(a, b, 7))
+        add("sgemm", "3xtf32", shape, ours, ref, tflops=flops / ours / 1e9)
+    # TF32 (variant 6) against torch with the tensor cores allowed: the same rounding contract
+    with matmul_tf32(True):
+        ours = time_ms(lambda: sk.sgemm(a, b, 6))
+        ref = time_ms(lambda: a @ b)
+        add("sgemm", "tf32", shape, ours, ref, tflops=flops / ours / 1e9)
 
 
 def bench_hgemm(sk, add, M, N, K):
@@ -336,7 +370,7 @@ def main() -> int:
     ap.add_argument("--sdpa-backend", choices=["flash", "cudnn", "efficient", "math"],
                     help="force this SDPA kernel for the attention rows instead of torch's own "
                          "choice (the default, which the JSON records as torch_backend)")
-    ap.add_argument("--only", choices=["attention", "hgemm_fused"],
+    ap.add_argument("--only", choices=["attention", "hgemm_fused", "sgemm"],
                     help="time only this kernel's rows (with --sdpa-backend: the attention "
                          "rows against that kernel; hgemm_fused: the fused-epilogue rows)")
     ap.add_argument("--iters", type=positive_int, default=ITERS,
@@ -391,6 +425,9 @@ def main() -> int:
     if args.only == "hgemm_fused":
         for M, N, K, tag in HGEMM_FUSED:
             bench_hgemm_fused(sk, add, M, N, K, tag)
+    if args.only == "sgemm":
+        for M, N, K in SGEMM_SHAPES:
+            bench_sgemm(sk, add, M, N, K)
         return 0
     if args.only != "attention":
         for dtype in (torch.float32, torch.bfloat16):

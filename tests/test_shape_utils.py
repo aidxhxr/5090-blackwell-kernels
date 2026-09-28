@@ -109,6 +109,25 @@ def test_fp8gemm_counts_bytes_per_operand_and_uses_the_fp8_peak():
     assert su.DEVICE_PEAKS["RTX 5090"]["fp8_tflops"] is None  # measured, never guessed
 
 
+def test_sgemm_tensor_core_rows_use_the_tf32_peak():
+    # bench_sgemm files variant 6 under dtype "tf32" and variant 7 under "3xtf32"; both are
+    # judged against the tf32 tensor-core peak, 3xTF32 against a third of it (three mmas per
+    # product), and the f32 rows stay on the fp32 FMA peak.
+    assert su.compute_peak_key("sgemm", "f32") == "fp32_tflops"
+    assert su.compute_peak_key("sgemm", "tf32") == "tf32_tflops"
+    assert su.compute_peak_key("sgemm", "3xtf32") == "tf32_tflops"
+    assert su.uses_tensor_cores("sgemm", "tf32") and not su.uses_tensor_cores("sgemm", "f32")
+    peaks = {"fp32_tflops": 123.4, "tf32_tflops": 129.4}
+    assert su.compute_peak("sgemm", "f32", peaks) == 123.4
+    assert su.compute_peak("sgemm", "tf32", peaks) == 129.4
+    assert su.compute_peak("sgemm", "3xtf32", peaks) == pytest.approx(129.4 / 3)
+    assert su.compute_peak("hgemm", "bf16", peaks) is None  # not measured: no ceiling
+    assert su.DEVICE_PEAKS["RTX 5090"]["tf32_tflops"] is None  # measured, never guessed
+    assert su.ITEMSIZE["tf32"] == 4 and su.ITEMSIZE["3xtf32"] == 4  # fp32 in and out
+    ref = su.normalize_row({"kernel": "sgemm_cublas_tf32", "dtype": "tf32"})
+    assert ref["kernel"] == "sgemm" and ref["reference"] == "cuBLAS TF32" and su.is_reference(ref)
+
+
 def test_measured_peaks_reads_the_fp8_roof_and_not_the_documentation_rows(tmp_path):
     rows = [{"device": "NVIDIA GeForce RTX 5090", "kernel": "peak_bf16_mma", "tflops": 258.7},
             {"device": "NVIDIA GeForce RTX 5090", "kernel": "sm_clock", "ref_ms": 2976.0},
@@ -117,13 +136,16 @@ def test_measured_peaks_reads_the_fp8_roof_and_not_the_documentation_rows(tmp_pa
              "tflops": 517.4},
             {"device": "NVIDIA GeForce RTX 5090", "kernel": "peak_fp8_mma_f16acc",
              "tflops": 1026.8},
+            {"device": "NVIDIA GeForce RTX 5090", "kernel": "peak_tf32_mma", "tflops": 129.4},
             {"device": "NVIDIA GeForce RTX 5090", "kernel": "peak_fp32_fma", "tflops": 123.4}]
     import json
     (tmp_path / su.PEAK_FILE).write_text("".join(json.dumps(r) + "\n" for r in rows))
     measured = su.measured_peaks(tmp_path)
     assert measured["fp8_tflops"] == 1013.9 and measured["bf16_tflops"] == 258.7
+    assert measured["tf32_tflops"] == 129.4
     key, peaks = su.peaks_for_rows([{"device": "NVIDIA GeForce RTX 5090"}], measured=measured)
     assert peaks["fp8_tflops"] == 1013.9 and peaks["bf16_tflops"] == 258.7
+    assert peaks["tf32_tflops"] == 129.4 and peaks["fp32_tflops"] == 123.4
     assert peaks["sm_mhz"] == 2976.0 and peaks["measured"]
 
 
