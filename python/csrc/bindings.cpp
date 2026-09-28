@@ -118,11 +118,43 @@ Tensor add_rmsnorm_(const Tensor& x, Tensor resid, const Tensor& w, double eps) 
     return out;
 }
 
+// A 2-D tensor whose rows are contiguous but not adjacent: one half of a fused gate|up
+// projection, gu[:, :I] or gu[:, I:].
+bool strided_rows(const Tensor& t) {
+    return t.is_cuda() && t.dim() == 2 && t.stride(1) == 1 && t.stride(0) >= t.size(1) &&
+           !t.is_contiguous();
+}
+
+// gate and up as the two halves of one [rows, 2 * cols] GEMM output (or any 2-D tensors with
+// contiguous rows), read in place through the strided kernel; the output is contiguous.
+Tensor swiglu_strided(const Tensor& gate, const Tensor& up) {
+    TORCH_CHECK(gate.sizes() == up.sizes(), "gate and up must have the same shape");
+    TORCH_CHECK(gate.stride(1) == 1 && up.stride(1) == 1, "swiglu needs contiguous rows");
+    TORCH_CHECK(gate.numel() > 0, "gate must be non-empty");
+    const c10::cuda::CUDAGuard guard(gate.device());
+    Tensor out = at::empty(gate.sizes(), gate.options());
+    cudaStream_t stream = current_stream(gate);
+    const int64_t rows = gate.size(0), cols = gate.size(1);
+    if (gate.scalar_type() == at::kFloat) {
+        spark::swiglu_strided_f32(gate.data_ptr<float>(), up.data_ptr<float>(),
+                                  out.data_ptr<float>(), rows, cols, gate.stride(0), up.stride(0),
+                                  stream);
+    } else {
+        spark::swiglu_strided_bf16(bf16_ptr(gate), bf16_ptr(up), bf16_ptr_mut(out), rows, cols,
+                                   gate.stride(0), up.stride(0), stream);
+    }
+    return out;
+}
+
 Tensor swiglu(const Tensor& gate, const Tensor& up, int variant) {
-    check_cuda_contig(gate, "gate");
-    check_cuda_contig(up, "up");
     check_float_or_bf16(gate, "gate");
     TORCH_CHECK(up.scalar_type() == gate.scalar_type(), "up must have the same dtype as gate");
+    if (variant < 0 && (strided_rows(gate) || strided_rows(up)) && gate.is_cuda() && up.is_cuda() &&
+        gate.dim() == 2 && up.dim() == 2 && gate.stride(1) == 1 && up.stride(1) == 1) {
+        return swiglu_strided(gate, up);
+    }
+    check_cuda_contig(gate, "gate");
+    check_cuda_contig(up, "up");
     TORCH_CHECK(up.sizes() == gate.sizes(), "gate and up must have the same shape");
     const c10::cuda::CUDAGuard guard(gate.device());
     Tensor out = at::empty_like(gate);
@@ -288,8 +320,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("eps") = 1e-6, py::arg("variant") = -1);
     m.def("add_rmsnorm_", &add_rmsnorm_, "resid += x; return rmsnorm(resid) * w (bf16, in place)",
           py::arg("x"), py::arg("resid"), py::arg("w"), py::arg("eps") = 1e-6);
-    m.def("swiglu", &swiglu, "silu(gate) * up", py::arg("gate"), py::arg("up"),
-          py::arg("variant") = -1);
+    m.def("swiglu", &swiglu,
+          "silu(gate) * up (2-D gate and up with contiguous rows may be strided: the halves "
+          "of a fused gate|up projection)",
+          py::arg("gate"), py::arg("up"), py::arg("variant") = -1);
     m.def("softmax", &softmax, "softmax over the last dim (fp32 math)", py::arg("x"),
           py::arg("variant") = -1);
     m.def("sgemm", &sgemm, "fp32 GEMM: a @ b", py::arg("a"), py::arg("b"), py::arg("variant") = -1);

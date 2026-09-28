@@ -55,6 +55,15 @@ void swiglu_f32(const float* gate, const float* up, float* out, int64_t n, int v
 void swiglu_bf16(const __nv_bfloat16* gate, const __nv_bfloat16* up, __nv_bfloat16* out, int64_t n,
                  int variant, cudaStream_t stream);
 int swiglu_num_variants();
+// Variant 1 over rows x cols with gate and up rows ld_gate / ld_up elements apart (the two
+// halves of a fused [rows, 2 * cols] gate|up projection, read in place), out contiguous.
+// Falls back to one element per thread when a row start or the row length is not a 16-byte
+// multiple.
+void swiglu_strided_f32(const float* gate, const float* up, float* out, int64_t rows, int64_t cols,
+                        int64_t ld_gate, int64_t ld_up, cudaStream_t stream);
+void swiglu_strided_bf16(const __nv_bfloat16* gate, const __nv_bfloat16* up, __nv_bfloat16* out,
+                         int64_t rows, int64_t cols, int64_t ld_gate, int64_t ld_up,
+                         cudaStream_t stream);
 
 // ---- Row-wise softmax --------------------------------------------------------------------
 // out[r, :] = softmax(x[r, :]) computed in fp32.

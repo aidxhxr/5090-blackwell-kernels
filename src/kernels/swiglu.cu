@@ -7,7 +7,11 @@
 // efficiently we move them: variant 1 issues one 128-bit load per operand per thread.
 //   0: scalar, one element per thread
 //   1: 16-byte vectorized (float4 for f32, 8 x bf16 for bf16), grid-stride, in-kernel tail
+// swiglu_strided_* is variant 1 over a rows x cols matrix whose rows are `ld` elements apart:
+// the two halves of a fused gate|up projection ([rows, 2 * cols] from one GEMM) are read in
+// place instead of being copied out to contiguous tensors first.
 #include <cstdint>
+#include <type_traits>
 
 #include "spark/common.cuh"
 #include "spark/kernels.h"
@@ -140,10 +144,94 @@ void swiglu_impl(const T* gate, const T* up, T* out, int64_t n, int variant, cud
     SPARK_CHECK_LAUNCH();
 }
 
+// Strided rows: element (r, c) of gate is gate[r * ld_gate + c], of up is up[r * ld_up + c],
+// out is contiguous rows x cols. Vectorized 16-byte loads when every row start and the
+// row length are 16-byte multiples, one scalar element per thread otherwise.
+template <typename T, int VEC>
+__global__ void swiglu_strided_vec_kernel(const T* __restrict__ gate, const T* __restrict__ up,
+                                          T* __restrict__ out, int64_t rows, int64_t cols_vec,
+                                          int64_t ld_gate, int64_t ld_up) {
+    using V = std::conditional_t<sizeof(T) == 4, f32x4, bf16x8>;
+    const int64_t n_vec = rows * cols_vec;
+    const int64_t tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+    for (int64_t i = tid; i < n_vec; i += stride) {
+        const int64_t r = i / cols_vec;
+        const int64_t c = (i - r * cols_vec) * VEC;
+        const V g = *reinterpret_cast<const V*>(gate + r * ld_gate + c);
+        const V u = *reinterpret_cast<const V*>(up + r * ld_up + c);
+        V o;
+        if constexpr (sizeof(T) == 4) {
+#pragma unroll
+            for (int k = 0; k < VEC; ++k) o.v[k] = silu_f(g.v[k]) * u.v[k];
+        } else {
+#pragma unroll
+            for (int k = 0; k < VEC / 2; ++k) {
+                const float2 gf = __bfloat1622float2(g.h[k]);
+                const float2 uf = __bfloat1622float2(u.h[k]);
+                float2 of;
+                of.x = silu_f(gf.x) * uf.x;
+                of.y = silu_f(gf.y) * uf.y;
+                o.h[k] = __float22bfloat162_rn(of);
+            }
+        }
+        *reinterpret_cast<V*>(out + r * cols_vec * VEC + c) = o;
+    }
+}
+
+template <typename T>
+__global__ void swiglu_strided_scalar_kernel(const T* __restrict__ gate, const T* __restrict__ up,
+                                             T* __restrict__ out, int64_t rows, int64_t cols,
+                                             int64_t ld_gate, int64_t ld_up) {
+    const int64_t n = rows * cols;
+    const int64_t tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+    for (int64_t i = tid; i < n; i += stride) {
+        const int64_t r = i / cols;
+        const int64_t c = i - r * cols;
+        const float g = to_f32(gate[r * ld_gate + c]);
+        const float u = to_f32(up[r * ld_up + c]);
+        out[i] = from_f32<T>(silu_f(g) * u);
+    }
+}
+
+template <typename T>
+void swiglu_strided_impl(const T* gate, const T* up, T* out, int64_t rows, int64_t cols,
+                         int64_t ld_gate, int64_t ld_up, cudaStream_t stream) {
+    SPARK_REQUIRE(gate != nullptr && up != nullptr && out != nullptr, "swiglu: null pointer");
+    SPARK_REQUIRE(rows >= 0 && cols >= 0, "swiglu: rows and cols must be >= 0");
+    SPARK_REQUIRE(ld_gate >= cols && ld_up >= cols, "swiglu: row stride shorter than the row");
+    if (rows == 0 || cols == 0) return;
+    constexpr int VEC = 16 / static_cast<int>(sizeof(T));
+    const bool vec = cols % VEC == 0 && ld_gate % VEC == 0 && ld_up % VEC == 0 &&
+                     is_aligned16(gate) && is_aligned16(up) && is_aligned16(out);
+    if (vec) {
+        const unsigned grid = vec_grid(rows * (cols / VEC));
+        swiglu_strided_vec_kernel<T, VEC>
+            <<<grid, kBlock, 0, stream>>>(gate, up, out, rows, cols / VEC, ld_gate, ld_up);
+    } else {
+        const unsigned grid = vec_grid(rows * cols);
+        swiglu_strided_scalar_kernel<T>
+            <<<grid, kBlock, 0, stream>>>(gate, up, out, rows, cols, ld_gate, ld_up);
+    }
+    SPARK_CHECK_LAUNCH();
+}
+
 }  // namespace
 
 int swiglu_num_variants() {
     return 2;
+}
+
+void swiglu_strided_f32(const float* gate, const float* up, float* out, int64_t rows, int64_t cols,
+                        int64_t ld_gate, int64_t ld_up, cudaStream_t stream) {
+    swiglu_strided_impl<float>(gate, up, out, rows, cols, ld_gate, ld_up, stream);
+}
+
+void swiglu_strided_bf16(const __nv_bfloat16* gate, const __nv_bfloat16* up, __nv_bfloat16* out,
+                         int64_t rows, int64_t cols, int64_t ld_gate, int64_t ld_up,
+                         cudaStream_t stream) {
+    swiglu_strided_impl<__nv_bfloat16>(gate, up, out, rows, cols, ld_gate, ld_up, stream);
 }
 
 void swiglu_f32(const float* gate, const float* up, float* out, int64_t n, int variant,
