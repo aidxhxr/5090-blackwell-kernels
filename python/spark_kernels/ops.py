@@ -75,8 +75,19 @@ def sgemm(a: torch.Tensor, b: torch.Tensor, variant: int = -1) -> torch.Tensor:
     return _C.sgemm(a, b, variant)
 
 
-def hgemm(a: torch.Tensor, b: torch.Tensor, variant: int = -1) -> torch.Tensor:
-    """bf16 tensor-core GEMM with fp32 accumulation: a[M,K] @ b[K,N] -> [M,N] (bf16).
+def hgemm(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    variant: int = -1,
+    *,
+    bias: torch.Tensor | None = None,
+    act: str | None = None,
+    residual: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """bf16 tensor-core GEMM with fp32 accumulation: a[M,K] @ b[K,N] -> [M,N] (bf16), with an
+    optional fused epilogue: act(a @ b + bias) + residual, applied in fp32 in the kernel
+    before the one rounding to bf16.
 
     Requires N and K multiples of 16. Variant 6 (the default: the TMA mainloop on the
     Stream-K schedule) takes any M >= 1 when N and K are multiples of 64, like variants 3 and
@@ -84,8 +95,48 @@ def hgemm(a: torch.Tensor, b: torch.Tensor, variant: int = -1) -> torch.Tensor:
     multiples of 128 and a grid of at least one 128x128 tile per SM; variants 0 to 2 need M a
     multiple of 16, and variant 2 M, N multiples of 128 and K a multiple of 32. The default
     steps down to the highest variant that accepts the shape.
+
+    Args:
+        bias: [N] bfloat16, added to every row before the activation.
+        act: None, "silu", "gelu" (the tanh form, as F.gelu(approximate="tanh")) or "relu".
+        residual: [M, N] bfloat16, added after the activation.
+        out: [M, N] bfloat16 to write into instead of allocating; `out=residual` is the
+            in-place accumulate `residual += act(a @ b + bias)`.
+    The fused options run on variants 4 and 6 only (N and K multiples of 64); asking for one
+    on another variant, or on a shape those two refuse, raises ValueError.
     """
-    return _C.hgemm(a, b, variant)
+    return _C.hgemm(a, b, variant, bias, act, residual, False, out)
+
+
+def interleave_gate_up(w_gate: torch.Tensor, w_up: torch.Tensor) -> torch.Tensor:
+    """The gate/up weight layout `hgemm_swiglu` takes: [..., 2N] with gate_j in column 2j and
+    up_j in column 2j+1. Done once at load time, for the [K, N] weights as `hgemm` takes them
+    (w_gate = gate_proj.weight.t() for an HF Llama layer) and for a [N] bias alike."""
+    if w_gate.shape != w_up.shape:
+        raise ValueError(f"gate and up must have the same shape, got {tuple(w_gate.shape)} and "
+                         f"{tuple(w_up.shape)}")
+    return torch.stack((w_gate, w_up), dim=-1).reshape(*w_gate.shape[:-1], 2 * w_gate.shape[-1])
+
+
+def hgemm_swiglu(
+    a: torch.Tensor,
+    w_gate_up: torch.Tensor,
+    variant: int = -1,
+    *,
+    bias: torch.Tensor | None = None,
+    residual: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """silu(a @ w_gate) * (a @ w_up) in one GEMM: a[M,K] @ w_gate_up[K,2N] -> [M,N] (bf16).
+
+    `w_gate_up` is the interleaved layout from `interleave_gate_up` (gate_j at column 2j, up_j
+    at 2j+1), so both halves of every output element land in the same lane of the epilogue,
+    which forms the product in fp32 and rounds once. One read of `a` and one kernel where
+    eager PyTorch runs two GEMMs, a silu and a multiply. `bias` is [2N] in the same
+    interleaved layout, added before the gate; `residual` is [M, N], added to the product.
+    Same shape and variant rules as `hgemm` with N = 2N (a multiple of 64).
+    """
+    return _C.hgemm(a, w_gate_up, variant, bias, None, residual, True, out)
 
 
 def fp8gemm(

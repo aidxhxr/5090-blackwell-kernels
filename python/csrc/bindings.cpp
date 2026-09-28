@@ -17,6 +17,7 @@
 #include <torch/extension.h>
 
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -213,18 +214,70 @@ Tensor sgemm(const Tensor& a, const Tensor& b, int variant) {
     return c;
 }
 
-Tensor hgemm(const Tensor& a, const Tensor& b, int variant) {
+// The activation of the fused epilogue, by name; None or "none" is the identity.
+int hgemm_act(const std::optional<std::string>& act) {
+    if (!act || *act == "none") return spark::HGEMM_ACT_NONE;
+    if (*act == "silu") return spark::HGEMM_ACT_SILU;
+    if (*act == "gelu") return spark::HGEMM_ACT_GELU;
+    if (*act == "relu") return spark::HGEMM_ACT_RELU;
+    throw std::invalid_argument("hgemm: act must be None, \"silu\", \"gelu\" or \"relu\", got \"" +
+                                *act + "\"");
+}
+
+// c = act(a @ b + bias) + residual, one kernel, the epilogue applied in fp32 before the one
+// rounding to bf16 (variants 4 and 6; the launcher throws std::invalid_argument, ValueError
+// here, for the others). `out` is written in place when given; out=residual is the in-place
+// accumulate c += act(a @ b + bias). With swiglu, b is [K, 2N] with gate_j and up_j in columns
+// 2j and 2j+1 (spark_kernels.interleave_gate_up) and the result is [M, N]:
+// silu(gate) * up (+ residual).
+Tensor hgemm(const Tensor& a, const Tensor& b, int variant, const std::optional<Tensor>& bias,
+             const std::optional<std::string>& act, const std::optional<Tensor>& residual,
+             bool swiglu, const std::optional<Tensor>& out) {
     check_cuda_contig(a, "a");
     check_cuda_contig(b, "b");
     TORCH_CHECK(a.scalar_type() == at::kBFloat16 && b.scalar_type() == at::kBFloat16,
                 "hgemm expects bfloat16 inputs");
     const GemmShape s = gemm_shape(a, b);
+    TORCH_CHECK(!swiglu || s.N % 2 == 0,
+                "hgemm_swiglu: b must have an even number of columns "
+                "(interleaved gate/up pairs), got ",
+                s.N);
+    const int n_out = swiglu ? s.N / 2 : s.N;
+    spark::HgemmEpilogue ep;
+    ep.act = hgemm_act(act);
+    ep.swiglu = swiglu;
+    if (bias) {
+        check_cuda_contig(*bias, "bias");
+        TORCH_CHECK(bias->scalar_type() == at::kBFloat16, "bias must be bfloat16");
+        TORCH_CHECK(bias->dim() == 1 && bias->size(0) == s.N, "bias must have shape [", s.N,
+                    "] (one entry per column of b), got ", bias->sizes());
+        TORCH_CHECK(bias->device() == a.device(), "bias must be on a's device");
+        ep.bias = bf16_ptr(*bias);
+    }
+    if (residual) {
+        check_cuda_contig(*residual, "residual");
+        TORCH_CHECK(residual->scalar_type() == at::kBFloat16, "residual must be bfloat16");
+        TORCH_CHECK(residual->dim() == 2 && residual->size(0) == s.M && residual->size(1) == n_out,
+                    "residual must have shape [", s.M, ", ", n_out, "], got ", residual->sizes());
+        TORCH_CHECK(residual->device() == a.device(), "residual must be on a's device");
+        ep.residual = bf16_ptr(*residual);
+    }
     const c10::cuda::CUDAGuard guard(a.device());
-    Tensor c = at::empty({s.M, s.N}, a.options());
+    Tensor c;
+    if (out) {
+        c = *out;
+        check_cuda_contig(c, "out");
+        TORCH_CHECK(c.scalar_type() == at::kBFloat16, "out must be bfloat16");
+        TORCH_CHECK(c.dim() == 2 && c.size(0) == s.M && c.size(1) == n_out, "out must have shape [",
+                    s.M, ", ", n_out, "], got ", c.sizes());
+        TORCH_CHECK(c.device() == a.device(), "out must be on a's device");
+    } else {
+        c = at::empty({s.M, n_out}, a.options());
+    }
     int v = resolve_variant(variant, spark::hgemm_num_variants());
     while (variant < 0 && v > 0 && !spark::hgemm_supports(s.M, s.N, s.K, v)) --v;
     spark::hgemm_bf16(bf16_ptr(a), bf16_ptr(b), bf16_ptr_mut(c), s.M, s.N, s.K, v,
-                      current_stream(a));
+                      current_stream(a), ep);
     return c;
 }
 
@@ -370,8 +423,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("softmax", &softmax, "softmax over the last dim (fp32 math)", py::arg("x"),
           py::arg("variant") = -1);
     m.def("sgemm", &sgemm, "fp32 GEMM: a @ b", py::arg("a"), py::arg("b"), py::arg("variant") = -1);
-    m.def("hgemm", &hgemm, "bf16 tensor-core GEMM: a @ b", py::arg("a"), py::arg("b"),
-          py::arg("variant") = -1);
+    m.def("hgemm", &hgemm,
+          "bf16 tensor-core GEMM with a fused epilogue: act(a @ b + bias) + residual, or "
+          "silu(gate) * up from an interleaved gate/up b (swiglu=True)",
+          py::arg("a"), py::arg("b"), py::arg("variant") = -1, py::arg("bias") = py::none(),
+          py::arg("act") = py::none(), py::arg("residual") = py::none(), py::arg("swiglu") = false,
+          py::arg("out") = py::none());
     m.def("fp8gemm", &fp8gemm,
           "fp8 (e4m3) tensor-core GEMM: scale_a * scale_b * a @ b_t^T, b_t is [N, K], bf16 out",
           py::arg("a"), py::arg("b_t"), py::arg("scale_a"), py::arg("scale_b"),

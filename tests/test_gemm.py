@@ -1,5 +1,6 @@
 import pytest
 import torch
+import torch.nn.functional as F
 
 from conftest import TOL
 
@@ -45,6 +46,20 @@ HGEMM_SHAPES_V6 = [(2048, 2048, 2048), (1000, 4096, 4096), (2064, 11008, 2048),
                    (2100, 11008, 4096), (1024, 1024, 1024), (272, 128, 4096), (100, 1024, 1024),
                    (128, 64, 16384), (16, 4096, 1024), (1, 4096, 4096)]
 HGEMM_TOL = dict(atol=3e-2, rtol=3e-2)
+# The fused epilogue (variants 4 and 6): one shape per route the default variant takes.
+# 1000x4096x4096 is the TMA tile on static ranges with a ragged M; 2064x11008x2048 the queue
+# with two K-passes per Stream-K tile (the finishing piece applies the epilogue after the
+# fixup); 1024^3 and 272x128x4096 variant 4's 64-row tiles; 128x64x16384 its 64-column tile
+# with 8 pieces per tile; 16x4096x1024 and 1x4096x4096 the decode kernel unsplit; 33x256x4096
+# and 5x4096x256 the decode kernel with K split four ways, where the last slice to arrive
+# applies the epilogue from the fp32 workspace.
+HGEMM_SHAPES_EPILOGUE = [(1000, 4096, 4096), (2064, 11008, 2048), (1024, 1024, 1024),
+                         (272, 128, 4096), (128, 64, 16384), (16, 4096, 1024), (1, 4096, 4096),
+                         (33, 256, 4096), (5, 4096, 256)]
+# (bias, act, residual mode): every option alone, then the decoder-block combinations.
+HGEMM_EPILOGUES = [(True, None, None), (False, "silu", None), (False, "gelu", None),
+                   (False, "relu", None), (False, None, "residual"), (False, None, "accumulate"),
+                   (True, "gelu", "residual"), (True, "silu", "accumulate")]
 # variant 4 (Stream-K): the same shape rules as variant 3. The shapes cover a tile split into
 # many K-pieces (128x64x16384: two 64x64 tiles, 8 pieces each), static ranges with two or
 # three pieces per tile, a problem past four waves with a tail and a ragged M (2064x11008x1024:
@@ -250,3 +265,149 @@ def test_hgemm_default_variant_takes_any_multiple_of_16(sk):
     torch.testing.assert_close(got.float(), ref.float(), **HGEMM_TOL)
     with pytest.raises(ValueError):  # an explicit variant is never substituted
         sk.hgemm(a, b, 2)
+
+
+def _epilogue_ref(a, b, bias, act, residual):
+    x = a.float() @ b.float()
+    if bias is not None:
+        x = x + bias.float()
+    if act == "silu":
+        x = F.silu(x)
+    elif act == "gelu":
+        x = F.gelu(x, approximate="tanh")
+    elif act == "relu":
+        x = F.relu(x)
+    if residual is not None:
+        x = x + residual.float()
+    return x.to(torch.bfloat16)
+
+
+def _epilogue_id(e):
+    bias, act, res = e
+    return "+".join(t for t in (("bias" if bias else ""), act or "", res or "") if t) or "plain"
+
+
+@pytest.mark.parametrize("epilogue", HGEMM_EPILOGUES, ids=_epilogue_id)
+@pytest.mark.parametrize("shape", HGEMM_SHAPES_EPILOGUE, ids=lambda s: f"M{s[0]}_N{s[1]}_K{s[2]}")
+def test_hgemm_fused_epilogue(sk, shape, epilogue):
+    if 6 not in _variants("hgemm"):
+        pytest.skip("variant 6 not built")
+    M, N, K = shape
+    has_bias, act, res_mode = epilogue
+    torch.manual_seed(0)
+    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn(N, device="cuda", dtype=torch.bfloat16) * 4 if has_bias else None
+    residual = (torch.randn(M, N, device="cuda", dtype=torch.bfloat16) * 4
+                if res_mode else None)
+    ref = _epilogue_ref(a, b, bias, act, residual)
+    for variant in (-1, 6, 4):
+        if res_mode == "accumulate":
+            out = residual.clone()
+            got = sk.hgemm(a, b, variant, bias=bias, act=act, residual=out, out=out)
+            assert got.data_ptr() == out.data_ptr()
+        else:
+            got = sk.hgemm(a, b, variant, bias=bias, act=act, residual=residual)
+        assert got.shape == (M, N) and got.dtype == torch.bfloat16
+        torch.testing.assert_close(got.float(), ref.float(), **HGEMM_TOL)
+
+
+@pytest.mark.parametrize("shape", HGEMM_SHAPES_EPILOGUE, ids=lambda s: f"M{s[0]}_N{s[1]}_K{s[2]}")
+def test_hgemm_swiglu(sk, shape):
+    # N here is the width of each of gate and up; the interleaved weight is [K, 2N].
+    if 6 not in _variants("hgemm"):
+        pytest.skip("variant 6 not built")
+    M, N, K = shape
+    torch.manual_seed(0)
+    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    # Weights scaled to K^-1/2 so gate and up are O(1): the product silu(g) * u multiplies the
+    # fp32 summation-order noise of u by |g|, and with |g| ~ 64 (unscaled randn at K = 4096)
+    # a near-cancelling u turns 2e-4 of noise into a 20% miss on one element in a million.
+    w_gate = (torch.randn(K, N, device="cuda") * K**-0.5).to(torch.bfloat16)
+    w_up = (torch.randn(K, N, device="cuda") * K**-0.5).to(torch.bfloat16)
+    w = sk.interleave_gate_up(w_gate, w_up)
+    assert w.shape == (K, 2 * N) and torch.equal(w[:, 0::2], w_gate) and torch.equal(w[:, 1::2],
+                                                                                    w_up)
+    ref = (F.silu(a.float() @ w_gate.float()) * (a.float() @ w_up.float())).to(torch.bfloat16)
+    for variant in (-1, 6, 4):
+        got = sk.hgemm_swiglu(a, w, variant)
+        assert got.shape == (M, N) and got.dtype == torch.bfloat16
+        torch.testing.assert_close(got.float(), ref.float(), **HGEMM_TOL)
+    # With an interleaved bias and a residual on the product.
+    b_gate = torch.randn(N, device="cuda", dtype=torch.bfloat16)
+    b_up = torch.randn(N, device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn(M, N, device="cuda", dtype=torch.bfloat16) * 4
+    ref = (F.silu(a.float() @ w_gate.float() + b_gate.float())
+           * (a.float() @ w_up.float() + b_up.float()) + residual.float()).to(torch.bfloat16)
+    got = sk.hgemm_swiglu(a, w, bias=sk.interleave_gate_up(b_gate, b_up), residual=residual)
+    torch.testing.assert_close(got.float(), ref.float(), **HGEMM_TOL)
+
+
+def test_hgemm_swiglu_matches_unfused(sk):
+    # The fused product against our own unfused route: two GEMMs then swiglu. Both round the
+    # inputs of the product differently (the fused form never rounds gate and up), so this is
+    # a tolerance check, not bitwise.
+    M, N, K = 64, 2048, 1024
+    torch.manual_seed(2)
+    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    w_gate = (torch.randn(K, N, device="cuda") * K**-0.5).to(torch.bfloat16)
+    w_up = (torch.randn(K, N, device="cuda") * K**-0.5).to(torch.bfloat16)
+    fused = sk.hgemm_swiglu(a, sk.interleave_gate_up(w_gate, w_up))
+    unfused = sk.swiglu(sk.hgemm(a, w_gate), sk.hgemm(a, w_up))
+    torch.testing.assert_close(fused.float(), unfused.float(), **HGEMM_TOL)
+
+
+def test_hgemm_epilogue_is_deterministic(sk):
+    # The Stream-K fixup still sums the pieces in K order; the epilogue runs once on the
+    # finished sum, so the fused output is the same bits every call too (queue mode here).
+    M, N, K = 2064, 11008, 2048
+    torch.manual_seed(1)
+    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn(N, device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+    first = sk.hgemm(a, b, 6, bias=bias, act="gelu", residual=residual)
+    for _ in range(3):
+        assert torch.equal(first, sk.hgemm(a, b, 6, bias=bias, act="gelu", residual=residual))
+
+
+def test_hgemm_epilogue_rejected_on_other_variants(sk):
+    M, N, K = 256, 256, 256
+    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn(N, device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+    for variant in (0, 1, 2, 3, 5):
+        if variant not in _variants("hgemm"):
+            continue
+        with pytest.raises(ValueError):
+            sk.hgemm(a, b, variant, bias=bias)
+        with pytest.raises(ValueError):
+            sk.hgemm(a, b, variant, act="gelu")
+        with pytest.raises(ValueError):
+            sk.hgemm(a, b, variant, residual=residual)
+        with pytest.raises(ValueError):
+            sk.hgemm_swiglu(a, b, variant)
+    # A shape variants 4 and 6 refuse (N % 64 != 0) steps the default down to a variant that
+    # has no epilogue, which is a ValueError, not a silent plain GEMM.
+    b48 = torch.randn(K, 48, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(ValueError):
+        sk.hgemm(a, b48, bias=torch.randn(48, device="cuda", dtype=torch.bfloat16))
+    with pytest.raises(ValueError):
+        sk.hgemm(a, b, act="tanh")  # not an activation
+
+
+def test_hgemm_epilogue_rejects_bad_shapes(sk):
+    M, N, K = 128, 256, 256
+    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    b = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError):  # bias must be [N]
+        sk.hgemm(a, b, bias=torch.randn(M, device="cuda", dtype=torch.bfloat16))
+    with pytest.raises(RuntimeError):  # residual must be [M, N]
+        sk.hgemm(a, b, residual=torch.randn(M, 2 * N, device="cuda", dtype=torch.bfloat16))
+    with pytest.raises(RuntimeError):  # swiglu residual is [M, N / 2]
+        sk.hgemm_swiglu(a, b, residual=torch.randn(M, N, device="cuda", dtype=torch.bfloat16))
+    with pytest.raises(RuntimeError):  # out must be [M, N] bf16
+        sk.hgemm(a, b, out=torch.empty(M, N, device="cuda", dtype=torch.float32))
+    with pytest.raises(ValueError):
+        sk.interleave_gate_up(torch.zeros(4, 8), torch.zeros(4, 6))
