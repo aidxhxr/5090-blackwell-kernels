@@ -300,6 +300,49 @@ Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, bool causal,
     return out;
 }
 
+// q = rope(qkv[..., :H_q D]) as [B, H_q, S, D]; the caches [B, H_kv, cap, D] get rope(k) and
+// v at positions pos0..pos0+S-1, in place. cos and sin are [>= pos0 + S, D] fp32 tables in
+// the rotate-half layout.
+Tensor rope_append_(const Tensor& qkv, const Tensor& cos, const Tensor& sin, Tensor k_cache,
+                    Tensor v_cache, int64_t pos0, int64_t H_q, int64_t H_kv) {
+    check_cuda_contig(qkv, "qkv");
+    check_cuda_contig(cos, "cos");
+    check_cuda_contig(sin, "sin");
+    check_cuda_contig(k_cache, "k_cache");
+    check_cuda_contig(v_cache, "v_cache");
+    TORCH_CHECK(qkv.scalar_type() == at::kBFloat16 && k_cache.scalar_type() == at::kBFloat16 &&
+                    v_cache.scalar_type() == at::kBFloat16,
+                "rope_append_ expects bfloat16 qkv and caches");
+    TORCH_CHECK(cos.scalar_type() == at::kFloat && sin.scalar_type() == at::kFloat,
+                "rope_append_ expects float32 cos and sin tables");
+    TORCH_CHECK(qkv.dim() == 3, "qkv must be [B, S, (H_q + 2 H_kv) * D]");
+    TORCH_CHECK(k_cache.dim() == 4 && k_cache.sizes() == v_cache.sizes(),
+                "k_cache and v_cache must be [B, H_kv, cap, D] with the same shape");
+    TORCH_CHECK(cos.dim() == 2 && cos.sizes() == sin.sizes(), "cos and sin must be [P, D]");
+    const int64_t B = qkv.size(0), S = qkv.size(1), D = k_cache.size(3), cap = k_cache.size(2);
+    TORCH_CHECK(H_q >= 1 && H_kv >= 1 && H_q % H_kv == 0, "H_q must be a multiple of H_kv");
+    TORCH_CHECK(qkv.size(2) == (H_q + 2 * H_kv) * D,
+                "qkv's last dim must be (H_q + 2 H_kv) * D = ", (H_q + 2 * H_kv) * D, ", got ",
+                qkv.size(2));
+    TORCH_CHECK(k_cache.size(0) == B && k_cache.size(1) == H_kv,
+                "caches must be [B, H_kv, cap, D]");
+    TORCH_CHECK(cos.size(1) == D, "cos and sin must be [P, D] with D = ", D);
+    TORCH_CHECK(D % 16 == 0, "D must be a multiple of 16");
+    TORCH_CHECK(pos0 >= 0 && pos0 + S <= cap, "the cache (capacity ", cap, ") cannot take ", S,
+                " tokens at position ", pos0);
+    TORCH_CHECK(cos.size(0) >= pos0 + S, "cos and sin cover ", cos.size(0), " positions, need ",
+                pos0 + S);
+    TORCH_CHECK(B * S * (H_q + 2 * H_kv) * D < (int64_t{1} << 40), "rope_append_ dims too large");
+    const c10::cuda::CUDAGuard guard(qkv.device());
+    Tensor q = at::empty({B, H_q, S, D}, qkv.options());
+    spark::rope_append_bf16(bf16_ptr(qkv), cos.data_ptr<float>(), sin.data_ptr<float>(),
+                            bf16_ptr_mut(q), bf16_ptr_mut(k_cache), bf16_ptr_mut(v_cache),
+                            static_cast<int>(B), static_cast<int>(S), static_cast<int>(H_q),
+                            static_cast<int>(H_kv), static_cast<int>(D), static_cast<int>(pos0),
+                            static_cast<int>(cap), current_stream(qkv));
+    return q;
+}
+
 int num_variants(const std::string& name) {
     if (name == "rmsnorm") return spark::rmsnorm_num_variants();
     if (name == "swiglu") return spark::swiglu_num_variants();
@@ -337,6 +380,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "softmax(q k^T / sqrt(D)) v over [B, H, S, D] bf16 tensors (k, v may have fewer heads)",
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("causal") = false,
           py::arg("variant") = -1);
+    m.def("rope_append_", &rope_append_,
+          "RoPE on the q and k columns of a fused qkv projection, k and v appended to the caches "
+          "in place; returns q as [B, H_q, S, D]",
+          py::arg("qkv"), py::arg("cos"), py::arg("sin"), py::arg("k_cache"), py::arg("v_cache"),
+          py::arg("pos0"), py::arg("H_q"), py::arg("H_kv"));
     m.def("num_variants", &num_variants, "number of implementation variants for a kernel",
           py::arg("name"));
 }

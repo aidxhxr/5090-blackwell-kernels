@@ -58,6 +58,9 @@ def swiglu(gate: torch.Tensor, up: torch.Tensor, variant: int = -1) -> torch.Ten
 
     Variant 1 (128-bit loads) needs gate, up and the output to be 16-byte aligned; the default
     variant falls back to the scalar kernel on a tensor sliced to an odd storage offset.
+    With the default variant, 2-D gate and up whose rows are contiguous but not adjacent
+    (the two halves `gu[:, :I]` and `gu[:, I:]` of a fused gate|up projection) are read in
+    place by a strided kernel; the output is a new contiguous tensor.
     """
     return _C.swiglu(gate, up, variant)
 
@@ -104,6 +107,28 @@ def fp8gemm(
     steps down to the highest variant that accepts the shape.
     """
     return _C.fp8gemm(a, b_t, scale_a, scale_b, variant)
+
+
+def rope_append_(
+    qkv: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    pos0: int,
+    H_q: int,
+    H_kv: int,
+) -> torch.Tensor:
+    """RoPE on q and k plus the K/V cache append, one launch.
+
+    qkv is [B, S, (H_q + 2 H_kv) * D] bf16, the q | k | v columns of one fused projection.
+    cos and sin are [P, D] float32 tables in the rotate-half layout (column d pairs with
+    d + D/2 and the tables repeat their first half), P >= pos0 + S. k_cache and v_cache are
+    [B, H_kv, cap, D] bf16 with cap >= pos0 + S; token s of the input goes to position
+    pos0 + s, in place. Returns the rotated q as [B, H_q, S, D] bf16, the layout `attention`
+    takes. D a multiple of 16, fp32 math, every byte read once and written once.
+    """
+    return _C.rope_append_(qkv, cos, sin, k_cache, v_cache, pos0, H_q, H_kv)
 
 
 def attention(

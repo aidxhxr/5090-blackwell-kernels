@@ -13,16 +13,20 @@ Ops (all run on the current CUDA stream, all accept float32 or bfloat16 unless n
     hgemm(a, b, variant=-1)                  bf16 tensor-core GEMM (a @ b), fp32 accumulate
     fp8gemm(a, b_t, scale_a, scale_b, variant=-1)  e4m3 GEMM (a @ b_t.T, scaled), bf16 out
     attention(q, k, v, causal=False, variant=-1)  fused attention over [B, H, S, D] (bf16)
+    rope_append_(qkv, cos, sin, k_cache, v_cache, pos0, H_q, H_kv)
+                                             RoPE on q and k, k and v into the caches; returns q
     num_variants(name)                       how many implementations exist for `name`
 
 `variant` selects a rung on the optimization ladder described in docs/DESIGN.md; -1 picks
 the fastest one that accepts the input (see ops.py for the two ladders where that is not the
 top rung). `spark_kernels.reference` holds plain-PyTorch implementations used by tests.
+`spark_kernels.layer` is a Llama-3-8B decoder layer built from these ops (prefill and decode
+with a K/V cache) next to the same layer in plain PyTorch.
 """
 
 from importlib.metadata import PackageNotFoundError, version
 
-from . import reference
+from . import layer, reference
 from .ops import (
     add_rmsnorm_,
     attention,
@@ -30,6 +34,7 @@ from .ops import (
     hgemm,
     num_variants,
     rmsnorm,
+    rope_append_,
     sgemm,
     softmax,
     swiglu,
@@ -40,9 +45,11 @@ __all__ = [
     "attention",
     "fp8gemm",
     "hgemm",
+    "layer",
     "num_variants",
     "reference",
     "rmsnorm",
+    "rope_append_",
     "sgemm",
     "softmax",
     "swiglu",

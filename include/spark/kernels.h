@@ -157,6 +157,16 @@ int fp8gemm_num_variants();
 // True if `variant` accepts this shape (the rules above); fp8gemm throws when it is false.
 bool fp8gemm_supports(int M, int N, int K, int variant);
 
+// ---- RoPE + K/V cache append -------------------------------------------------------------
+// From qkv = [B, S, (H_q + 2 H_kv) * D] bf16 (a fused q|k|v projection) and rotary tables
+// cos, sin = [>= pos0 + S, D] fp32 in the rotate-half layout (column d pairs with d + D/2;
+// only columns 0..D/2-1 are read): q rotated into [B, H_q, S, D], k rotated and v copied into
+// the caches [B, H_kv, cap, D] at positions pos0..pos0+S-1. One launch, every byte read and
+// written once. D a multiple of 16, 16-byte aligned pointers.
+void rope_append_bf16(const __nv_bfloat16* qkv, const float* cos, const float* sin,
+                      __nv_bfloat16* q, __nv_bfloat16* k_cache, __nv_bfloat16* v_cache, int B,
+                      int S, int H_q, int H_kv, int D, int pos0, int cap, cudaStream_t stream);
+
 // ---- Fused attention (scaled dot product, forward) ----------------------------------------
 // O = softmax(Q K^T / sqrt(D)) V per (b, h), for Q, O = [B, H_q, S_q, D] and
 // K, V = [B, H_kv, S_kv, D], row-major contiguous, bf16 in/out, fp32 scores / softmax /
