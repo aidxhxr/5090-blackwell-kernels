@@ -10,7 +10,7 @@ each change bought.
 
 Where it ended up: the bf16 GEMM is ahead of cuBLAS on every shape from 2048 cubed up and at
 the memory floor on decode shapes. The fp8 GEMM is level with cuBLASLt at 4096 cubed. The
-attention kernel is 15 to 30% ahead of PyTorch's FlashAttention-2 on prefill and streams a
+attention kernel is 18 to 38% ahead of PyTorch's FlashAttention-2 on prefill and streams a
 128K-token cache faster than `cudaMemcpy` copies it. And four things about this card turned out
 to be different from the spec sheet, which is the part I'd read first.
 
@@ -35,8 +35,8 @@ PyTorch" column is eager PyTorch on the same shapes through the extension.
 | fp8 GEMM | 4096 x 4096 x 4096 | v2 | 0.195 ms | 704 TFLOPS | 100.1% of cuBLASLt | 1.36x |
 | fp8 GEMM | 8192 x 8192 x 8192 | v2 | 1.62 ms | 678 TFLOPS | 91.5% of cuBLASLt | 1.03x |
 | fp8 GEMM, decode | 16 x 4096 x 4096 | v1 | 13.2 us | 1,284 GB/s | 125% of cuBLASLt | 1.64x |
-| attention | 32 heads, 4096 x 128, causal | v4 | 0.601 ms | 229 TFLOPS | | 1.29x over flash |
-| attention | 32 heads, 8192 x 128, causal | v4 | 2.33 ms | 235 TFLOPS | | 1.18x over flash |
+| attention | 32 heads, 4096 x 128, causal | v5 | 0.582 ms | 236 TFLOPS | | 1.34x over flash |
+| attention | 32 heads, 8192 x 128, causal | v5 | 2.30 ms | 239 TFLOPS | | 1.18x over flash |
 | attention, decode | 1 query, 4096 keys, 32 heads | v3 | 46 us | 1,461 GB/s | | 1.43x over flash |
 | attention, GQA decode | 1 query, 128K keys, 32/8 heads | v3 | 328 us | 1,635 GB/s | | 1.09x over flash |
 | fp32 GEMM | 4096 x 11008 x 4096 | v5 | 6.45 ms | 57 TFLOPS | 84.5% of cuBLAS | 0.86x |
@@ -214,7 +214,7 @@ Fused scaled-dot-product attention, forward, bf16 in and out, fp32 math. Head si
 fewer heads than Q, as Llama-3's 32 query heads over 8 K/V heads). The comparison is
 `F.scaled_dot_product_attention`, which picks its FlashAttention-2 kernel on every shape here
 (`enable_gqa=True` for the grouped ones). cuDNN's attention forced through `sdpa_kernel` is 2
-to 7% faster than flash on prefill and still 13 to 28% behind.
+to 7% faster than flash on prefill and still 16 to 32% behind.
 
 | rung | what changed |
 |---|---|
@@ -223,6 +223,7 @@ to 7% faster than flash on prefill and still 13 to 28% behind.
 | v2 | `mma.sync` flash attention: Q in registers for the whole KV loop, P repacked from the S accumulators straight into the next mma, three-stage `cp.async` on K and V |
 | v3 | the last partial wave split along the keys and merged by a combine kernel; a 64-row tile for short queries; a flash-decoding kernel for decode |
 | v4 | K and V through TMA into mbarrier stages issued by one lane, no barrier in the KV loop |
+| v5 | a persistent grid: 170 resident blocks take Q tiles from a queue, heaviest first, and a producer warp keeps the TMA pipeline running from one tile into the next |
 
 The trick variant 2 is built on is FlashAttention-2's: after S = Q K^T each lane holds exactly
 the pairs of S the next mma wants for its A operand, so P is four conversions and never
@@ -232,16 +233,24 @@ softmaxes were a hole in the tensor pipe. Take the barrier out and they drift ap
 its softmax while the other issues mma, and the pipe goes from 87% to 93% active. I built
 FlashAttention-3's ping-pong on top of that and measured it slower every way, because one
 `mma.sync` warp does not fill the pipe alone on this card; those schedules stay in the source
-behind a build flag so the table in the design note is reproducible.
+behind a build flag so the table in the design note is reproducible. Variant 5 is the
+persistent grid I had on the list: every one of variant 4's 1,028 blocks on the causal 4096
+shape initialized its barriers and waited for its Q tile before its first mma, 3 us a block.
+Now 170 blocks stay resident and take tiles from a queue, a ninth warp owns the loads and
+publishes each tile to the eight compute warps through a shared-memory ring, so the next
+tile's Q is in flight while the current one finishes, and the tensor pipe went from 94 to
+96% active. The ninth warp costs registers (three warps on one scheduler cap it at 168), and
+it still beat the version that issues from a compute warp's lane by 1.6%, because that lane
+waits for the slowest warp before every load.
 
-| shape (B x H x S x D) | v0 | v1 | v2 | v3 | v4 | flash | v4 / flash |
-|---|---|---|---|---|---|---|---|
-| 1 x 32 x 4096 x 128 | 10 | 51 | 195 | 223 | **236** | 188 | 1.25x |
-| 1 x 32 x 4096 x 128, causal | 10 | 56 | 214 | 215 | **229** | 174 | 1.29x |
-| 1 x 32 x 8192 x 128, causal | 10 | 50 | 221 | 221 | **235** | 198 | 1.18x |
-| 4 x 32 x 2048 x 128, causal | 10 | 54 | 200 | 200 | **213** | 180 | 1.15x |
-| 1 x 32 x 4096 x 64, causal | 7 | 46 | 208 | 208 | **217** | 164 | 1.28x |
-| 1 x 32/8 x 4096 x 128, causal | 10 | 56 | 216 | 216 | **230** | 174 | 1.29x |
+| shape (B x H x S x D) | v0 | v1 | v2 | v3 | v4 | v5 | flash | v5 / flash |
+|---|---|---|---|---|---|---|---|---|
+| 1 x 32 x 4096 x 128 | 10 | 51 | 195 | 223 | 236 | **242** | 189 | 1.25x |
+| 1 x 32 x 4096 x 128, causal | 10 | 56 | 214 | 215 | 229 | **236** | 174 | 1.34x |
+| 1 x 32 x 8192 x 128, causal | 10 | 50 | 221 | 221 | 235 | **239** | 198 | 1.18x |
+| 4 x 32 x 2048 x 128, causal | 10 | 54 | 200 | 200 | 213 | **227** | 180 | 1.22x |
+| 1 x 32 x 4096 x 64, causal | 7 | 46 | 208 | 208 | 217 | **235** | 164 | 1.38x |
+| 1 x 32/8 x 4096 x 128, causal | 10 | 56 | 216 | 216 | 230 | **237** | 174 | 1.33x |
 
 TFLOPS, causal counted as half the products the way FlashAttention reports it. The 32/8 row is
 grouped-query attention and matches its multi-head twin, as it should: it is the same math
@@ -305,7 +314,7 @@ described above, not the kernel.
 | `sgemm` fp32 | naive, smem tile, 8x8 register tile, cp.async, register prefetch with swizzle, 256x128 tile | cuBLAS SGEMM |
 | `hgemm` bf16 | WMMA, smem tile, cp.async, `mma.sync` + `ldmatrix` with swizzle and split-K, Stream-K, TMA, TMA on Stream-K; a weight-streaming kernel for decode | cuBLAS GemmEx |
 | `fp8gemm` e4m3 | naive `mma.sync.m16n8k32`, the swizzled cp.async tile with a 64x64 warp tile and decode configs, TMA; all on the block-scaled instruction | cuBLASLt, `torch._scaled_mm` |
-| `attention` bf16 | warp per row, CUDA-core flash attention, `mma.sync` flash attention, split-KV tail, TMA mbarrier pipeline; GQA and a flash-decoding kernel | `F.scaled_dot_product_attention` |
+| `attention` bf16 | warp per row, CUDA-core flash attention, `mma.sync` flash attention, split-KV tail, TMA mbarrier pipeline, persistent tile queue with a producer warp; GQA and a flash-decoding kernel | `F.scaled_dot_product_attention` |
 | `bench_peak` | | the card's real `mma.sync` (bf16, fp8 plain and block-scaled) and FMA peaks and the clock they ran at |
 
 Every kernel takes a `variant` argument so each rung can be run, timed and tested on its own.
@@ -368,10 +377,11 @@ numbers, the sweeps that picked the constants, and which Nsight metric moved:
   [sgemm](docs/design/sgemm.md), [hgemm](docs/design/hgemm.md),
   [fp8gemm](docs/design/fp8gemm.md), [attention](docs/design/attention.md)
 
-Things I'd still like to do: a persistent grid for attention, since every one of its 1,028
-blocks on the 4096 shape pays a prologue that a tile queue would pay once per SM; per-block
-scales on the fp8 GEMM, which the instruction already takes; CUDA graphs for the 2 us a lone
-decode launch pays over the back-to-back rate; and a GB10 run when the Spark arrives. Both
+Things I'd still like to do: a 128-key tile for attention, which would halve how often the
+two warps of a scheduler land in their softmaxes together (the 3% of tensor pipe still idle);
+per-block scales on the fp8 GEMM, which the instruction already takes; CUDA graphs for the
+2 us a lone decode launch pays over the back-to-back rate; and a GB10 run when the Spark
+arrives. Both
 cards are consumer Blackwell, so `mma.sync`, `cp.async` and TMA are there and `tcgen05` isn't.
 
 ```
