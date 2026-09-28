@@ -211,6 +211,32 @@ __device__ __forceinline__ void mma_bf16_16816(float (&d)[4], const unsigned (&a
         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
+// fp32 -> tf32. A tf32 operand is an fp32 word whose low 13 mantissa bits the tensor core
+// ignores, so any fp32 register can be handed to the mma as it is (truncation, a biased
+// 2^-10 relative error). Rounding to the nearest tf32 first halves the bound to 2^-11 and
+// removes the bias. cvt.rn (nearest even, sm_90+) is one SASS instruction on sm_120
+// (F2FP.TF32.F32); cvt.rna (ties away, the sm_80 form) is emulated there with three (a
+// NaN test, an add of 0x1000 and a mask), which at 24 conversions per 16 mma set the clock
+// of the tf32 GEMM (docs/design/sgemm.md).
+__device__ __forceinline__ unsigned f32_to_tf32(float x) {
+    unsigned r;
+    asm("cvt.rn.tf32.f32 %0, %1;\n" : "=r"(r) : "f"(x));
+    return r;
+}
+// D[16x8] (+)= A[16x8] * B[8x8], tf32 inputs, fp32 accumulate (sgemm variants 6 and 7).
+// Fragment layouts are the PTX ISA ones for m16n8k8 with 32-bit types, one element per
+// register: a[4] = (row g, k c), (row g+8, k c), (row g, k c+4), (row g+8, k c+4);
+// b[2] = (k c, col g), (k c+4, col g); d[4] as for m16n8k16, with g = lane/4, c = lane%4.
+// 2,048 FLOP per instruction, half of m16n8k16's 4,096, and the RTX 5090 issues it at half
+// the bf16 rate on top (bench_peak: 130 vs 259 TFLOPS).
+__device__ __forceinline__ void mma_tf32_1688(float (&d)[4], const unsigned (&a)[4],
+                                              const unsigned (&b)[2]) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
 // D[16x8] (+)= A[16x32] * B[32x8], e4m3 inputs, fp32 accumulate (the fp8gemm variants).
 // Fragment layouts are the PTX ISA ones for m16n8k32 with 8-bit types, four elements per
 // register with the lowest k in the low byte: a[4] = (row g / g+8) x (k 4c..4c+3 / 16+4c..
