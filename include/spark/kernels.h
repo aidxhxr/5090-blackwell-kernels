@@ -188,6 +188,21 @@ void fp8gemm(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat16* C, 
 int fp8gemm_num_variants();
 // True if `variant` accepts this shape (the rules above); fp8gemm throws when it is false.
 bool fp8gemm_supports(int M, int N, int K, int variant);
+// MX mode (MXFP8): C = scale_a * scale_b * sum_k 2^(sfa[m][k/32] - 127) A[m][k]
+// 2^(sfb[n][k/32] - 127) Bt[n][k], the same variants with a ue8m0 scale (the OCP MX E8M0
+// byte: exponent + 127, 0xFF is NaN) per row per 32 k on both operands, sfa [M][K/32] and
+// sfb [N][K/32] row-major uint8, applied inside the block-scaled mma. scale_a and scale_b
+// may both be null (1.0). Requires K % 256 == 0 on top of the per-tensor rules (a row's
+// scales for two 128-k stages are one aligned 8-byte chunk) and 16-byte aligned sfa, sfb;
+// throws std::invalid_argument on a build without the instruction.
+void fp8gemm_mx(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat16* C, int M, int N,
+                int K, const float* scale_a, const float* scale_b, const unsigned char* sfa,
+                const unsigned char* sfb, int variant, cudaStream_t stream);
+bool fp8gemm_mx_supports(int M, int N, int K, int variant);
+// True if the fp8 kernels were compiled for sm_120a / sm_121a, where the block-scaled mma
+// exists. On a plain sm_120 build the per-tensor mode runs the plain instruction and MX mode
+// is refused.
+bool fp8gemm_mx_available();
 
 // ---- RoPE + K/V cache append -------------------------------------------------------------
 // From qkv = [B, S, (H_q + 2 H_kv) * D] bf16 (a fused q|k|v projection) and rotary tables

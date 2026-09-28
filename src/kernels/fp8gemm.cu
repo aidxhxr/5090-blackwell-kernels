@@ -14,6 +14,11 @@
 //              of Bt for decode shapes (M <= 64).
 //   variant 2: variant 1's 128x128 tile fed by TMA through a warp-specialized mbarrier
 //              pipeline (fp8gemm_tma.cu).
+//
+// MX mode (fp8gemm_mx): the same three variants with a ue8m0 scale per row per 32 k on both
+// operands, sfa[M][K/32] and sfb[N][K/32], applied by the block-scaled mma itself
+// (fp8gemm_tile.cuh, MxFrag / MxChunk). Requires K % 256 == 0 so that a row's scales for
+// two 128-k stages are one aligned 8-byte chunk.
 
 #include <cuda_fp8.h>
 
@@ -26,9 +31,16 @@
 
 namespace spark {
 
+// Variant 2 lives in fp8gemm_tma.cu.
+bool fp8gemm_tma_supports(int M, int N, int K);
+void fp8gemm_tma(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat16* C, int M, int N,
+                 int K, const float* scale_a, const float* scale_b, fp8gemm_tile::MxScales mx,
+                 cudaStream_t stream);
+
 namespace {
 
 using fp8gemm_tile::Cfg;
+using fp8gemm_tile::MxScales;
 
 // ---------------------------------------------------------------------------------------
 // Variant 0. Block = 4 warps covering 16 rows x 32 columns; each warp walks K in steps of 32
@@ -39,10 +51,16 @@ using fp8gemm_tile::Cfg;
 constexpr int V0_THREADS = 128;
 constexpr int V0_ROWS = 16, V0_COLS = 32;
 
+// In MX mode lane (g, t) also reads, per k32 step, the scale byte of row g + 8 (t & 1) and of
+// column g for that k-block, straight from the scale tensors (the lanes the instruction reads
+// with thread-id 0: fp8gemm_tile.cuh). This is the reference the smem variants are checked
+// against: nothing about the fragment or word layout is assumed beyond the probe.
+template <bool MX>
 __global__ void __launch_bounds__(V0_THREADS)
     fp8gemm_v0_kernel(const unsigned char* __restrict__ A, const unsigned char* __restrict__ Bt,
                       __nv_bfloat16* __restrict__ C, int M, int N, int K,
-                      const float* __restrict__ scale_a, const float* __restrict__ scale_b) {
+                      const float* __restrict__ scale_a, const float* __restrict__ scale_b,
+                      MxScales mx) {
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int g = lane >> 2;
@@ -54,6 +72,8 @@ __global__ void __launch_bounds__(V0_THREADS)
     const unsigned char* a0 = A + static_cast<size_t>(row + g) * K + 4 * t;
     const unsigned char* a1 = a0 + static_cast<size_t>(8) * K;
     const unsigned char* b0 = Bt + static_cast<size_t>(col + g) * K + 4 * t;
+    const unsigned char* sa = mx.a + static_cast<size_t>(row + g + 8 * (t & 1)) * mx.ld;
+    const unsigned char* sb = mx.b + static_cast<size_t>(col + g) * mx.ld;
     float acc[4] = {0.f, 0.f, 0.f, 0.f};
     for (int k0 = 0; k0 < K; k0 += 32) {
         unsigned a[4], b[2];
@@ -63,7 +83,10 @@ __global__ void __launch_bounds__(V0_THREADS)
         a[3] = *reinterpret_cast<const unsigned*>(a1 + k0 + 16);
         b[0] = *reinterpret_cast<const unsigned*>(b0 + k0);
         b[1] = *reinterpret_cast<const unsigned*>(b0 + k0 + 16);
-        mma_e4m3_16832(acc, a, b);
+        if constexpr (MX)
+            mma_e4m3_16832_mx<0>(acc, a, b, sa[k0 >> 5], sb[k0 >> 5]);
+        else
+            mma_e4m3_16832(acc, a, b);
     }
     const float s = *scale_a * *scale_b;
     __nv_bfloat16* c0 = C + static_cast<size_t>(row + g) * N + col + 2 * t;
@@ -91,12 +114,12 @@ struct Sched {
     int* counters;
 };
 
-template <class C>
+template <class C, bool MX, int SFW>
 __global__ void __launch_bounds__(C::THREADS)
     fp8gemm_v1_kernel(const unsigned char* __restrict__ A, const unsigned char* __restrict__ Bt,
                       __nv_bfloat16* __restrict__ Cout, int M, int N, int K,
                       const float* __restrict__ scale_a, const float* __restrict__ scale_b,
-                      Sched sched) {
+                      MxScales mx, Sched sched) {
     constexpr int BM = C::BM, BN = C::BN, BK = C::BK, THREADS = C::THREADS;
     constexpr int WROWS = C::WROWS, WCOLS = C::WCOLS, MT = C::MT, NT = C::NT;
     extern __shared__ __align__(128) unsigned char smem_raw[];
@@ -120,14 +143,21 @@ __global__ void __launch_bounds__(C::THREADS)
         kt_begin = static_cast<int>(static_cast<long long>(slice) * KT / sched.split);
         kt_end = static_cast<int>(static_cast<long long>(slice + 1) * KT / sched.split);
     }
+    if constexpr (MX) {
+        // Slices start on a scale-chunk boundary (the host caps split at KT / SPC, so none
+        // is empty).
+        constexpr int SPC = fp8gemm_tile::MxChunk<C, SFW>::SPC;
+        kt_begin = kt_begin / SPC * SPC;
+        if (slice + 1 < sched.split) kt_end = kt_end / SPC * SPC;
+    }
     const int bm = (tile / sched.tiles_n) * BM;
     const int bn = (tile % sched.tiles_n) * BN;
     const int m_valid = M - bm;  // rows of this tile that exist
     const float scale = *scale_a * *scale_b;
 
     typename C::Acc acc;
-    fp8gemm_tile::mainloop<C>(A, Bt, K, bm, bn, m_valid, kt_begin, kt_end - kt_begin, smem_raw,
-                              acc);
+    fp8gemm_tile::mainloop<C, MX, SFW>(A, Bt, K, bm, bn, m_valid, kt_begin, kt_end - kt_begin,
+                                       smem_raw, acc, mx);
 
     if (tile < sched.dp_tiles) {
         fp8gemm_tile::store_bf16<C>(acc, scale, Cout, M, N, bm, bn);
@@ -182,29 +212,43 @@ struct Workspace {
     size_t tiles = 0;
 };
 
-// Resident blocks per GPU for one configuration; also the > 48 KB smem opt-in.
-template <class C>
+// Resident blocks per GPU for one configuration (and mode: the MX kernel holds two stages of
+// scale words in registers and may fit fewer blocks); also the > 48 KB smem opt-in.
+template <class C, bool MX, int SFW>
 int resident_blocks() {
     static int resident = 0;
     if (resident == 0) {
         SPARK_CUDA_CHECK(cudaFuncSetAttribute(
-            fp8gemm_v1_kernel<C>, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM));
+            fp8gemm_v1_kernel<C, MX, SFW>, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM));
         int per_sm = 0;
         SPARK_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &per_sm, fp8gemm_v1_kernel<C>, C::THREADS, C::SMEM));
+            &per_sm, fp8gemm_v1_kernel<C, MX, SFW>, C::THREADS, C::SMEM));
         resident = (per_sm > 0 ? per_sm : 1) * num_sms();
     }
     return resident;
 }
 
+// The scale chunk width of MX mode for this K (fp8gemm_tile::MxChunk): 16-byte chunks when
+// every row stride is 16-byte aligned, else 8. Per-tensor mode is the SFW = 2 instantiation,
+// whose code does not depend on it.
+constexpr int sfw_for(int K) {
+    return K % 512 == 0 ? 4 : 2;
+}
+// Split-K slices of MX mode are whole chunk groups: at most KT / SPC of them.
+template <class C, bool MX, int SFW>
+constexpr int max_split(int KT) {
+    if constexpr (MX) return std::max(1, KT / fp8gemm_tile::MxChunk<C, SFW>::SPC);
+    return KT;
+}
+
 // `split` K-slices for the `tail` last tiles in row-major tile order (whole tiles first).
 // split == 1 is a plain launch of `tiles` blocks with no workspace.
-template <class C>
+template <class C, bool MX, int SFW>
 void launch(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout, int M, int N,
-            int K, const float* scale_a, const float* scale_b, int tail, int split,
+            int K, const float* scale_a, const float* scale_b, MxScales mx, int tail, int split,
             cudaStream_t stream) {
     constexpr int BM = C::BM, BN = C::BN;
-    (void)resident_blocks<C>();  // the smem opt-in, if the caller has not done it
+    (void)resident_blocks<C, MX, SFW>();  // the smem opt-in, if the caller has not done it
     Sched s;
     s.tiles_n = N / BN;
     const int tiles = cdiv(M, BM) * s.tiles_n;
@@ -213,8 +257,8 @@ void launch(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout
         s.split = 1;
         s.ws = nullptr;
         s.counters = nullptr;
-        fp8gemm_v1_kernel<C>
-            <<<tiles, C::THREADS, C::SMEM, stream>>>(A, Bt, Cout, M, N, K, scale_a, scale_b, s);
+        fp8gemm_v1_kernel<C, MX, SFW>
+            <<<tiles, C::THREADS, C::SMEM, stream>>>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, s);
         return;
     }
     s.dp_tiles = tiles - tail;
@@ -234,21 +278,33 @@ void launch(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout
     SPARK_CUDA_CHECK(
         cudaMemsetAsync(w.counters, 0, static_cast<size_t>(tail) * sizeof(int), stream));
     const int grid = s.dp_tiles + tail * s.split;
-    fp8gemm_v1_kernel<C>
-        <<<grid, C::THREADS, C::SMEM, stream>>>(A, Bt, Cout, M, N, K, scale_a, scale_b, s);
+    fp8gemm_v1_kernel<C, MX, SFW>
+        <<<grid, C::THREADS, C::SMEM, stream>>>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, s);
 }
 
 // Wave quantization (hgemm variant 3's rule): the tiles past the last full wave of resident
 // blocks are split along K over the otherwise idle blocks, `split = min(KT, resident / tail)`.
-template <class C>
-void launch_tiles(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout, int M,
-                  int N, int K, const float* scale_a, const float* scale_b, cudaStream_t stream) {
-    const int resident = resident_blocks<C>();
+template <class C, bool MX, int SFW>
+void launch_tiles_sfw(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout, int M,
+                      int N, int K, const float* scale_a, const float* scale_b, MxScales mx,
+                      cudaStream_t stream) {
+    const int resident = resident_blocks<C, MX, SFW>();
     const int tiles = cdiv(M, C::BM) * (N / C::BN);
     const int KT = K / C::BK;
     const int tail = tiles % resident;
-    const int split = tail > 0 ? std::min(KT, resident / tail) : 1;
-    launch<C>(A, Bt, Cout, M, N, K, scale_a, scale_b, tail, split, stream);
+    const int split = tail > 0 ? std::min(max_split<C, MX, SFW>(KT), resident / tail) : 1;
+    launch<C, MX, SFW>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, tail, split, stream);
+}
+
+// MX mode picks the chunk width from K; per-tensor mode has one instantiation.
+template <class C, bool MX>
+void launch_tiles(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout, int M,
+                  int N, int K, const float* scale_a, const float* scale_b, MxScales mx,
+                  cudaStream_t stream) {
+    if (MX && sfw_for(K) == 4)
+        launch_tiles_sfw<C, MX, 4>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
+    else
+        launch_tiles_sfw<C, MX, 2>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
 }
 
 // Decode shapes (M <= 64): one CTA per BN-row strip of Bt, no split-K unless a narrow N
@@ -258,18 +314,30 @@ void launch_tiles(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16
 // in one wave of resident CTAs, otherwise the second, which has more slots.
 constexpr int kMinCtas = 64;
 
-template <class C>
+template <class C, bool MX>
 bool fits(int N) {
-    return N % C::BN == 0 && N / C::BN <= resident_blocks<C>();
+    return N % C::BN == 0 && N / C::BN <= resident_blocks<C, MX, 2>();
 }
 
-template <class C>
-void launch_decode(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout, int M,
-                   int N, int K, const float* scale_a, const float* scale_b, cudaStream_t stream) {
+template <class C, bool MX, int SFW>
+void launch_decode_sfw(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout, int M,
+                       int N, int K, const float* scale_a, const float* scale_b, MxScales mx,
+                       cudaStream_t stream) {
     const int strips = N / C::BN;
     const int KT = K / C::BK;
-    const int split = std::min(KT, std::max(1, cdiv(kMinCtas, strips)));
-    launch<C>(A, Bt, Cout, M, N, K, scale_a, scale_b, split > 1 ? strips : 0, split, stream);
+    const int split = std::min(max_split<C, MX, SFW>(KT), std::max(1, cdiv(kMinCtas, strips)));
+    launch<C, MX, SFW>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, split > 1 ? strips : 0, split,
+                       stream);
+}
+
+template <class C, bool MX>
+void launch_decode(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout, int M,
+                   int N, int K, const float* scale_a, const float* scale_b, MxScales mx,
+                   cudaStream_t stream) {
+    if (MX && sfw_for(K) == 4)
+        launch_decode_sfw<C, MX, 4>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
+    else
+        launch_decode_sfw<C, MX, 2>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
 }
 
 // Large shapes: the 128x128 tile when its grid is at least one wave, else 64x128, else 64x64
@@ -286,16 +354,18 @@ using Small64 = Cfg<64, 64, 64, 3, 2, 4>;  // 24 KB, for K % 128 != 0
 // Alternatives for the 128x128 tile, for a re-sweep: SPARK_FP8GEMM_V1_CONFIG=<index> forces
 // one (the sweep is in docs/design/fp8gemm.md). Index 0 is the shipped `Big`.
 using BigFn = void (*)(const unsigned char*, const unsigned char*, __nv_bfloat16*, int, int, int,
-                       const float*, const float*, cudaStream_t);
+                       const float*, const float*, MxScales, cudaStream_t);
+template <bool MX>
 constexpr BigFn BIG_CONFIGS[] = {
-    launch_tiles<Big>,                          // 0: BK 64, 3 stages, 2x2 warps of 64x64, 48 KB
-    launch_tiles<Cfg<128, 128, 64, 3, 2, 4>>,   // 1: 2x4 warps of 64x32 (hgemm v3's grid), 48 KB
-    launch_tiles<Cfg<128, 128, 128, 2, 2, 4>>,  // 2: BK 128, 2 stages, 64 KB, one block per SM
-    launch_tiles<Cfg<128, 128, 128, 3, 2, 4>>,  // 3: BK 128, 3 stages, 96 KB
-    launch_tiles<Cfg<128, 128, 64, 4, 2, 4>>,   // 4: BK 64, 4 stages, 64 KB
-    launch_tiles<Cfg<128, 128, 128, 2, 2, 2>>,  // 5: 2x2 warps of 64x64, BK 128, 64 KB
+    launch_tiles<Big, MX>,                          // 0: BK 64, 3 stages, 2x2 warps of 64x64, 48 KB
+    launch_tiles<Cfg<128, 128, 64, 3, 2, 4>, MX>,   // 1: 2x4 warps of 64x32 (hgemm v3's grid)
+    launch_tiles<Cfg<128, 128, 128, 2, 2, 4>, MX>,  // 2: BK 128, 2 stages, 64 KB, one block per SM
+    launch_tiles<Cfg<128, 128, 128, 3, 2, 4>, MX>,  // 3: BK 128, 3 stages, 96 KB
+    launch_tiles<Cfg<128, 128, 64, 4, 2, 4>, MX>,   // 4: BK 64, 4 stages, 64 KB
+    launch_tiles<Cfg<128, 128, 128, 2, 2, 2>, MX>,  // 5: 2x2 warps of 64x64, BK 128, 64 KB
 };
-constexpr int NUM_BIG_CONFIGS = static_cast<int>(sizeof(BIG_CONFIGS) / sizeof(BIG_CONFIGS[0]));
+constexpr int NUM_BIG_CONFIGS =
+    static_cast<int>(sizeof(BIG_CONFIGS<false>) / sizeof(BIG_CONFIGS<false>[0]));
 
 int forced_big_config() {
     static int idx = -2;
@@ -311,9 +381,9 @@ int forced_big_config() {
 
 // Decode configurations per row tile, (first, second) as described at launch_decode, with
 // BK = 128 bytes (K % 128 == 0) or 64 (any other K % 64 == 0). Stage bytes are BK x (BM + BN).
-template <int BK>
+template <int BK, bool MX>
 void launch_decode_auto(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout, int M,
-                        int N, int K, const float* scale_a, const float* scale_b,
+                        int N, int K, const float* scale_a, const float* scale_b, MxScales mx,
                         cudaStream_t stream) {
     using D16a = Cfg<16, 64, BK, 4, 1, 4>;  // BK 128: 40 KB, 2 per SM, 340 slots
     using D16b = Cfg<16, 32, BK, 4, 1, 2>;  // 24 KB, 4 per SM, 680 slots
@@ -322,50 +392,91 @@ void launch_decode_auto(const unsigned char* A, const unsigned char* Bt, __nv_bf
     using D64a = Cfg<64, 32, BK, 4, 4, 2>;  // 48 KB, 2 per SM, 340 slots
     using D64b = Cfg<64, 64, BK, 3, 2, 4>;  // 48 KB, 2 per SM, 340 slots
     if (M <= 16) {
-        if (fits<D16a>(N))
-            launch_decode<D16a>(A, Bt, Cout, M, N, K, scale_a, scale_b, stream);
+        if (fits<D16a, MX>(N))
+            launch_decode<D16a, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
         else
-            launch_decode<D16b>(A, Bt, Cout, M, N, K, scale_a, scale_b, stream);
+            launch_decode<D16b, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
     } else if (M <= 32) {
-        if (fits<D32a>(N))
-            launch_decode<D32a>(A, Bt, Cout, M, N, K, scale_a, scale_b, stream);
+        if (fits<D32a, MX>(N))
+            launch_decode<D32a, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
         else
-            launch_decode<D32b>(A, Bt, Cout, M, N, K, scale_a, scale_b, stream);
+            launch_decode<D32b, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
     } else {
-        if (fits<D64a>(N))
-            launch_decode<D64a>(A, Bt, Cout, M, N, K, scale_a, scale_b, stream);
+        if (fits<D64a, MX>(N))
+            launch_decode<D64a, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
         else
-            launch_decode<D64b>(A, Bt, Cout, M, N, K, scale_a, scale_b, stream);
+            launch_decode<D64b, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
     }
 }
 
+// MX mode requires K % 256 == 0 (fp8gemm_mx_supports), so the tiles that only serve
+// K % 128 != 0 (Small64, the BK = 64 decode set) are not instantiated for it.
+template <bool MX>
 void launch_auto(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout, int M, int N,
-                 int K, const float* scale_a, const float* scale_b, cudaStream_t stream) {
+                 int K, const float* scale_a, const float* scale_b, MxScales mx,
+                 cudaStream_t stream) {
     auto tiles = [&](int bm, int bn) { return cdiv(M, bm) * (N / bn); };
     if (M <= 64) {
         if (K % 128 == 0)
-            launch_decode_auto<128>(A, Bt, Cout, M, N, K, scale_a, scale_b, stream);
-        else
-            launch_decode_auto<64>(A, Bt, Cout, M, N, K, scale_a, scale_b, stream);
-    } else if (N % 128 == 0 && tiles(128, 128) >= resident_blocks<Big>()) {
-        BIG_CONFIGS[forced_big_config()](A, Bt, Cout, M, N, K, scale_a, scale_b, stream);
-    } else if (N % 128 == 0 && tiles(64, 128) >= resident_blocks<Half>()) {
-        launch_tiles<Half>(A, Bt, Cout, M, N, K, scale_a, scale_b, stream);
+            launch_decode_auto<128, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
+        else if constexpr (!MX)
+            launch_decode_auto<64, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
+    } else if (N % 128 == 0 && tiles(128, 128) >= resident_blocks<Big, MX, 2>()) {
+        BIG_CONFIGS<MX>[forced_big_config()](A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
+    } else if (N % 128 == 0 && tiles(64, 128) >= resident_blocks<Half, MX, 2>()) {
+        launch_tiles<Half, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
     } else if (K % 128 == 0) {
-        launch_tiles<Small>(A, Bt, Cout, M, N, K, scale_a, scale_b, stream);
-    } else {
-        launch_tiles<Small64>(A, Bt, Cout, M, N, K, scale_a, scale_b, stream);
+        launch_tiles<Small, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
+    } else if constexpr (!MX) {
+        launch_tiles<Small64, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
     }
 }
 
 }  // namespace v1
 
-}  // namespace
+// Whether this build's device code has the block-scaled instruction (an sm_120a / sm_121a
+// build): the macro only exists in the device pass, so a kernel reports it.
+__global__ void mx_available_kernel(int* out) {
+    *out = SPARK_HAS_MX_MMA;
+}
 
-// Variant 2 lives in fp8gemm_tma.cu.
-bool fp8gemm_tma_supports(int M, int N, int K);
-void fp8gemm_tma(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat16* C, int M, int N,
-                 int K, const float* scale_a, const float* scale_b, cudaStream_t stream);
+// A device-resident 1.0f for callers of the MX mode that pass no per-tensor scales.
+__device__ const float kUnitScale = 1.0f;
+
+// The common launcher: MX mode when mx.a != nullptr.
+void run(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat16* C, int M, int N, int K,
+         const float* scale_a, const float* scale_b, MxScales mx, int variant,
+         cudaStream_t stream) {
+    const unsigned char* a = reinterpret_cast<const unsigned char*>(A);
+    const unsigned char* b = reinterpret_cast<const unsigned char*>(Bt);
+    const bool MX = mx.a != nullptr;
+    switch (variant) {
+        case 0: {
+            const dim3 grid(N / V0_COLS, M / V0_ROWS);
+            if (MX)
+                fp8gemm_v0_kernel<true>
+                    <<<grid, V0_THREADS, 0, stream>>>(a, b, C, M, N, K, scale_a, scale_b, mx);
+            else
+                fp8gemm_v0_kernel<false>
+                    <<<grid, V0_THREADS, 0, stream>>>(a, b, C, M, N, K, scale_a, scale_b, mx);
+            break;
+        }
+        case 1:
+            if (MX)
+                v1::launch_auto<true>(a, b, C, M, N, K, scale_a, scale_b, mx, stream);
+            else
+                v1::launch_auto<false>(a, b, C, M, N, K, scale_a, scale_b, mx, stream);
+            break;
+        case 2:
+            fp8gemm_tma(A, Bt, C, M, N, K, scale_a, scale_b, mx, stream);
+            break;
+        default:
+            break;
+    }
+    SPARK_CHECK_LAUNCH();
+}
+
+}  // namespace
 
 int fp8gemm_num_variants() {
     return 3;
@@ -380,6 +491,25 @@ bool fp8gemm_supports(int M, int N, int K, int variant) {
     return true;  // variant 1 zero-fills rows past M
 }
 
+bool fp8gemm_mx_supports(int M, int N, int K, int variant) {
+    return K % 256 == 0 && fp8gemm_supports(M, N, K, variant);
+}
+
+bool fp8gemm_mx_available() {
+    static int available = -1;
+    if (available < 0) {
+        int* d = nullptr;
+        SPARK_CUDA_CHECK(cudaMalloc(&d, sizeof(int)));
+        mx_available_kernel<<<1, 1>>>(d);
+        SPARK_CHECK_LAUNCH();
+        int h = 0;
+        SPARK_CUDA_CHECK(cudaMemcpy(&h, d, sizeof(int), cudaMemcpyDeviceToHost));
+        SPARK_CUDA_CHECK(cudaFree(d));
+        available = h ? 1 : 0;
+    }
+    return available == 1;
+}
+
 void fp8gemm(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat16* C, int M, int N, int K,
              const float* scale_a, const float* scale_b, int variant, cudaStream_t stream) {
     SPARK_REQUIRE(
@@ -389,26 +519,37 @@ void fp8gemm(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat16* C, 
     SPARK_REQUIRE(N % 64 == 0 && K % 64 == 0, "fp8gemm: N, K must be multiples of 64");
     SPARK_REQUIRE(variant >= 0 && variant < fp8gemm_num_variants(), "fp8gemm: unknown variant");
     SPARK_REQUIRE(is_aligned16(A) && is_aligned16(Bt), "fp8gemm: A, Bt must be 16-byte aligned");
-    const unsigned char* a = reinterpret_cast<const unsigned char*>(A);
-    const unsigned char* b = reinterpret_cast<const unsigned char*>(Bt);
+    SPARK_REQUIRE(variant != 0 || M % 16 == 0, "fp8gemm variant 0: M must be a multiple of 16");
+    run(A, Bt, C, M, N, K, scale_a, scale_b, MxScales{}, variant, stream);
+}
 
-    switch (variant) {
-        case 0: {
-            SPARK_REQUIRE(M % 16 == 0, "fp8gemm variant 0: M must be a multiple of 16");
-            const dim3 grid(N / V0_COLS, M / V0_ROWS);
-            fp8gemm_v0_kernel<<<grid, V0_THREADS, 0, stream>>>(a, b, C, M, N, K, scale_a, scale_b);
-            break;
-        }
-        case 1:
-            v1::launch_auto(a, b, C, M, N, K, scale_a, scale_b, stream);
-            break;
-        case 2:
-            fp8gemm_tma(A, Bt, C, M, N, K, scale_a, scale_b, stream);
-            break;
-        default:
-            break;
+void fp8gemm_mx(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat16* C, int M, int N,
+                int K, const float* scale_a, const float* scale_b, const unsigned char* sfa,
+                const unsigned char* sfb, int variant, cudaStream_t stream) {
+    SPARK_REQUIRE(A != nullptr && Bt != nullptr && C != nullptr && sfa != nullptr && sfb != nullptr,
+                  "fp8gemm_mx: null pointer");
+    SPARK_REQUIRE((scale_a == nullptr) == (scale_b == nullptr),
+                  "fp8gemm_mx: scale_a and scale_b must both be given or both be null");
+    SPARK_REQUIRE(M > 0 && N > 0 && K > 0, "fp8gemm_mx: M, N, K must be positive");
+    SPARK_REQUIRE(N % 64 == 0 && K % 256 == 0,
+                  "fp8gemm_mx: N must be a multiple of 64 and K of 256");
+    SPARK_REQUIRE(variant >= 0 && variant < fp8gemm_num_variants(), "fp8gemm_mx: unknown variant");
+    SPARK_REQUIRE(is_aligned16(A) && is_aligned16(Bt), "fp8gemm_mx: A, Bt must be 16-byte aligned");
+    SPARK_REQUIRE(is_aligned16(sfa) && is_aligned16(sfb),
+                  "fp8gemm_mx: sfa, sfb must be 16-byte aligned");
+    SPARK_REQUIRE(variant != 0 || M % 16 == 0, "fp8gemm_mx variant 0: M must be a multiple of 16");
+    SPARK_REQUIRE(fp8gemm_mx_available(),
+                  "fp8gemm_mx: this build has no block-scaled mma (compile for sm_120a / sm_121a)");
+    if (scale_a == nullptr) {
+        void* unit = nullptr;
+        SPARK_CUDA_CHECK(cudaGetSymbolAddress(&unit, kUnitScale));
+        scale_a = scale_b = static_cast<const float*>(unit);
     }
-    SPARK_CHECK_LAUNCH();
+    MxScales mx;
+    mx.a = sfa;
+    mx.b = sfb;
+    mx.ld = K / 32;
+    run(A, Bt, C, M, N, K, scale_a, scale_b, mx, variant, stream);
 }
 
 }  // namespace spark

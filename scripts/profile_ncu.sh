@@ -40,8 +40,9 @@ profile attention_v3 'attention_v2_kernel' "$BUILD_DIR/bench_attention" --varian
 profile attention_v1 'attention_v1_kernel' "$BUILD_DIR/bench_attention" --variant=1 --b=1 --h=32 --s=4096 --d=128 --causal=1 --iters=1 --warmup=0
 profile hgemm_v6   'hgemm_v6' "$BUILD_DIR/bench_hgemm" --variant=6 --m=8192 --n=8192 --k=8192 --iters=1 --warmup=0
 profile attention_decode 'attention_decode_kernel' "$BUILD_DIR/bench_attention" --variant=3 --b=1 --hq=32 --hkv=8 --sq=1 --skv=131072 --d=128 --iters=1 --warmup=0
-profile fp8gemm_v2 'fp8gemm_v2' "$BUILD_DIR/bench_fp8gemm" --variant=2 --m=8192 --n=8192 --k=8192 --iters=1 --warmup=0
-profile fp8gemm_v1 'fp8gemm_v1' "$BUILD_DIR/bench_fp8gemm" --variant=1 --m=8192 --n=8192 --k=8192 --iters=1 --warmup=0
+profile fp8gemm_v2 'fp8gemm_v2' "$BUILD_DIR/bench_fp8gemm" --mode=tensor --variant=2 --m=8192 --n=8192 --k=8192 --iters=1 --warmup=0
+profile fp8gemm_v2_mx 'fp8gemm_v2' "$BUILD_DIR/bench_fp8gemm" --mode=mx --variant=2 --m=8192 --n=8192 --k=8192 --iters=1 --warmup=0
+profile fp8gemm_v1 'fp8gemm_v1' "$BUILD_DIR/bench_fp8gemm" --mode=tensor --variant=1 --m=8192 --n=8192 --k=8192 --iters=1 --warmup=0
 profile hgemm_v5   'hgemm_v5' "$BUILD_DIR/bench_hgemm" --variant=5 --m=8192 --n=8192 --k=8192 --iters=1 --warmup=0
 profile hgemm_v4   'hgemm_v4' "$BUILD_DIR/bench_hgemm" --variant=4 --m=8192 --n=8192 --k=8192 --iters=1 --warmup=0
 profile hgemm_v3   'hgemm_v3' "$BUILD_DIR/bench_hgemm" --variant=3 --m=8192 --n=8192 --k=8192 --iters=1 --warmup=0

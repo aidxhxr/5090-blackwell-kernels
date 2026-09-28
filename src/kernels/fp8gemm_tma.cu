@@ -15,6 +15,10 @@
 //     completes it) and an "empty" mbarrier (each consumer warp arrives once it has read the
 //     stage), and nothing in the k-loop is a block-wide barrier.
 // Host guarantees M % 128 == 0, N % 128 == 0, K % BK == 0 and a grid of at least one wave.
+//
+// MX mode: the consumer warps fetch their scale chunks (fp8gemm_tile.cuh, MxChunk) from
+// global memory one group of stages ahead, as variant 1 does; the producer and the stages
+// are unchanged.
 
 #include <cuda_fp8.h>
 
@@ -30,6 +34,8 @@ namespace spark {
 namespace {
 
 namespace v2 {
+
+using fp8gemm_tile::MxScales;
 
 constexpr int BM = 128, BN = 128;
 constexpr int TAIL_BARRIER = 1;  // named barrier id for the consumer threads
@@ -55,12 +61,12 @@ struct Sched {
     int* counters;
 };
 
-template <int BK, int STAGES, int WARPS_M, int WARPS_N, int MIN_BLOCKS>
+template <int BK, int STAGES, int WARPS_M, int WARPS_N, int MIN_BLOCKS, bool MX, int SFW>
 __global__ void __launch_bounds__((WARPS_M * WARPS_N + 1) * 32, MIN_BLOCKS)
     fp8gemm_v2_kernel(const __grid_constant__ CUtensorMap tmA,
                       const __grid_constant__ CUtensorMap tmB, __nv_bfloat16* __restrict__ Cout,
                       int M, int N, int K, const float* __restrict__ scale_a,
-                      const float* __restrict__ scale_b, Sched sched) {
+                      const float* __restrict__ scale_b, MxScales mx, Sched sched) {
     using C = TileCfg<BK, STAGES, WARPS_M, WARPS_N>;
     static_assert(BK == 64 || BK == 128, "the TMA swizzles cover 64 B and 128 B rows");
     constexpr int CONSUMER_WARPS = WARPS_M * WARPS_N;
@@ -90,6 +96,11 @@ __global__ void __launch_bounds__((WARPS_M * WARPS_N + 1) * 32, MIN_BLOCKS)
         slice = r % sched.split;
         kt_begin = static_cast<int>(static_cast<long long>(slice) * KT / sched.split);
         kt_end = static_cast<int>(static_cast<long long>(slice + 1) * KT / sched.split);
+    }
+    if constexpr (MX) {  // slices start on a scale-chunk boundary (host: split <= KT / SPC)
+        constexpr int SPC = fp8gemm_tile::MxChunk<C, SFW>::SPC;
+        kt_begin = kt_begin / SPC * SPC;
+        if (slice + 1 < sched.split) kt_end = kt_end / SPC * SPC;
     }
     const int bm = (tile / sched.tiles_n) * BM;
     const int bn = (tile % sched.tiles_n) * BN;
@@ -138,19 +149,30 @@ __global__ void __launch_bounds__((WARPS_M * WARPS_N + 1) * 32, MIN_BLOCKS)
 #pragma unroll
             for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.f;
 
-    for (int kt = 0; kt < nkt; ++kt) {
+    auto stage = [&](int kt, const fp8gemm_tile::MxFrag<C>& words) {
         const int s = kt % STAGES;
         mbar_wait(&full_bar[s], (kt / STAGES) & 1);
         const unsigned char* as = smem + s * STAGE_BYTES;
         const unsigned char* bs = as + A_STAGE;
-#pragma unroll
-        for (int kk = 0; kk < BK; kk += 32)
-            fp8gemm_tile::mma_step<C>(as, bs, kk, wm, wn, lane, acc);
+        fp8gemm_tile::mma_stage<C, MX>(as, bs, wm, wn, lane, acc, words);
         // The ldmatrix reads went through the generic proxy and the refill comes through the
         // async proxy: fence, then one arrive per warp hands the stage back.
         fence_proxy_async_smem();
         __syncwarp();
         if (lane == 0) mbar_arrive(&empty_bar[s]);
+    };
+    if constexpr (!MX) {
+        fp8gemm_tile::MxFrag<C> none;
+        for (int kt = 0; kt < nkt; ++kt) stage(kt, none);
+    } else {
+        // Variant 1's group loop (fp8gemm_tile.cuh): the next group's scale chunks are
+        // fetched while this group's SPC stages run.
+        mx.a += static_cast<size_t>(bm) * mx.ld;
+        mx.b += static_cast<size_t>(bn) * mx.ld;
+        fp8gemm_tile::mx_loop<C, SFW>(
+            nkt, lane, stage, [&](fp8gemm_tile::MxChunk<C, SFW>& ch, int kt) {
+                fp8gemm_tile::mx_fetch<C, SFW>(ch, mx, kt_begin + kt, wm, wn, lane, BM);
+            });
     }
 
     if (tile < sched.dp_tiles) {
@@ -200,29 +222,31 @@ struct Workspace {
     size_t tiles = 0;
 };
 
-template <int BK, int STAGES, int WARPS_M, int WARPS_N, int MIN_BLOCKS>
+template <int BK, int STAGES, int WARPS_M, int WARPS_N, int MIN_BLOCKS, bool MX, int SFW>
 int resident_blocks() {
     constexpr int bytes = smem_bytes<BK, STAGES>();
     constexpr int threads = (WARPS_M * WARPS_N + 1) * 32;
     static int resident = 0;
     if (resident == 0) {
-        SPARK_CUDA_CHECK(
-            cudaFuncSetAttribute(fp8gemm_v2_kernel<BK, STAGES, WARPS_M, WARPS_N, MIN_BLOCKS>,
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+        SPARK_CUDA_CHECK(cudaFuncSetAttribute(
+            fp8gemm_v2_kernel<BK, STAGES, WARPS_M, WARPS_N, MIN_BLOCKS, MX, SFW>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
         int per_sm = 0;
         SPARK_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &per_sm, fp8gemm_v2_kernel<BK, STAGES, WARPS_M, WARPS_N, MIN_BLOCKS>, threads, bytes));
+            &per_sm, fp8gemm_v2_kernel<BK, STAGES, WARPS_M, WARPS_N, MIN_BLOCKS, MX, SFW>, threads,
+            bytes));
         resident = (per_sm > 0 ? per_sm : 1) * num_sms();
     }
     return resident;
 }
 
-template <int BK, int STAGES, int WARPS_M, int WARPS_N, int MIN_BLOCKS>
-void launch(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout, int M, int N,
-            int K, const float* scale_a, const float* scale_b, cudaStream_t stream) {
+template <int BK, int STAGES, int WARPS_M, int WARPS_N, int MIN_BLOCKS, bool MX, int SFW>
+void launch_sfw(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout, int M, int N,
+                int K, const float* scale_a, const float* scale_b, MxScales mx,
+                cudaStream_t stream) {
     constexpr int bytes = smem_bytes<BK, STAGES>();
     constexpr int THREADS = (WARPS_M * WARPS_N + 1) * 32;
-    const int resident = resident_blocks<BK, STAGES, WARPS_M, WARPS_N, MIN_BLOCKS>();
+    const int resident = resident_blocks<BK, STAGES, WARPS_M, WARPS_N, MIN_BLOCKS, MX, SFW>();
 
     // Both boxes: 128 rows by BK bytes, swizzled over the BK-byte row. The maps are 128 bytes
     // of host arithmetic each and are rebuilt per call (27 ns each, measured for hgemm v5).
@@ -236,14 +260,19 @@ void launch(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout
     const int tiles = (M / BM) * s.tiles_n;
     const int KT = K / BK;
     const int tail = tiles % resident;
-    s.split = tail > 0 ? std::min(KT, resident / tail) : 1;
+    // MX slices are whole scale-chunk groups (fp8gemm_tile::MxChunk).
+    const int max_split =
+        MX ? std::max(1,
+                      KT / fp8gemm_tile::MxChunk<TileCfg<BK, STAGES, WARPS_M, WARPS_N>, SFW>::SPC)
+           : KT;
+    s.split = tail > 0 ? std::min(max_split, resident / tail) : 1;
     if (s.split <= 1) {
         s.dp_tiles = tiles;
         s.split = 1;
         s.ws = nullptr;
         s.counters = nullptr;
-        fp8gemm_v2_kernel<BK, STAGES, WARPS_M, WARPS_N, MIN_BLOCKS>
-            <<<tiles, THREADS, bytes, stream>>>(tmA, tmB, Cout, M, N, K, scale_a, scale_b, s);
+        fp8gemm_v2_kernel<BK, STAGES, WARPS_M, WARPS_N, MIN_BLOCKS, MX, SFW>
+            <<<tiles, THREADS, bytes, stream>>>(tmA, tmB, Cout, M, N, K, scale_a, scale_b, mx, s);
         return;
     }
     s.dp_tiles = tiles - tail;
@@ -262,29 +291,49 @@ void launch(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout
     SPARK_CUDA_CHECK(
         cudaMemsetAsync(w.counters, 0, static_cast<size_t>(tail) * sizeof(int), stream));
     const int grid = s.dp_tiles + tail * s.split;
-    fp8gemm_v2_kernel<BK, STAGES, WARPS_M, WARPS_N, MIN_BLOCKS>
-        <<<grid, THREADS, bytes, stream>>>(tmA, tmB, Cout, M, N, K, scale_a, scale_b, s);
+    fp8gemm_v2_kernel<BK, STAGES, WARPS_M, WARPS_N, MIN_BLOCKS, MX, SFW>
+        <<<grid, THREADS, bytes, stream>>>(tmA, tmB, Cout, M, N, K, scale_a, scale_b, mx, s);
+}
+
+// MX mode fetches 16-byte scale chunks when every row stride is 16-byte aligned (K % 512
+// == 0), else 8-byte ones; per-tensor mode has one instantiation.
+template <int BK, int STAGES, int WARPS_M, int WARPS_N, int MIN_BLOCKS, bool MX>
+void launch(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout, int M, int N,
+            int K, const float* scale_a, const float* scale_b, MxScales mx, cudaStream_t stream) {
+    if (MX && K % 512 == 0)
+        launch_sfw<BK, STAGES, WARPS_M, WARPS_N, MIN_BLOCKS, MX, 4>(A, Bt, Cout, M, N, K, scale_a,
+                                                                    scale_b, mx, stream);
+    else
+        launch_sfw<BK, STAGES, WARPS_M, WARPS_N, MIN_BLOCKS, MX, 2>(A, Bt, Cout, M, N, K, scale_a,
+                                                                    scale_b, mx, stream);
 }
 
 // Pipeline configurations (BK in bytes, stages, consumer warp grid, blocks per SM the compiler
 // is asked to fit). SPARK_FP8GEMM_V2_CONFIG=<index> forces one; the sweep is in
 // docs/design/fp8gemm.md.
 using LaunchFn = void (*)(const unsigned char*, const unsigned char*, __nv_bfloat16*, int, int, int,
-                          const float*, const float*, cudaStream_t);
+                          const float*, const float*, MxScales, cudaStream_t);
+template <bool MX>
 constexpr LaunchFn CONFIGS[] = {
-    launch<128, 2, 2, 4, 1>,  // 0: 64 KB of smem, 2x4 warps, one block per SM
-    launch<128, 3, 2, 4, 1>,  // 1: 96 KB, 2x4 warps, one block per SM
-    launch<64, 3, 2, 4, 2>,   // 2: hgemm v3's tile and depth, 48 KB, two blocks per SM
-    launch<64, 2, 2, 4, 2>,   // 3: 32 KB, two blocks per SM
-    launch<64, 4, 2, 4, 1>,   // 4: 64 KB, one block per SM
-    launch<128, 3, 2, 2, 1>,  // 5: 96 KB, 2x2 warps of 64x64, one block per SM
-    launch<128, 2, 2, 2, 1>,  // 6: 64 KB, 2x2 warps of 64x64
-    launch<64, 3, 2, 2, 2>,   // 7: 48 KB, 2x2 warps of 64x64, two blocks per SM
-    launch<64, 2, 2, 2, 2>,   // 8: 32 KB, 2x2 warps of 64x64, two blocks per SM
+    launch<128, 2, 2, 4, 1, MX>,  // 0: 64 KB of smem, 2x4 warps, one block per SM
+    launch<128, 3, 2, 4, 1, MX>,  // 1: 96 KB, 2x4 warps, one block per SM
+    launch<64, 3, 2, 4, 2, MX>,   // 2: hgemm v3's tile and depth, 48 KB, two blocks per SM
+    launch<64, 2, 2, 4, 2, MX>,   // 3: 32 KB, two blocks per SM
+    launch<64, 4, 2, 4, 1, MX>,   // 4: 64 KB, one block per SM
+    launch<128, 3, 2, 2, 1, MX>,  // 5: 96 KB, 2x2 warps of 64x64, one block per SM
+    launch<128, 2, 2, 2, 1, MX>,  // 6: 64 KB, 2x2 warps of 64x64
+    launch<64, 3, 2, 2, 2, MX>,   // 7: 48 KB, 2x2 warps of 64x64, two blocks per SM
+    launch<64, 2, 2, 2, 2, MX>,   // 8: 32 KB, 2x2 warps of 64x64, two blocks per SM
+    launch<64, 5, 2, 4, 1, MX>,   // 9: 80 KB, five stages of 64 B, one block per SM
+    launch<64, 6, 2, 4, 1, MX>,   // 10: 96 KB, six stages of 64 B, one block per SM
 };
-constexpr int NUM_CONFIGS = static_cast<int>(sizeof(CONFIGS) / sizeof(CONFIGS[0]));
+constexpr int NUM_CONFIGS = static_cast<int>(sizeof(CONFIGS<false>) / sizeof(CONFIGS<false>[0]));
 constexpr int CONFIG_WAVES = 1;  // grids of more than two blocks per SM
 constexpr int CONFIG_SMALL = 3;  // up to two blocks per SM: two resident blocks, no tail
+// MX mode: the consumer warps carry the scale fetches and shuffles, and a deeper pipeline of
+// 64-byte stages hides what that costs them better than three 128-byte stages (the sweep in
+// docs/design/fp8gemm.md); the two-block configuration loses on every MX shape.
+constexpr int CONFIG_MX = 4;
 
 int forced_config() {
     static int idx = -2;
@@ -299,13 +348,17 @@ int forced_config() {
 }
 
 void launch_auto(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout, int M, int N,
-                 int K, const float* scale_a, const float* scale_b, cudaStream_t stream) {
+                 int K, const float* scale_a, const float* scale_b, MxScales mx,
+                 cudaStream_t stream) {
     int cfg = forced_config();
     if (cfg < 0) {
         const int tiles = (M / BM) * (N / BN);
-        cfg = tiles <= 2 * num_sms() ? CONFIG_SMALL : CONFIG_WAVES;
+        cfg = mx.a != nullptr ? CONFIG_MX : tiles <= 2 * num_sms() ? CONFIG_SMALL : CONFIG_WAVES;
     }
-    CONFIGS[cfg](A, Bt, Cout, M, N, K, scale_a, scale_b, stream);
+    if (mx.a != nullptr)
+        CONFIGS<true>[cfg](A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
+    else
+        CONFIGS<false>[cfg](A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
 }
 
 }  // namespace v2
@@ -318,12 +371,13 @@ bool fp8gemm_tma_supports(int M, int N, int K) {
 }
 
 void fp8gemm_tma(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat16* C, int M, int N,
-                 int K, const float* scale_a, const float* scale_b, cudaStream_t stream) {
+                 int K, const float* scale_a, const float* scale_b, fp8gemm_tile::MxScales mx,
+                 cudaStream_t stream) {
     SPARK_REQUIRE(fp8gemm_tma_supports(M, N, K),
                   "fp8gemm variant 2: requires M % 128 == 0, N % 128 == 0, K % 128 == 0 and at "
                   "least one 128x128 tile per SM");
     v2::launch_auto(reinterpret_cast<const unsigned char*>(A),
-                    reinterpret_cast<const unsigned char*>(Bt), C, M, N, K, scale_a, scale_b,
+                    reinterpret_cast<const unsigned char*>(Bt), C, M, N, K, scale_a, scale_b, mx,
                     stream);
 }
 
