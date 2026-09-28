@@ -174,6 +174,14 @@ bool fp8gemm_supports(int M, int N, int K, int variant);
 //            mbarrier pipeline issued by one lane, so the KV loop has no block-wide barrier and
 //            one warp's softmax runs under the other warp's mma on each scheduler. Same tail
 //            split and decode paths as variant 3
+// variant 5: variant 4's tile and pipeline on a persistent grid of one block per SM: the
+//            blocks take (b, h, q-tile) items from a queue in the heaviest-first order, the
+//            producer lane publishes each item to the warps through a shared-memory ring and
+//            keeps the TMA pipeline running across items, so the barrier init and the wait
+//            for a first box are paid once per block and the next item's Q tile is in flight
+//            during the current one's last tiles. The tail split stays on for the non-causal
+//            shapes, where the queue alone cannot fix 1,024 equal tiles on 170 SMs; same
+//            decode paths as variant 3
 void attention_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_bfloat16* V,
                     __nv_bfloat16* O, int B, int H_q, int H_kv, int S_q, int S_kv, int D,
                     bool causal, int variant, cudaStream_t stream);

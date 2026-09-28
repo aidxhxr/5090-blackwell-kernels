@@ -1,8 +1,9 @@
 """Parity of every attention variant against torch's scaled_dot_product_attention (in fp32,
 from the same bf16 inputs), on shapes that cover both head sizes, both masks, a sequence that
-is not a multiple of the 128 x 64 tile, a decode step, the split-KV tail of variants 3 and 4,
-the TMA boxes of variant 4 that hang off the end of a head, and grouped-query attention
-(H_q / H_kv in {1, 4, 8}) in prefill and decode."""
+is not a multiple of the 128 x 64 tile, a decode step, the split-KV tail of variants 3 to 5,
+the TMA boxes of variants 4 and 5 that hang off the end of a head, the persistent queue of
+variant 5 with more items than blocks, and grouped-query attention (H_q / H_kv in {1, 4, 8})
+in prefill and decode."""
 
 import pytest
 import torch
@@ -77,7 +78,7 @@ def test_attention_default_is_the_top_rung(sk):
 
 @pytest.mark.parametrize("variant", [v for v in _variants() if v >= 3])
 def test_attention_split_tail_is_stable_across_calls(sk, variant):
-    # variants 3 and 4 reuse a workspace for the split tiles; repeated calls must agree
+    # variants 3 to 5 reuse a workspace for the split tiles; repeated calls must agree
     q, k, v = _inputs(1, 4, 4, 512, 512, 128)
     a = sk.attention(q, k, v, variant=variant)
     b = sk.attention(q, k, v, variant=variant)
@@ -95,39 +96,64 @@ def test_attention_decode_split_is_stable_across_calls(sk):
     torch.testing.assert_close(a.float(), _reference(q, k, v, False), **TOL)
 
 
-@pytest.mark.skipif(4 not in _variants(), reason="variant 4 not built")
+TMA_VARIANTS = [v for v in _variants() if v >= 4]
+
+
+@pytest.mark.skipif(not TMA_VARIANTS, reason="variant 4 not built")
+@pytest.mark.parametrize("variant", TMA_VARIANTS)
 @pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
-def test_attention_v4_heads_do_not_bleed(sk, causal):
-    # Variant 4 loads K and V by TMA in 64-row boxes. With S_kv = 200 the last box of every head
-    # hangs 56 rows past the head; the 3-D tensor map must zero-fill them, not read the next
-    # head's keys. Head 0 is checked alone against a copy of itself with the other heads made
-    # hostile (large values), so a bleed would show.
+def test_attention_tma_heads_do_not_bleed(sk, causal, variant):
+    # Variants 4 and 5 load K and V by TMA in 64-row boxes. With S_kv = 200 the last box of
+    # every head hangs 56 rows past the head; the 3-D tensor map must zero-fill them, not read
+    # the next head's keys. Head 0 is checked alone against a copy of itself with the other
+    # heads made hostile (large values), so a bleed would show.
     B, H, S, D = 1, 3, 200, 128
     q, k, v = _inputs(B, H, H, S, S, D)
     k2, v2 = k.clone(), v.clone()
     k2[:, 1:] = 8.0
     v2[:, 1:] = 8.0
-    a = sk.attention(q, k, v, causal=causal, variant=4)
-    b = sk.attention(q, k2, v2, causal=causal, variant=4)
+    a = sk.attention(q, k, v, causal=causal, variant=variant)
+    b = sk.attention(q, k2, v2, causal=causal, variant=variant)
     torch.testing.assert_close(a[:, 0], b[:, 0], atol=0, rtol=0)
     torch.testing.assert_close(a.float(), _reference(q, k, v, causal), **TOL)
 
 
-@pytest.mark.skipif(4 not in _variants(), reason="variant 4 not built")
-def test_attention_v4_repeated_calls_and_streams(sk):
+@pytest.mark.skipif(not TMA_VARIANTS, reason="variant 4 not built")
+@pytest.mark.parametrize("variant", TMA_VARIANTS)
+def test_attention_tma_repeated_calls_and_streams(sk, variant):
     # Every launch encodes fresh tensor maps and runs the mbarrier pipeline from scratch; the
-    # result must not depend on what ran before, including on another stream.
+    # result must not depend on what ran before, including on another stream. Variant 5 also
+    # keeps a queue counter per stream that every launch must leave zero.
     q, k, v = _inputs(2, 4, 4, 1000, 1000, 64)
-    ref = sk.attention(q, k, v, causal=True, variant=4)
+    ref = sk.attention(q, k, v, causal=True, variant=variant)
     s = torch.cuda.Stream()
     with torch.cuda.stream(s):
-        other = sk.attention(q, k, v, causal=True, variant=4)
+        other = sk.attention(q, k, v, causal=True, variant=variant)
     torch.cuda.synchronize()
     for _ in range(3):
-        torch.testing.assert_close(sk.attention(q, k, v, causal=True, variant=4), ref,
+        torch.testing.assert_close(sk.attention(q, k, v, causal=True, variant=variant), ref,
                                    atol=0, rtol=0)
     torch.testing.assert_close(other, ref, atol=0, rtol=0)
     torch.testing.assert_close(ref.float(), _reference(q, k, v, True), **TOL)
+
+
+@pytest.mark.skipif(5 not in _variants(), reason="variant 5 not built")
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+def test_attention_v5_queue_with_more_items_than_blocks(sk, causal):
+    # Variant 5's blocks walk a queue: 2 x 8 heads x 16 Q tiles = 256 items on 170 blocks, so
+    # every block takes several, some the split slices of the tail, and the counter is reset
+    # by the last block for the next launch. Two launches back to back on one stream and one
+    # on a second stream while the first may still be running must all agree.
+    q, k, v = _inputs(2, 8, 2, 2048, 2048, 128)
+    a = sk.attention(q, k, v, causal=causal, variant=5)
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        c = sk.attention(q, k, v, causal=causal, variant=5)
+    b = sk.attention(q, k, v, causal=causal, variant=5)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(a, b, atol=0, rtol=0)
+    torch.testing.assert_close(a, c, atol=0, rtol=0)
+    torch.testing.assert_close(a.float(), _reference(q, k, v, causal), **TOL)
 
 
 def test_attention_rejects_bad_inputs(sk):
