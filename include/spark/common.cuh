@@ -276,10 +276,37 @@ __device__ __forceinline__ void mma_e4m3_16832(float (&d)[4], const unsigned (&a
         : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(one));
 }
+// The same instruction with real scales (the MX mode of fp8gemm): `sa` and `sb` are the
+// lane's four ue8m0 bytes for four consecutive 32-wide k-blocks of its row of A and its
+// column of B, and BID (an immediate) picks the byte for this k32 step. With thread-id 0 the
+// hardware reads, for a lane in quad g (g = lane / 4): row g of A from lane 4g, row g+8 from
+// lane 4g+1, column g of B from lane 4g; the other lanes' registers are ignored (thread-id 1
+// would read lanes 4g+2 / 4g+3 for A and 4g+1 for B instead). Measured with a probe of
+// distinct bytes in every lane, docs/design/fp8gemm.md.
+template <int BID>
+__device__ __forceinline__ void mma_e4m3_16832_mx(float (&d)[4], const unsigned (&a)[4],
+                                                  const unsigned (&b)[2], unsigned sa,
+                                                  unsigned sb) {
+    static_assert(BID >= 0 && BID < 4, "byte-id selects one of the four ue8m0 bytes");
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.kind::mxf8f6f4.block_scale.scale_vec::1X"
+        ".f32.e4m3.e4m3.f32.ue8m0 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, %10, {%12, 0}, %11, {%12, 0};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(sa), "r"(sb),
+          "n"(BID));
+}
 #else
 #define SPARK_HAS_MX_MMA 0
 __device__ __forceinline__ void mma_e4m3_16832(float (&d)[4], const unsigned (&a)[4],
                                                const unsigned (&b)[2]) {
+    mma_e4m3_16832_plain(d, a, b);
+}
+// No block-scaled instruction on this target: the host refuses MX mode (fp8gemm_mx_available)
+// and this body is never reached.
+template <int BID>
+__device__ __forceinline__ void mma_e4m3_16832_mx(float (&d)[4], const unsigned (&a)[4],
+                                                  const unsigned (&b)[2], unsigned, unsigned) {
     mma_e4m3_16832_plain(d, a, b);
 }
 #endif
