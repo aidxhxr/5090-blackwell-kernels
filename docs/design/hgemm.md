@@ -5,8 +5,10 @@ Source: `src/kernels/hgemm.cu` (variants 0 to 3), `src/kernels/hgemm_streamk.cu`
 `src/kernels/hgemm_tma.cu` (variant 5) and `src/kernels/hgemm_tma_sk.cu` (variant 6), with the
 pieces they share in private headers: the `cp.async` tile of variants 3 and 4 in
 `hgemm_tile.cuh`, the Stream-K schedule of variants 4 and 6 in `hgemm_streamk.cuh`, the TMA
-tile of variants 5 and 6 in `hgemm_tma_tile.cuh`. Bench: `bench_hgemm` (validates every
-variant against cuBLAS).
+tile of variants 5 and 6 in `hgemm_tma_tile.cuh`, and the fused epilogue of variants 4 and 6
+(bias, activation, residual, the interleaved gate/up SwiGLU) in `hgemm_epilogue.cuh`. Bench:
+`bench_hgemm` (validates every variant against cuBLAS, and the fused rows against the fused
+math on cuBLAS's fp32 result).
 
 ## Why WMMA / mma.sync on these GPUs
 
@@ -979,6 +981,168 @@ Everything else is v4 and v5 unchanged, which is what factoring them into header
 The clock told the last part of the story: at 600 W the card runs this kernel 53 MHz faster
 than v5 because the DRAM is nearly idle.
 
+### Fused epilogues: bias, activation, residual, and the gate/up pair
+
+Source: `src/kernels/hgemm_epilogue.cuh`, applied in `hgemm_tma_sk.cu` (v6),
+`hgemm_tile.cuh` (v4's tiles) and `hgemm_decode.cu`; the options are the `HgemmEpilogue`
+argument of `hgemm_bf16` in `include/spark/kernels.h`, and `hgemm(a, b, bias=, act=,
+residual=, out=)` and `hgemm_swiglu(a, w_gate_up)` in Python.
+
+Every rung so far stores `C = A B` as bf16 straight from the accumulators, and a decoder
+block then runs more kernels over C: a bias add on some models, the residual add after
+`o_proj` and `down_proj`, and `silu(gate) * up` between the MLP's two projections and its
+third. Each of those is a pass over an activation-sized tensor, and at decode sizes each is
+a launch on top of a 23 us GEMM. The accumulators are fp32 and already in registers when
+the GEMM ends, so the epilogue can do all of it before the one rounding to bf16:
+
+```
+x = acc + bias[col]                      bias: [N] bf16, per column of B
+y = act(x)                               none, silu, gelu (tanh form), relu
+y = silu(x[2j]) * x[2j+1]                swiglu: instead of act, see below
+C = bf16(y + residual[row][col])         residual: [M][N] bf16; residual == C is C += ...
+```
+
+The default `HgemmEpilogue` is the plain store and every existing call is unchanged. The
+fused options run on variants 4 and 6 (which share the code), and a request for one on
+another variant, or on a shape those two refuse, throws `std::invalid_argument`, a
+`ValueError` from Python. Variant 6 routes some shapes to variant 4's tiles and the decode
+shapes to `hgemm_decode.cu`, so the epilogue lives in each of those and in the Stream-K
+fixup, where the piece that ends a tile's chain applies it after adding the slot: the
+partials that pass through the slot are plain fp32 sums, so bias, activation and residual
+happen once, on the finished sum, and the output is still the same bits every run
+(`test_hgemm_epilogue_is_deterministic` checks queue mode). In the decode kernel the storing
+thread applies it: the block itself when K is not split, the last K-slice to arrive at a
+strip when it is, from the fp32 workspace.
+
+#### The interleaved gate/up layout
+
+HF Llama stores `gate_proj` and `up_proj` as two `[N][K]` weights; a model runs two GEMMs
+over the same A and a third kernel over the two results. One GEMM over a `[K][2N]` weight
+reads A once, but the tile that owns gate column j has to see up column j in the same
+epilogue, and with the two halves side by side those columns are 11008 apart, in another
+tile. So the weight is permuted once at load time: column `2j` is `gate_j` and column
+`2j+1` is `up_j` (`spark_kernels.interleave_gate_up(w_gate, w_up)`, a `stack` and a
+`reshape`; the same helper interleaves a bias). The `mma.sync` accumulator layout gives each
+lane columns `(c, c+1)` of an n8 tile, an adjacent pair, so gate and up of the same output
+element land in one lane's register pair whatever the block or warp tile, and the epilogue
+forms `silu(g) * u` in fp32 without touching shared memory. The output has N columns for a
+2N-wide B. The only cost of the pair layout is the store width: each lane ends up with one
+output element per row instead of two adjacent ones. The lanes `2q` and `2q+1` of a quad
+hold columns `j` and `j+1` of the same two rows, so one `__shfl_xor_sync(1)` per fragment
+gives the even lane the odd lane's upper-row value and the odd lane the even lane's
+lower-row value, and each stores a whole `bfloat162`: the same 4-byte stores as the plain
+epilogue, half as many of them.
+
+#### Shape of the code, and the three things that made it cheap
+
+The first version applied the options per fragment: a runtime `switch` on the activation
+and an `if (swiglu)` inside the sixteen unrolled fragments of a warp tile, each fragment's
+residual loaded right before its store, and `__frcp_rn` for the sigmoid. It passed every
+shape and cost, at 4096^3 on v6, 33 us for `relu` alone, 45 for `gelu`, 81 for `residual`
+and 100 for the in-place accumulate, on a 556 us GEMM; the separate elementwise pass it was
+meant to replace costs 31 us. The v6 block runs nine warps per SM, so nothing hides latency
+behind other warps, and three things were exposed:
+
+* **Instruction fetch.** The per-element switch inlined every activation into every
+  fragment, a straight-line epilogue of about 10 K SASS instructions with the taken path
+  threaded through all of it. The shipped version makes the activation and the SwiGLU flag
+  template parameters of the warp-tile loop (`store_warp_tile_mode<Mode<ACT, SWIGLU>>`) and
+  picks the instantiation with one uniform branch per tile (`dispatch`), so the executed
+  path is one compact loop. `relu` went from 33 us to 6.
+* **One DRAM round trip per fragment.** Each fragment's residual load was followed by its
+  store before the next fragment's load. Now the bias of the lane's four column pairs and
+  the residual of all sixteen fragments are loaded into registers first (`Pre`, 40
+  registers), and in v6 that happens before the k-loop of any piece that will store its
+  tile (the piece knows: `ke == KT`), so the round trip hides under the mma work. The
+  fused v6 kernel takes 167 registers against the plain one's 160 with no spills, at one
+  block per SM where the budget is 224. `residual` went from 81 us to 20 with the loads
+  hoisted to the top of the epilogue, and to 13 with them above the k-loop. Variant 4's
+  tile cannot do that: it runs two blocks per SM at 121 to 128 registers, and 40 more live
+  across its mainloop would cost the second block, so it loads at the store and pays the
+  round trip (18 us at 1000x4096x4096 when variant 4 is asked for by name; the default
+  route takes that shape through v6 for 2.4 us). The shapes v6 hands to variant 4's tiles
+  are the small and the N % 128 != 0 ones, where the tile is a few microseconds.
+* **A subroutine per element.** `__frcp_rn` (and a plain `/`) is the correctly rounded
+  reciprocal, which ptxas lowers to `MUFU.RCP`, two Newton steps and a slow-path `CALL`;
+  sixty-four of those per lane serialized the loop, and `gelu` still cost 57 us after the
+  first two fixes. `silu` is `__fdividef(x, 1 + __expf(-x))`, `MUFU.EX2`, `MUFU.RCP` and a
+  multiply, and the tanh-form `gelu` is the same function of `2u` with
+  `u = sqrt(2/pi) (x + 0.044715 x^3)`, since `0.5 x (1 + tanh(u)) = x sigmoid(2u)`. Both
+  are within 2 ulp of fp32, far under the bf16 rounding that follows.
+
+The plain instantiation is a separate template so the plain path is unchanged; its 4096^3,
+2048^3 and decode numbers were re-measured after the change (246.5 TFLOPS, 224.3, 23.5 us).
+
+#### Traffic arithmetic
+
+What the fusion takes off the bus, per call, for an `[M][N]` output in bf16:
+
+| form | unfused | fused | removed |
+|---|---|---|---|
+| bias, act, residual | GEMM writes C (2MN), the pass reads C (2MN) and the residual (2MN), writes out (2MN) | reads the residual (2MN), writes out (2MN) | 4MN bytes, one launch |
+| swiglu, from two `[K][N]` weights | two GEMMs read A twice, write gate and up (4MN), swiglu reads both (4MN), writes out (2MN) | reads A once, writes out (2MN) | 8MN bytes + one read of A, two launches |
+
+At 4096x4096 that is 67 MB per call for the first form and 360 MB for the SwiGLU form at
+4096x11008 (plus 32 MB of A, mostly from L2). The written C of the unfused sequence is
+still in L2 when the pass reads it (32 MB against 96 MB), so on the prefill shapes the
+removed bytes are mostly L2 traffic and the saving is the pass's own time; on the decode
+shapes the output is a few hundred KB and the saving is the launch.
+
+#### Measured
+
+`bench_hgemm --iters=50` with the epilogue flags, one session, variant 6 (the default
+route: the TMA tile for the 4096-row shapes, the decode kernel for the 16-row ones). "plain"
+is the same GEMM with the plain store; "unfused ours" is the plain GEMM followed by a
+separate elementwise pass (bias, activation, residual) or, for SwiGLU, two GEMMs over the
+un-interleaved halves and `swiglu_bf16`; "unfused cuBLAS" is the same sequence with
+`cublasGemmEx`. "torch" is eager PyTorch from `scripts/bench_torch.py` (`F.gelu(F.linear(a,
+b.t(), bias))`, `torch.addmm(res, a, b)`, `F.silu(a @ g) * (a @ u)`), timed next to the
+fused call through the extension. Times in microseconds; "removed" is the DRAM traffic the
+fusion takes off the bus per call (the table above).
+
+| M x N x K | epilogue | plain | fused | epilogue cost | unfused ours | unfused cuBLAS | saved vs unfused ours | torch | fused vs torch | removed |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 4096 x 4096 x 4096 | bias + gelu | 563.8 | 574.0 | +10.2 | 585.3 | 628.4 | 11.3 (2%) | 688.5 | 1.19x | 67 MB |
+| 4096 x 4096 x 4096 | residual | 565.3 | 578.0 | +12.7 | 600.4 | 641.2 | 22.4 (4%) | 713.1 | 1.24x | 67 MB |
+| 4096 x 4096 x 4096 | accumulate (C += A B) | 565.4 | 574.1 | +8.7 | 598.8 | 641.1 | 24.6 (4%) | | | 67 MB |
+| 4096 x 4096 x 4096 | bias + silu + residual | 565.8 | 583.7 | +17.9 | 602.7 | 641.0 | 19.0 (3%) | | | 67 MB |
+| 4096 x 11008 x 4096 | bias + gelu | 1521.2 | 1545.1 | +23.9 | 1620.5 | 1647.2 | 75.4 (5%) | 2021.7 | 1.30x | 180 MB |
+| 4096 x 11008 x 4096 | residual | 1522.0 | 1545.8 | +23.8 | 1675.9 | 1697.5 | 130.1 (8%) | 1964.3 | 1.26x | 180 MB |
+| 4096 x 22016 x 4096 | swiglu, C is [4096][11008] | 3044.5 | 3038.6 | -5.9 | 3221.1 | 3319.4 | 182.5 (6%) | 3481.3 | 1.13x | 361 MB + A |
+| 16 x 4096 x 4096 | bias + gelu | 23.5 | 23.5 | 0.0 | 24.4 | 30.7 | 1.0 (4%) | 35.2 | 1.34x | 0.3 MB |
+| 16 x 4096 x 4096 | residual | 23.6 | 23.5 | -0.1 | 23.6 | 30.8 | 0.2 (1%) | 33.2 | 1.27x | 0.3 MB |
+| 16 x 4096 x 4096 | bias + silu + accumulate | 23.6 | 23.5 | -0.1 | 25.5 | 30.9 | 2.0 (8%) | | | 0.3 MB |
+| 16 x 11008 x 4096 | bias + gelu | 56.2 | 56.4 | +0.2 | 58.2 | 61.7 | 1.8 (3%) | 68.1 | 1.15x | 0.7 MB |
+| 16 x 11008 x 4096 | residual | 56.3 | 56.4 | +0.1 | 58.4 | 63.4 | 2.0 (4%) | 66.1 | 1.12x | 0.7 MB |
+| 16 x 22016 x 4096 | swiglu, C is [16][11008] | 113.5 | 113.3 | -0.2 | 114.5 | 120.2 | 1.2 (1%) | 123.9 | 1.08x | 1.4 MB + A |
+
+Every row passes the check against the fused math on cuBLAS's fp32 result (2% of max|ref|
+plus 1e-3, the plain rows' form), including the in-place accumulate, which the bench runs
+from a fresh copy of the residual.
+
+What the numbers say:
+
+* On the prefill shapes the epilogue costs 9 to 24 us on the TMA tile, 1.5 to 3% of the
+  GEMM, and that is the cost of a heavier store: the residual read is 32 MB from DRAM at
+  4096^2 (21 us at the copy rate if nothing hid it; the prefetch above the k-loop hides most
+  of it) and the bias and activation are a few instructions per element. The saving is the
+  separate pass minus that: 11 to 25 us at 4096^2, 75 to 130 at 4096 x 11008. Against
+  eager PyTorch it is 1.2 to 1.3x; `torch.addmm(res, a, b)` is one cuBLAS call with beta = 1,
+  but torch copies the residual into the output first, so it moves the same bytes as our
+  unfused pair and then some.
+* The SwiGLU form is free at prefill: 3038.6 fused against 3044.5 plain is within the run
+  to run noise, because the epilogue stores half the bytes of the plain [M][2N] output and
+  the 45 M `silu` calls are a few microseconds of SFU work spread over 170 SMs. What it
+  saves is the two-GEMM, one-kernel sequence a model runs today: 183 us (6%) against ours,
+  281 against cuBLAS's GEMMs, 443 (13%) against eager torch. One read of A instead of two
+  is part of that: 32 MB, mostly from L2.
+* On the decode shapes the epilogue costs nothing measurable: the kernel is the weight
+  stream and the output is a few hundred KB. The saving is the launch that is gone, 1 to 2
+  us per call on 23.5 to 113 us (1 to 8%), and 1.1 to 1.3x against eager torch, whose add
+  and activation are two launches more. A decoder layer has four of these GEMMs, so a fused
+  Llama-7B layer at 16 tokens is about 6 us and four launches shorter per layer, 32 layers
+  deep.
+
 ## Correctness
 
 Inputs uniform in [-1, 1]. cuBLAS (`cublasGemmEx`, `CUBLAS_COMPUTE_32F`, bf16 in/out) is the
@@ -1100,6 +1264,13 @@ Done in v6:
   at 8192³ against a serialized producer. The slot traffic stays, as expected.
 - Two schedule constants re-swept for 170 blocks in flight: static ranges at any wave count
   when the operands fit in L2, and the L2-footprint raster group.
+
+Done after v6, on the same kernels ("Fused epilogues" above):
+
+- Bias, activation, residual (or in-place accumulate) and the interleaved gate/up SwiGLU
+  applied in fp32 from the accumulators, in the TMA tile, the Stream-K finisher, variant 4's
+  tiles and the decode kernel, with the plain instantiations untouched. The separate passes
+  and their launches are gone from the decoder block's GEMMs.
 
 Still open:
 

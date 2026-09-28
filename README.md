@@ -131,6 +131,34 @@ stages, and the stage counters run on across pieces, so it is loading the next p
 consumers finish the last one's epilogue. It is the fastest rung on every shape it takes and
 the Python default.
 
+The epilogue then took on the kernels that used to follow the GEMM. The accumulators are fp32
+and in registers when a tile ends, so bias, an activation (silu, gelu, relu), the residual add
+(or `C += A B` in place) and the SwiGLU product are applied there, before the one rounding to
+bf16: `hgemm(a, b, bias=, act=, residual=)` and `hgemm_swiglu(a, w)`. The SwiGLU form takes
+one `[K, 2N]` weight with gate and up interleaved column by column
+(`interleave_gate_up(w_gate, w_up)`, once at load time), so gate_j and up_j land in the same
+lane's register pair whatever the tile, and one GEMM reads A once where a model runs two GEMMs
+and a third kernel. The same epilogue runs in the Stream-K finishing piece, in variant 4's
+tiles and in the decode kernel, so every shape the default variant takes gets it.
+
+| M x N x K | epilogue | plain GEMM | fused | unfused, ours | torch eager | vs torch |
+|---|---|---|---|---|---|---|
+| 4096 x 4096 x 4096 | bias + gelu | 564 us | 574 us | 585 us | 689 us | 1.19x |
+| 4096 x 4096 x 4096 | residual | 565 us | 578 us | 600 us | 713 us | 1.24x |
+| 4096 x 11008 x 4096 | residual | 1522 us | 1546 us | 1676 us | 1964 us | 1.26x |
+| 4096 x 22016 x 4096 | swiglu, C is [4096][11008] | 3045 us | 3039 us | 3221 us | 3481 us | 1.13x |
+| 16 x 4096 x 4096 | bias + gelu | 23.5 us | 23.5 us | 24.4 us | 35.2 us | 1.34x |
+| 16 x 22016 x 4096 | swiglu, C is [16][11008] | 113.5 us | 113.3 us | 114.5 us | 123.9 us | 1.08x |
+
+"unfused, ours" is the plain GEMM followed by a separate pass, or two GEMMs and the swiglu
+kernel; "torch eager" is `F.gelu(F.linear(...))`, `torch.addmm` and `F.silu(a @ g) * (a @ u)`.
+The epilogue costs 1.5 to 3% of a prefill GEMM (the residual read and the activation) and
+nothing measurable on a decode shape, where the saving is the launch that is gone. The
+SwiGLU form is free at prefill and saves the second GEMM's read of A and the two intermediate
+tensors: 183 us at 4096 tokens. The design note has the full table, and how the first version
+of this epilogue cost 33 us for a `relu` (instruction fetch on nine warps per SM) before it
+was restructured.
+
 | M x N x K | v0 | v1 | v2 | v3 | v4 | v5 | v6 | cuBLAS | v6 / cuBLAS | vs torch |
 |---|---|---|---|---|---|---|---|---|---|---|
 | 1024 x 1024 x 1024 | 30 | 49 | 54 | 123 | 123 |  | **124** | 122 | 101.9% | 0.87x |
@@ -359,7 +387,7 @@ described above, not the kernel.
 | `swiglu` | scalar, 128-bit vectorized | PyTorch eager, two kernels |
 | `softmax` | three pass, warp online softmax, block online softmax, row in registers | `torch.softmax` |
 | `sgemm` fp32 | naive, smem tile, 8x8 register tile, cp.async, register prefetch with swizzle, 256x128 tile | cuBLAS SGEMM |
-| `hgemm` bf16 | WMMA, smem tile, cp.async, `mma.sync` + `ldmatrix` with swizzle and split-K, Stream-K, TMA, TMA on Stream-K; a weight-streaming kernel for decode | cuBLAS GemmEx |
+| `hgemm` bf16 | WMMA, smem tile, cp.async, `mma.sync` + `ldmatrix` with swizzle and split-K, Stream-K, TMA, TMA on Stream-K; a weight-streaming kernel for decode; fused bias / activation / residual / SwiGLU epilogues | cuBLAS GemmEx; eager `addmm`, `F.gelu`, `F.silu * up` |
 | `fp8gemm` e4m3 | naive `mma.sync.m16n8k32`, the swizzled cp.async tile with a 64x64 warp tile and decode configs, TMA; all on the block-scaled instruction | cuBLASLt, `torch._scaled_mm` |
 | `attention` bf16 | warp per row, CUDA-core flash attention, `mma.sync` flash attention, split-KV tail, TMA mbarrier pipeline, persistent tile queue with a producer warp; GQA and a flash-decoding kernel | `F.scaled_dot_product_attention` |
 | `rope_append` bf16 | RoPE on q and k plus the K/V cache append from a fused q\|k\|v projection, one launch | the torch spelling, ten kernels |
@@ -410,6 +438,9 @@ out = sk.add_rmsnorm_(x, resid, w)         # resid += x, then norm, in place
 h = sk.swiglu(gate, up)
 p = sk.softmax(scores)
 c = sk.hgemm(a_bf16, b_bf16)               # bf16 tensor-core GEMM
+c = sk.hgemm(a_bf16, b_bf16, bias=bias, act="gelu", residual=r)  # fused epilogue, one kernel
+w = sk.interleave_gate_up(w_gate, w_up)    # [K, 2N], once at load time
+h = sk.hgemm_swiglu(a_bf16, w)             # silu(a @ w_gate) * (a @ w_up), one GEMM, A read once
 c = sk.fp8gemm(a_e4m3, w_e4m3, sa, sb)     # sa * sb * a @ w.T, w is [N, K] as nn.Linear stores it
 o = sk.attention(q, k, v, causal=True)     # q is [B, H, S, D] bf16; k and v may have fewer heads
 q = sk.rope_append_(qkv, cos, sin, k_cache, v_cache, pos, 32, 8)  # RoPE; q head-major; k, v into the cache
