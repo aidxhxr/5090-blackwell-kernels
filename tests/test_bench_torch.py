@@ -34,6 +34,16 @@ def test_gemm_shapes_match_the_cpp_defaults():
         assert [tuple(flat[i:i + 3]) for i in range(0, len(flat), 3)] == shapes
 
 
+def test_hgemm_fused_rows_match_the_cpp_defaults():
+    # bench_hgemm.cu's fused_rows: {{M, N, K}, "tag"} entries; bench_torch times the same list
+    src = (ROOT / "src" / "bench" / "bench_hgemm.cu").read_text()
+    m = re.search(r"fused_rows\[\] =\s*\{(.*?)\};", src, re.S)
+    assert m, "fused_rows not found in bench_hgemm.cu; update this test and bench_torch.py"
+    cpp = [(int(a), int(b), int(c), tag)
+           for a, b, c, tag in re.findall(r"\{\{(\d+), (\d+), (\d+)\}, \"([^\"]+)\"\}", m.group(1))]
+    assert cpp == bench_torch.HGEMM_FUSED
+
+
 def test_clock_ramp_spins_once_for_the_whole_process(monkeypatch):
     monkeypatch.setattr(bench_torch.torch.cuda, "synchronize", lambda: None)
     monkeypatch.setattr(bench_torch, "RAMP_MS", 20)

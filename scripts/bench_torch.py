@@ -38,6 +38,15 @@ HGEMM_SHAPES = [(1024, 1024, 1024), (2048, 2048, 2048), (4096, 4096, 4096), (819
                 (1, 4096, 4096), (16, 4096, 4096), (32, 4096, 4096), (64, 4096, 4096),
                 (16, 11008, 4096), (64, 4096, 11008)]
 FP8GEMM_SHAPES = HGEMM_SHAPES  # bench_fp8gemm.cu times bench_hgemm's list
+# The fused-epilogue rows of bench_hgemm.cu (`fused_rows`): (M, N, K, tag), N the width of
+# b, so the swiglu rows have N = 2 x 11008 and an [M, 11008] output. The torch side is the
+# eager sequence a model runs without the fusion: F.linear + F.gelu, torch.addmm, and two
+# GEMMs + F.silu * up for the gate/up pair.
+HGEMM_FUSED = [(4096, 4096, 4096, "bias+gelu"), (4096, 4096, 4096, "residual"),
+               (4096, 11008, 4096, "bias+gelu"), (4096, 11008, 4096, "residual"),
+               (4096, 22016, 4096, "swiglu"), (16, 4096, 4096, "bias+gelu"),
+               (16, 4096, 4096, "residual"), (16, 11008, 4096, "bias+gelu"),
+               (16, 11008, 4096, "residual"), (16, 22016, 4096, "swiglu")]
 # (B, H_q, H_kv, S_q, S_kv, D, causal): the timed shapes of bench_attention.cu (its small
 # validation shapes are timed there too but are not worth a torch line). H_kv < H_q is
 # grouped-query attention (Llama-3-8B is 32/8), which torch's SDPA takes with enable_gqa=True.
@@ -164,6 +173,68 @@ def bench_hgemm(sk, add, M, N, K):
     add("hgemm", "bf16", gemm_shape(M, N, K), ours, ref, tflops=2.0 * M * N * K / ours / 1e9)
 
 
+def bench_hgemm_fused(sk, add, M, N, K, tag):
+    """One fused-epilogue row: ours in one kernel against eager torch's sequence, with our own
+    unfused sequence (sk.hgemm then torch's add / our swiglu) as a third number."""
+    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    copies = (256 << 20) // (K * N * 2) + 1 if M <= 64 else 1
+    bs = [torch.randn(K, N, device="cuda", dtype=torch.bfloat16) for _ in range(copies)]
+    turn = [0]
+
+    def next_b():
+        b = bs[turn[0] % copies]
+        turn[0] += 1
+        return b
+
+    if tag == "swiglu":
+        # The interleaved weight is the same bytes as gate and up side by side; the eager
+        # form runs the two projections separately, as an HF Llama MLP does.
+        gates = [b[:, 0::2].contiguous() for b in bs]
+        ups = [b[:, 1::2].contiguous() for b in bs]
+
+        def next_gu():
+            i = turn[0] % copies
+            turn[0] += 1
+            return gates[i], ups[i]
+
+        ours = time_ms(lambda: sk.hgemm_swiglu(a, next_b()))
+
+        def unfused():
+            g, u = next_gu()
+            return sk.swiglu(sk.hgemm(a, g), sk.hgemm(a, u))
+
+        def eager():
+            g, u = next_gu()
+            return F.silu(a @ g) * (a @ u)
+
+    elif tag == "bias+gelu":
+        bias = torch.randn(N, device="cuda", dtype=torch.bfloat16)
+        ours = time_ms(lambda: sk.hgemm(a, next_b(), bias=bias, act="gelu"))
+
+        def unfused():
+            return F.gelu(sk.hgemm(a, next_b()) + bias, approximate="tanh")
+
+        def eager():  # F.linear takes the weight as [N, K]; b.t() is that without a copy
+            return F.gelu(F.linear(a, next_b().t(), bias), approximate="tanh")
+
+    elif tag == "residual":
+        res = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+        ours = time_ms(lambda: sk.hgemm(a, next_b(), residual=res))
+
+        def unfused():
+            return sk.hgemm(a, next_b()) + res
+
+        def eager():
+            return torch.addmm(res, a, next_b())
+
+    else:
+        raise ValueError(f"unknown fused row tag {tag!r}")
+    unfused_ms = time_ms(unfused)
+    ref = time_ms(eager)
+    add("hgemm", "bf16", gemm_shape(M, N, K) + "+" + tag, ours, ref,
+        tflops=2.0 * M * N * K / ours / 1e9, unfused_ms=unfused_ms)
+
+
 def bench_fp8gemm(sk, add, M, N, K):
     # a [M, K] and b_t [N, K] e4m3, per-tensor fp32 scales, bf16 out. torch._scaled_mm is
     # cuBLASLt and takes b_t.t() (column-major [K, N]), the same bytes in the same layout.
@@ -265,9 +336,9 @@ def main() -> int:
     ap.add_argument("--sdpa-backend", choices=["flash", "cudnn", "efficient", "math"],
                     help="force this SDPA kernel for the attention rows instead of torch's own "
                          "choice (the default, which the JSON records as torch_backend)")
-    ap.add_argument("--only", choices=["attention"],
+    ap.add_argument("--only", choices=["attention", "hgemm_fused"],
                     help="time only this kernel's rows (with --sdpa-backend: the attention "
-                         "rows against that kernel)")
+                         "rows against that kernel; hgemm_fused: the fused-epilogue rows)")
     ap.add_argument("--iters", type=positive_int, default=ITERS,
                     help="timed iterations per op (default: %(default)s, same as the C++ benches)")
     ap.add_argument("--warmup", type=non_negative_int, default=WARMUP,
@@ -290,7 +361,8 @@ def main() -> int:
     device = torch.cuda.get_device_name()
     print(f"device: {device} | cc {torch.cuda.get_device_capability()}", file=sys.stderr)
 
-    def add(kernel, dtype, shape, ours_ms, torch_ms, gbps=None, tflops=None, backend=None):
+    def add(kernel, dtype, shape, ours_ms, torch_ms, gbps=None, tflops=None, backend=None,
+            unfused_ms=None):
         r = {
             "device": device,
             "kernel": kernel,
@@ -306,13 +378,20 @@ def main() -> int:
             r["tflops"] = tflops
         if backend:
             r["torch_backend"] = backend  # which SDPA kernel torch picked for this shape
+        if unfused_ms is not None:
+            r["spark_unfused_ms"] = unfused_ms  # our GEMM followed by the separate op(s)
         rows_out.append(r)
         print(
             f"{kernel:12s} {dtype:5s} {shape:26s} spark {ours_ms:9.4f} ms  torch {torch_ms:9.4f} ms"
-            f"  x{r['speedup']:.2f}" + (f"  ({backend})" if backend else ""),
+            f"  x{r['speedup']:.2f}" + (f"  ({backend})" if backend else "")
+            + (f"  (unfused ours {unfused_ms:.4f} ms)" if unfused_ms is not None else ""),
             file=sys.stderr,
         )
 
+    if args.only == "hgemm_fused":
+        for M, N, K, tag in HGEMM_FUSED:
+            bench_hgemm_fused(sk, add, M, N, K, tag)
+        return 0
     if args.only != "attention":
         for dtype in (torch.float32, torch.bfloat16):
             for rows, cols in RMSNORM_SHAPES:
@@ -325,6 +404,8 @@ def main() -> int:
             bench_sgemm(sk, add, M, N, K)
         for M, N, K in HGEMM_SHAPES:
             bench_hgemm(sk, add, M, N, K)
+        for M, N, K, tag in HGEMM_FUSED:
+            bench_hgemm_fused(sk, add, M, N, K, tag)
         for M, N, K in FP8GEMM_SHAPES:
             bench_fp8gemm(sk, add, M, N, K)
     for B, Hq, Hkv, Sq, Skv, D, causal in ATTENTION_SHAPES:
