@@ -1,7 +1,9 @@
 # SGEMM (fp32): the optimization ladder
 
 `C[M,N] = A[M,K] · B[K,N]`, row-major, fp32 in/out, fp32 accumulate. Every rung accepts arbitrary
-`M, N, K ≥ 1`. Source: `src/kernels/sgemm.cu`; bench: `src/bench/bench_sgemm.cu`.
+`M, N, K ≥ 1`. Source: `src/kernels/sgemm.cu` (rungs 0 to 5, CUDA cores) and
+`src/kernels/sgemm_tf32.cu` (variants 6 and 7, the tensor cores in TF32 and 3xTF32, a
+different precision contract and opt-in); bench: `src/bench/bench_sgemm.cu`.
 
 The point of this ladder is not to beat cuBLAS. It is to show, one change at a time, *which*
 bottleneck each classic GEMM optimization removes, and to measure it on the RTX 5090 (primary
@@ -13,6 +15,7 @@ target) and later on the GB10.
 |---|---|---|
 | FP32 lanes | 170 SMs × 128 | 48 SMs × 128 at ≈ 2.42 GHz |
 | fp32 peak (CUDA cores, no tensor cores) | **123.4 TFLOPS measured** (`bench_peak`, FMA chains at 2,976 MHz; the 104.8 TFLOPS spec figure assumes 2.41 GHz) | **≈ 31 TFLOPS** |
+| tf32 peak (tensor cores, `mma.sync.m16n8k8`, variants 6 and 7 only) | **129.4 TFLOPS measured** at 2,977 MHz, half the bf16 rate | not measured |
 | memory | 1,792 GB/s GDDR7 | 273 GB/s LPDDR5X |
 | fp32 ridge point | 123.4e12 / 1,792e9 ≈ **69 FLOP/byte** | 31e12 / 273e9 ≈ **114 FLOP/byte** |
 
@@ -166,6 +169,279 @@ The fix took rung 4 from 49.6 to 60.6 TFLOPS at 4096³ in the tuning run, but ru
 55.0 to 56.9: with 245 registers and one block per SM there is no second block to soak up the
 issue slots a straggling slice leaves idle, and 4096³ at one block per SM is more sensitive to
 per-block latency than the 2048³ shape. I have not profiled the tail phase itself yet.
+
+## Variants 6 and 7: tensor cores (TF32 and 3xTF32)
+
+Everything above runs on the CUDA cores and stops at the shared-memory wall. The tensor
+cores take fp32 words too, as TF32: the `mma.sync.m16n8k8.row.col.f32.tf32.tf32.f32`
+instruction (sm_80 and up, present on sm_120) reads fp32 registers, ignores the low 13
+mantissa bits of each operand and accumulates in fp32. That is a different precision
+contract, the one cuBLAS runs under `CUBLAS_TF32_TENSOR_OP_MATH` and torch under
+`allow_tf32`, so these two rungs are opt-in: `variant = -1` stays on rung 5, the bench
+times both cuBLAS modes next to them, and the results scripts file their rows under the
+dtypes `tf32` and `3xtf32`. Source: `src/kernels/sgemm_tf32.cu`.
+
+| | rung 5 (CUDA cores) | variant 6 (TF32) | variant 7 (3xTF32) |
+|---|---|---|---|
+| operand precision | 24 significant bits | 11 (2^-11 relative per operand) | 22 (2^-22) |
+| tensor-core passes per product | none | 1 | 3 |
+| roof (`bench_peak`) | 123.4 TFLOPS fp32 FMA | 129.4 TFLOPS tf32 mma | 129.4 / 3 = 43.1 TFLOPS |
+| max abs error vs cuBLAS fp32, 4096³ | 3.5e-4 | 3.2e-2 (cuBLAS TF32: 3.2e-2) | 3.6e-3 |
+| 4096³, unlocked | 56 to 65 TFLOPS (the limiter decides) | 107.0 | 38.1 |
+
+### The instruction and its roof
+
+`m16n8k8` is 2,048 FLOP per instruction, half of the bf16 `m16n8k16`, and the RTX 5090 issues
+it at half the bf16 rate on top: `bench_peak` (`peak_tf32_mma`, register-resident operands,
+eight independent accumulator chains per warp) measures **129.4 TFLOPS at 2,977 MHz**,
+exactly half of the 258.8 TFLOPS bf16 row and 4.9% above the 123.4 TFLOPS fp32 FMA peak.
+So the tensor cores are not a 3x ceiling for fp32 work on this card, as they are on the
+datacenter parts; they are a 5% higher ceiling that the ladder can actually reach, because
+the mma does not go through the shared-memory wall: a warp reads 3 KB of fragments per 16
+mmas (32 KFLOP), 24 B per clock per SM at the tensor rate against 128 B per clock available,
+where the 8x8 SIMT micro-tile needed 1 B per FMA. And the mma keeps the clock up: the
+sustained fp32 FMA kernels trip the limiter at 1.9 to 2.2 GHz ("The 11008 shapes" above);
+a tensor kernel gets 2.7 to 2.9 GHz at the same 600 W.
+
+### Fragments for 32-bit operands
+
+The fragment layout of `m16n8k8` with 32-bit types is one element per register (PTX ISA,
+"Matrix Fragments for mma.m16n8k8", .tf32): with g = lane / 4 and c = lane % 4,
+
+```
+a0 = A[g][c]      a1 = A[g+8][c]      a2 = A[g][c+4]      a3 = A[g+8][c+4]
+b0 = B[c][g]      b1 = B[c+4][g]
+d0, d1 = C[g][2c], C[g][2c+1]         d2, d3 = C[g+8][2c], C[g+8][2c+1]
+```
+
+`ldmatrix` moves 8x8 matrices of 16-bit elements, 16 bytes per row. Read a 16-byte row as
+four fp32 and an 8x8 b16 matrix is 8 rows x 4 tf32; lane l receives the 32-bit word at (row
+l/4, word l%4) = element (g, c), exactly a0's position. So `ldmatrix.x4` on the A tile with
+matrix 0 = rows 0-7 at k chunk 0 (k 0..3), matrix 1 = rows 8-15 at chunk 0, matrix 2 = rows
+0-7 at chunk 1 (k 4..7), matrix 3 = rows 8-15 at chunk 1 lands a0..a3 in order, one
+instruction per m16 tile, and the lane address selectors are variant 3 of hgemm's, unchanged
+(`lane & 15` for the row, `lane >> 4` for the chunk). The A tile is stored row-major with BK
+= 16 fp32 = 64 B rows and the 64-byte XOR swizzle of the bf16 BK = 32 tile (chunk ^= (row/2)
+% 4), which is what keeps the eight row addresses of each matrix in eight bank groups.
+
+B cannot use `ldmatrix`: `.trans` transposes 16-bit halves, not 32-bit words, and no layout
+that `cp.async` can write (16-byte chunks moved as they are) puts B[c][g] and B[c+4][g] in
+one vector. So B is read with plain 32-bit-element loads, and the trick is *which* columns
+the warp's four n8 tiles own. The mma does not care what global column its label g is; if
+n-tile j, column g of a warp's 32-wide strip is declared to hold global column n0 + 4g + j,
+then lane (g, c) reads the `float4` at Bs[c][n0 + 4g .. 4g + 3] and gets b0 of all four
+tiles in one `LDS.128`, and the `float4` at row c + 4 gives the four b1. Two 128-bit loads
+per k8 step instead of eight 32-bit ones. The B tile is row-major (k rows of 512 B) with
+chunk ^= 2 (k % 8): a quarter-warp phase of an `LDS.128` is lanes g = 2q, 2q+1 with c = 0..3,
+i.e. two neighbouring chunks at four consecutive k rows, and XOR-ing with {0, 2, 4, 6} sends
+those eight accesses to eight bank groups. The permutation comes out in the epilogue for
+free: d0 of tile j is column 2c, global n0 + 8c + j, so gathering d0 across the four tiles
+gives four consecutive columns and the epilogue is two `float4` stores per row per lane, where
+the bf16 tile stores pairs.
+
+### Rounding
+
+A tf32 operand is whatever the register holds with 13 bits ignored. Feeding raw fp32 is
+truncation: a relative error of up to 2^-10 per operand, always toward zero, so a dot
+product of K terms carries a bias of about 2^-11 of its own value. Rounding to the nearest
+tf32 first halves the bound and removes the bias, and it is what cuBLAS does (its TF32 result
+has the same 3.2e-2 max error as this kernel's, not the 0.1 that truncation gives at 4096³).
+The fragments are rounded as they are loaded, 24 conversions per 16 mmas per warp. Which
+instruction does the rounding matters more than I expected: `cvt.rna.tf32.f32` (ties away,
+the sm_80 form) has no SASS instruction on sm_120 and expands to three (an FSETP for the
+NaN case, an IMAD of 0x1000 and a LOP3 mask), 144 instructions per 32 mmas; `cvt.rn.tf32.f32`
+(nearest even, sm_90 and up) is one `F2FP.TF32.F32`. The kernel does the same mmas either way;
+what changed is the clock (next section).
+
+### 3xTF32: the split
+
+Variant 7 recovers fp32-class operands with three mmas per product. Each fp32 x is split as
+
+```
+big   = tf32(x)             |x - big| <= 2^-11 |x|, and x - big is exact in fp32
+small = tf32(x - big)       |x - big - small| <= 2^-11 |x - big| <= 2^-22 |x|
+```
+
+so x = big + small + e with |e| <= 2^-22 |x|, and
+
+```
+a b = Ab Bb + Ab Bs + As Bb + As Bs + (terms in e)
+```
+
+The kernel accumulates the first three (small x big, big x small, then big x big, so the
+corrections are not swallowed by a partial sum 2^24 times larger); the dropped As Bs is at
+most 2^-22 |ab| and the e terms 2^-22 |ab| each, about 2^-20.4 relative per product against
+2^-24 for an fp32 FMA. Both are below the error of accumulating K products in fp32. What is
+left is the accumulator: the tensor core's fp32 adder is not an IEEE one (it aligns the
+eight products to the largest exponent and truncates), and the measured error grows linearly
+with K, 3.6e-3 max abs at 4096³ and 1.1e-2 at 8192³ (3.2e-5 and 6.6e-5 of max |C|), against
+3.5e-4 for rung 5 and 3.1e-2 for TF32. It passes the fp32 rows' tolerance with a 20x margin,
+and it is a tenth of the way from TF32 to fp32 on a log scale, not fp32 bit for bit.
+
+Three mmas per product puts its roof at a third of the tf32 peak, 43.1 TFLOPS; it measures
+38.1 at 4096³ and 38.5 at 8192³ in the 100-iteration sweep (40.1 in 20-iteration runs, before
+the clock settles), 88 to 93% of that roof and 57 to 60% of cuBLAS fp32 SGEMM. On this card, where
+tf32 runs at half the bf16 rate, 3xTF32 is a precision option, not a speed one: rung 5 is
+faster. The bf16 analogue (three bf16 mmas at 258.7 TFLOPS, 16-bit operands, 2^-16 per
+product) would sit at 86 TFLOPS, and is the version worth building if fp32-class accuracy
+at tensor-core speed is what is wanted.
+
+### Tolerances
+
+The bench checks every variant against cuBLAS fp32 (`CUBLAS_DEFAULT_MATH`). The fp32 rungs
+and 3xTF32 keep the existing bound, 2e-5 K + 1e-3 (summation order). TF32 gets 1% of
+max |C|: each operand carries up to 2^-11 relative error, a product up to 2^-10 |ab|, and a
+sum of K products up to K 2^-10 max|A| max|B| in the worst case (4 at K = 4096 for inputs in
+[-1, 1]); the rounding errors are independent, so the typical error is sqrt(K) 2^-11 rms(ab),
+1e-2 at K = 4096 against a max |C| of 113, and the measured maximum is 3.15e-2, for this
+kernel and for cuBLAS TF32 alike. The 1% check is 35 times the measured error and a hundredth
+of the worst case; a wrong k or a dropped chunk misses it by orders of magnitude. The pytest
+parity tests use the same reasoning against torch (`fp32_precision = "tf32"` / `"ieee"`),
+and additionally check that variant 6 agrees with torch's TF32 result to fp32 summation
+noise, i.e. the same rounding contract, and that variant 7 is at least ten times closer to
+fp32 than TF32 is.
+
+### The tile, and what was tried
+
+The block tile is hgemm variant 3's with 32-bit elements: 128x128x16, 8 warps as 2 x 4,
+64x32 warp tiles (4 x 4 m16n8 accumulators, 64 registers), a 3-stage `cp.async` ring of 16 KB
+stages (48 KB, two blocks per SM at 118 registers), split-K over the tiles of the last
+partial wave with fp32 atomics into a zeroed C as rungs 4 and 5 do, and a 64x128 tile when
+the 128-row one cannot fill a wave. `cp.async` zero-fills rows past M and columns past N,
+so any M, N, K works; a problem whose rows are not 16-byte multiples (N or K not a
+multiple of 4) takes a guarded register fill instead. Two things are new relative to the
+sgemm rungs above:
+
+* **The tail tiles are zeroed by one kernel launch**, not one `cudaMemset2DAsync` each. At
+  1024³ the 64x128 tile gives 128 tiles on 340 slots, every tile is a tail tile split two
+  ways, and 128 memsets cost 0.16 ms of launch overhead on a 0.05 ms GEMM (0.214 ms before,
+  0.053 after). Rungs 4 and 5 pay the same at their small shapes; it is why their 1024³ rows
+  read 47% of cuBLAS.
+* **Tiles are rastered in bands of 16 tile rows.** At 8192³ an fp32 operand is 256 MB; a
+  row-major wave of 340 tiles touches 5.3 tile rows of A (21 MB) and all of B, and re-reads
+  B from DRAM every wave, 3.3 GB per GEMM. A 16-row band makes a wave a 16 x 21 rectangle
+  (64 + 84 MB). The sweep at 8192³: bands of 1 / 4 / 8 / 16 / 32 / 64 rows give 10.48 / 10.35 /
+  10.35 / 10.35 / 10.46 / 10.53 ms. Worth 1.3%; Nsight has both orders at 92% L2 hit rate,
+  which is the number that says the row-major order was not far off on a 96 MB L2.
+
+The sweep, TF32, median of 30, unlocked (ms and TFLOPS at 4096³ / 8192³):
+
+| tile | warps | BK | stages | smem | blocks/SM | regs | 4096³ | 8192³ |
+|---|---|---|---|---|---|---|---|---|
+| **128x128** | **2x4** | **16** | **3** | **48 KB** | **2** | **118** | **1.281 / 107.3** | **10.00 / 110.0** |
+| 128x128 | 4x2 | 16 | 3 | 48 KB | 2 | 124 | 1.265 / 108.6 | 10.00 / 109.9 |
+| 256x128 | 4x2 | 16 | 3 | 72 KB | 1 | 190 | 1.334 / 103.0 | 10.04 / 109.5 |
+| 256x128 | 2x4 | 16 | 3 | 72 KB | 1 | 170 | 1.363 / 100.9 | 10.54 / 104.4 |
+| 256x128 | 4x2 | 32 | 2 | 96 KB | 1 | 194 | 1.349 / 101.9 | 10.28 / 107.0 |
+| 128x128 | 2x4 | 32 | 2 | 64 KB | 1 | 123 | 1.354 / 101.5 | 10.90 / 100.9 |
+| 128x128 | 2x4 | 16 | 4 | 64 KB | 1 | 119 | 1.423 / 96.6 | 11.45 / 96.0 |
+| 128x128, register prefetch, rounding once per element | 2x4 | 16 | 2 | 32 KB | 2 | 128 (capped) | 1.297 / 105.9 | 10.26 / 107.2 |
+
+(The first three rows and the last were measured with the one-instruction `cvt.rn`, the
+other four with the three-instruction `cvt.rna` of the first build; the ordering did not
+change between the two.)
+
+Two of those rows are the interesting negatives. cuBLAS's TF32 kernel on this card is
+`cutlass_80_tensorop_s1688gemm_256x128_16x3_nn_align4`: a 256x128 tile with 64x64 warp tiles,
+BK = 16, three stages, 74 KB, 217 registers, one block per SM. Its warp tile reads a third
+less shared memory per mma and converts a third fewer operands (1 per mma instead of 1.5), so
+I expected the 256x128 / 4x2 row to win on energy. It does not: with eight warps per SM and
+no fragment double-buffering, the latency the second block used to cover is exposed, and
+the two effects cancel. The register-prefetch row is rung 4's idea on this tile, loading
+the next slab into registers and rounding it once on the way into shared memory (16
+conversions per thread per slab instead of 48, and `ldmatrix` feeding the mma directly as in
+the bf16 tile); it loses 2 to 3% because one slab of prefetch distance behind a block barrier
+exposes more L2 latency than the 100 fewer instructions save.
+
+### Where the time goes
+
+Nsight Compute at its fixed clock (2.43 to 2.48 GHz), 4096³: tensor pipe 88.1% of peak
+sustained active, issue slots busy 25%, 3.75 warps per scheduler with 0.42 eligible, L2 hit
+95.4%, DRAM 7.6%, "waiting for the execution pipe" 62% of stall cycles. That is a kernel
+bound by the tensor pipe with the block barrier per stage as its overhead, the same 88 to
+92% hgemm variant 3 showed before TMA took it to 99%. At 8192³ ours is 10.99 ms against
+10.73 for cuBLAS TF32 at the same fixed clock, 2.4% apart, both with a 92% L2 hit rate; ours
+moves 259 GB/s against their 217 (two blocks per SM double the L2 working set of a wave).
+
+Unlocked the gap is 6%, and `nvidia-smi` sampled at 250 ms through a 300-iteration run
+at 8192³ says why:
+
+| phase | SM clock | board power | limiter |
+|---|---|---|---|
+| cuBLAS SGEMM, fp32 SIMT | 2,197 MHz | 556 W | SW power cap |
+| cuBLAS SGEMM, TF32 | 2,895 to 2,910 MHz | 600 W | SW power cap |
+| variant 6, `cvt.rna` build | 2,670 MHz | 600 W | SW power cap |
+| variant 6, `cvt.rn` build (shipped) | 2,745 MHz | 600 W | SW power cap |
+
+All three tensor-core rows sit at the 600 W cap; cuBLAS gets 8.6% more clock than the first
+build and 5.5% more than the shipped one, which is the 9% and the 6% of time. The instruction
+stream is the difference: the `cvt.rna` loop body was 296 SASS instructions per 32 HMMA (48
+FSETP, 62 IMAD, 65 MOV); with `cvt.rn` it is 250 (48 F2FP, 66 MOV). The MOVs are the B fragments: b0 comes from the `LDS.128` of k row c and b1
+from the one of row c + 4, and HMMA wants the pair in adjacent registers, so two moves per
+mma that no `cp.async`-writable layout removes. Swapping the rounding instruction took 8192³
+from 105.8 to 110.0 TFLOPS and 4096³ from 105.2 to 107.3 without changing a single mma,
+which is the clearest measurement in this repo of the limiter charging for ALU instructions.
+
+### Measured (RTX 5090, default sweep, median of 100, unlocked)
+
+TF32, variant 6, against both cuBLAS math modes:
+
+| shape | cuBLAS fp32 ms | cuBLAS TF32 ms / TFLOPS | v6 ms | v6 TFLOPS | % of tf32 peak | % of cuBLAS fp32 | % of cuBLAS TF32 | max abs err (v6 / cuBLAS TF32) |
+|---|---|---|---|---|---|---|---|---|
+| 512³ | 0.0146 | 0.0114 / 23.6 | 0.0377 | 7.1 | 5.5 | 38.7 | 30.2 | 9.4e-3 / 9.4e-3 |
+| 1024³ | 0.0450 | 0.0296 / 72.5 | 0.0513 | 41.8 | 32.3 | 87.7 | 57.7 | 1.41e-2 / 1.41e-2 |
+| 2048³ | 0.2449 | 0.2009 / 85.5 | 0.2181 | 78.8 | 60.9 | 112.3 | 92.1 | 2.18e-2 / 2.18e-2 |
+| 4096³ | 2.0537 | 1.3032 / 105.5 | **1.2848** | **107.0** | 82.7 | 159.8 | **101.4** | 3.15e-2 / 3.15e-2 |
+| 8192³ | 16.4233 | 9.4470 / 116.4 | **10.0294** | **109.6** | 84.7 | 163.8 | **94.2** | 4.75e-2 / 4.75e-2 |
+| 4096×4096×11008 | 5.4995 | 3.4740 / 106.3 | **3.4177** | **108.1** | 83.5 | 160.9 | **101.6** | 5.12e-2 / 5.12e-2 |
+| 4096×11008×4096 | 5.4411 | 3.2947 / 112.1 | **3.3357** | **110.7** | 85.6 | 163.1 | **98.8** | 3.18e-2 / 3.18e-2 |
+
+3xTF32, variant 7 (reference: cuBLAS fp32, the contract it claims):
+
+| shape | cuBLAS fp32 ms | v7 ms | v7 TFLOPS | % of tf32 peak / 3 | % of cuBLAS fp32 | max abs err (v7 / rung 5 where measured) |
+|---|---|---|---|---|---|---|
+| 512³ | 0.0146 | 0.0392 | 6.9 | 15.9 | 37.3 | 1.9e-5 / n/a |
+| 1024³ | 0.0451 | 0.0924 | 23.3 | 53.9 | 48.8 | 2.1e-4 / n/a |
+| 2048³ | 0.2460 | 0.5930 | 29.0 | 67.2 | 41.5 | 1.3e-3 / n/a |
+| 4096³ | 2.0702 | 3.6094 | 38.1 | 88.3 | 57.4 | 3.6e-3 / 3.5e-4 |
+| 8192³ | 16.4234 | 28.5668 | 38.5 | 89.3 | 57.5 | 1.1e-2 / n/a |
+| 4096×4096×11008 | 5.5598 | 9.6150 | 38.4 | 89.1 | 57.8 | 1.7e-2 / n/a |
+| 4096×11008×4096 | 5.4368 | 9.6376 | 38.3 | 88.9 | 56.4 | 3.7e-3 / n/a |
+
+Against torch (`scripts/bench_torch.py --only sgemm`, `torch.matmul` with
+`fp32_precision = "tf32"` for the TF32 row and `"ieee"` for the others):
+
+| shape | v6 (TF32) ms | torch TF32 ms | v6 / torch | v7 (3xTF32) ms | torch fp32 ms | v7 / torch |
+|---|---|---|---|---|---|---|
+| 2048³ | 0.2198 | 0.1911 | 0.87× | 0.5989 | 0.2596 | 0.43× |
+| 4096³ | 1.2903 | 1.3132 | 1.02× | 3.6107 | 2.1524 | 0.60× |
+| 8192³ | 10.0650 | 9.4945 | 0.94× | 28.5742 | 16.4351 | 0.58× |
+| 4096×4096×11008 | 3.4346 | 3.5064 | 1.02× | 9.6169 | 5.6293 | 0.59× |
+| 4096×11008×4096 | 3.3489 | 3.3115 | 0.99× | 9.6421 | 5.5765 | 0.58× |
+
+(512³ and 1024³ are 0.35× and 0.63× for TF32: the same under-one-wave and tail-split story as
+the SIMT rungs, with the 64x128 tile.)
+
+Targets and where they landed: TF32 at 4096³ and 8192³ is 83 to 85% of the 129.4 TFLOPS
+peak measured at 2,977 MHz, and 90 to 92% of the peak at the 2,745 MHz the kernel actually
+runs at under the power cap (129.4 x 2,745 / 2,977 = 119.3 TFLOPS); against cuBLAS TF32 it is
+101% at 4096³ and 94% at 8192³, and 160% of cuBLAS fp32 on every large shape. 3xTF32 at 40 TFLOPS is 93% of
+its own roof and 60% of the SIMT rung, not the 2x the tf32 rate would give on a card where
+tf32 is not half rate.
+
+### What remains here
+
+* **TMA and a producer warp** (hgemm variants 5 and 6). The barrier per stage and the
+  per-thread copy addressing are the 12% of the tensor pipe still idle at a fixed clock, and
+  fewer instructions per mma is the other half of the 6% at 8192³. The A box is a 128x16
+  fp32 tile with the 64-byte TMA swizzle, the same bits `swz_a` computes; B needs four 32-column
+  boxes of 128 B rows with the 128-byte swizzle, and with that swizzle the column permutation
+  has to change to n0 + 4 p(g) + j with p(g) = 4 (g % 2) + g / 2 to keep the `LDS.128` phases
+  conflict-free. Everything else transfers.
+* **A split accumulator for 3xTF32**: the big x big products in one accumulator and the two
+  corrections in another, summed once at the end, so the tensor core's truncation applies to
+  each at its own magnitude. 64 more registers, one block per SM.
+* **bf16x3** as the fast fp32-class option, at the full-rate 258.7 TFLOPS instruction.
 
 ## What Nsight Compute shows
 
@@ -379,7 +655,10 @@ All shapes, best rung per shape in bold (ms / TFLOPS / % of cuBLAS):
 | 4096×11008×4096 | 5.4645 / 67.59 | 7.3249 / 50.43 / 74.6% | 7.2536 / 50.92 / 75.3% | 7.0252 / 52.58 / 77.8% | **6.4446 / 57.31 / 84.8%** |
 
 Rungs 0 and 1 at the small shapes: v0 5.82 / 7.46 / 7.58 TFLOPS and v1 7.03 / 8.55 / 9.59 at
-512³ / 1024³ / 2048³. The Python default (`variant=-1`) is rung 5. Against PyTorch eager
+512³ / 1024³ / 2048³. The Python default (`variant=-1`) is rung 5; the tensor-core variants
+6 and 7 have their own tables in "Variants 6 and 7" above (107 to 111 TFLOPS for TF32 on the
+large shapes, 38 for 3xTF32) and the 8192³ shape is in the default sweep since they were
+added. Against PyTorch eager
 (`torch.matmul` in fp32, `results/torch_comparison.json`) that is 0.95× at 2048³, 0.90× at
 4096³ and 0.86–0.87× on the MLP shapes; torch's cuBLAS call is a little faster than the bench's
 `cublasSgemm` on the large shapes.
@@ -396,6 +675,9 @@ Rungs 0 and 1 at the small shapes: v0 5.82 / 7.46 / 7.58 TFLOPS and v1 7.03 / 8.
   print `min_ms` next to the median, which it now does; a results table that mixes 1.9 and
   2.6 GHz runs of the same kernel is not a kernel table.
 * **Small shapes**: a 64×64 tile or whole-problem split-K for 512³ / 1024³.
-* **TF32 tensor cores** would roughly triple the ceiling, but that is a different precision
-  contract (10-bit mantissa inputs), which is why cuBLAS is run without it here; it would be a
-  separate ladder, not a rung on this one.
+* **TF32 tensor cores** are variants 6 and 7 now ("Variants 6 and 7" above). On this card
+  they are a 5% higher ceiling than the CUDA cores, not the 3x of the datacenter parts, and
+  the win is that the mma neither hits the shared-memory wall nor trips the clock limiter:
+  107 to 111 TFLOPS on the large shapes against rung 5's 56 to 65. It is a different
+  precision contract (11-bit operands), so it stays opt-in and cuBLAS is timed in both
+  math modes.

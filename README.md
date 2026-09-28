@@ -378,6 +378,18 @@ shared memory, and cuBLAS SGEMM is stuck at the same wall at 54% of the measured
 reads 84 to 90% of cuBLAS, and at a locked clock it is 99 to 106%; the difference is the limiter
 described above, not the kernel.
 
+Variants 6 and 7 take the fp32 GEMM to the tensor cores. `mma.sync.m16n8k8` reads fp32
+registers as TF32 (11 significant bits) and measures 129.4 TFLOPS on this card, half the bf16
+rate and only 5% above the fp32 FMA peak; what it buys is that it needs 24 bytes of shared
+memory per clock instead of 128 and runs at 2.7 to 2.9 GHz where the FMA kernels are held at
+1.9 to 2.2. Variant 6 rounds the operands to TF32 as the fragments are loaded (`cvt.rn`, one
+instruction; the sm_80 `cvt.rna` is three here and cost 4% of clock) and does 107 to 111
+TFLOPS on the large shapes, 160% of cuBLAS SGEMM and 94 to 102% of cuBLAS in its own TF32
+mode, with the same 3e-2 error against fp32 that cuBLAS TF32 has. Variant 7 splits each
+operand into two TF32 parts and does three passes (3xTF32), which brings the error back to
+4e-3 at a third of the rate, 38 TFLOPS. Both are opt-in, as torch's `allow_tf32` is: the
+default stays on the CUDA cores.
+
 ## what's here
 
 | kernel | ladder | reference |
@@ -386,13 +398,13 @@ described above, not the kernel.
 | `rmsnorm`, `add_rmsnorm` | thread per row, warp per row, 128-bit loads, block per row, row in registers | PyTorch eager |
 | `swiglu` | scalar, 128-bit vectorized | PyTorch eager, two kernels |
 | `softmax` | three pass, warp online softmax, block online softmax, row in registers | `torch.softmax` |
-| `sgemm` fp32 | naive, smem tile, 8x8 register tile, cp.async, register prefetch with swizzle, 256x128 tile | cuBLAS SGEMM |
+| `sgemm` fp32 | naive, smem tile, 8x8 register tile, cp.async, register prefetch with swizzle, 256x128 tile; TF32 and 3xTF32 on the tensor cores (opt-in) | cuBLAS SGEMM, in fp32 and in TF32 math mode |
 | `hgemm` bf16 | WMMA, smem tile, cp.async, `mma.sync` + `ldmatrix` with swizzle and split-K, Stream-K, TMA, TMA on Stream-K; a weight-streaming kernel for decode; fused bias / activation / residual / SwiGLU epilogues | cuBLAS GemmEx; eager `addmm`, `F.gelu`, `F.silu * up` |
 | `fp8gemm` e4m3 | naive `mma.sync.m16n8k32`, the swizzled cp.async tile with a 64x64 warp tile and decode configs, TMA; all on the block-scaled instruction | cuBLASLt, `torch._scaled_mm` |
 | `attention` bf16 | warp per row, CUDA-core flash attention, `mma.sync` flash attention, split-KV tail, TMA mbarrier pipeline, persistent tile queue with a producer warp; GQA and a flash-decoding kernel | `F.scaled_dot_product_attention` |
 | `rope_append` bf16 | RoPE on q and k plus the K/V cache append from a fused q\|k\|v projection, one launch | the torch spelling, ten kernels |
 | `layer` | one Llama-3-8B decoder layer from the kernels above, prefill and decode with a K/V cache, our decode step as a CUDA graph | the same layer in PyTorch, eager and `torch.compile` |
-| `bench_peak` | | the card's real `mma.sync` (bf16, fp8 plain and block-scaled) and FMA peaks and the clock they ran at |
+| `bench_peak` | | the card's real `mma.sync` (bf16, fp8 plain and block-scaled, tf32) and FMA peaks and the clock they ran at |
 
 Every kernel takes a `variant` argument so each rung can be run, timed and tested on its own.
 All of them are exposed to PyTorch through a C++ extension, with parity tests for every
