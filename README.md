@@ -1,4 +1,4 @@
-# spark-kernels
+# 5090-blackwell-kernels
 
 I have an RTX 5090 and a copy of cuBLAS, and I wanted to know how close I could get to it by
 hand. So I wrote the pieces of a Llama-style decoder block from scratch: RMSNorm, SwiGLU,
@@ -14,8 +14,9 @@ attention kernel is 15 to 30% ahead of PyTorch's FlashAttention-2 on prefill and
 128K-token cache faster than `cudaMemcpy` copies it. And four things about this card turned out
 to be different from the spec sheet, which is the part I'd read first.
 
-The name is left over from when this was going to run on a DGX Spark. The Spark hasn't shipped,
-the 5090 has. The same source builds for the GB10 with `ARCH=121`.
+This started as spark-kernels, for a DGX Spark that hasn't shipped, and the Python package still
+carries that name. The 5090 is what the numbers come from. The same source builds for the GB10
+with `ARCH=121`.
 
 ## numbers
 
