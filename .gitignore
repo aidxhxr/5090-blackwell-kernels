@@ -33,3 +33,6 @@ results/headline.md
 .vscode/
 .idea/
 .DS_Store
+
+# any extra build directory (build_exp/, build-121/ ...)
+build*/
