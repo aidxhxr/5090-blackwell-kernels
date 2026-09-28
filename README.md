@@ -279,6 +279,53 @@ does not pay the copy's write turnaround, and Nsight puts the DRAM at 93 to 95% 
 1,792 GB/s peak there. At 4K tokens a step is 17 to 46 us and launch plus pipeline fill are a
 visible share of it.
 
+## a whole layer
+
+The kernels run together as one Llama-3-8B decoder layer in `spark_kernels.layer`: two
+`add_rmsnorm_` (each residual add fused into the norm after it), four `hgemm` on fused
+weights (q|k|v as one [4096, 6144], gate|up as one [4096, 28672]), a `rope_append_` kernel
+that rotates q and k and writes k and v into the cache in one launch, `attention` with
+grouped-query heads, and `swiglu` reading the two halves of the gate|up output in place.
+`scripts/bench_layer.py` times it against the same layer in plain PyTorch, eager and
+`torch.compile` (`max-autotune-no-cudagraphs` for prefill, `reduce-overhead`, which is CUDA
+graphs, for decode), and captures our decode step into a `torch.cuda.CUDAGraph`. One layer's
+weights are 436 MB in bf16, so a decode step streams them from DRAM with no help from L2.
+
+| shape | ours | torch eager | torch compiled | ours, graph | tokens/s, 32 layers |
+|---|---|---|---|---|---|
+| prefill B=1, S=4096 | 8.43 ms | 9.59 | 8.93 | | 15,190 |
+| prefill B=1, S=8192 | 18.11 ms | 20.73 | 18.80 | | 14,140 |
+| prefill B=4, S=2048 | 16.41 ms | 18.80 | 16.86 | | 15,610 |
+| decode B=1, L=4096 | 0.298 ms | 0.352 | 0.326 | 0.297 | 105 |
+| decode B=1, L=16384 | 0.328 ms | 0.371 | 0.344 | 0.326 | 96 |
+| decode B=1, L=131072 | 0.604 ms | 0.682 | 0.650 | 0.603 | 52 |
+| decode B=8, L=4096 | 0.370 ms | 0.417 | 0.376 | 0.369 | 678 |
+
+ms per layer; a decode row is one token per sequence against a cache of L - 1 tokens,
+appended in place; tokens/s is 32 copies of this layer and nothing else. Where a decode step
+goes, kernel time from the torch profiler:
+
+| stage | B=1, L=4096 | B=1, L=131072 | B=8, L=4096 |
+|---|---|---|---|
+| qkv GEMM, 50 MB | 31 us | 31 | 31 |
+| o GEMM, 34 MB | 21 us | 22 | 22 |
+| gate/up GEMM, 235 MB | 145 us | 145 | 146 |
+| down GEMM, 117 MB | 71 us | 71 | 73 |
+| attention | 16 us | 324 | 84 |
+| two norms, RoPE + append, swiglu | 12 us | 12 | 13 |
+| total | 296 us | 605 | 370 |
+
+The four GEMMs are 91% of a 4K-context step and run at 1,575 to 1,650 GB/s, the
+back-to-back rate of the decode kernel; the whole layer moves its 436 MB at 96% of the
+`cudaMemcpy` rate. At 128K tokens the cache is 512 MB and attention is more than half the
+step. The graph buys 1 us per layer: the ten launches are queued back to back by a host that
+issues a step in 52 us while the GPU runs it in 297, so there is no launch gap left for a
+graph to close. Prefill is 88% GEMM at 246 to 254 TFLOPS. Torch eager is 14 to 18% behind on
+every row and compiled torch 2 to 10%. The reading of it, and the honest caveats (no head
+stride in the attention kernels, so a cache with spare capacity is copied before the kernel
+reads it: 19 us at 4K tokens, 0.68 ms at 128K), are in
+[docs/design/layer.md](docs/design/layer.md).
+
 ## the memory-bound kernels
 
 RMSNorm, SwiGLU and softmax move bytes and do almost no math, so the only question is whether
@@ -315,6 +362,8 @@ described above, not the kernel.
 | `hgemm` bf16 | WMMA, smem tile, cp.async, `mma.sync` + `ldmatrix` with swizzle and split-K, Stream-K, TMA, TMA on Stream-K; a weight-streaming kernel for decode | cuBLAS GemmEx |
 | `fp8gemm` e4m3 | naive `mma.sync.m16n8k32`, the swizzled cp.async tile with a 64x64 warp tile and decode configs, TMA; all on the block-scaled instruction | cuBLASLt, `torch._scaled_mm` |
 | `attention` bf16 | warp per row, CUDA-core flash attention, `mma.sync` flash attention, split-KV tail, TMA mbarrier pipeline, persistent tile queue with a producer warp; GQA and a flash-decoding kernel | `F.scaled_dot_product_attention` |
+| `rope_append` bf16 | RoPE on q and k plus the K/V cache append from a fused q\|k\|v projection, one launch | the torch spelling, ten kernels |
+| `layer` | one Llama-3-8B decoder layer from the kernels above, prefill and decode with a K/V cache, our decode step as a CUDA graph | the same layer in PyTorch, eager and `torch.compile` |
 | `bench_peak` | | the card's real `mma.sync` (bf16, fp8 plain and block-scaled) and FMA peaks and the clock they ran at |
 
 Every kernel takes a `variant` argument so each rung can be run, timed and tested on its own.
@@ -334,6 +383,7 @@ make results          # docs/RESULTS.md, results/headline.md, results/roofline.p
 pip install -e . --no-build-isolation
 pytest -q tests
 python scripts/bench_torch.py
+python scripts/bench_layer.py     # one decoder layer against PyTorch, results/layer.json
 
 make ncu              # Nsight Compute on the top rungs of every ladder, needs root on GeForce
 ```
@@ -362,6 +412,13 @@ p = sk.softmax(scores)
 c = sk.hgemm(a_bf16, b_bf16)               # bf16 tensor-core GEMM
 c = sk.fp8gemm(a_e4m3, w_e4m3, sa, sb)     # sa * sb * a @ w.T, w is [N, K] as nn.Linear stores it
 o = sk.attention(q, k, v, causal=True)     # q is [B, H, S, D] bf16; k and v may have fewer heads
+q = sk.rope_append_(qkv, cos, sin, k_cache, v_cache, pos, 32, 8)  # RoPE; q head-major; k, v into the cache
+
+from spark_kernels import layer as L        # one Llama-3-8B decoder layer
+lyr = L.SparkLayer(L.LayerWeights.random(), L.RoPE(8192))
+cache = L.KVCache(batch=1, capacity=8192)
+x, delta = lyr.prefill(x, cache)           # x is [B, S, 4096]; returns the residual stream and the pending MLP output
+x, delta = lyr.decode(x_next, cache, delta)
 ```
 
 ## notes
@@ -375,12 +432,13 @@ numbers, the sweeps that picked the constants, and which Nsight metric moved:
 - [bandwidth](docs/design/bandwidth.md), [rmsnorm](docs/design/rmsnorm.md),
   [swiglu](docs/design/swiglu.md), [softmax](docs/design/softmax.md),
   [sgemm](docs/design/sgemm.md), [hgemm](docs/design/hgemm.md),
-  [fp8gemm](docs/design/fp8gemm.md), [attention](docs/design/attention.md)
+  [fp8gemm](docs/design/fp8gemm.md), [attention](docs/design/attention.md),
+  [layer](docs/design/layer.md)
 
 Things I'd still like to do: a 128-key tile for attention, which would halve how often the
 two warps of a scheduler land in their softmaxes together (the 3% of tensor pipe still idle);
-per-block scales on the fp8 GEMM, which the instruction already takes; CUDA graphs for the
-2 us a lone decode launch pays over the back-to-back rate; and a GB10 run when the Spark
+per-block scales on the fp8 GEMM, which the instruction already takes; a K/V head stride in the
+attention kernels so a growing cache is read where it is; and a GB10 run when the Spark
 arrives. Both
 cards are consumer Blackwell, so `mma.sync`, `cp.async` and TMA are there and `tcgen05` isn't.
 
