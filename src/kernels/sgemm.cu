@@ -13,7 +13,12 @@
 // variant 5: variant 4 with a 256x128 tile and 16x8 micro-tiles: 0.75 instead of 1 byte of
 //            shared memory read per FMA, which is the binding limit on sm_120 (128 FMA and
 //            128 B of LDS per SM per clock)
-// Variants 4 and 5 split the tiles of the last partial wave along K (fp32 atomics into C).
+// variant 6: tensor cores, TF32: 128x128x16 block tile of mma.sync.m16n8k8 + ldmatrix out of
+//            XOR-swizzled shared memory, 3-stage cp.async ring; operands rounded to tf32
+//            (cvt.rna) as the fragments are loaded, one mma per product (sgemm_tf32.cu)
+// variant 7: the same tile with each operand split into big + small tf32 parts and three mmas
+//            per product (3xTF32), which brings the error back to the fp32 class
+// Variants 4 to 7 split the tiles of the last partial wave along K (fp32 atomics into C).
 //
 // All variants accept arbitrary M, N, K >= 1 and guard every global access.
 // See docs/design/sgemm.md for the reasoning behind each rung. Tile sizes are GB10-derived
@@ -592,11 +597,19 @@ void launch_prefetch(const float* A, const float* B, float* C, int M, int N, int
 
 }  // namespace
 
+// Variants 6 and 7 (sgemm_tf32.cu): the tensor-core tile, one or three tf32 passes.
+void sgemm_tf32(const float* A, const float* B, float* C, int M, int N, int K, bool three_pass,
+                cudaStream_t stream);
+
 // ---------------------------------------------------------------------------
 // Host entry point
 // ---------------------------------------------------------------------------
 int sgemm_num_variants() {
-    return 6;
+    return 8;
+}
+
+int sgemm_default_variant() {
+    return 5;
 }
 
 void sgemm(const float* A, const float* B, float* C, int M, int N, int K, int variant,
@@ -638,6 +651,12 @@ void sgemm(const float* A, const float* B, float* C, int M, int N, int K, int va
             break;
         case 5:
             launch_prefetch<256, 128, 16, 16, 8, 1>(A, B, C, M, N, K, stream);
+            break;
+        case 6:
+            sgemm_tf32(A, B, C, M, N, K, /*three_pass=*/false, stream);
+            break;
+        case 7:
+            sgemm_tf32(A, B, C, M, N, K, /*three_pass=*/true, stream);
             break;
         default:
             break;

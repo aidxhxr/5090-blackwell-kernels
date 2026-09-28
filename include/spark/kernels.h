@@ -86,11 +86,23 @@ int softmax_num_variants();
 // variant 3: variant 2 + double-buffered shared memory (cp.async)
 // variant 4: variant 2 + register-prefetch double buffering, 128x128x16 tile
 // variant 5: variant 4 with a 256x128 tile and 16x8 micro-tiles (fewer smem bytes per FMA)
-// Variants 4 and 5 split the last partial wave of tiles along K and reduce with fp32 atomics
+// variant 6: tensor cores in TF32: mma.sync.m16n8k8 + ldmatrix on a 128x128x16 block tile
+//            with a 3-stage cp.async ring, the operands rounded to tf32 (11 significant bits,
+//            cvt.rna) as the fragments are loaded. The precision contract of cuBLAS under
+//            CUBLAS_TF32_TENSOR_OP_MATH and of torch with allow_tf32: about 2^-11 relative
+//            error per operand, so the result is not fp32-accurate
+// variant 7: the same tile in 3xTF32: each operand split into big + small tf32 parts and
+//            big*big + big*small + small*big accumulated (three mmas per product), which
+//            brings the error back to the fp32 class at a third of variant 6's rate
+// Variants 4 to 7 split the last partial wave of tiles along K and reduce with fp32 atomics
 // into C, so those tiles are not bitwise reproducible run to run.
 void sgemm(const float* A, const float* B, float* C, int M, int N, int K, int variant,
            cudaStream_t stream);
 int sgemm_num_variants();
+// The variant a caller that wants plain fp32 should run: 5, the top rung on the CUDA cores.
+// Variants 6 and 7 compute on the tensor cores in TF32 and are opt-in, as torch's allow_tf32
+// is, so the highest variant number is not the default here.
+int sgemm_default_variant();
 
 // ---- HGEMM (bf16 tensor cores) ------------------------------------------------------------
 // C = A * B, bf16 in/out, fp32 accumulate, via mma.sync tensor-core instructions (WMMA API).

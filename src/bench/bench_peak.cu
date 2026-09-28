@@ -9,7 +9,9 @@
 //   peak_fp8_mma_plain    the plain mma.sync.m16n8k32...e4m3 with fp32 accumulate, which the
 //                   RTX 5090 runs at half that rate, as the GeForce Ada parts did
 //   peak_fp8_mma_f16acc   the plain instruction with fp16 accumulators, the full rate
-//   peak_fp32_fma   fp32 FMA throughput on the CUDA cores: the sgemm roof
+//   peak_tf32_mma   tf32 tensor-core throughput, fp32 accumulate (mma.sync.m16n8k8): the roof
+//                   of the tensor-core sgemm variants (docs/design/sgemm.md)
+//   peak_fp32_fma   fp32 FMA throughput on the CUDA cores: the roof of the sgemm SIMT rungs
 //   sm_clock        SM clock observed *during* the mma loop (clock64 / globaltimer), so the
 //                   peaks can be related to the spec clock
 //
@@ -130,6 +132,37 @@ __global__ void __launch_bounds__(kThreads)
 #pragma unroll
     for (int c = 0; c < kChains; ++c) s += acc[c][0] + acc[c][1];
     if (s == 12345u) sink[threadIdx.x] = static_cast<float>(s);
+}
+
+// One m16n8k8 tf32 mma per chain per iteration. 0x3f800000 is 1.0f, already a tf32.
+__global__ void __launch_bounds__(kThreads)
+    mma_tf32_peak_kernel(int iters, float* __restrict__ sink, long long* __restrict__ clk) {
+    const unsigned u = 0x3f800000u ^ (threadIdx.x & 1);
+    const unsigned a[4] = {u, u, u, u};
+    const unsigned b[2] = {u, u};
+    float acc[kChains][4];
+#pragma unroll
+    for (int c = 0; c < kChains; ++c) acc[c][0] = acc[c][1] = acc[c][2] = acc[c][3] = 0.f;
+
+    long long c0 = 0, t0 = 0;
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        c0 = clock64();
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    }
+    for (int i = 0; i < iters; ++i) {
+#pragma unroll
+        for (int c = 0; c < kChains; ++c) mma_tf32_1688(acc[c], a, b);
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        long long c1 = clock64(), t1;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t1));
+        clk[0] = c1 - c0;
+        clk[1] = t1 - t0;
+    }
+    float s = 0.f;
+#pragma unroll
+    for (int c = 0; c < kChains; ++c) s += acc[c][0] + acc[c][1] + acc[c][2] + acc[c][3];
+    if (s == 12345.f) sink[threadIdx.x] = s;
 }
 
 // kChains independent FMA chains per thread.
@@ -269,6 +302,34 @@ int main(int argc, char** argv) {
         r16.tflops = fp8_warps * n16 * kChains * (16.0 * 8.0 * 32.0 * 2.0) /
                      (best16.median_ms * 1e-3) / 1e12;
         print_row(r16);
+    }
+
+    // ---- tf32 mma.sync peak ---------------------------------------------------------------
+    {
+        int n = 1000;
+        Timing t = time_kernel(
+            [&] { mma_tf32_peak_kernel<<<blocks, kThreads, 0, stream>>>(n, sink, clk); }, stream, 1,
+            1);
+        n = static_cast<int>(n * target_ms / std::max(0.01, static_cast<double>(t.median_ms)));
+        n = std::max(n, 100);
+        const Timing best =
+            time_best([&] { mma_tf32_peak_kernel<<<blocks, kThreads, 0, stream>>>(n, sink, clk); });
+        const double warps = static_cast<double>(blocks) * (kThreads / kWarpSize);
+        const double flops = warps * n * kChains * (16.0 * 8.0 * 8.0 * 2.0);
+        long long h[2] = {0, 0};
+        SPARK_CUDA_CHECK(cudaMemcpy(h, clk, sizeof(h), cudaMemcpyDeviceToHost));
+        const double mhz = h[1] > 0 ? static_cast<double>(h[0]) / h[1] * 1e3 : 0.0;
+        Row r;
+        r.kernel = "peak_tf32_mma";
+        r.dtype = "tf32";
+        r.variant = 0;
+        r.shape = "m16n8k8";
+        r.median_ms = best.median_ms;
+        r.min_ms = best.min_ms;
+        r.tflops = flops / (best.median_ms * 1e-3) / 1e12;
+        r.ref_ms = mhz;  // the clock this loop ran at, MHz, as for sm_clock above
+        print_row(r);
+        std::fprintf(stderr, "    SM clock during the tf32 mma loop: %.0f MHz\n", mhz);
     }
 
     // ---- fp32 FMA peak -----------------------------------------------------------------------

@@ -1,3 +1,5 @@
+import contextlib
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -5,6 +7,11 @@ import torch.nn.functional as F
 from conftest import TOL
 
 SGEMM_SHAPES = [(64, 64, 64), (129, 257, 65), (1024, 1024, 1024), (1, 4096, 4096)]
+# The tensor-core rungs (6: TF32, 7: 3xTF32) on top of those: the 128x128 tile with a
+# split-K tail (2048^3 is 256 tiles on 340 resident blocks, every tile split), the 64x128
+# tile, a K that is not a multiple of the 16-wide k-slab, and the unaligned register-fill
+# path with a ragged N.
+SGEMM_SHAPES_TF32 = SGEMM_SHAPES + [(2048, 2048, 2048), (384, 1024, 4104), (200, 300, 100)]
 HGEMM_SHAPES_16 = [(256, 256, 256), (272, 144, 48), (16, 16, 16)]
 HGEMM_SHAPES_128 = [(256, 384, 256), (128, 128, 32), (512, 512, 4096)]
 # variant 3: any M % 16 == 0 (rows past M are zero-filled), N % 64 == 0, K % 64 == 0. The
@@ -82,6 +89,33 @@ def _variants(name):
         return [0]
 
 
+@contextlib.contextmanager
+def matmul_tf32(enabled: bool):
+    """torch's fp32 matmul on the tensor cores in TF32 (the contract of sgemm variant 6) or
+    on the CUDA cores. torch >= 2.9 spells it fp32_precision, older releases allow_tf32."""
+    m = torch.backends.cuda.matmul
+    attr, on, off = (("fp32_precision", "tf32", "ieee") if hasattr(m, "fp32_precision")
+                     else ("allow_tf32", True, False))
+    prev = getattr(m, attr)
+    setattr(m, attr, on if enabled else off)
+    try:
+        yield
+    finally:
+        setattr(m, attr, prev)
+
+
+def _sgemm_tol(variant: int, K: int) -> dict:
+    """fp32 rungs and 3xTF32: the summation order differs from cuBLAS, so the tolerance
+    scales with sqrt(K). TF32 (variant 6): each operand carries a rounding error of up to
+    2^-11, so a product is off by up to 2^-10 |a b| and a sum of K products by about
+    sqrt(K) 2^-11 rms(a b) in the typical case; for N(0, 1) inputs that is 5e-4 sqrt(K), and
+    the max over M x N outputs a few times that. 1.5e-2 sqrt(K) is fifteen times the fp32
+    bound and well under the K 2^-10 worst case."""
+    if variant == 6:
+        return dict(atol=1.5e-2 * (K**0.5), rtol=1e-2)
+    return dict(atol=1e-3 * (K**0.5), rtol=1e-4)
+
+
 @pytest.mark.parametrize("variant", _variants("sgemm"))
 @pytest.mark.parametrize("shape", SGEMM_SHAPES, ids=lambda s: f"M{s[0]}_N{s[1]}_K{s[2]}")
 def test_sgemm_matches_torch(sk, shape, variant):
@@ -90,10 +124,55 @@ def test_sgemm_matches_torch(sk, shape, variant):
     a = torch.randn(M, K, device="cuda")
     b = torch.randn(K, N, device="cuda")
     got = sk.sgemm(a, b, variant)
-    ref = a @ b
+    with matmul_tf32(False):
+        ref = a @ b
     assert got.shape == (M, N)
-    # fp32 accumulation order differs from cuBLAS; scale tolerance with K.
-    torch.testing.assert_close(got, ref, atol=1e-3 * (K**0.5), rtol=1e-4)
+    torch.testing.assert_close(got, ref, **_sgemm_tol(variant, K))
+
+
+@pytest.mark.parametrize("variant", [v for v in _variants("sgemm") if v >= 6])
+@pytest.mark.parametrize("shape", SGEMM_SHAPES_TF32, ids=lambda s: f"M{s[0]}_N{s[1]}_K{s[2]}")
+def test_sgemm_tensor_core_variants(sk, shape, variant):
+    M, N, K = shape
+    torch.manual_seed(0)
+    a = torch.randn(M, K, device="cuda")
+    b = torch.randn(K, N, device="cuda")
+    with matmul_tf32(False):
+        ref32 = a @ b
+    with matmul_tf32(True):
+        ref_tf32 = a @ b
+    # Twice: the split-K tail zeroes its tiles of C on every call.
+    for _ in range(2):
+        got = sk.sgemm(a, b, variant)
+        torch.testing.assert_close(got, ref32, **_sgemm_tol(variant, K))
+    if torch.equal(ref_tf32, ref32):
+        return  # torch ran this shape as a GEMV (M = 1), which never rounds to TF32
+    if variant == 6:
+        # The same precision contract as torch in TF32 mode: the two agree to fp32
+        # summation noise, not just to the TF32 tolerance.
+        torch.testing.assert_close(got, ref_tf32, **_sgemm_tol(5, K))
+    else:
+        # 3xTF32 is closer to fp32 than TF32 is, by an order of magnitude at least.
+        assert (got - ref32).abs().max() * 10 < (ref_tf32 - ref32).abs().max()
+
+
+def test_sgemm_default_variant_is_the_fp32_rung(sk):
+    # -1 never picks the tensor-core variants: they round the operands to TF32 and are
+    # opt-in, as torch's allow_tf32 is.
+    M, N, K = 512, 512, 4096
+    torch.manual_seed(0)
+    a = torch.randn(M, K, device="cuda")
+    b = torch.randn(K, N, device="cuda")
+    with matmul_tf32(False):
+        ref = a @ b
+    assert sk.num_variants("sgemm") == 8
+    err = (sk.sgemm(a, b) - ref).abs().max()
+    err_tf32 = (sk.sgemm(a, b, 6) - ref).abs().max()
+    # An fp32 rung's error is summation-order noise, an order of magnitude under TF32's
+    # rounding error (the two rungs are not compared bit for bit: variant 5's split-K
+    # tail adds its slices with atomics, in whichever order they finish).
+    assert err * 10 < err_tf32
+    torch.testing.assert_close(sk.sgemm(a, b), ref, **_sgemm_tol(5, K))
 
 
 def _hgemm_case(sk, shape, variant):

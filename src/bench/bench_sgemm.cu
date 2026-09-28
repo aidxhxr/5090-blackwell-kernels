@@ -4,13 +4,21 @@
 //   ./bench_sgemm --m=4096 --n=4096 --k=4096 --variant=3 --iters=50
 //   ./bench_sgemm --all                # also run the naive variant on the largest shapes
 //
-// stdout: one JSON object per row (collected by scripts/run_all_benches.sh)
+// cuBLAS is timed twice per shape: with CUBLAS_DEFAULT_MATH (fp32 FMAs on the CUDA cores, the
+// reference of variants 0 to 5 and 7) and with CUBLAS_TF32_TENSOR_OP_MATH (the tensor cores
+// in TF32, the reference of variant 6). Every variant is checked against the fp32 result;
+// the tolerance depends on the variant's precision contract (see `tolerance_for`).
+//
+// stdout: one JSON object per row (collected by scripts/run_all_benches.sh); the rows of
+//         variant 6 carry dtype "tf32" and those of variant 7 "3xtf32", so the results
+//         scripts judge them against the tf32 tensor-core peak
 // stderr: human-readable table
 // exit code 1 if any variant disagrees with cuBLAS.
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -50,6 +58,28 @@ double tflops_of(const Shape& s, double ms) {
     return 2.0 * s.M * s.N * s.K / (ms * 1e-3) / 1e12;
 }
 
+// The precision contract of each rung, as the results scripts see it: variant 6 computes in
+// TF32, variant 7 in 3xTF32, everything else in fp32.
+const char* dtype_of(int variant) {
+    return variant == 6 ? "tf32" : variant == 7 ? "3xtf32" : "f32";
+}
+
+// Max absolute error allowed against the fp32 cuBLAS result.
+//   fp32 rungs and 3xTF32: only the summation order differs (3xTF32 adds a 2^-22 relative
+//     error per product, below fp32 accumulation noise), so the bound scales with K.
+//   TF32: each operand is rounded to 11 significant bits, a relative error up to 2^-11, so a
+//     product is off by up to 2^-10 |a||b| and a dot product of K such terms by up to
+//     K 2^-10 max|A| max|B| in the worst case (4 at K = 4096 for inputs in [-1, 1]). The
+//     rounding errors are independent, so the typical error is sqrt(K) 2^-11 times the rms
+//     product, about 1e-2 at K = 4096, against a max |C| of about 110. The check is 1% of
+//     max |C|, ten times the errors actually measured and well inside the worst case; it
+//     is loose enough that a broken kernel (a wrong k, a dropped chunk) still fails it by
+//     orders of magnitude.
+double tolerance_for(int variant, int K, double max_abs_ref) {
+    if (variant == 6) return 1e-2 * max_abs_ref;
+    return 2e-5 * K + 1e-3;
+}
+
 }  // namespace
 
 int run(int argc, char** argv) {
@@ -67,8 +97,8 @@ int run(int argc, char** argv) {
         const int m = args.geti("m", 1024);
         shapes.push_back({m, args.geti("n", m), args.geti("k", m)});
     } else {
-        shapes = {{512, 512, 512},    {1024, 1024, 1024},  {2048, 2048, 2048},
-                  {4096, 4096, 4096}, {4096, 4096, 11008}, {4096, 11008, 4096}};
+        shapes = {{512, 512, 512},    {1024, 1024, 1024},  {2048, 2048, 2048}, {4096, 4096, 4096},
+                  {8192, 8192, 8192}, {4096, 4096, 11008}, {4096, 11008, 4096}};
     }
 
     cudaStream_t stream;
@@ -76,7 +106,8 @@ int run(int argc, char** argv) {
     cublasHandle_t handle;
     CUBLAS_CHECK(cublasCreate(&handle));
     CUBLAS_CHECK(cublasSetStream(handle, stream));
-    // Keep cuBLAS on the plain fp32 path (no TF32) so the comparison is like-for-like.
+    // cuBLAS starts on the plain fp32 path (no TF32), the like-for-like reference of the
+    // fp32 rungs; the TF32 reference below switches the math mode and switches it back.
     CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH));
 
     print_header();
@@ -99,13 +130,16 @@ int run(int argc, char** argv) {
         SPARK_CUDA_CHECK(cudaMemcpy(dA, hA.data(), nA * sizeof(float), cudaMemcpyHostToDevice));
         SPARK_CUDA_CHECK(cudaMemcpy(dB, hB.data(), nB * sizeof(float), cudaMemcpyHostToDevice));
 
-        // ---- cuBLAS reference (result + timing)
+        // ---- cuBLAS fp32 reference (result + timing)
         cublas_sgemm_rowmajor(handle, dA, dB, dRef, s.M, s.N, s.K);
         SPARK_CUDA_CHECK(cudaStreamSynchronize(stream));
         SPARK_CUDA_CHECK(cudaMemcpy(hRef.data(), dRef, nC * sizeof(float), cudaMemcpyDeviceToHost));
         const Timing tref =
             time_kernel([&] { cublas_sgemm_rowmajor(handle, dA, dB, dRef, s.M, s.N, s.K); }, stream,
                         warmup, iters);
+        double max_abs_ref = 0.0;
+        for (size_t i = 0; i < nC; ++i)
+            max_abs_ref = std::max(max_abs_ref, std::fabs(static_cast<double>(hRef[i])));
 
         const std::string shape_str =
             std::to_string(s.M) + "x" + std::to_string(s.N) + "x" + std::to_string(s.K);
@@ -123,8 +157,33 @@ int run(int argc, char** argv) {
             print_row(r);
         }
 
-        // Different summation order than cuBLAS => allow an error that scales with K.
-        const double tol = 2e-5 * s.K + 1e-3;
+        // ---- cuBLAS TF32 reference: the same call with the tensor cores allowed. Its error
+        // against the fp32 result is recorded too, so the TF32 rung's error can be read
+        // next to the library's.
+        CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH));
+        cublas_sgemm_rowmajor(handle, dA, dB, dC, s.M, s.N, s.K);
+        SPARK_CUDA_CHECK(cudaStreamSynchronize(stream));
+        SPARK_CUDA_CHECK(cudaMemcpy(hOut.data(), dC, nC * sizeof(float), cudaMemcpyDeviceToHost));
+        const ErrorStats err_tf32 = compare(hOut.data(), hRef.data(), nC);
+        const Timing tref_tf32 =
+            time_kernel([&] { cublas_sgemm_rowmajor(handle, dA, dB, dC, s.M, s.N, s.K); }, stream,
+                        warmup, iters);
+        CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH));
+        {
+            Row r;
+            r.kernel = "sgemm_cublas_tf32";
+            r.dtype = "tf32";
+            r.variant = -1;
+            r.shape = shape_str;
+            r.median_ms = tref_tf32.median_ms;
+            r.min_ms = tref_tf32.min_ms;
+            r.tflops = tflops_of(s, tref_tf32.median_ms);
+            r.ref_ms = tref_tf32.median_ms;
+            r.max_abs_err = err_tf32.max_abs;
+            r.max_rel_err = err_tf32.max_rel;
+            r.ok = err_tf32.max_abs <= tolerance_for(6, s.K, max_abs_ref);
+            print_row(r);
+        }
 
         for (int v = 0; v < spark::sgemm_num_variants(); ++v) {
             if (only_variant >= 0 && v != only_variant) continue;
@@ -138,24 +197,33 @@ int run(int argc, char** argv) {
             SPARK_CUDA_CHECK(
                 cudaMemcpy(hOut.data(), dC, nC * sizeof(float), cudaMemcpyDeviceToHost));
             const ErrorStats err = compare(hOut.data(), hRef.data(), nC);
+            const double tol = tolerance_for(v, s.K, max_abs_ref);
             const bool ok = err.max_abs <= tol && std::isfinite(err.max_abs);
 
             const Timing t = time_kernel(
                 [&] { spark::sgemm(dA, dB, dC, s.M, s.N, s.K, v, stream); }, stream, warmup, iters);
 
+            // ref_ms is the reference with the same precision contract: cuBLAS TF32 for
+            // variant 6, cuBLAS fp32 for everything else (3xTF32 claims fp32 accuracy).
             Row r;
             r.kernel = "sgemm";
-            r.dtype = "f32";
+            r.dtype = dtype_of(v);
             r.variant = v;
             r.shape = shape_str;
             r.median_ms = t.median_ms;
             r.min_ms = t.min_ms;
             r.tflops = tflops_of(s, t.median_ms);
-            r.ref_ms = tref.median_ms;
+            r.ref_ms = v == 6 ? tref_tf32.median_ms : tref.median_ms;
             r.max_abs_err = err.max_abs;
             r.max_rel_err = err.max_rel;
             r.ok = ok;
             print_row(r);
+            if (v >= 6) {
+                std::fprintf(stderr,
+                             "    variant %d: %.1f%% of cuBLAS fp32, %.1f%% of cuBLAS TF32\n", v,
+                             100.0 * tref.median_ms / t.median_ms,
+                             100.0 * tref_tf32.median_ms / t.median_ms);
+            }
             if (!ok) {
                 std::fprintf(stderr, "  MISMATCH: variant %d shape %s max_abs=%.3e tol=%.3e\n", v,
                              shape_str.c_str(), err.max_abs, tol);

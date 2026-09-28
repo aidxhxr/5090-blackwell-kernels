@@ -7,8 +7,10 @@ exist for the docstrings and type hints.
 `variant=-1` (the default) runs the fastest implementation that accepts the input. Two
 ladders have a top rung with extra requirements, and there the default steps down one rung
 instead of failing: `swiglu` needs 16-byte aligned storage for its vectorized variant, and
-`hgemm` needs N and K multiples of 64 for its top rungs (variants 3, 4 and 6). An explicit
-variant is never substituted; it raises ValueError if it cannot take the input.
+`hgemm` needs N and K multiples of 64 for its top rungs (variants 3, 4 and 6). `sgemm`'s
+default is its top fp32 rung (variant 5); its TF32 tensor-core variants 6 and 7 are a
+different precision contract and have to be asked for. An explicit variant is never
+substituted; it raises ValueError if it cannot take the input.
 """
 
 from __future__ import annotations
@@ -71,7 +73,14 @@ def softmax(x: torch.Tensor, variant: int = -1) -> torch.Tensor:
 
 
 def sgemm(a: torch.Tensor, b: torch.Tensor, variant: int = -1) -> torch.Tensor:
-    """fp32 GEMM: a[M,K] @ b[K,N] -> [M,N]. Any M, N, K."""
+    """fp32 GEMM: a[M,K] @ b[K,N] -> [M,N]. Any M, N, K.
+
+    The default (variant 5) is plain fp32 on the CUDA cores. Variants 6 and 7 run on the
+    tensor cores: 6 rounds the operands to TF32 (the contract of torch's
+    ``allow_tf32``, about 2^-11 relative error per operand) and 7 does three TF32 passes
+    (3xTF32) for fp32-class accuracy at a third of the rate. Both are opt-in: -1 never
+    picks them.
+    """
     return _C.sgemm(a, b, variant)
 
 

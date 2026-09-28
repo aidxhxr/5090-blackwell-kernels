@@ -9,7 +9,8 @@
 // `variant = -1` means "the fastest variant that accepts this input". That is
 // num_variants() - 1 except where the top rung has requirements the rung below does not
 // (swiglu: 16-byte aligned storage; hgemm: N and K multiples of 64), in which case the default
-// steps down one rung. An explicitly requested variant is never substituted.
+// steps down one rung, and except for sgemm, whose variants 6 and 7 trade fp32 accuracy for
+// the tensor cores (TF32) and are opt-in. An explicitly requested variant is never substituted.
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>
@@ -208,7 +209,11 @@ Tensor sgemm(const Tensor& a, const Tensor& b, int variant) {
     const GemmShape s = gemm_shape(a, b);
     const c10::cuda::CUDAGuard guard(a.device());
     Tensor c = at::empty({s.M, s.N}, a.options());
-    const int v = resolve_variant(variant, spark::sgemm_num_variants());
+    // -1 is variant 5, the top fp32 rung. Variants 6 and 7 run on the tensor cores in TF32
+    // (one and three passes) and are a different precision contract, so they are opt-in,
+    // as torch's allow_tf32 is.
+    const int v = variant < 0 ? spark::sgemm_default_variant()
+                              : resolve_variant(variant, spark::sgemm_num_variants());
     spark::sgemm(a.data_ptr<float>(), b.data_ptr<float>(), c.data_ptr<float>(), s.M, s.N, s.K, v,
                  current_stream(a));
     return c;
@@ -422,7 +427,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("gate"), py::arg("up"), py::arg("variant") = -1);
     m.def("softmax", &softmax, "softmax over the last dim (fp32 math)", py::arg("x"),
           py::arg("variant") = -1);
-    m.def("sgemm", &sgemm, "fp32 GEMM: a @ b", py::arg("a"), py::arg("b"), py::arg("variant") = -1);
+    m.def("sgemm", &sgemm, "fp32 GEMM: a @ b (variants 6 and 7: tensor cores in TF32 / 3xTF32)",
+          py::arg("a"), py::arg("b"), py::arg("variant") = -1);
     m.def("hgemm", &hgemm,
           "bf16 tensor-core GEMM with a fused epilogue: act(a @ b + bias) + residual, or "
           "silu(gate) * up from an interleaved gate/up b (swiglu=True)",
