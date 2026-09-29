@@ -33,7 +33,7 @@ arch flag and the tuning constants differ. What the two machines mean for kernel
 | fp8 (e4m3) dense peak, fp32 accumulate | 1,014 TFLOPS measured at 2,923 MHz on the block-scaled `mma.sync.kind::mxf8f6f4` (sm_120a); the plain fp8 `mma.sync` runs at half that, 517; a sustained fp8 GEMM settles at 2.13–2.16 GHz, ≈ 745 | not measured | Ridge ≈ 566 FLOP/byte. The fp8 kernels are built for the architecture-specific target (`120a`, `121a`) to reach the full-rate instruction ([fp8gemm](design/fp8gemm.md)). |
 | fp4 (e2m1) dense peak, fp32 accumulate | 2,029 TFLOPS measured at 2,924 MHz on `mma.sync.m16n8k64.kind::mxf4nvf4` (sm_120a), NVFP4 and MXFP4 alike, twice the fp8 rate; a sustained fp4 GEMM settles at 2.15–2.21 GHz, ≈ 1,530 | not measured | Ridge ≈ 1,132 FLOP/byte. Built for the architecture-specific target with the fp8 kernels ([fp4gemm](design/fp4gemm.md)). |
 | L2 | 96 MB | 24 MB | GB10: a 4096×4096 bf16 operand (32 MB) does *not* fit, so tile order matters. On the 5090 both operands of a 4096³ GEMM fit, and any row-kernel bench shape under ~32 MB per operand measures L2, not DRAM, so the headline shapes are 256 MB+. |
-| `mma.sync`, `cp.async` and TMA yes; `tcgen05` / `wgmma` no | same | same | Tensor-core GEMMs use `mma.sync` (WMMA for the early rungs) with `cp.async` (`hgemm` v3, `fp8gemm` v1, `fp4gemm` v1) or TMA plus mbarriers (`hgemm` v5 and v6, `fp8gemm` v2, `fp4gemm` v2, `attention` v4 and v5, `attention_fp8` v1), not CUTLASS 3.x SM100 pipelines. |
+| `mma.sync`, `cp.async` and TMA yes; `tcgen05` / `wgmma` no | same | same | Tensor-core GEMMs use `mma.sync` (WMMA for the early rungs) with `cp.async` (`hgemm` v3, `fp8gemm` v1, `fp4gemm` v1) or TMA plus mbarriers (`hgemm` v5 and v6, `fp8gemm` v2, `fp4gemm` v2, `attention` v4 and v5, `attention_bwd` v3, `attention_fp8` v1), not CUTLASS 3.x SM100 pipelines. |
 | SMs | 170 | 48 | Grid sizes for grid-stride kernels are set from `multiProcessorCount` at runtime. Fixed-size launches (one block per GEMM tile, one block per row) need 3.5× more blocks to fill the 5090. |
 
 The tile sizes and crossovers in the first rungs (`hgemm` 128×128×32 with +8 padding and 8
@@ -97,5 +97,6 @@ docs:
 - [fp8gemm](design/fp8gemm.md)
 - [fp4gemm](design/fp4gemm.md) (NVFP4 and MXFP4, and the quantizer)
 - [attention](design/attention.md)
+- [attention backward](design/attention_bwd.md)
 - [one decoder layer](design/layer.md)
 - [serving: the paged K/V cache, paged decode, varlen prefill and the engine](design/serving.md)

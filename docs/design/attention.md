@@ -4,7 +4,8 @@
 `K, V = [B, H_kv, S_kv, D]`, row-major with `D` contiguous. bf16 in and out, fp32 for every
 score, exponential and accumulator. `H_q % H_kv == 0`: query head `h` reads K/V head
 `h / (H_q / H_kv)`, grouped-query attention, with `H_kv == H_q` the plain multi-head case.
-`D` in {64, 128}, optional causal mask, no dropout, no bias, forward only. Source:
+`D` in {64, 128}, optional causal mask, no dropout, no bias. This note is the forward; the
+backward pass has its own, [attention_bwd.md](attention_bwd.md). Source:
 `src/kernels/attention.cu` (the ladder) and `src/kernels/attention_decode.cu` (the
 flash-decoding kernel variant 3 runs on decode shapes); the e4m3 forward, `attention_fp8`,
 has its own section ("FP8") and source `src/kernels/attention_fp8.cu`. Bench: `bench_attention` (validates
@@ -200,6 +201,21 @@ decode GEMM: 49 µs, 1,369 GB/s, 89% of the 1,532 GB/s `cudaMemcpy` roof, agains
 torch's split-KV flash kernel under the same rotation. That was the decode path until the
 flash-decoding kernel below replaced it for every shape whose rows fit its 16-row tile; the
 64-row tile still takes `S_q <= 64` queries that do not (`S_q = 32` in MHA, say).
+
+## The log-sum-exp output
+
+Training needs one more number per query row: the backward recomputes P from Q, K and the
+row's log-sum-exp `L_i = log Σ_j exp(q_i · k_j / sqrt(D))` instead of storing the `S_q x S_kv`
+probabilities. Every variant already holds it at the end of the row: `m` is the row max in the
+`log2(e) / sqrt(D)` domain and `l` the row sum of `2^(s − m)`, so `L = (m + log2 l) · ln 2`,
+one `MUFU.LG2` and two multiplies per row in the epilogue. `attention_bf16` takes an optional
+`float* lse` (`[B, H_q, S_q]`, natural log, torch's `logsumexp` convention) and every rung
+writes it when it is not null: variants 0 and 1 from their row state, variants 2, 4 and 5 from
+the lanes with `c = 0` of each row, and the split-KV combine kernel from its merged `(M, L)`.
+The flash-decoding kernel has no such output, so a call that asks for one on a decode shape
+runs variant 3's 64-row tile instead. With the pointer null nothing changes: the branch is on
+a kernel argument, taken once per row in the epilogue. Measured cost of asking for it is in
+the backward note.
 
 ## GQA
 
@@ -1092,8 +1108,8 @@ should (same math, a stride on the K/V pointer).
   does not fill the pipe alone. A version that keeps two warps per scheduler in the `mma`
   phase and only forbids two softmaxes at once (a barrier a warp takes before its softmax and
   releases after, with one slot per scheduler) has not been tried.
-- **Backward**, which needs the log-sum-exp saved from the forward (`m + log2(l)` per row,
-  free here) and two more kernels.
+- **Backward.** Done: the forward writes the log-sum-exp on request, and the backward pass
+  is its own ladder in [attention_bwd.md](attention_bwd.md).
 - **GQA prefill with grouped tiles.** The prefill kernels read a K/V head once per query head
   and let L2 serve the group; a 128-row tile holding 4 heads x 32 tokens would read it once
   from L2 too. Prefill is compute-bound, so this is a few percent at most.

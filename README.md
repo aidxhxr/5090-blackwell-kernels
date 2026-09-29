@@ -12,7 +12,8 @@ Where it ended up: the bf16 GEMM is ahead of cuBLAS on every shape from 2048 cub
 the memory floor on decode shapes. The fp8 GEMM is level with cuBLASLt at 4096 cubed, and the
 fp4 GEMM gives cuBLASLt's NVFP4 bits at 96 to 98% of its speed on the big squares. The
 attention kernel is 18 to 38% ahead of PyTorch's FlashAttention-2 on prefill and streams a
-128K-token cache faster than `cudaMemcpy` copies it. And four things about this card turned out
+128K-token cache faster than `cudaMemcpy` copies it, and its backward pass is 2 to 41% ahead
+of FlashAttention-2's backward. And four things about this card turned out
 to be different from the spec sheet, which is the part I'd read first.
 
 This started as spark-kernels, for a DGX Spark that hasn't shipped, and the Python package still
@@ -348,6 +349,39 @@ does not pay the copy's write turnaround, and Nsight puts the DRAM at 93 to 95% 
 1,792 GB/s peak there. At 4K tokens a step is 17 to 46 us and launch plus pipeline fill are a
 visible share of it.
 
+### backward
+
+`attention_bwd` computes dQ, dK and dV from Q, K, V, the forward's output and the
+log-sum-exp the forward writes on request (`attention_fwd`), and `attention_with_grad` wraps
+the pair as a `torch.autograd.Function`. Under GQA dK and dV are summed over each K/V head's
+query heads inside the kernel. The design is FlashAttention-2's: a block owns a tile of keys,
+keeps their dK and dV in registers while it walks the query tiles, and adds its share of dQ
+to an fp32 buffer with atomics. What made it fast on this card:
+
+| rung | what changed |
+|---|---|
+| v0 | a warp per query row for dQ and per key row for dK, dV |
+| v1 | FlashAttention-2's key-tile loop on `mma.sync`, keys on the mma rows so P and dS feed dV and dK straight from the accumulators |
+| v2 | 128 keys per block with V's fragments in registers, which frees the shared memory for a double-buffered Q/dO tile; one barrier per tile; the grid split by simulating the block scheduler |
+| v3 | the barrier gone: Q and dO by TMA into mbarrier stages, the dS buffers handed between warps by mbarriers |
+
+| shape (B x H x S x D) | v1 | v2 | v3 | flash | v3 / flash |
+|---|---|---|---|---|---|
+| 1 x 32 x 1024 x 128, causal | 125 | 148 | **154** | 104 | 1.41x |
+| 1 x 32 x 4096 x 128 | 157 | 212 | **224** | 196 | 1.11x |
+| 1 x 32 x 4096 x 128, causal | 162 | 200 | **209** | 177 | 1.14x |
+| 1 x 32 x 8192 x 128, causal | 162 | 209 | **216** | 202 | 1.04x |
+| 1 x 32/8 x 4096 x 128, causal | 155 | 194 | **202** | 175 | 1.12x |
+| 1 x 32 x 4096 x 64, causal | 207 | 204 | **217** | 166 | 1.27x |
+
+TFLOPS with the backward counted as 2.5 times the forward's FLOPs, halved under the mask. The
+split mattered most for GQA: 256 key tiles on 170 SMs is two waves with the second half
+empty, 159 TFLOPS before the split and 208 after. Taking the barrier out bought the same thing
+it bought the forward: the tensor pipe went from 85% to 90% busy. The atomics make the last
+bits of dQ run-to-run dependent; `deterministic=True` computes dQ in a separate pass instead,
+1.4x the time under the causal mask. The numbers, the profiles and the experiments that lost
+are in [the design note](docs/design/attention_bwd.md).
+
 ## a whole layer
 
 The kernels run together as one Llama-3-8B decoder layer in `spark_kernels.layer`: two
@@ -467,6 +501,7 @@ default stays on the CUDA cores.
 | `fp4gemm` NVFP4, MXFP4 | naive `mma.sync.m16n8k64.kind::mxf4nvf4`, the swizzled cp.async tile with the block scales staged beside it, TMA with bulk-copied scales; a bf16 -> fp4 quantizer | cuBLASLt NVFP4 (bit-identical), `F.scaled_mm` |
 | `attention` bf16 | warp per row, CUDA-core flash attention, `mma.sync` flash attention, split-KV tail, TMA mbarrier pipeline, persistent tile queue with a producer warp; GQA and a flash-decoding kernel | `F.scaled_dot_product_attention` |
 | `attention_fp8` e4m3 | warp per row on dequantized inputs, variant 5's persistent TMA kernel with both products on the block-scaled fp8 `mma.sync`, P rounded to e4m3 in registers, V transposed by `ldmatrix.trans` and byte permutes | the bf16 kernel, `F.scaled_dot_product_attention` in bf16 |
+| `attention_bwd` bf16 | warp per row, FlashAttention-2's key-tile loop on `mma.sync`, V in registers with a double-buffered Q/dO tile and a simulated split, TMA and mbarriers with no block barrier; GQA, a deterministic dQ pass, an autograd Function | torch autograd through `F.scaled_dot_product_attention` (flash and cuDNN) |
 | `rope_append` bf16 | RoPE on q and k plus the K/V cache append from a fused q\|k\|v projection, one launch | the torch spelling, ten kernels |
 | `layer` | one Llama-3-8B decoder layer from the kernels above, prefill and decode with a K/V cache, our decode step as a CUDA graph | the same layer in PyTorch, eager and `torch.compile` |
 | `bench_peak` | | the card's real `mma.sync` (bf16, fp8 plain and block-scaled, fp4, tf32) and FMA peaks and the clock they ran at |
