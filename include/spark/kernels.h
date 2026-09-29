@@ -321,6 +321,44 @@ void attention_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_b
 int attention_num_variants();
 bool attention_supports(int S_q, int S_kv, int D, int variant);
 
+// ---- Fused attention backward -------------------------------------------------------------
+// Gradients of O = softmax(Q K^T / sqrt(D)) V with respect to Q, K and V, from the forward's
+// inputs, its output O, the upstream gradient dO (all bf16, the forward's shapes and GQA
+// layout) and its log-sum-exp `lse` (fp32 [B, H_q, S_q], attention_bf16's optional output).
+// dQ is [B, H_q, S_q, D]; dK and dV are [B, H_kv, S_kv, D], summed over the H_q / H_kv query
+// heads that share each K/V head. fp32 accumulation, bf16 out. Same masks, head sizes and
+// shape range as the forward. With P = exp(Q K^T / sqrt(D) - lse) and Dv_i = dO_i . O_i:
+//   dV = P^T dO,  dS = P * (dO V^T - Dv),  dQ = dS K / sqrt(D),  dK = dS^T Q / sqrt(D).
+// variant 0: one warp per query row for dQ and one per key row for dK, dV, keys (queries)
+//            one at a time with shuffle reductions. Reference only
+// variant 1: FlashAttention-2's structure on mma.sync: a block owns 64 keys of one K/V head
+//            (4 warps x 16), walks the 64-row query tiles of every query head of its group
+//            with dK and dV in registers, and adds its share of dQ to an fp32 buffer with
+//            atomics; a preprocess kernel computes Dv and a last one converts dQ to bf16
+// variant 2: variant 1 rebuilt for sm_120: 128 keys per block (8 warps), V's fragments held
+//            in registers so a 32-row (D = 128) or 64-row (D = 64) Q/dO tile can be double
+//            buffered by cp.async inside 99 KB, dS double-buffered so the dQ product of the
+//            previous tile runs after the loop's one barrier, warps skip query tiles their keys
+//            cannot see under the causal mask, and the grid is split (every key tile into
+//            ranges of its query tiles, then the last partial wave again) by a simulation of
+//            the block scheduler, split tiles adding fp32 partials of dK and dV
+// variant 3: variant 2 without the block barrier: Q, dO and the (L, Dv) rows by TMA into
+//            three full / empty mbarrier stages issued by one lane, the dS buffers handed
+//            between warps by mbarriers, so the warps drift apart instead of starting every
+//            tile in phase. The default
+// `deterministic` (variants 1 to 3) replaces the dQ atomics with a separate dQ pass, a
+// query-tile-outer kernel that recomputes P and dP, and turns the split off: 7 matrix products
+// instead of 5, bitwise reproducible results. Uses a per-device workspace (L and Dv, the fp32
+// dQ buffer, the split partials) shared by every stream, like the forward's split workspace:
+// two backward calls must not run concurrently on different streams.
+void attention_bwd_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_bfloat16* V,
+                        const __nv_bfloat16* O, const __nv_bfloat16* dO, const float* lse,
+                        __nv_bfloat16* dQ, __nv_bfloat16* dK, __nv_bfloat16* dV, int B, int H_q,
+                        int H_kv, int S_q, int S_kv, int D, bool causal, bool deterministic,
+                        int variant, cudaStream_t stream);
+int attention_bwd_num_variants();
+bool attention_bwd_supports(int S_q, int S_kv, int D, int variant);
+
 // ---- Attention over a paged K/V cache (src/kernels/attention_paged.cu) ------------------
 // The cache is k_cache, v_cache = [num_pages, H_kv, page, D] bf16, page a power of two >= 16.
 // Sequence b owns pages block_table[b][0..], block_table [B, max_pages] int32 row-major, and
