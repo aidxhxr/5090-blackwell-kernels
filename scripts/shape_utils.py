@@ -245,7 +245,7 @@ def parse_shape(kernel: str, shape: str) -> dict:
             raise ValueError(f"not a rope shape string: {shape!r}")
         B, S, Hq, Hkv, D, pos = (int(g) for g in m.groups())
         return {"B": B, "S": S, "H": Hq, "H_kv": Hkv, "D": D, "pos0": pos}
-    if k in ATTENTION_KERNELS:
+    if k in ATTENTION_KERNELS + ("attention_bwd",):
         m = ATTENTION_SHAPE.match(shape)
         if not m:
             raise ValueError(f"not an attention shape string: {shape!r}")
@@ -300,6 +300,10 @@ def traffic_bytes(kernel: str, dtype: str, dims: dict) -> float:
         if k == "attention_fp8":  # Q, K, V in e4m3, O in bf16
             return (3.0 * q_rows + 2.0 * kv_rows) * dims["D"]
         return 2.0 * (q_rows + kv_rows) * dims["D"] * isz
+    if k == "attention_bwd":  # Q, O, dO read, dQ written; K, V read, dK, dV written
+        q_rows = dims["B"] * dims["H"] * dims["S_q"]
+        kv_rows = dims["B"] * dims.get("H_kv", dims["H"]) * dims["S_kv"]
+        return 4.0 * (q_rows + kv_rows) * dims["D"] * isz
     return 0.0
 
 
@@ -307,8 +311,11 @@ def flops(kernel: str, dims: dict) -> float:
     k = kernel.lower()
     if k in GEMM_KERNELS:
         return 2.0 * dims["M"] * dims["N"] * dims["K"]
-    if k in ATTENTION_KERNELS:  # Q K^T and P V, halved under the causal mask (FlashAttention)
+    if k in ATTENTION_KERNELS + ("attention_bwd",):
+        # forward: Q K^T and P V; backward: those two again plus dP, dQ and dK (2.5x); halved
+        # under the causal mask as FlashAttention counts it
         fl = 4.0 * dims["B"] * dims["H"] * dims["S_q"] * dims["S_kv"] * dims["D"]
+        fl *= 2.5 if k == "attention_bwd" else 1.0
         return fl / 2 if dims["causal"] else fl
     if k == "paged_decode":  # one query row per head against every key: Q K^T and P V
         return 4.0 * dims["H"] * dims["keys"] * dims["D"]
@@ -330,13 +337,14 @@ def arithmetic_intensity(kernel: str, dtype: str, shape: str) -> float:
 
 
 def is_compute_bound_kernel(kernel: str) -> bool:
-    return kernel.lower() in GEMM_KERNELS + ATTENTION_KERNELS + ("attention_varlen",)
+    return kernel.lower() in (GEMM_KERNELS + ATTENTION_KERNELS
+                              + ("attention_varlen", "attention_bwd"))
 
 
 def uses_tensor_cores(kernel: str, dtype: str = "") -> bool:
     """Kernels judged against a tensor-core peak (bf16, fp8, fp4 or tf32) rather than the fp32
     one. sgemm is the CUDA-core ladder except for its tf32 / 3xtf32 rows."""
-    return (kernel.lower() in ("hgemm", "fp8gemm", "fp4gemm", "attention_varlen")
+    return (kernel.lower() in ("hgemm", "fp8gemm", "fp4gemm", "attention_varlen", "attention_bwd")
             + ATTENTION_KERNELS or dtype in TF32_DTYPES)
 
 

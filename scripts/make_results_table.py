@@ -32,7 +32,8 @@ OUT_HEADLINE = RESULTS / "headline.md"
 
 SHEETS = {"RTX 5090": "RTX5090.md", "GB10": "GB10.md"}
 KERNEL_ORDER = ["bandwidth", "rmsnorm", "add_rmsnorm", "swiglu", "softmax", "sgemm", "hgemm",
-                "fp8gemm", "fp4gemm", "fp4quant", "attention", "attention_fp8", "rope"]
+                "fp8gemm", "fp4gemm", "fp4quant", "attention", "attention_bwd", "attention_fp8",
+                "rope"]
 # The GEMM benches time a library reference next to every variant (ref_ms).
 # bench_attention_fp8 times the bf16 attention's top rung on the same shape.
 REFERENCE_NAME = {"sgemm": "cuBLAS", "hgemm": "cuBLAS", "fp8gemm": "cuBLASLt",

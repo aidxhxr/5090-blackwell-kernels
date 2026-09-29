@@ -68,6 +68,15 @@ ATTENTION_SHAPES = [(1, 32, 32, 4096, 4096, 128, 0), (1, 32, 32, 4096, 4096, 128
 ATTENTION_FP8_SHAPES = [(1, 32, 32, s, 128, c) for s in (1024, 2048, 4096, 8192, 16384)
                         for c in (0, 1)] + [(1, 32, 8, 4096, 128, 0), (1, 32, 8, 4096, 128, 1),
                                             (4, 32, 32, 2048, 128, 1), (1, 32, 32, 4096, 64, 1)]
+# (B, H_q, H_kv, S, D, causal): the timed backward shapes of bench_attention_bwd.cu (S_q = S_kv),
+# 1K to 8K tokens with and without the mask, a batch of four, D = 64 and Llama-3-8B's 32 / 8.
+ATTENTION_BWD_SHAPES = [(1, 32, 32, 1024, 128, 0), (1, 32, 32, 1024, 128, 1),
+                        (1, 32, 32, 2048, 128, 0), (1, 32, 32, 2048, 128, 1),
+                        (1, 32, 32, 4096, 128, 0), (1, 32, 32, 4096, 128, 1),
+                        (1, 32, 32, 8192, 128, 0), (1, 32, 32, 8192, 128, 1),
+                        (4, 32, 32, 2048, 128, 1), (1, 32, 32, 4096, 64, 1),
+                        (1, 32, 8, 4096, 128, 0), (1, 32, 8, 4096, 128, 1),
+                        (1, 32, 8, 8192, 128, 1)]
 WARMUP, ITERS = 10, 100
 SDPA_BACKEND = None  # --sdpa-backend: force torch's SDPA kernel instead of letting it choose
 
@@ -360,8 +369,9 @@ def sdpa_backend(fn) -> str:
         names = " ".join(e.name for e in p.events() if e.device_type.name == "CUDA")
     except Exception:
         return ""
-    for tag, key in (("flash", "flash_fwd"), ("cudnn", "cudnn"), ("efficient", "fmha_cutlass")):
-        if key in names:
+    for tag, keys in (("flash", ("flash_fwd", "flash_bwd")), ("cudnn", ("cudnn",)),
+                      ("efficient", ("fmha_cutlass",))):
+        if any(key in names for key in keys):
             return tag
     return "math" if names else ""
 
@@ -428,6 +438,43 @@ def bench_attention_fp8(sk, add, B, Hq, Hkv, S, D, causal):
         ours_ms, ref, gbps=gbps, tflops=flops / ours_ms / 1e9, backend=sdpa_backend(theirs))
 
 
+def bench_attention_bwd(sk, add, B, Hq, Hkv, S, D, causal):
+    """The backward pass alone: ours from the saved (out, lse), torch's as autograd.grad of
+    its SDPA output (the same kernels loss.backward() runs, preprocess and dq conversion
+    included on both sides)."""
+    q = torch.randn(B, Hq, S, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, Hkv, S, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(B, Hkv, S, D, device="cuda", dtype=torch.bfloat16)
+    do = torch.randn(B, Hq, S, D, device="cuda", dtype=torch.bfloat16)
+    gqa = Hkv != Hq
+    out, lse = sk.attention_fwd(q, k, v, causal=bool(causal))
+
+    def ours():
+        return sk.attention_bwd(q, k, v, out, do, lse, causal=bool(causal))
+
+    qr, kr, vr = (t.clone().requires_grad_() for t in (q, k, v))
+    backend = SDPA_BACKEND
+    ctx = contextlib.nullcontext()
+    if backend is not None:
+        from torch.nn.attention import sdpa_kernel
+
+        ctx = sdpa_kernel(backend)
+    with ctx:
+        o = F.scaled_dot_product_attention(qr, kr, vr, is_causal=bool(causal), enable_gqa=gqa)
+
+    def theirs():
+        return torch.autograd.grad(o, (qr, kr, vr), do, retain_graph=True)
+
+    ours_ms = time_ms(ours)
+    ref = time_ms(theirs)
+    # the five products of the backward: 2.5x the forward's 4 B H S S D, halved under the mask
+    flops = 10.0 * B * Hq * S * S * D * (0.5 if causal else 1.0)
+    # Q, O, dO read and dQ written per query head; K, V read and dK, dV written per K/V head
+    gbps = 2 * 4 * B * (Hq + Hkv) * S * D / ours_ms / 1e6
+    add("attention_bwd", "bf16", attention_shape(B, Hq, S, S, D, bool(causal), H_kv=Hkv),
+        ours_ms, ref, gbps=gbps, tflops=flops / ours_ms / 1e9, backend=sdpa_backend(theirs))
+
+
 def positive_int(text: str) -> int:
     n = int(text)
     if n < 1:
@@ -448,11 +495,12 @@ def main() -> int:
     ap.add_argument("--sdpa-backend", choices=["flash", "cudnn", "efficient", "math"],
                     help="force this SDPA kernel for the attention rows instead of torch's own "
                          "choice (the default, which the JSON records as torch_backend)")
-    ap.add_argument("--only", choices=["attention", "attention_fp8", "hgemm_fused", "sgemm",
-                                       "fp4gemm"],
+    ap.add_argument("--only", choices=["attention", "attention_fp8", "attention_bwd",
+                                       "hgemm_fused", "sgemm", "fp4gemm"],
                     help="time only this kernel's rows (with --sdpa-backend: the attention "
                          "rows against that kernel; hgemm_fused: the fused-epilogue rows; "
-                         "attention_fp8: the fp8 kernel against torch's bf16 SDPA)")
+                         "attention_fp8: the fp8 kernel against torch's bf16 SDPA; "
+                         "attention_bwd: the backward rows)")
     ap.add_argument("--iters", type=positive_int, default=ITERS,
                     help="timed iterations per op (default: %(default)s, same as the C++ benches)")
     ap.add_argument("--warmup", type=non_negative_int, default=WARMUP,
@@ -513,7 +561,7 @@ def main() -> int:
         for M, N, K in FP4GEMM_SHAPES:
             bench_fp4gemm(sk, add, M, N, K)
         return 0
-    if args.only not in ("attention", "attention_fp8"):
+    if args.only not in ("attention", "attention_fp8", "attention_bwd"):
         for dtype in (torch.float32, torch.bfloat16):
             for rows, cols in RMSNORM_SHAPES:
                 bench_rmsnorm(sk, add, dtype, rows, cols)
@@ -531,12 +579,15 @@ def main() -> int:
             bench_fp8gemm(sk, add, M, N, K)
         for M, N, K in FP4GEMM_SHAPES:
             bench_fp4gemm(sk, add, M, N, K)
-    if args.only != "attention_fp8":
+    if args.only not in ("attention_fp8", "attention_bwd"):
         for B, Hq, Hkv, Sq, Skv, D, causal in ATTENTION_SHAPES:
             bench_attention(sk, add, B, Hq, Hkv, Sq, Skv, D, causal)
     if args.only in (None, "attention_fp8"):
         for B, Hq, Hkv, S, D, causal in ATTENTION_FP8_SHAPES:
             bench_attention_fp8(sk, add, B, Hq, Hkv, S, D, causal)
+    if args.only in (None, "attention_bwd"):
+        for B, Hq, Hkv, S, D, causal in ATTENTION_BWD_SHAPES:
+            bench_attention_bwd(sk, add, B, Hq, Hkv, S, D, causal)
     if args.only or args.sdpa_backend:
         return 0  # a partial or forced-backend run is not the results table's input
 

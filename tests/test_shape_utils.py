@@ -254,3 +254,15 @@ def test_attention_fp8_rows_use_the_fp8_peak_and_one_byte_operands():
     assert su.traffic_bytes("attention_fp8", "e4m3", dims) == (3 * 32 + 2 * 8) * 4096 * 128
     assert su.is_compute_bound_kernel("attention_fp8")
     assert su.compute_peak_key("attention_fp8", "e4m3") == "fp8_tflops"
+
+
+def test_attention_bwd_counts_the_five_products_and_the_gradient_traffic():
+    # bench_attention_bwd.cu uses the forward's shape strings; FLOPs are 2.5x the forward's
+    dims = su.parse_shape("attention_bwd", "b1_hq32_hkv8_s4096_d128_causal")
+    assert dims == {"B": 1, "H": 32, "H_kv": 8, "S_q": 4096, "S_kv": 4096, "D": 128,
+                    "causal": True}
+    assert su.flops("attention_bwd", dims) == 2.5 * su.flops("attention", dims)
+    assert su.flops("attention_bwd", dims) == 10 * 32 * 4096 * 4096 * 128 / 2
+    # Q, O, dO, dQ per query head and K, V, dK, dV per K/V head, bf16
+    assert su.traffic_bytes("attention_bwd", "bf16", dims) == 4 * (32 + 8) * 4096 * 128 * 2
+    assert su.is_compute_bound_kernel("attention_bwd") and su.uses_tensor_cores("attention_bwd")

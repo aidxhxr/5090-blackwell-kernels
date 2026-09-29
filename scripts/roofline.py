@@ -35,7 +35,7 @@ OUT = RESULTS / "roofline.png"
 
 MARKERS = {"bandwidth": "P", "rmsnorm": "o", "add_rmsnorm": "D", "swiglu": "s", "softmax": "^",
            "sgemm": "v", "sgemm (tf32)": "<", "sgemm (3xtf32)": ">", "hgemm": "*", "fp8gemm": "h",
-           "fp4gemm": "H", "fp4quant": "d", "attention": "X"}
+           "fp4gemm": "H", "fp4quant": "d", "attention": "X", "attention_bwd": "p"}
 
 
 def series_of(r: dict) -> str:
