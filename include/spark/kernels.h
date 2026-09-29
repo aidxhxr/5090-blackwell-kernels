@@ -254,6 +254,52 @@ size_t fp4_scale_bytes(int rows, int K, int format);
 void fp4_quantize(const __nv_bfloat16* x, unsigned char* q, unsigned char* sf, int rows, int K,
                   const float* scale, int format, cudaStream_t stream);
 
+// ---- W4A16 GEMM (int4 weights, bf16 activations) ------------------------------------------
+// C[M,N] = A[M,K] * dequant(W)[K,N] for bf16 A and C, int4 weights with one bf16 scale (and,
+// optionally, one zero point) per group of 128 consecutive k of a column, fp32 accumulation.
+// The dequantized weight is w[k][n] = bf16((q[k][n] - z) * s[k / 128][n]), rounded once, with
+// z = 8 for symmetric weights and z = zeros[k / 128][n] for asymmetric ones: the kernel's
+// weights are bit for bit the ones a dequantize-then-bf16-GEMM reference multiplies.
+// Design and measurements: docs/design/w4gemm.md.
+constexpr int kW4GroupSize = 128;
+
+// Round-to-nearest quantization of W [K, N] bf16 (row-major, the [K, N] layout hgemm takes),
+// per group of 128 k of one column, in fp32:
+//   symmetric (zeros == nullptr): s = bf16(max|w| / 7), q = clamp(rint(w / s), -8, 7) + 8
+//   asymmetric: lo = min(min w, 0), hi = max(max w, 0), s = bf16((hi - lo) / 15),
+//               z = clamp(rint(-lo / s), 0, 15), q = clamp(rint(w / s) + z, 0, 15)
+// (an all-zero group gets s = 0 and q = z). Outputs: qweight [K/8, N] int32, eight
+// consecutive k per word with the lowest k in the lowest nibble (GPTQ's qweight layout),
+// scales [K/128, N] bf16, zeros [K/128, N] uint8 (asymmetric only). K % 128 == 0,
+// N % 16 == 0.
+void w4_quantize_bf16(const __nv_bfloat16* W, int32_t* qweight, __nv_bfloat16* scales,
+                      uint8_t* zeros, int K, int N, cudaStream_t stream);
+// Offline repack of qweight into the layout w4gemm reads: int32 [N/16][K/64][32][4], one
+// 512-byte block per 16 columns x 64 k in which lane l's 16 bytes are exactly the four
+// mma.sync A fragments (16 output columns x 16 k each) it needs for those 64 k, nibbles
+// ordered for the lop3 dequant (docs/design/w4gemm.md, "The repacked layout").
+void w4_repack(const int32_t* qweight, int32_t* packed, int K, int N, cudaStream_t stream);
+
+// C = A * dequant(packed, scales, zeros), zeros == nullptr for symmetric weights. Requires
+// N % 16 == 0, K % 128 == 0, any M >= 1, 16-byte aligned A, packed, scales and zeros.
+// variant 0: one thread per output element, scalar dequant from the packed layout
+// variant 1: one warp per 16-column strip and 8 tokens over the whole K: each lane's 16 bytes
+//            of weights and of activations straight into registers, lop3 dequant into the
+//            mma.sync A fragment (weights as the 16-row operand, tokens as the n8 operand)
+// variant 2: the block shape picked per call (docs/design/w4gemm.md). M = 1: four warps along
+//            K on a multi-stage cp.async pipeline with one activation row staged; M <= 16:
+//            independent warps with the weights of the next groups in flight in registers,
+//            four or eight along K per 16 or 32 columns, or one per 16 columns when N is wide;
+//            M > 16: 64 or 128-column tiles with warps along N and M sharing staged
+//            activations, on a Stream-K grid. A K split across blocks goes through an fp32
+//            workspace with atomics (those outputs are not bitwise reproducible run to run),
+//            which the kernel leaves zeroed: one launch, no memset
+void w4gemm_bf16(const __nv_bfloat16* A, const int32_t* packed, const __nv_bfloat16* scales,
+                 const uint8_t* zeros, __nv_bfloat16* C, int M, int N, int K, int variant,
+                 cudaStream_t stream);
+int w4gemm_num_variants();
+bool w4gemm_supports(int M, int N, int K, int variant);
+
 // ---- RoPE + K/V cache append -------------------------------------------------------------
 // From qkv = [B, S, (H_q + 2 H_kv) * D] bf16 (a fused q|k|v projection) and rotary tables
 // cos, sin = [>= pos0 + S, D] fp32 in the rotate-half layout (column d pairs with d + D/2;
