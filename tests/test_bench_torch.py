@@ -65,3 +65,15 @@ def test_attention_shapes_match_the_cpp_defaults():
     # bench_torch times the large shapes only; every one of them must be in the C++ list
     for shape in bench_torch.ATTENTION_SHAPES:
         assert shape in cpp, f"{shape} is timed by bench_torch.py but not by bench_attention.cu"
+
+
+def test_attention_fp8_shapes_match_the_cpp_defaults():
+    # bench_attention_fp8.cu lists (B, H_q, H_kv, S_q, S_kv, D, causal); bench_torch times the
+    # prefill ones as (B, H_q, H_kv, S, D, causal), and every one must be in the C++ list
+    flat = ints_after("bench_attention_fp8", r"shapes =")
+    assert len(flat) % 7 == 0
+    cpp = [tuple(flat[i:i + 7]) for i in range(0, len(flat), 7)]
+    for B, Hq, Hkv, S, D, causal in bench_torch.ATTENTION_FP8_SHAPES:
+        assert (B, Hq, Hkv, S, S, D, causal) in cpp, (
+            f"{(B, Hq, Hkv, S, D, causal)} is timed by bench_torch.py but not by "
+            "bench_attention_fp8.cu")

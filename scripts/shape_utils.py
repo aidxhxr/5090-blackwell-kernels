@@ -164,6 +164,8 @@ def row_shape(rows: int, cols: int) -> str:
 
 
 GEMM_KERNELS = ("sgemm", "hgemm", "fp8gemm", "gemm")
+# bench_attention (bf16) and bench_attention_fp8 (e4m3 Q, K, V, bf16 O): same shape strings.
+ATTENTION_KERNELS = ("attention", "attention_fp8")
 
 
 def gemm_shape(M: int, N: int, K: int) -> str:
@@ -239,7 +241,7 @@ def parse_shape(kernel: str, shape: str) -> dict:
             raise ValueError(f"not a rope shape string: {shape!r}")
         B, S, Hq, Hkv, D, pos = (int(g) for g in m.groups())
         return {"B": B, "S": S, "H": Hq, "H_kv": Hkv, "D": D, "pos0": pos}
-    if k == "attention":
+    if k in ATTENTION_KERNELS:
         m = ATTENTION_SHAPE.match(shape)
         if not m:
             raise ValueError(f"not an attention shape string: {shape!r}")
@@ -283,9 +285,11 @@ def traffic_bytes(kernel: str, dtype: str, dims: dict) -> float:
         return 2.0 * dims["B"] * dims["S"] * (dims["H"] + 2 * dims["H_kv"]) * dims["D"] * isz
     if k == "paged_decode":  # K and V once per K/V head, one Q and O row per query head
         return 2.0 * (dims["keys"] * dims["H_kv"] + dims["B"] * dims["H"]) * dims["D"] * isz
-    if k == "attention":  # Q and O once (H_q heads), K and V once (H_kv heads under GQA)
+    if k in ATTENTION_KERNELS:  # Q and O once (H_q heads), K and V once (H_kv heads under GQA)
         q_rows = dims["B"] * dims["H"] * dims["S_q"]
         kv_rows = dims["B"] * dims.get("H_kv", dims["H"]) * dims["S_kv"]
+        if k == "attention_fp8":  # Q, K, V in e4m3, O in bf16
+            return (3.0 * q_rows + 2.0 * kv_rows) * dims["D"]
         return 2.0 * (q_rows + kv_rows) * dims["D"] * isz
     return 0.0
 
@@ -294,7 +298,7 @@ def flops(kernel: str, dims: dict) -> float:
     k = kernel.lower()
     if k in GEMM_KERNELS:
         return 2.0 * dims["M"] * dims["N"] * dims["K"]
-    if k == "attention":  # Q K^T and P V, halved under the causal mask as FlashAttention counts it
+    if k in ATTENTION_KERNELS:  # Q K^T and P V, halved under the causal mask (FlashAttention)
         fl = 4.0 * dims["B"] * dims["H"] * dims["S_q"] * dims["S_kv"] * dims["D"]
         return fl / 2 if dims["causal"] else fl
     if k == "paged_decode":  # one query row per head against every key: Q K^T and P V
@@ -317,20 +321,20 @@ def arithmetic_intensity(kernel: str, dtype: str, shape: str) -> float:
 
 
 def is_compute_bound_kernel(kernel: str) -> bool:
-    return kernel.lower() in GEMM_KERNELS + ("attention", "attention_varlen")
+    return kernel.lower() in GEMM_KERNELS + ATTENTION_KERNELS + ("attention_varlen",)
 
 
 def uses_tensor_cores(kernel: str, dtype: str = "") -> bool:
     """Kernels judged against a tensor-core peak (bf16, fp8 or tf32) rather than the fp32 one.
     sgemm is the CUDA-core ladder except for its tf32 / 3xtf32 rows."""
-    return (kernel.lower() in ("hgemm", "fp8gemm", "attention", "attention_varlen")
+    return (kernel.lower() in ("hgemm", "fp8gemm", "attention_varlen") + ATTENTION_KERNELS
             or dtype in TF32_DTYPES)
 
 
 def compute_peak_key(kernel: str, dtype: str = "") -> str:
     """The DEVICE_PEAKS entry a compute-bound kernel is judged against."""
     k = kernel.lower()
-    if k == "fp8gemm":
+    if k in ("fp8gemm", "attention_fp8"):
         return "fp8_tflops"
     if dtype in TF32_DTYPES:
         return "tf32_tflops"

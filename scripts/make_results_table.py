@@ -32,10 +32,12 @@ OUT_HEADLINE = RESULTS / "headline.md"
 
 SHEETS = {"RTX 5090": "RTX5090.md", "GB10": "GB10.md"}
 KERNEL_ORDER = ["bandwidth", "rmsnorm", "add_rmsnorm", "swiglu", "softmax", "sgemm", "hgemm",
-                "fp8gemm", "attention", "rope"]
+                "fp8gemm", "attention", "attention_fp8", "rope"]
 # The GEMM benches time a library reference next to every variant (ref_ms).
+# bench_attention_fp8 times the bf16 attention's top rung on the same shape.
 REFERENCE_NAME = {"sgemm": "cuBLAS", "hgemm": "cuBLAS", "fp8gemm": "cuBLASLt",
-                  "attention_varlen": "dense attention per sequence"}
+                  "attention_varlen": "dense attention per sequence",
+                  "attention_fp8": "bf16 attention v5"}
 
 
 def on_device(r: dict, device: str) -> bool:
@@ -163,7 +165,8 @@ def fmt(x: float, nd=3) -> str:
 def vs_ref(kernel: str, r: dict) -> str:
     """ref_ms is cuBLAS for the GEMMs (shown as % of cuBLAS throughput) and the naive variant
     or cudaMemcpy for everything else (shown as a speedup). Attention has no library
-    reference in the C++ bench (ref_ms = 0); its comparison is the torch column."""
+    reference in the C++ bench (ref_ms = 0); its comparison is the torch column. The fp8
+    attention's ref_ms is the bf16 attention's top rung, so its "%" is the fp8 speedup."""
     ref_ms, ms = r.get("ref_ms", 0), r["median_ms"]
     if ref_ms <= 0 or ms <= 0:
         return "—"

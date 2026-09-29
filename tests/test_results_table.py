@@ -173,6 +173,26 @@ def test_attention_rows_use_the_tensor_peak_and_the_torch_backend_column(results
     assert "| attention | bf16 | b1_h32_s4096_d128_causal | v3 |" in headline  # the largest shape
 
 
+def test_attention_fp8_rows_use_the_fp8_peak_and_the_bf16_kernel_as_reference(results):
+    # bench_attention_fp8 times attention variant 5 (bf16) on the same shape as ref_ms
+    out, write = results
+    shape = "b1_h32_s4096_d128_causal"
+    write("attention_fp8.json", [
+        bench_row("attention_fp8", "e4m3", 0, shape, 12.2, tflops=11.3, ref_ms=0.58),
+        bench_row("attention_fp8", "e4m3", 1, shape, 0.232, tflops=592.4, ref_ms=0.58),
+    ])
+    write("peak.json", [{"device": DEVICE, "kernel": "peak_bf16_mma", "tflops": 258.7},
+                        {"device": DEVICE, "kernel": "peak_fp8_mma", "tflops": 1014.0}])
+    assert mrt.main() == 0
+    md = (out / "RESULTS.md").read_text()
+    section = md.split("## attention_fp8\n")[1]
+    assert "% of peak (1014 TFLOPS)" in section and "% of bf16 attention v5" in section
+    assert "| e4m3 | b1_h32_s4096_d128_causal | 1 | 0.2320 | 0.2274 | 592.40 | 58.4% | 250.0% |" \
+        in section
+    headline = (out / "headline.md").read_text()
+    assert "| attention_fp8 | e4m3 | b1_h32_s4096_d128_causal | v1 |" in headline
+
+
 def test_layer_rows_get_their_own_section_and_stay_out_of_the_kernel_tables(results):
     out, write = results
     write("hgemm.json", [

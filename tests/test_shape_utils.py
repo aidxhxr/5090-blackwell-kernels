@@ -222,3 +222,14 @@ def test_paged_shapes_parse_and_count_the_kv_bytes():
     assert (v["B"], v["keys"]) == (16, 8353)
     assert su.is_compute_bound_kernel("attention_varlen")
     assert not su.is_compute_bound_kernel("paged_decode")
+
+
+def test_attention_fp8_rows_use_the_fp8_peak_and_one_byte_operands():
+    # bench_attention_fp8.cu writes kernel "attention_fp8" with bench_attention's shape strings
+    dims = su.parse_shape("attention_fp8", "b1_hq32_hkv8_s4096_d128_causal")
+    assert dims["H"] == 32 and dims["H_kv"] == 8 and dims["causal"]
+    assert su.flops("attention_fp8", dims) == su.flops("attention", dims)
+    # Q, K, V one byte per element (K and V per K/V head), O two bytes
+    assert su.traffic_bytes("attention_fp8", "e4m3", dims) == (3 * 32 + 2 * 8) * 4096 * 128
+    assert su.is_compute_bound_kernel("attention_fp8")
+    assert su.compute_peak_key("attention_fp8", "e4m3") == "fp8_tflops"
