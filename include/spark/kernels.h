@@ -14,6 +14,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace spark {
@@ -203,6 +204,55 @@ bool fp8gemm_mx_supports(int M, int N, int K, int variant);
 // exists. On a plain sm_120 build the per-tensor mode runs the plain instruction and MX mode
 // is refused.
 bool fp8gemm_mx_available();
+
+// ---- FP4GEMM (e2m1 tensor cores, NVFP4 and MXFP4) ----------------------------------------
+// C = scale_a * scale_b * sum_k (sfa[m][k/V] A[m][k]) (sfb[n][k/V] Bt[n][k]), with A [M,K] and
+// Bt [N,K] e2m1 (fp4) packed two values per byte, K contiguous (element k in the low nibble of
+// byte k/2 when k is even: the layout of torch.float4_e2m1fn_x2 and cuBLASLt's CUDA_R_4F_E2M1),
+// so A is [M][K/2] bytes and Bt [N][K/2]. The block scales:
+//   FP4_NVFP4: one e4m3 scale per 16 k (V = 16), as the NVFP4 format; scale_a / scale_b are
+//              the per-tensor fp32 second-level scales
+//   FP4_MXFP4: one ue8m0 scale (OCP E8M0, exponent + 127) per 32 k (V = 32), as MXFP4
+// Both scale tensors are in the blocked layout cuBLASLt's VEC16_UE4M3 / VEC32_UE8M0 modes and
+// torch's SWIZZLE_32_4_4 take: tiles of 128 rows by 4 scale bytes (512 bytes), the tiles of a
+// 128-row block consecutive along K, and inside a tile the byte for row r and scale column j
+// at (r % 32) * 16 + (r / 32) * 4 + j % 4. Rows are padded to a multiple of 128, so a tensor of
+// `rows` rows takes fp4_scale_bytes(rows, K, format) bytes. scale_a / scale_b are device fp32
+// scalars and may both be null (1.0). C is bf16, accumulation fp32 on
+// mma.sync.m16n8k64.kind::mxf4nvf4, which applies the block scales. Requires N % 64 == 0,
+// K % 256 == 0, 16-byte aligned A, Bt, sfa, sfb and an sm_120a / sm_121a build.
+// variant 0: one warp per 16x8 output tile, fragments and scale words straight from global
+//            memory (requires M % 16 == 0)
+// variant 1: 128x128 block tile, mma.sync + ldmatrix out of XOR-swizzled shared memory with the
+//            scale tiles staged beside the operand tiles, cp.async pipeline, split-K over the
+//            last partial wave (fp32 atomics, not bitwise reproducible run to run), 64x128 /
+//            64x64 tiles for small grids and one CTA per 32- to 64-row strip of Bt for decode
+//            shapes (M <= 64). Any M >= 1
+// variant 2: the 128x128 tile fed by TMA through a warp-specialized mbarrier pipeline, the
+//            scale tiles by bulk copies on the same barriers. Requires M % 128 == 0,
+//            N % 128 == 0 and at least one 128x128 tile per SM
+enum Fp4Format { FP4_NVFP4 = 0, FP4_MXFP4 = 1 };
+void fp4gemm(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* C, int M, int N, int K,
+             const unsigned char* sfa, const unsigned char* sfb, const float* scale_a,
+             const float* scale_b, int format, int variant, cudaStream_t stream);
+int fp4gemm_num_variants();
+bool fp4gemm_supports(int M, int N, int K, int variant);
+// True if the fp4 kernels were compiled for sm_120a / sm_121a, where the fp4 mma exists.
+bool fp4gemm_available();
+// Bytes of a blocked scale tensor for a [rows][K] fp4 matrix (rows padded to 128).
+size_t fp4_scale_bytes(int rows, int K, int format);
+// Quantizes x [rows][K] bf16 into q [rows][K/2] (packed e2m1) and sf (blocked layout, all
+// fp4_scale_bytes of it written, the padding rows as zero scales), K % 64 == 0 (NVFP4) or
+// K % 128 == 0 (MXFP4), 16-byte aligned pointers.
+//   NVFP4: `scale` is the per-tensor decode scale s (device fp32, x ~ s * sf * q; the NVFP4
+//          recipe takes s = max|x| / (6 * 448)). A block's scale is e4m3(max|block| / 6 / s)
+//          (round to nearest even, at most 448) and its elements e2m1(x / (s * sf)), round to
+//          nearest even, saturating at 6. A null `scale` means s = 1.
+//   MXFP4: the OCP recipe, `scale` ignored: a block of 32 gets 2^e with
+//          e = floor(log2(max|block|)) - 2 (e2m1's largest exponent), stored as e + 127, and
+//          its elements e2m1(x / 2^e), saturating at 6.
+void fp4_quantize(const __nv_bfloat16* x, unsigned char* q, unsigned char* sf, int rows, int K,
+                  const float* scale, int format, cudaStream_t stream);
 
 // ---- RoPE + K/V cache append -------------------------------------------------------------
 // From qkv = [B, S, (H_q + 2 H_kv) * D] bf16 (a fused q|k|v projection) and rotary tables

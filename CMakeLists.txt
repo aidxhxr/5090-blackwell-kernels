@@ -21,10 +21,11 @@ option(SPARK_BUILD_BENCH "Build benchmark binaries (needs cuBLAS)" ON)
 option(SPARK_LINEINFO "Embed line info for Nsight Compute source view" ON)
 
 # The architecture-specific form of each requested arch ("120a"): the block-scaled fp8
-# mma.sync (.kind::mxf8f6f4) that gives the fp8 GEMM its full rate is only exposed there
-# (docs/design/fp8gemm.md). Only the fp8 kernels (the GEMM and the fp8 attention) and
-# bench_peak are built for it; an "a" cubin runs on exactly that compute capability, which
-# the plain arch already implies here.
+# mma.sync (.kind::mxf8f6f4) that gives the fp8 GEMM its full rate, and the fp4 one
+# (.kind::mxf4nvf4) that is the fp4 GEMM's only instruction, are only exposed there
+# (docs/design/fp8gemm.md, docs/design/fp4gemm.md). Only the fp8 kernels (the GEMM and the
+# fp8 attention), the fp4 kernels and bench_peak are built for it; an "a" cubin runs on
+# exactly that compute capability, which the plain arch already implies here.
 set(SPARK_CUDA_ARCHITECTURES_A "")
 foreach(arch ${CMAKE_CUDA_ARCHITECTURES})
   if(arch MATCHES "a$")
@@ -37,7 +38,8 @@ endforeach()
 # ---- kernel library ----------------------------------------------------------------------
 file(GLOB SPARK_KERNEL_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/kernels/*.cu)
 file(GLOB SPARK_FP8_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/kernels/fp8gemm*.cu
-     ${CMAKE_SOURCE_DIR}/src/kernels/attention_fp8*.cu)
+     ${CMAKE_SOURCE_DIR}/src/kernels/attention_fp8*.cu
+     ${CMAKE_SOURCE_DIR}/src/kernels/fp4*.cu)
 list(REMOVE_ITEM SPARK_KERNEL_SOURCES ${SPARK_FP8_SOURCES})
 add_library(spark_kernels_fp8 STATIC ${SPARK_FP8_SOURCES})
 add_library(spark_kernels STATIC ${SPARK_KERNEL_SOURCES})

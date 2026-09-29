@@ -5,9 +5,10 @@
     TORCH_CUDA_ARCH_LIST="12.1a" pip install -e . --no-build-isolation  # DGX Spark (GB10)
 
 The default architecture is compute capability 12.0 in its architecture-specific form
-(sm_120a: the RTX 5090 and the other RTX Blackwell cards). The "a" matters for one kernel:
+(sm_120a: the RTX 5090 and the other RTX Blackwell cards). The "a" matters for two kernels:
 the fp8 GEMM's block-scaled mma.sync is only exposed on sm_120a / sm_121a, and a plain
-"12.0" build falls back to the half-rate fp8 instruction (docs/design/fp8gemm.md). Set
+"12.0" build falls back to the half-rate fp8 instruction (docs/design/fp8gemm.md); the fp4
+GEMM has no instruction at all without it and refuses to run (docs/design/fp4gemm.md). Set
 TORCH_CUDA_ARCH_LIST to build for something else: "12.1a" for the DGX Spark, "12.0a;12.1a"
 for both.
 """
