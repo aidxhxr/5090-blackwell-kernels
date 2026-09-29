@@ -3,14 +3,16 @@
 ## Conventions
 
 - **Row-major everywhere.** GEMMs compute `C[M,N] = A[M,K] · B[K,N]`. Row ops treat the input as
-  `rows × cols` with `cols` contiguous. The one exception is the fp8 GEMM, which takes B
-  transposed (`Bt[N,K]`, K contiguous, the layout cuBLASLt requires for fp8 and the one a
-  weight is stored in) and says so in its signature.
+  `rows × cols` with `cols` contiguous. The exceptions are the fp8 and fp4 GEMMs, which take B
+  transposed (`Bt[N,K]`, K contiguous, the layout cuBLASLt requires for fp8 and fp4 and the one
+  a weight is stored in) and say so in their signatures; the fp4 GEMM's block scales come in
+  cuBLASLt's blocked (128 x 4) layout.
 - **`variant` is the ladder.** Variant 0 is always the naive baseline. Numbers are stable so the
   benchmarks, tests, and design docs can refer to them. The Python bindings default to the
   highest variant.
 - **fp32 accumulation** for every reduction and every GEMM, regardless of I/O dtype (the fp8
-  GEMM included: it uses the block-scaled instruction to get that at the full rate).
+  GEMM included: it uses the block-scaled instruction to get that at the full rate; the fp4
+  GEMM's only instruction accumulates in fp32).
 - **Host validation throws** `std::invalid_argument`; CUDA errors throw `std::runtime_error`.
   The PyTorch bindings surface these as Python exceptions.
 - **One 128-bit transaction per thread** is the target memory access pattern for the
@@ -29,8 +31,9 @@ arch flag and the tuning constants differ. What the two machines mean for kernel
 | tf32 dense peak, fp32 accumulate | 129.4 TFLOPS measured at 2,977 MHz on `mma.sync.m16n8k8`, half the bf16 rate | not measured | The roof of `sgemm` variants 6 and 7, which compute the fp32 GEMM on the tensor cores in TF32 and 3xTF32 ([sgemm](design/sgemm.md)); `results/peak.json` carries it as `peak_tf32_mma`. |
 | bf16 dense peak | 258.7 TFLOPS measured at 2,976 MHz; ≈ 239 at the 2.72–2.78 GHz a sustained GEMM runs at under the 600 W power limit | ~213 TFLOPS (community measurement) | Ridges ≈ 144 vs 780 FLOP/byte; a GEMM block tile must reuse operands heavily through smem and L2. The results scripts read the measured peaks from `results/peak.json`. The GB10 number is not scaled. |
 | fp8 (e4m3) dense peak, fp32 accumulate | 1,014 TFLOPS measured at 2,923 MHz on the block-scaled `mma.sync.kind::mxf8f6f4` (sm_120a); the plain fp8 `mma.sync` runs at half that, 517; a sustained fp8 GEMM settles at 2.13–2.16 GHz, ≈ 745 | not measured | Ridge ≈ 566 FLOP/byte. The fp8 kernels are built for the architecture-specific target (`120a`, `121a`) to reach the full-rate instruction ([fp8gemm](design/fp8gemm.md)). |
+| fp4 (e2m1) dense peak, fp32 accumulate | 2,029 TFLOPS measured at 2,924 MHz on `mma.sync.m16n8k64.kind::mxf4nvf4` (sm_120a), NVFP4 and MXFP4 alike, twice the fp8 rate; a sustained fp4 GEMM settles at 2.15–2.21 GHz, ≈ 1,530 | not measured | Ridge ≈ 1,132 FLOP/byte. Built for the architecture-specific target with the fp8 kernels ([fp4gemm](design/fp4gemm.md)). |
 | L2 | 96 MB | 24 MB | GB10: a 4096×4096 bf16 operand (32 MB) does *not* fit, so tile order matters. On the 5090 both operands of a 4096³ GEMM fit, and any row-kernel bench shape under ~32 MB per operand measures L2, not DRAM, so the headline shapes are 256 MB+. |
-| `mma.sync`, `cp.async` and TMA yes; `tcgen05` / `wgmma` no | same | same | Tensor-core GEMMs use `mma.sync` (WMMA for the early rungs) with `cp.async` (`hgemm` v3, `fp8gemm` v1) or TMA plus mbarriers (`hgemm` v5 and v6, `fp8gemm` v2, `attention` v4 and v5, `attention_fp8` v1), not CUTLASS 3.x SM100 pipelines. |
+| `mma.sync`, `cp.async` and TMA yes; `tcgen05` / `wgmma` no | same | same | Tensor-core GEMMs use `mma.sync` (WMMA for the early rungs) with `cp.async` (`hgemm` v3, `fp8gemm` v1, `fp4gemm` v1) or TMA plus mbarriers (`hgemm` v5 and v6, `fp8gemm` v2, `fp4gemm` v2, `attention` v4 and v5, `attention_fp8` v1), not CUTLASS 3.x SM100 pipelines. |
 | SMs | 170 | 48 | Grid sizes for grid-stride kernels are set from `multiProcessorCount` at runtime. Fixed-size launches (one block per GEMM tile, one block per row) need 3.5× more blocks to fill the 5090. |
 
 The tile sizes and crossovers in the first rungs (`hgemm` 128×128×32 with +8 padding and 8
@@ -92,6 +95,7 @@ docs:
 - [sgemm](design/sgemm.md)
 - [hgemm](design/hgemm.md)
 - [fp8gemm](design/fp8gemm.md)
+- [fp4gemm](design/fp4gemm.md) (NVFP4 and MXFP4, and the quantizer)
 - [attention](design/attention.md)
 - [one decoder layer](design/layer.md)
 - [serving: the paged K/V cache, paged decode, varlen prefill and the engine](design/serving.md)

@@ -2,14 +2,15 @@
 
 I have an RTX 5090 and a copy of cuBLAS, and I wanted to know how close I could get to it by
 hand. So I wrote the pieces of a Llama-style decoder block from scratch: RMSNorm, SwiGLU,
-softmax, an fp32 GEMM, a bf16 tensor-core GEMM, an fp8 tensor-core GEMM and fused attention
-with grouped-query heads. Each kernel is a ladder. Variant 0 is the naive version. Every rung
+softmax, an fp32 GEMM, a bf16 tensor-core GEMM, fp8 and fp4 tensor-core GEMMs and fused
+attention with grouped-query heads. Each kernel is a ladder. Variant 0 is the naive version. Every rung
 after it changes one thing, gets benchmarked against cuBLAS, cuBLASLt or PyTorch on the same
 shapes in the same timing loop, and gets profiled in Nsight Compute so the ladder says what
 each change bought.
 
 Where it ended up: the bf16 GEMM is ahead of cuBLAS on every shape from 2048 cubed up and at
-the memory floor on decode shapes. The fp8 GEMM is level with cuBLASLt at 4096 cubed. The
+the memory floor on decode shapes. The fp8 GEMM is level with cuBLASLt at 4096 cubed, and the
+fp4 GEMM gives cuBLASLt's NVFP4 bits at 96 to 98% of its speed on the big squares. The
 attention kernel is 18 to 38% ahead of PyTorch's FlashAttention-2 on prefill and streams a
 128K-token cache faster than `cudaMemcpy` copies it. And four things about this card turned out
 to be different from the spec sheet, which is the part I'd read first.
@@ -463,11 +464,12 @@ default stays on the CUDA cores.
 | `sgemm` fp32 | naive, smem tile, 8x8 register tile, cp.async, register prefetch with swizzle, 256x128 tile; TF32 and 3xTF32 on the tensor cores (opt-in) | cuBLAS SGEMM, in fp32 and in TF32 math mode |
 | `hgemm` bf16 | WMMA, smem tile, cp.async, `mma.sync` + `ldmatrix` with swizzle and split-K, Stream-K, TMA, TMA on Stream-K; a weight-streaming kernel for decode; fused bias / activation / residual / SwiGLU epilogues | cuBLAS GemmEx; eager `addmm`, `F.gelu`, `F.silu * up` |
 | `fp8gemm` e4m3 | naive `mma.sync.m16n8k32`, the swizzled cp.async tile with a 64x64 warp tile and decode configs, TMA; all on the block-scaled instruction, with per-tensor scales or MXFP8 block scales | cuBLASLt, `torch._scaled_mm`, `F.scaled_mm` |
+| `fp4gemm` NVFP4, MXFP4 | naive `mma.sync.m16n8k64.kind::mxf4nvf4`, the swizzled cp.async tile with the block scales staged beside it, TMA with bulk-copied scales; a bf16 -> fp4 quantizer | cuBLASLt NVFP4 (bit-identical), `F.scaled_mm` |
 | `attention` bf16 | warp per row, CUDA-core flash attention, `mma.sync` flash attention, split-KV tail, TMA mbarrier pipeline, persistent tile queue with a producer warp; GQA and a flash-decoding kernel | `F.scaled_dot_product_attention` |
 | `attention_fp8` e4m3 | warp per row on dequantized inputs, variant 5's persistent TMA kernel with both products on the block-scaled fp8 `mma.sync`, P rounded to e4m3 in registers, V transposed by `ldmatrix.trans` and byte permutes | the bf16 kernel, `F.scaled_dot_product_attention` in bf16 |
 | `rope_append` bf16 | RoPE on q and k plus the K/V cache append from a fused q\|k\|v projection, one launch | the torch spelling, ten kernels |
 | `layer` | one Llama-3-8B decoder layer from the kernels above, prefill and decode with a K/V cache, our decode step as a CUDA graph | the same layer in PyTorch, eager and `torch.compile` |
-| `bench_peak` | | the card's real `mma.sync` (bf16, fp8 plain and block-scaled, tf32) and FMA peaks and the clock they ran at |
+| `bench_peak` | | the card's real `mma.sync` (bf16, fp8 plain and block-scaled, fp4, tf32) and FMA peaks and the clock they ran at |
 
 Every kernel takes a `variant` argument so each rung can be run, timed and tested on its own.
 All of them are exposed to PyTorch through a C++ extension, with parity tests for every
@@ -479,7 +481,7 @@ You need CUDA 13, CMake 3.24 and, for the extension, a PyTorch with cu130 wheels
 newer). The extension builds as C++20 because the torch headers ask for it.
 
 ```bash
-make build            # sm_120 (the fp8 kernels as sm_120a); ARCH=121 for the GB10
+make build            # sm_120 (the fp8 and fp4 kernels as sm_120a); ARCH=121 for the GB10
 make bench            # every bench_* binary, validates each variant, writes results/*.json
 make results          # docs/RESULTS.md, results/headline.md, results/roofline.png
 
@@ -519,6 +521,8 @@ h = sk.hgemm_swiglu(a_bf16, w)             # silu(a @ w_gate) * (a @ w_up), one 
 c = sk.fp8gemm(a_e4m3, w_e4m3, sa, sb)     # sa * sb * a @ w.T, w is [N, K] as nn.Linear stores it
 a_mx, sfa = sk.reference.quantize_mx(a_bf16)   # MXFP8: e4m3 plus a ue8m0 scale per 32 elements
 c = sk.fp8gemm(a_mx, w_mx, sfa=sfa, sfb=sfw)   # the scales go into the tensor-core instruction
+a4, sfa4, sa4 = sk.fp4_quantize(a_bf16)    # NVFP4: packed e2m1, e4m3 scale per 16, fp32 per tensor
+c = sk.fp4gemm(a4, w4, sfa4, sfw4, sa4, sw4)  # fmt="mxfp4" for a ue8m0 scale per 32
 o = sk.attention(q, k, v, causal=True)     # q is [B, H, S, D] bf16; k and v may have fewer heads
 (q8, sq), (k8, sk8), (v8, sv) = (sk.quantize_fp8(x) for x in (q, k, v))   # e4m3 + descale
 o = sk.attention_fp8(q8, k8, v8, sq, sk8, sv, causal=True)   # both products on the fp8 tensor cores
@@ -542,7 +546,8 @@ numbers, the sweeps that picked the constants, and which Nsight metric moved:
 - [bandwidth](docs/design/bandwidth.md), [rmsnorm](docs/design/rmsnorm.md),
   [swiglu](docs/design/swiglu.md), [softmax](docs/design/softmax.md),
   [sgemm](docs/design/sgemm.md), [hgemm](docs/design/hgemm.md),
-  [fp8gemm](docs/design/fp8gemm.md), [attention](docs/design/attention.md),
+  [fp8gemm](docs/design/fp8gemm.md), [fp4gemm](docs/design/fp4gemm.md),
+  [attention](docs/design/attention.md),
   [layer](docs/design/layer.md), [serving](docs/design/serving.md)
 
 Things I'd still like to do: a 128-key tile for attention, which would halve how often the
