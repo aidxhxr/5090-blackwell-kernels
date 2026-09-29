@@ -6,7 +6,8 @@ score, exponential and accumulator. `H_q % H_kv == 0`: query head `h` reads K/V 
 `h / (H_q / H_kv)`, grouped-query attention, with `H_kv == H_q` the plain multi-head case.
 `D` in {64, 128}, optional causal mask, no dropout, no bias, forward only. Source:
 `src/kernels/attention.cu` (the ladder) and `src/kernels/attention_decode.cu` (the
-flash-decoding kernel variant 3 runs on decode shapes). Bench: `bench_attention` (validates
+flash-decoding kernel variant 3 runs on decode shapes); the e4m3 forward, `attention_fp8`,
+has its own section ("FP8") and source `src/kernels/attention_fp8.cu`. Bench: `bench_attention` (validates
 every variant against a CPU double-precision reference). The library comparison is
 `torch.nn.functional.scaled_dot_product_attention` in `scripts/bench_torch.py`, which on this
 card and this torch picks the FlashAttention-2 kernel for every shape below.
@@ -645,6 +646,303 @@ GQA is the same `kv_index` stride on the K/V head; rows past `S_q` and keys past
 zero-filled by the copy engine as before. The split workspace stays one per device, shared
 with variants 3 and 4 (the same caveat about concurrent split launches on two streams); the
 queue counters are per stream.
+
+## FP8: `attention_fp8`
+
+Variant 5 runs its tensor pipe 96 to 97% busy, so the bf16 kernel is done: 239 TFLOPS against
+a 258.7 TFLOPS roof, and the roof is the bf16 `mma.sync` rate. The fp8 GEMM measured the
+block-scaled e4m3 `mma.sync` at 1,014 TFLOPS on this card ([fp8gemm](fp8gemm.md)), 3.9 times
+the bf16 instruction. `attention_fp8` is the same forward with Q, K and V in e4m3 and both
+products on that instruction, FlashAttention-3's fp8 recipe on `mma.sync`.
+
+`O = softmax(sq sk Q K^T / sqrt(D)) sv V`, where `Q = sq Q8` and so on: e4m3 inputs with fp32
+descale factors on the device, one per tensor or one per (b, head) (`per_head`), bf16 out.
+Heads, GQA, masks, `D` in {64, 128} and any `S_q`, `S_kv` are the bf16 op's. Source
+`src/kernels/attention_fp8.cu`, built with the fp8 GEMM for `sm_120a`; bench
+`bench_attention_fp8`; Python `sk.attention_fp8(q8, k8, v8, sq, sk, sv, causal)` with
+`sk.quantize_fp8(x, per_head=False)` making the e4m3 tensor and its scale. It is its own op with
+its own ladder rather than variants 6 and up of `attention`, because the inputs are a
+different type with a different contract (scales, an accuracy bound), the way `fp8gemm` sits
+next to `hgemm`.
+
+| variant | idea | what it fixes |
+|---|---|---|
+| 0 | one warp per query row, every element dequantized to fp32, P in fp32 | baseline: the arithmetic of the quantized inputs, with no rounding of P |
+| 1 | variant 5's persistent TMA kernel on e4m3: both products on `mma.sync.m16n8k32` (block-scaled, unit scales), P rounded to e4m3 in registers, V transposed by `ldmatrix.trans` and byte permutes, the O rescale skipped while no row max moves | the bf16 `mma` roof |
+
+### The three problems
+
+**V is the wrong way round.** The fp8 B fragment of `m16n8k32` holds four consecutive k of
+one column n per register. For `P V`, k is the key and n is d, so a register wants four keys
+of one d column, and V in memory is `[key][d]`: four keys of one column are four rows apart.
+The bf16 kernel had the same problem and `ldmatrix.trans` solved it, but `ldmatrix` is a
+16-bit instruction: its transpose moves pairs of bytes, so it delivers two keys of two
+adjacent d columns, `{key 2c, 2c+1} x {d 2g, 2g+1}` in lane `(g, c)`. The fix is two byte
+permutes per register pair. Lane l addresses key `32kt + l` at 16-byte chunk j, so the four
+matrices of one `ldmatrix.x4.trans` are keys +0..7, +8..15, +16..23 and +24..31;
+`prmt(r0, r1, 0x6420)` takes bytes 0 and 2 of the first two (keys 2c, 2c+1, 8+2c, 9+2c at
+`d = 16j + 2g`) and `0x7531` takes bytes 1 and 3 (the same keys at `d = 16j + 2g + 1`). One
+`ldmatrix` and four `PRMT` give the B fragments of two n8 tiles of O, one holding the even d of
+the chunk and one the odd d. The keys inside a register come out in the order
+`{2c, 2c+1, 8+2c, 9+2c}`, not `4c .. 4c+3`, which is the next problem's answer.
+
+**The S accumulator is not the A fragment.** In bf16, the accumulator of `S = Q K^T` was
+exactly the A fragment of `P V` (the section on variant 2). In fp8 the A fragment wants four
+consecutive k per register and lane `(g, c)` holds keys `2c, 2c+1` of each n8 tile of S: the
+layouts disagree, and the usual fix is a round of shuffles. But the sum over keys does not
+care about their order, only that P and V agree on it. Lane `(g, c)` holds keys
+`{2c, 2c+1}` of n8 tile 2i and `{8+2c, 9+2c}` of tile 2i+1, which is exactly the key order
+the permuted V registers carry. So P is two `cvt.rn.satfinite.e4m3x2.f32` per register, in
+that order, and it never leaves the lane. The transpose V needs and the layout S already has
+are the same permutation. Two further consequences: O's n8 tiles 2j and 2j+1 hold
+`d = 16j + 4c + {0, 2}` and `{1, 3}`, four adjacent columns per row, so the epilogue writes 8
+bytes per row per chunk; and K is `[key][d]` with d contiguous, the "Bt" layout, so its
+fragments load with a plain `ldmatrix` as the fp8 GEMM's do.
+
+**P's dynamic range.** e4m3's normal range starts at 2^-6. Rounded as they are, every
+probability under 1/64 of the row max would keep fewer than three mantissa bits, down to
+2^-9 where it becomes 0. The kernel computes `p = 2^(s - m + 8)` instead, in (0, 256], which
+costs nothing (the 8 goes into the bias of the `ex2`'s FFMA) and moves the subnormal edge to
+2^-14 of the row max. The row sum carries the same 2^8 and the final division cancels it.
+The accuracy section says how much it buys: less than I expected.
+
+### Two cheap fixes
+
+The first profile of the kernel (4096 non-causal, one launch at the 2.3 GHz Nsight locks the
+clock to) counted 548 instructions per warp per 64-key tile, 64 of them `QMMA`. Two fixes
+came from the SASS:
+
+- **32 MOVs.** The fp8 GEMM's `ldmatrix` addressing (lanes 0-15 on rows 0-15 at the first 16
+  bytes, lanes 16-31 at the second) returns the two registers of an n8 tile as r0, r2 and the
+  next tile's as r1, r3, and `QMMA` wants its B operand in an aligned register pair, so ptxas
+  moved them, 32 `MOV` a tile. Addressing lanes 8-15 at the second 16 bytes of rows 0-7 and
+  lanes 16-31 at rows 8-15 returns them as r0, r1 and r2, r3. 287 M to 268 M instructions.
+- **The lazy rescale.** The O rescale is 64 `FMUL` per tile per warp, and once the running
+  maxima settle it multiplies by 1. A row now keeps its max until a score beats it by more
+  than 0.8 (log2 units): p then peaks at `2^8.8 = 446`, still inside e4m3's 448, and its alpha
+  is exactly 1, and the multiplies run under a warp vote only when some row moved.
+  FlashAttention-4 does the same with a larger threshold; here the P shift and e4m3's range
+  set it. 268 M to 246 M instructions, 2.3% fewer cycles.
+
+| `SPARK_ATTN_FP8_LAG` | instructions | SM cycles | tensor pipe |
+|---|---|---|---|
+| -1 (rescale every tile) | 268.4 M | 1,208 K | 67.5% |
+| 0 (skip only when no max moved) | 253.2 M | 1,193 K | 68.4% |
+| **0.8** | **246.3 M** | **1,181 K** | **69.0%** |
+
+(Nsight, `--metrics`, 4096 tokens, 32 heads, no mask, one launch.)
+
+### What limits it
+
+Nsight at 4096 tokens, one launch each, both kernels at the clock Nsight locks:
+
+| | bf16 v5, no mask | fp8 v1, no mask | fp8 v1, causal |
+|---|---|---|---|
+| SM cycles | 3,407 K | 1,173 K | 613 K |
+| tensor pipe active | 96.7% | 69.0% | 67.3% |
+| instructions | 349.1 M | 246.2 M | 130.3 M |
+| issue slots busy | 15.7% | 32.1% | 32.7% |
+| registers | 168 | 168 (8 bytes of stack) | 168 |
+| cycles between a warp's issues | | 7.0 | |
+| of which `wait` / `math_pipe_throttle` / `mio_throttle` / `branch_resolving` / `long_scoreboard` / `short_scoreboard` | | 2.09 / 1.45 / 0.50 / 0.52 / 0.45 / 0.36 | |
+| XU (`MUFU`) / ALU / FMA pipes | | 18.6% / 12.4% / 7.0% | |
+| L2 hit rate | | 91.8% | |
+
+2.9 times fewer cycles than the bf16 kernel, where the instruction's rate says up to 3.9. The
+arithmetic of where the rest goes: a warp's 64-key tile is 64 `QMMA` of 16 cycles each on its
+scheduler's pipe, 1,024 cycles, where bf16's 128 `HMMA` of 32 cycles were 4,096. The softmax,
+the conversions, the `ldmatrix`s and the permutes are the same 400-odd instructions per tile
+in both kernels (the fp8 one: 32 `LDSM`, 64 `PRMT`, 34 `FFMA` and 34 `MUFU` for the
+exponentials, 36 `FMNMX`, 36 `FADD`, 16 `F2FP` for P, the rescale when it runs), issued at one
+every 7 cycles by a warp that is waiting on its own dependencies, about 2,800 cycles of
+which only the mma part overlaps the other warp's. In bf16 that chain hid under 4,096 cycles
+of the other warp's products; in fp8 it is longer than them. Two warps per scheduler at 2 x
+1,024 pipe cycles out of about 2,900 is 70%, which is what Nsight shows.
+
+So the work is in the softmax, and I tried four ways to hide it:
+
+| change | SM cycles, no mask | causal | instructions | verdict |
+|---|---|---|---|---|
+| **variant 1 as shipped** | **1,173 K** | **613 K** | **246 M** | |
+| row max and row sum as trees, not chains | 1,180 K | 616 K | 246 M | same |
+| softmax per 32-key half tile, `Q K^T` of one half issued before the other half's softmax (FlashAttention-3's intra-warp overlap without a second S) | 1,229 K | 647 K | 282 M | spills 32 bytes, slower |
+| the same half tiles, not pipelined | 1,205 K | 628 K | 256 M | the extra max and vote cost 2% |
+| 12 compute warps, three per scheduler, 192-row tile, the producer on a lane of warp 0 (a thirteenth warp would cap registers at 128) | 1,425 K | 762 K | 274 M | slower |
+| softmax turns between the two warps of a scheduler (named barriers, one softmax at a time per scheduler), against the same build without them | 1,257 K against 1,244 K | 657 K against 654 K | 263 M | slower |
+| V rewritten into fragment order once per tile by the producer warp (next section) | 1,244 K | 643 K | 216 M | slower |
+
+The half-tile pipelining is the idea that works for FlashAttention-3 on Hopper, where
+`wgmma` is asynchronous. With `mma.sync` the overlap depends on ptxas interleaving the
+softmax of one half into the `QMMA` stream of the other, and at 168 registers it spilled
+instead. The twelve-warp tile gives each scheduler a third warp to fill the softmax gaps, but
+the inline producer paces every warp to warp 0 (the ring cannot run ahead of it) and the Q
+tile needs its own 24 KB buffer; that version measured 1,217 K cycles with eight warps too,
+against 1,179 K for Q through a K/V stage, so a third of its loss is the buffer. Code
+placement moves these numbers by several percent on its own: the same kernel with the loop
+body split into three basic blocks measured 1,307 K. None of the rows above is within noise
+of a gain, so variant 1 stayed as it is.
+
+### V in fragment order: what a transposed V layout would buy
+
+Every consumer warp transposes the same V tile: 8 warps x (16 `LDSM.T` + 64 `PRMT`) per tile,
+a quarter of the non-mma instructions. With `-DSPARK_ATTN_FP8_EXPERIMENTS` and
+`SPARK_ATTN_FP8_VT=1` the producer warp, whose other 31 lanes were idle, does it once: after
+issuing load u it waits for load u - 1 to land, reads its V tile into registers with the same
+`ldmatrix.trans` and permutes, and writes the fragments back in place, 512 bytes per
+(k32 step, 16-byte chunk) with lane l's four registers at offset `16 l`; a per-stage `vready`
+mbarrier tells the consumers, who then read their four registers with one 16-byte `LDS` and
+no permutes. Instructions drop 12% (246 M to 216 M), and the kernel gets 6% slower: 1,244 K
+cycles. Nsight puts `math_pipe_throttle` up from 1.45 to 2.27 and `wait` from 2.09 to 2.43:
+without the permutes between them, each warp's `P V` products issue as one dense burst, and
+the two warps of a scheduler collide on the pipe more often. The producer's rewrite also lands
+on scheduler 0 only.
+
+The same build with the rewrite removed (wrong output, timing only) is the best a V stored
+transposed in memory could do, since the consumers then see exactly that layout: 1,208 K
+cycles at Nsight's clock, still 3% more than variant 1, and 3% faster in the timed loop
+(584 against 565 TFLOPS, 4096 no mask), where fewer instructions buy clock under the power
+cap (below). A transpose pass over V per call would cost more than that: V is 16 MB at 32
+heads x 4096 x 128 bytes, 32 MB of traffic, about 22 us against a 440 us kernel, 5%. So the
+kernel reads V as it lies. A K/V cache that stores V in fragment order as it is appended is
+the one layout that would gain, at most 3%.
+
+### Power
+
+`nvidia-smi` at 250 ms during 8,000 back-to-back launches of the 4096 no-mask shape:
+
+| kernel | SM clock | power | throttle reason |
+|---|---|---|---|
+| fp8 v1 | 2,362 to 2,422 MHz | 567 to 577 W | software power cap |
+| bf16 v5 | 2,872 MHz | 600 W | software power cap |
+
+The fp8 kernel runs 17% below the bf16 one's clock. At 2.4 GHz the instruction's roof is
+1,014 x 2.4 / 2.92 = 833 TFLOPS, and 69% of it is 575, which is what a long loop measures; the
+bench's 625 to 635 at 4096 come from shorter bursts on a cooler card. The 16K shapes run
+7.8 ms a launch and settle to the capped clock inside the timing loop, hence their 561 and
+601. It is the fp8 GEMM's story (2.13 to 2.16 GHz at 600 W there): at this rate fewer
+instructions per FLOP are also fewer joules per FLOP, which is why the transposed-V timing
+above gained where the fixed-clock one lost.
+
+### Measured
+
+`bench_attention_fp8`, medians of 50, uniform inputs quantized per tensor (the bf16 bench's:
+Q, K in [-2, 2], V in [-1, 1]). The bf16 column is attention variant 5 on the unquantized
+inputs rounded to bf16, timed in the same process right before; "% of peak" is against the
+1,014 TFLOPS block-scaled roof.
+
+| shape | bf16 v5 ms / TFLOPS | fp8 v1 ms / TFLOPS | fp8 / bf16 | % of fp8 peak |
+|---|---|---|---|---|
+| b1 h32 s1024 d128 | 0.0992 / 173.2 | 0.0418 / 411.4 | 2.37x | 41% |
+| b1 h32 s1024 d128 causal | 0.0520 / 165.2 | 0.0213 / 403.1 | 2.44x | 40% |
+| b1 h32 s2048 d128 | 0.2927 / 234.8 | 0.1321 / 520.1 | 2.22x | 51% |
+| b1 h32 s2048 d128 causal | 0.1646 / 208.8 | 0.0626 / 549.2 | 2.63x | 54% |
+| b1 h32 s4096 d128 | 1.1453 / 240.0 | 0.4328 / 635.2 | 2.65x | 63% |
+| b1 h32 s4096 d128 causal | 0.5819 / 236.2 | 0.2199 / 625.1 | 2.65x | 62% |
+| b1 h32 s8192 d128 | 4.5460 / 241.9 | 1.7441 / 630.4 | 2.61x | 62% |
+| b1 h32 s8192 d128 causal | 2.2993 / 239.1 | 0.8648 / 635.7 | 2.66x | 63% |
+| b1 h32 s16384 d128 | 18.438 / 238.5 | 7.8379 / 561.1 | 2.35x | 55% |
+| b1 h32 s16384 d128 causal | 9.2820 / 236.9 | 3.6606 / 600.7 | 2.54x | 59% |
+| b1 hq32 hkv8 s4096 d128 | 1.1495 / 239.1 | 0.4351 / 631.7 | 2.64x | 62% |
+| b1 hq32 hkv8 s4096 d128 causal | 0.5818 / 236.2 | 0.2218 / 619.7 | 2.62x | 61% |
+| b4 h32 s2048 d128 causal | 0.6029 / 228.0 | 0.2422 / 567.4 | 2.49x | 56% |
+| b1 h32 s4096 d64 causal | 0.2924 / 235.0 | 0.1342 / 512.2 | 2.18x | 51% |
+
+Variant 0 runs at 7.5 to 12.6 TFLOPS on these shapes, like the bf16 variant 0. The short
+sequences pay a larger share for the per-item boundary (one Q box, eight `ldmatrix`, the
+epilogue) against 16 or 32 tiles of 1,024 pipe cycles; the batch of four has short causal
+items for the same reason. A decode step (`S_q = 1`) runs the 128-row tile and is slower than
+the bf16 op, which hands it to the flash-decoding kernel (8.9 against 7.2 us at 700 keys):
+decode is bound by streaming the cache, where e4m3 halves the bytes, but that needs its own
+kernel.
+
+Against torch (`scripts/bench_torch.py --only attention_fp8`, `F.scaled_dot_product_attention`
+in bf16 on the same shapes, 100 iterations; torch has no fp8 attention on this card, so this
+is the kernel a model would otherwise call; the loop runs launches back to back, so the fp8
+times are nearer the power-capped clock than the C++ bench's):
+
+| shape | fp8 v1 ms | flash ms | fp8 / flash | cuDNN ms | fp8 / cuDNN |
+|---|---|---|---|---|---|
+| b1 h32 s1024 d128 | 0.0407 | 0.1183 | 2.91x | 0.1202 | 2.95x |
+| b1 h32 s1024 d128 causal | 0.0255 | 0.0950 | 3.72x | 0.1022 | 4.07x |
+| b1 h32 s2048 d128 | 0.1191 | 0.4308 | 3.62x | 0.4063 | 3.41x |
+| b1 h32 s2048 d128 causal | 0.0659 | 0.2490 | 3.78x | 0.2506 | 3.80x |
+| b1 h32 s4096 d128 | 0.4451 | 1.4647 | 3.29x | 1.3617 | 3.07x |
+| b1 h32 s4096 d128 causal | 0.2303 | 0.7951 | 3.45x | 0.7833 | 3.41x |
+| b1 h32 s8192 d128 | 1.8924 | 5.3578 | 2.83x | 5.0300 | 2.64x |
+| b1 h32 s8192 d128 causal | 0.9097 | 2.7774 | 3.05x | 2.7156 | 2.96x |
+| b1 h32 s16384 d128 | 8.1749 | 20.459 | 2.50x | 19.440 | 2.38x |
+| b1 h32 s16384 d128 causal | 3.9326 | 10.379 | 2.64x | 10.118 | 2.56x |
+| b1 hq32 hkv8 s4096 d128 | 0.4497 | 1.4630 | 3.25x | 1.3557 | 2.99x |
+| b1 hq32 hkv8 s4096 d128 causal | 0.2297 | 0.7892 | 3.44x | 0.7769 | 3.38x |
+| b4 h32 s2048 d128 causal | 0.2486 | 0.7644 | 3.07x | 0.7538 | 3.03x |
+| b1 h32 s4096 d64 causal | 0.1396 | 0.4177 | 2.99x | 0.3956 | 2.83x |
+
+(The cuDNN column's fp8 times are the same kernel in the second run of the script.)
+
+### Accuracy
+
+`scripts/attention_fp8_accuracy.py`: B = 1, 8 heads, 4096 tokens, D = 128, q, k, v drawn in
+fp32 and quantized by `sk.quantize_fp8`; the reference is `F.scaled_dot_product_attention` in
+fp64 on the unquantized values. Each cell is max / mean |O - O_ref|, absolute. "v0" is the
+fp8 baseline, whose only error is the rounding of q, k and v; "no shift" is variant 1 with
+P rounded as 2^(s - m) (`SPARK_ATTN_FP8_PSHIFT=0`).
+
+| input | mask | bf16 kernel | fp8 v0 (P in fp32) | fp8 v1 | v1 per-head scales | v1 no shift | v1 against the bf16 kernel | max / mean \|O_ref\| |
+|---|---|---|---|---|---|---|---|---|
+| Gaussian | none | 8.4e-4 / 7.6e-5 | 1.5e-2 / 9.5e-4 | 1.6e-2 / 1.09e-3 | 1.4e-2 / 1.09e-3 | 1.7e-2 / 1.09e-3 | 1.6e-2 / 1.09e-3 | 0.18 / 0.020 |
+| Gaussian | causal | 1.3e-2 / 1.4e-4 | 1.3e-1 / 1.8e-3 | 1.4e-1 / 2.0e-3 | 1.4e-1 / 2.0e-3 | 1.4e-1 / 2.0e-3 | 1.4e-1 / 2.0e-3 | 3.20 / 0.040 |
+| Gaussian, q x 4 (peaked softmax) | none | 4.4e-2 / 2.0e-3 | 6.6e-1 / 3.1e-2 | 6.2e-1 / 3.1e-2 | 6.7e-1 / 3.1e-2 | 6.2e-1 / 3.1e-2 | 6.4e-1 / 3.1e-2 | 4.46 / 0.325 |
+| Gaussian, q x 4 | causal | 4.9e-2 / 2.1e-3 | 7.1e-1 / 3.2e-2 | 6.8e-1 / 3.2e-2 | 8.2e-1 / 3.2e-2 | 6.8e-1 / 3.2e-2 | 7.0e-1 / 3.2e-2 | 4.58 / 0.371 |
+| 0.1% of entries x 20 | none | 1.0e0 / 2.9e-3 | 1.8e1 / 4.4e-2 | 1.8e1 / 4.4e-2 | 1.8e1 / 4.4e-2 | 1.8e1 / 4.4e-2 | 1.8e1 / 4.4e-2 | 52.3 / 0.377 |
+| 0.1% of entries x 20 | causal | 5.2e-1 / 2.2e-3 | 1.8e1 / 3.4e-2 | 1.8e1 / 3.4e-2 | 1.8e1 / 3.4e-2 | 1.8e1 / 3.4e-2 | 1.8e1 / 3.4e-2 | 52.3 / 0.324 |
+| 4 key channels of 128 x 20 | none | 1.3e-1 / 2.5e-3 | 1.5e0 / 4.0e-2 | 1.5e0 / 4.0e-2 | 1.8e0 / 3.9e-2 | 1.5e0 / 4.0e-2 | 1.5e0 / 4.0e-2 | 3.93 / 0.250 |
+| 4 key channels x 20 | causal | 1.1e-1 / 2.5e-3 | 1.5e0 / 4.1e-2 | 1.4e0 / 4.1e-2 | 1.7e0 / 4.0e-2 | 1.4e0 / 4.1e-2 | 1.5e0 / 4.1e-2 | 4.13 / 0.293 |
+| 4 value channels x 20 | none | 1.3e-2 / 1.2e-4 | 1.5e-1 / 1.5e-3 | 1.8e-1 / 1.7e-3 | 1.8e-1 / 1.8e-3 | 1.7e-1 / 1.7e-3 | 1.7e-1 / 1.7e-3 | 2.49 / 0.033 |
+| 4 value channels x 20 | causal | 2.0e-1 / 2.3e-4 | 1.7e0 / 2.9e-3 | 2.4e0 / 3.2e-3 | 2.2e0 / 3.2e-3 | 2.4e0 / 3.2e-3 | 2.3e0 / 3.2e-3 | 62.3 / 0.064 |
+
+What it says:
+
+- **The error is the inputs, not P.** Variant 0, which keeps P in fp32, is within 15% of
+  variant 1's mean error on every row. e4m3 carries 3 mantissa bits, 2^-4 relative per
+  element, against bf16's 7, and every row of the table sits at 10 to 16 times the bf16
+  kernel's mean error. The last column shows the fp8 kernel against the bf16 kernel is the
+  same number as against the fp64 reference: the bf16 error is noise next to it.
+- **Scores amplify it.** A score is a sum of 128 products each off by up to 2^-4, and the
+  softmax exponentiates the absolute score error, so anything that makes the scores large
+  makes the output error large: a peaked softmax (q x 4) or a few large key channels move the
+  mean error from 5% to 10 to 16% of mean |O|. That is the case FlashAttention-3's
+  incoherent processing (a random Hadamard rotation of q and k before the rounding) is for;
+  it is not implemented here.
+- **The P shift is nearly free and nearly useless at this size.** Without the 2^8 the
+  probabilities under 2^-6 of the row max go subnormal, and the max error on Gaussian inputs
+  rises from 1.56e-2 to 1.71e-2; the mean does not move. Those probabilities carry little of a
+  row's mass, and their rounding errors are unbiased. I kept the shift because it costs no
+  instruction.
+- **Per-head scales change nothing for heads drawn alike.** e4m3 is a float format: a finer
+  scale only keeps small values out of the subnormal range, which a per-tensor scale already
+  does unless one head is 2^15 smaller than another. `tests/test_attention_fp8.py` runs heads
+  spread over three decades with per-head scales to check the indexing, not the benefit.
+
+In the bench's own terms (uniform inputs, the dequantized reference, so only the kernel's
+rounding counts) the largest error is 2.1e-2 against max |O| = 1 on the causal shapes, where
+the first rows attend to a handful of keys and a rounded p is not averaged away; the check is
+`max|O - O_ref| <= 0.04 max|O_ref| + 4e-3`. The pytest parity test uses the same bound
+against SDPA on the dequantized inputs plus a mean error under 3% of mean |O| (measured 1.5 to
+2% on its short sequences), on every shape of `test_attention.py`, both masks, GQA groups of
+4 and 8, per-head scales, the split tail, the queue with more items than blocks, and a second
+stream.
+
+### What remains for fp8
+
+- **The softmax chain.** 69% of the pipe. The rows above are the ways that did not work; the
+  one left is ptxas-proof interleaving: writing the half-tile pipeline so that the `QMMA`s of
+  one half and the softmax instructions of the other alternate in the source, one `QMMA`
+  per handful of softmax instructions, and freeing the 32 registers it needs by keeping Q in
+  shared memory (4 `ldmatrix` per tile per warp).
+- **Decode.** A flash-decoding kernel on e4m3 K and V would halve the bytes a decode step
+  streams, the one place fp8 attention helps at the memory roof.
+- **Incoherent processing** for inputs with outlier channels, and per-block scales for K and V
+  (the MX form the fp8 GEMM already takes) as the other answer to them.
 
 ## Correctness
 

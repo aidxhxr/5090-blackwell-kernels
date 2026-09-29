@@ -299,6 +299,18 @@ tile's Q is in flight while the current one finishes, and the tensor pipe went f
 it still beat the version that issues from a compute warp's lane by 1.6%, because that lane
 waits for the slowest warp before every load.
 
+`attention_fp8` is the same forward on e4m3 Q, K and V with fp32 descale factors, both
+products on the block-scaled fp8 `mma.sync`: 620 to 636 TFLOPS at 4K and 8K tokens, 2.6 times
+the bf16 kernel and 3 to 3.8 times torch's bf16 SDPA. The two layout problems cancel: the fp8
+B operand wants four keys per register and V is stored by key, so `ldmatrix.trans` plus two
+byte permutes per register pair deliver V with its keys in the order {2c, 2c+1, 8+2c, 9+2c},
+which is exactly the order the S accumulators already hold P in, so P goes from the first
+product to the second without a shuffle. It runs the tensor pipe 69% busy: at four times the
+bf16 rate the softmax no longer hides under the other warp's products, and the card drops to
+2.4 GHz at its power cap. The error is that of rounding q, k and v to 3 mantissa bits, 10 to
+16 times the bf16 kernel's; the design note has the tables and the five things that did not
+make it faster.
+
 | shape (B x H x S x D) | v0 | v1 | v2 | v3 | v4 | v5 | flash | v5 / flash |
 |---|---|---|---|---|---|---|---|---|
 | 1 x 32 x 4096 x 128 | 10 | 55 | 194 | 223 | 237 | **239** | 189 | 1.26x |
@@ -452,6 +464,7 @@ default stays on the CUDA cores.
 | `hgemm` bf16 | WMMA, smem tile, cp.async, `mma.sync` + `ldmatrix` with swizzle and split-K, Stream-K, TMA, TMA on Stream-K; a weight-streaming kernel for decode; fused bias / activation / residual / SwiGLU epilogues | cuBLAS GemmEx; eager `addmm`, `F.gelu`, `F.silu * up` |
 | `fp8gemm` e4m3 | naive `mma.sync.m16n8k32`, the swizzled cp.async tile with a 64x64 warp tile and decode configs, TMA; all on the block-scaled instruction, with per-tensor scales or MXFP8 block scales | cuBLASLt, `torch._scaled_mm`, `F.scaled_mm` |
 | `attention` bf16 | warp per row, CUDA-core flash attention, `mma.sync` flash attention, split-KV tail, TMA mbarrier pipeline, persistent tile queue with a producer warp; GQA and a flash-decoding kernel | `F.scaled_dot_product_attention` |
+| `attention_fp8` e4m3 | warp per row on dequantized inputs, variant 5's persistent TMA kernel with both products on the block-scaled fp8 `mma.sync`, P rounded to e4m3 in registers, V transposed by `ldmatrix.trans` and byte permutes | the bf16 kernel, `F.scaled_dot_product_attention` in bf16 |
 | `rope_append` bf16 | RoPE on q and k plus the K/V cache append from a fused q\|k\|v projection, one launch | the torch spelling, ten kernels |
 | `layer` | one Llama-3-8B decoder layer from the kernels above, prefill and decode with a K/V cache, our decode step as a CUDA graph | the same layer in PyTorch, eager and `torch.compile` |
 | `bench_peak` | | the card's real `mma.sync` (bf16, fp8 plain and block-scaled, tf32) and FMA peaks and the clock they ran at |
@@ -507,6 +520,8 @@ c = sk.fp8gemm(a_e4m3, w_e4m3, sa, sb)     # sa * sb * a @ w.T, w is [N, K] as n
 a_mx, sfa = sk.reference.quantize_mx(a_bf16)   # MXFP8: e4m3 plus a ue8m0 scale per 32 elements
 c = sk.fp8gemm(a_mx, w_mx, sfa=sfa, sfb=sfw)   # the scales go into the tensor-core instruction
 o = sk.attention(q, k, v, causal=True)     # q is [B, H, S, D] bf16; k and v may have fewer heads
+(q8, sq), (k8, sk8), (v8, sv) = (sk.quantize_fp8(x) for x in (q, k, v))   # e4m3 + descale
+o = sk.attention_fp8(q8, k8, v8, sq, sk8, sv, causal=True)   # both products on the fp8 tensor cores
 q = sk.rope_append_(qkv, cos, sin, k_cache, v_cache, pos, 32, 8)  # RoPE; q head-major; k, v into the cache
 
 from spark_kernels import layer as L        # one Llama-3-8B decoder layer
