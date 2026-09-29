@@ -18,6 +18,9 @@ Ops (all run on the current CUDA stream, all accept float32 or bfloat16 unless n
     fp8gemm(a, b_t, scale_a, scale_b, variant=-1, sfa=None, sfb=None)
                                              e4m3 GEMM (a @ b_t.T, scaled), bf16 out; with
                                              sfa, sfb: MXFP8 (a ue8m0 scale per 32 k)
+    fp4_quantize(x, fmt="nvfp4", scale=None)   bf16 -> packed e2m1 + blocked block scales
+    fp4gemm(a, b_t, sfa, sfb, scale_a=None, scale_b=None, fmt="nvfp4", variant=-1)
+                                             fp4 GEMM (NVFP4 or MXFP4), bf16 out
     attention(q, k, v, causal=False, variant=-1)  fused attention over [B, H, S, D] (bf16)
     attention_fp8(q, k, v, q_scale, k_scale, v_scale, causal=False, variant=-1)
                                              the same over e4m3 q, k, v with descale factors,
@@ -48,6 +51,8 @@ from .ops import (
     attention,
     attention_fp8,
     attention_varlen,
+    fp4_quantize,
+    fp4gemm,
     fp8gemm,
     hgemm,
     hgemm_swiglu,
@@ -69,6 +74,8 @@ __all__ = [
     "attention_fp8",
     "attention_varlen",
     "engine",
+    "fp4_quantize",
+    "fp4gemm",
     "fp8gemm",
     "hgemm",
     "hgemm_swiglu",

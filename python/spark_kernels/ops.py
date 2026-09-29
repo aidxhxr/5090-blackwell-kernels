@@ -19,8 +19,8 @@ import torch
 
 from . import _C
 
-KERNELS = ("bandwidth", "rmsnorm", "swiglu", "softmax", "sgemm", "hgemm", "fp8gemm", "attention",
-           "paged_decode", "attention_varlen", "attention_fp8")
+KERNELS = ("bandwidth", "rmsnorm", "swiglu", "softmax", "sgemm", "hgemm", "fp8gemm", "fp4gemm",
+           "attention", "paged_decode", "attention_varlen", "attention_fp8")
 
 
 def num_variants(name: str) -> int:
@@ -177,6 +177,49 @@ def fp8gemm(
     aligned scale storage; the same variants apply.
     """
     return _C.fp8gemm(a, b_t, scale_a, scale_b, variant, sfa, sfb)
+
+
+def fp4_quantize(
+    x: torch.Tensor, fmt: str = "nvfp4", scale: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Quantize the rows of x [rows, K] (bfloat16) to fp4: (q, sf, scale).
+
+    q is [rows, K // 2] uint8, two e2m1 values per byte with the lower-index element in the
+    low nibble (the layout of torch.float4_e2m1fn_x2). sf is a flat uint8 tensor with the
+    block scales in the blocked layout `fp4gemm` and cuBLASLt take (see
+    `reference.to_blocked`; rows padded to 128). For fmt="nvfp4" (K a multiple of 64) there is
+    an e4m3 scale per 16 values on top of a per-tensor fp32 decode scale: `scale` if given,
+    else max|x| / (6 * 448) computed on the device, returned as a 0-dim float32 tensor. For
+    fmt="mxfp4" (K a multiple of 128) a ue8m0 power-of-two scale per 32 values with the OCP
+    recipe, and scale is None. Both round to nearest even and saturate at 6; the arithmetic
+    is `reference.quantize_nvfp4` / `reference.quantize_mxfp4` operation for operation.
+    """
+    return _C.fp4_quantize(x, fmt, scale)
+
+
+def fp4gemm(
+    a: torch.Tensor,
+    b_t: torch.Tensor,
+    sfa: torch.Tensor,
+    sfb: torch.Tensor,
+    scale_a: torch.Tensor | None = None,
+    scale_b: torch.Tensor | None = None,
+    fmt: str = "nvfp4",
+    variant: int = -1,
+) -> torch.Tensor:
+    """fp4 block-scaled tensor-core GEMM: scale_a * scale_b * (A @ B_t.T) -> [M, N] bfloat16.
+
+    a [M, K // 2] and b_t [N, K // 2] are packed e2m1 (uint8 or torch.float4_e2m1fn_x2, as
+    `fp4_quantize` returns them; b_t is the weight as nn.Linear stores it), sfa and sfb their
+    block scales in the blocked layout (uint8, or float8_e4m3fn for NVFP4 / float8_e8m0fnu for
+    MXFP4), scale_a and scale_b optional per-tensor float32 CUDA scalars (the NVFP4 second
+    level). Every product is scaled by its two block scales inside the tensor-core instruction
+    and summed in fp32, rounded once to bf16. Requires N a multiple of 64, K a multiple of 256
+    and an sm_120a build. Variant 1 takes any M; variant 0 needs M a multiple of 16; variant 2
+    (TMA, the default where it applies) M and N multiples of 128 and at least one 128x128
+    tile per SM. The default steps down to the highest variant that takes the shape.
+    """
+    return _C.fp4gemm(a, b_t, sfa, sfb, scale_a, scale_b, fmt, variant)
 
 
 def rope_append_(

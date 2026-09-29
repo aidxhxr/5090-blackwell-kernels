@@ -18,9 +18,11 @@
 #include <torch/extension.h>
 
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 
 #include "spark/kernels.h"
@@ -361,6 +363,118 @@ Tensor fp8gemm(const Tensor& a, const Tensor& b_t, const std::optional<Tensor>& 
     return c;
 }
 
+// ---- fp4 (e2m1): NVFP4 and MXFP4 -------------------------------------------------------
+int fp4_format(const std::string& fmt) {
+    if (fmt == "nvfp4") return spark::FP4_NVFP4;
+    if (fmt == "mxfp4") return spark::FP4_MXFP4;
+    TORCH_CHECK(false, "fp4 format must be 'nvfp4' or 'mxfp4', got '", fmt, "'");
+    return -1;
+}
+
+// Packed e2m1 operands are uint8 or torch.float4_e2m1fn_x2 (two values per byte, the element
+// with the lower index in the low nibble); block scales are uint8 or the float8 type of the
+// format (float8_e4m3fn for NVFP4, float8_e8m0fnu for MXFP4), all read as bytes.
+void check_fp4_bytes(const Tensor& t, const char* name) {
+    check_cuda_contig(t, name);
+    TORCH_CHECK(t.scalar_type() == at::kByte || t.scalar_type() == at::kFloat4_e2m1fn_x2, name,
+                " must be uint8 or float4_e2m1fn_x2 (packed e2m1), got ", t.scalar_type());
+    TORCH_CHECK(t.dim() == 2, name, " must be 2-D [rows, K / 2]");
+    TORCH_CHECK(aligned16(t), name, " needs 16-byte aligned storage");
+}
+void check_fp4_scales(const Tensor& t, const char* name, int rows, int K, int format,
+                      const Tensor& like) {
+    check_cuda_contig(t, name);
+    TORCH_CHECK(t.scalar_type() == at::kByte ||
+                    (format == spark::FP4_NVFP4 && t.scalar_type() == at::kFloat8_e4m3fn) ||
+                    (format == spark::FP4_MXFP4 && t.scalar_type() == at::kFloat8_e8m0fnu),
+                name, " must be uint8 or the format's float8 scale type, got ", t.scalar_type());
+    const auto want = static_cast<int64_t>(spark::fp4_scale_bytes(rows, K, format));
+    TORCH_CHECK(t.numel() == want, name, " must hold the blocked scale layout of ", rows, " rows (",
+                want, " bytes, rows padded to 128), got ", t.numel());
+    TORCH_CHECK(t.device() == like.device(), name, " must be on a's device");
+    TORCH_CHECK(aligned16(t), name, " needs 16-byte aligned storage");
+}
+
+// (q, sf, scale) for x [rows, K] bf16: q [rows, K/2] uint8 packed e2m1, sf the block scales in
+// the blocked layout (a flat uint8 tensor of fp4_scale_bytes), scale the per-tensor decode
+// scale (NVFP4: the given one, or max|x| / (6 * 448) computed on the device; None for MXFP4).
+std::tuple<Tensor, Tensor, std::optional<Tensor>> fp4_quantize(const Tensor& x,
+                                                               const std::string& fmt,
+                                                               const std::optional<Tensor>& scale) {
+    check_cuda_contig(x, "x");
+    TORCH_CHECK(x.scalar_type() == at::kBFloat16, "fp4_quantize expects bfloat16 x");
+    TORCH_CHECK(x.dim() == 2, "fp4_quantize expects a 2-D [rows, K] tensor");
+    TORCH_CHECK(aligned16(x), "fp4_quantize needs 16-byte aligned x storage");
+    const int format = fp4_format(fmt);
+    TORCH_CHECK(x.size(0) <= INT32_MAX && x.size(1) <= INT32_MAX, "fp4_quantize dims too large");
+    const int rows = static_cast<int>(x.size(0)), K = static_cast<int>(x.size(1));
+    TORCH_CHECK(K % (format == spark::FP4_MXFP4 ? 128 : 64) == 0,
+                "fp4_quantize needs K a multiple of 64 (nvfp4) or 128 (mxfp4), got ", K);
+    const c10::cuda::CUDAGuard guard(x.device());
+    std::optional<Tensor> s;
+    if (format == spark::FP4_NVFP4) {
+        if (scale.has_value()) {
+            TORCH_CHECK(scale->is_cuda() && scale->scalar_type() == at::kFloat &&
+                            scale->numel() == 1 && scale->device() == x.device(),
+                        "scale must be a float32 CUDA tensor with one element on x's device");
+            s = scale->reshape({}).contiguous();
+        } else {
+            s = (x.abs().amax().to(at::kFloat) / (6.0f * 448.0f))
+                    .clamp_min(std::numeric_limits<float>::min());
+        }
+    }
+    Tensor q = at::empty({rows, K / 2}, x.options().dtype(at::kByte));
+    Tensor sf = at::empty({static_cast<int64_t>(spark::fp4_scale_bytes(rows, K, format))},
+                          x.options().dtype(at::kByte));
+    spark::fp4_quantize(bf16_ptr(x), static_cast<unsigned char*>(q.data_ptr()),
+                        static_cast<unsigned char*>(sf.data_ptr()), rows, K,
+                        s.has_value() ? s->data_ptr<float>() : nullptr, format, current_stream(x));
+    return {q, sf, s};
+}
+
+// C = scale_a * scale_b * sum_k (sfa a)(sfb b_t) with a [M, K/2] and b_t [N, K/2] packed
+// e2m1, block scales in the blocked layout, per-tensor fp32 scales optional (1.0), bf16 out.
+Tensor fp4gemm(const Tensor& a, const Tensor& b_t, const Tensor& sfa, const Tensor& sfb,
+               const std::optional<Tensor>& scale_a, const std::optional<Tensor>& scale_b,
+               const std::string& fmt, int variant) {
+    check_fp4_bytes(a, "a");
+    check_fp4_bytes(b_t, "b_t");
+    const int format = fp4_format(fmt);
+    TORCH_CHECK(a.size(1) == b_t.size(1), "inner dimensions mismatch: a is ", a.size(0), "x",
+                a.size(1), " bytes, b_t is ", b_t.size(0), "x", b_t.size(1),
+                " (both [rows, K / 2])");
+    TORCH_CHECK(b_t.device() == a.device(), "b_t must be on a's device");
+    TORCH_CHECK(a.size(0) <= INT32_MAX && b_t.size(0) <= INT32_MAX && 2 * a.size(1) <= INT32_MAX,
+                "fp4gemm dims too large for int32");
+    const int M = static_cast<int>(a.size(0)), N = static_cast<int>(b_t.size(0)),
+              K = static_cast<int>(2 * a.size(1));
+    TORCH_CHECK(scale_a.has_value() == scale_b.has_value(),
+                "fp4gemm: scale_a and scale_b must both be given or both be None");
+    const float* sa = nullptr;
+    const float* sb = nullptr;
+    if (scale_a.has_value()) {
+        for (const Tensor* sp : {&*scale_a, &*scale_b}) {
+            TORCH_CHECK(sp->is_cuda() && sp->scalar_type() == at::kFloat && sp->numel() == 1 &&
+                            sp->device() == a.device(),
+                        "scale_a and scale_b must be float32 CUDA tensors with one element");
+        }
+        sa = scale_a->data_ptr<float>();
+        sb = scale_b->data_ptr<float>();
+    }
+    check_fp4_scales(sfa, "sfa", M, K, format, a);
+    check_fp4_scales(sfb, "sfb", N, K, format, a);
+    const c10::cuda::CUDAGuard guard(a.device());
+    Tensor c = at::empty({M, N}, a.options().dtype(at::kBFloat16));
+    int v = resolve_variant(variant, spark::fp4gemm_num_variants());
+    while (variant < 0 && v > 0 && !spark::fp4gemm_supports(M, N, K, v)) --v;
+    spark::fp4gemm(static_cast<const unsigned char*>(a.data_ptr()),
+                   static_cast<const unsigned char*>(b_t.data_ptr()), bf16_ptr_mut(c), M, N, K,
+                   static_cast<const unsigned char*>(sfa.data_ptr()),
+                   static_cast<const unsigned char*>(sfb.data_ptr()), sa, sb, format, v,
+                   current_stream(a));
+    return c;
+}
+
 // O = softmax(q k^T / sqrt(D)) v for q = [B, H_q, S_q, D] and k, v = [B, H_kv, S_kv, D] bf16
 // tensors, H_q a multiple of H_kv (grouped-query attention: query head h reads k/v head
 // h / (H_q / H_kv)); every variant takes any S_q, S_kv >= 1 and D in {64, 128}. The default
@@ -629,6 +743,7 @@ int num_variants(const std::string& name) {
     if (name == "sgemm") return spark::sgemm_num_variants();
     if (name == "hgemm") return spark::hgemm_num_variants();
     if (name == "fp8gemm") return spark::fp8gemm_num_variants();
+    if (name == "fp4gemm") return spark::fp4gemm_num_variants();
     if (name == "attention") return spark::attention_num_variants();
     if (name == "attention_fp8") return spark::attention_fp8_num_variants();
     if (name == "bandwidth") return spark::bandwidth_num_variants();
@@ -665,6 +780,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("a"), py::arg("b_t"), py::arg("scale_a") = py::none(),
           py::arg("scale_b") = py::none(), py::arg("variant") = -1, py::arg("sfa") = py::none(),
           py::arg("sfb") = py::none());
+    m.def("fp4gemm", &fp4gemm,
+          "fp4 (e2m1) block-scaled GEMM, NVFP4 or MXFP4: scale_a * scale_b * a @ b_t^T with a "
+          "[M, K/2] and b_t [N, K/2] packed e2m1 and block scales in the blocked layout, bf16 out",
+          py::arg("a"), py::arg("b_t"), py::arg("sfa"), py::arg("sfb"),
+          py::arg("scale_a") = py::none(), py::arg("scale_b") = py::none(),
+          py::arg("fmt") = "nvfp4", py::arg("variant") = -1);
+    m.def("fp4_quantize", &fp4_quantize,
+          "bf16 [rows, K] -> (packed e2m1 [rows, K/2], blocked block scales, per-tensor scale)",
+          py::arg("x"), py::arg("fmt") = "nvfp4", py::arg("scale") = py::none());
     m.def("attention", &attention,
           "softmax(q k^T / sqrt(D)) v over [B, H, S, D] bf16 tensors (k, v may have fewer heads)",
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("causal") = false,
