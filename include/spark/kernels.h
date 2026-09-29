@@ -214,6 +214,17 @@ void rope_append_bf16(const __nv_bfloat16* qkv, const float* cos, const float* s
                       __nv_bfloat16* q, __nv_bfloat16* k_cache, __nv_bfloat16* v_cache, int B,
                       int S, int H_q, int H_kv, int D, int pos0, int cap, cudaStream_t stream);
 
+// Paged form for a batch of sequences in a paged K/V cache (docs/design/serving.md): qkv is
+// [T, (H_q + 2 H_kv) * D], one row per token of any sequence (a packed prefill or one token
+// per sequence at decode). Token t is rotated at position positions[t] and its k and v go to
+// slot slots[t] of the caches [num_pages, H_kv, page, D] (slot = page_id * page + row; a
+// negative slot skips the cache write, for padding tokens). q comes out as [T, H_q, D], the
+// layout attention_varlen_bf16 and paged_decode_bf16 take. page a power of two.
+void rope_append_paged_bf16(const __nv_bfloat16* qkv, const float* cos, const float* sin,
+                            const int* positions, const int* slots, __nv_bfloat16* q,
+                            __nv_bfloat16* k_cache, __nv_bfloat16* v_cache, int T, int H_q,
+                            int H_kv, int D, int page, cudaStream_t stream);
+
 // ---- Fused attention (scaled dot product, forward) ----------------------------------------
 // O = softmax(Q K^T / sqrt(D)) V per (b, h), for Q, O = [B, H_q, S_q, D] and
 // K, V = [B, H_kv, S_kv, D], row-major contiguous, bf16 in/out, fp32 scores / softmax /

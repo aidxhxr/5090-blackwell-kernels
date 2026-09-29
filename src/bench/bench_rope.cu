@@ -4,9 +4,14 @@
 // Default shapes are Llama-3-8B's heads (32 query, 8 K/V, 128 wide): a 4096-token prefill,
 // an 8192-token prefill, and decode steps of 1 and 8 sequences against a 4096-token cache.
 // Validates against a CPU double-precision reference; exits 1 on mismatch.
+// Each shape also runs the paged form (rope_append_paged_bf16, row "rope_paged"): the same
+// B * S tokens packed, positions pos0 + s, k and v into 16-token pages of a shuffled pool.
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <exception>
+#include <numeric>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -129,6 +134,84 @@ bool run_shape(const Shape& sh, int iters, cudaStream_t stream) {
     const Timing t = time_kernel(launch, stream, 10, iters);
     // traffic: the qkv rows read once, q and the k / v slots written once
     const double moved_gb = 2.0 * static_cast<double>(n_qkv) * sizeof(__nv_bfloat16) / 1e9;
+
+    // The paged form on the same tokens: token (b, s) is row b * S + s, its k and v go to row
+    // pos % 16 of page pages[b][pos / 16], the pages of the pool shuffled.
+    constexpr int kPage = 16;
+    const int per_seq = (sh.pos0 + sh.S + kPage - 1) / kPage;
+    const int npages = sh.B * per_seq;
+    std::vector<int> perm(npages);
+    std::iota(perm.begin(), perm.end(), 0);
+    std::shuffle(perm.begin(), perm.end(), std::mt19937(3));
+    std::vector<int> h_pos(tokens), h_slot(tokens);
+    for (int b = 0; b < sh.B; ++b)
+        for (int s = 0; s < sh.S; ++s) {
+            const int pos = sh.pos0 + s, i = b * sh.S + s;
+            h_pos[i] = pos;
+            h_slot[i] = perm[b * per_seq + pos / kPage] * kPage + pos % kPage;
+        }
+    const size_t n_pool = static_cast<size_t>(npages) * sh.H_kv * kPage * sh.D;
+    __nv_bfloat16 *d_pk = nullptr, *d_pv = nullptr, *d_pq = nullptr;
+    int *d_pos = nullptr, *d_slot = nullptr;
+    SPARK_CUDA_CHECK(cudaMalloc(&d_pk, n_pool * sizeof(__nv_bfloat16)));
+    SPARK_CUDA_CHECK(cudaMalloc(&d_pv, n_pool * sizeof(__nv_bfloat16)));
+    SPARK_CUDA_CHECK(cudaMalloc(&d_pq, n_q * sizeof(__nv_bfloat16)));
+    SPARK_CUDA_CHECK(cudaMalloc(&d_pos, tokens * sizeof(int)));
+    SPARK_CUDA_CHECK(cudaMalloc(&d_slot, tokens * sizeof(int)));
+    SPARK_CUDA_CHECK(cudaMemcpy(d_pos, h_pos.data(), tokens * sizeof(int), cudaMemcpyHostToDevice));
+    SPARK_CUDA_CHECK(
+        cudaMemcpy(d_slot, h_slot.data(), tokens * sizeof(int), cudaMemcpyHostToDevice));
+    auto launch_paged = [&] {
+        spark::rope_append_paged_bf16(d_qkv, d_cos, d_sin, d_pos, d_slot, d_pq, d_pk, d_pv,
+                                      static_cast<int>(tokens), sh.H_q, sh.H_kv, sh.D, kPage,
+                                      stream);
+    };
+    launch_paged();
+    SPARK_CUDA_CHECK(cudaStreamSynchronize(stream));
+    const std::vector<float> pq = fetch(d_pq, n_q), pk = fetch(d_pk, n_pool),
+                             pv = fetch(d_pv, n_pool);
+    double perr = 0;
+    for (int b = 0; b < sh.B; ++b)
+        for (int s = 0; s < sh.S; ++s) {
+            const int i = b * sh.S + s, pos = sh.pos0 + s;
+            for (int h = 0; h < sh.H_q; ++h)
+                for (int d = 0; d < sh.D; ++d)
+                    perr = std::max(
+                        perr,
+                        std::fabs(static_cast<double>(
+                            pq[(static_cast<size_t>(i) * sh.H_q + h) * sh.D + d] -
+                            ref_q[((static_cast<size_t>(b) * sh.H_q + h) * sh.S + s) * sh.D + d])));
+            for (int h = 0; h < sh.H_kv; ++h) {
+                const size_t dst = ((static_cast<size_t>(h_slot[i] / kPage) * sh.H_kv + h) * kPage +
+                                    h_slot[i] % kPage) *
+                                   sh.D;
+                const size_t src = ((static_cast<size_t>(b) * sh.H_kv + h) * sh.cap + pos) * sh.D;
+                for (int d = 0; d < sh.D; ++d) {
+                    perr = std::max(perr,
+                                    std::fabs(static_cast<double>(pk[dst + d] - ref_k[src + d])));
+                    perr = std::max(perr,
+                                    std::fabs(static_cast<double>(pv[dst + d] - ref_v[src + d])));
+                }
+            }
+        }
+    const bool pok = perr <= 2e-2;
+    const Timing tp = time_kernel(launch_paged, stream, 10, iters);
+    Row rp;
+    rp.kernel = "rope_paged";
+    rp.dtype = "bf16";
+    rp.variant = 0;
+    rp.shape = shape_name(sh);
+    rp.median_ms = tp.median_ms;
+    rp.min_ms = tp.min_ms;
+    rp.gbps = moved_gb / (tp.median_ms * 1e-3);
+    rp.max_abs_err = perr;
+    rp.ok = pok;
+    SPARK_CUDA_CHECK(cudaFree(d_pk));
+    SPARK_CUDA_CHECK(cudaFree(d_pv));
+    SPARK_CUDA_CHECK(cudaFree(d_pq));
+    SPARK_CUDA_CHECK(cudaFree(d_pos));
+    SPARK_CUDA_CHECK(cudaFree(d_slot));
+
     Row r;
     r.kernel = "rope";
     r.dtype = "bf16";
@@ -141,6 +224,7 @@ bool run_shape(const Shape& sh, int iters, cudaStream_t stream) {
     r.max_rel_err = err.max_rel;
     r.ok = ok;
     print_row(r);
+    print_row(rp);
 
     SPARK_CUDA_CHECK(cudaFree(d_qkv));
     SPARK_CUDA_CHECK(cudaFree(d_q));
@@ -148,7 +232,7 @@ bool run_shape(const Shape& sh, int iters, cudaStream_t stream) {
     SPARK_CUDA_CHECK(cudaFree(d_v));
     SPARK_CUDA_CHECK(cudaFree(d_cos));
     SPARK_CUDA_CHECK(cudaFree(d_sin));
-    return ok;
+    return ok && pok;
 }
 
 }  // namespace
