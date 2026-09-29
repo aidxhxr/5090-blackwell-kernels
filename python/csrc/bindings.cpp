@@ -400,6 +400,64 @@ Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, bool causal,
     return out;
 }
 
+// The fp8 forward: q = [B, H_q, S_q, D], k, v = [B, H_kv, S_kv, D] float8_e4m3fn, with fp32
+// descale factors q_scale, k_scale, v_scale on the device: one element each (per tensor) or
+// B * H elements each (per head, b-major, as [B, H]). bf16 out. The default variant is the
+// highest.
+Tensor attention_fp8(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& q_scale,
+                     const Tensor& k_scale, const Tensor& v_scale, bool causal, int variant) {
+    check_cuda_contig(q, "q");
+    check_cuda_contig(k, "k");
+    check_cuda_contig(v, "v");
+    TORCH_CHECK(q.scalar_type() == at::kFloat8_e4m3fn && k.scalar_type() == at::kFloat8_e4m3fn &&
+                    v.scalar_type() == at::kFloat8_e4m3fn,
+                "attention_fp8 expects float8_e4m3fn q, k, v");
+    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4,
+                "attention_fp8 expects [B, H, S, D] tensors");
+    TORCH_CHECK(k.sizes() == v.sizes(), "k and v must have the same shape");
+    TORCH_CHECK(q.size(0) == k.size(0) && q.size(3) == k.size(3),
+                "q and k must agree on B and D (q is ", q.sizes(), ", k is ", k.sizes(), ")");
+    TORCH_CHECK(q.size(1) % k.size(1) == 0, "q must have a multiple of k's heads (GQA), got ",
+                q.size(1), " query heads and ", k.size(1), " k/v heads");
+    TORCH_CHECK(q.size(3) == 64 || q.size(3) == 128, "attention_fp8 supports D = 64 or 128, got ",
+                q.size(3));
+    TORCH_CHECK(
+        q.size(2) <= INT32_MAX && k.size(2) <= INT32_MAX && q.size(0) * q.size(1) <= INT32_MAX,
+        "attention_fp8 dims too large for int32");
+    TORCH_CHECK(aligned16(q) && aligned16(k) && aligned16(v),
+                "attention_fp8 needs 16-byte aligned q, k, v storage");
+    const bool per_head = q_scale.numel() != 1 || k_scale.numel() != 1 || v_scale.numel() != 1;
+    const std::pair<const Tensor*, const char*> scales[3] = {
+        {&q_scale, "q_scale"}, {&k_scale, "k_scale"}, {&v_scale, "v_scale"}};
+    const int64_t heads[3] = {q.size(0) * q.size(1), k.size(0) * k.size(1), k.size(0) * k.size(1)};
+    for (int i = 0; i < 3; ++i) {
+        const Tensor& sc = *scales[i].first;
+        TORCH_CHECK(sc.is_cuda() && sc.scalar_type() == at::kFloat && sc.is_contiguous(),
+                    scales[i].second, " must be a contiguous float32 CUDA tensor");
+        TORCH_CHECK(sc.device() == q.device(), scales[i].second, " must be on q's device");
+        TORCH_CHECK(sc.numel() == (per_head ? heads[i] : 1), scales[i].second, " must have ",
+                    per_head ? heads[i] : 1,
+                    " elements (the scales are all per tensor or all per (b, head)), got ",
+                    sc.numel());
+    }
+    const c10::cuda::CUDAGuard guard(q.device());
+    Tensor out = at::empty(q.sizes(), q.options().dtype(at::kBFloat16));
+    int var = resolve_variant(variant, spark::attention_fp8_num_variants());
+    while (variant < 0 && var > 0 &&
+           !spark::attention_fp8_supports(static_cast<int>(q.size(2)), static_cast<int>(k.size(2)),
+                                          static_cast<int>(q.size(3)), var))
+        --var;
+    spark::attention_fp8(reinterpret_cast<const __nv_fp8_e4m3*>(q.data_ptr()),
+                         reinterpret_cast<const __nv_fp8_e4m3*>(k.data_ptr()),
+                         reinterpret_cast<const __nv_fp8_e4m3*>(v.data_ptr()), bf16_ptr_mut(out),
+                         static_cast<int>(q.size(0)), static_cast<int>(q.size(1)),
+                         static_cast<int>(k.size(1)), static_cast<int>(q.size(2)),
+                         static_cast<int>(k.size(2)), static_cast<int>(q.size(3)),
+                         q_scale.data_ptr<float>(), k_scale.data_ptr<float>(),
+                         v_scale.data_ptr<float>(), per_head, causal, var, current_stream(q));
+    return out;
+}
+
 // q = rope(qkv[..., :H_q D]) as [B, H_q, S, D]; the caches [B, H_kv, cap, D] get rope(k) and
 // v at positions pos0..pos0+S-1, in place. cos and sin are [>= pos0 + S, D] fp32 tables in
 // the rotate-half layout.
@@ -572,6 +630,7 @@ int num_variants(const std::string& name) {
     if (name == "hgemm") return spark::hgemm_num_variants();
     if (name == "fp8gemm") return spark::fp8gemm_num_variants();
     if (name == "attention") return spark::attention_num_variants();
+    if (name == "attention_fp8") return spark::attention_fp8_num_variants();
     if (name == "bandwidth") return spark::bandwidth_num_variants();
     if (name == "paged_decode") return spark::paged_decode_num_variants();
     if (name == "attention_varlen") return spark::attention_varlen_num_variants();
@@ -610,6 +669,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "softmax(q k^T / sqrt(D)) v over [B, H, S, D] bf16 tensors (k, v may have fewer heads)",
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("causal") = false,
           py::arg("variant") = -1);
+    m.def("attention_fp8", &attention_fp8,
+          "softmax(q k^T / sqrt(D)) v over [B, H, S, D] float8_e4m3fn tensors with fp32 descale "
+          "factors (per tensor or per (b, head)), bf16 out",
+          py::arg("q"), py::arg("k"), py::arg("v"), py::arg("q_scale"), py::arg("k_scale"),
+          py::arg("v_scale"), py::arg("causal") = false, py::arg("variant") = -1);
     m.def("rope_append_", &rope_append_,
           "RoPE on the q and k columns of a fused qkv projection, k and v appended to the caches "
           "in place; returns q as [B, H_q, S, D]",

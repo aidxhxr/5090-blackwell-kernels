@@ -20,7 +20,7 @@ import torch
 from . import _C
 
 KERNELS = ("bandwidth", "rmsnorm", "swiglu", "softmax", "sgemm", "hgemm", "fp8gemm", "attention",
-           "paged_decode", "attention_varlen")
+           "paged_decode", "attention_varlen", "attention_fp8")
 
 
 def num_variants(name: str) -> int:
@@ -285,3 +285,48 @@ def attention_varlen(
     """
     return _C.attention_varlen(q, k_cache, v_cache, cu_seqlens_q, seq_lens, block_table, causal,
                                variant)
+
+
+E4M3_MAX = 448.0
+
+
+def quantize_fp8(x: torch.Tensor, per_head: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+    """e4m3 quantization of an attention operand: (x8, scale) with x ~= scale * x8.
+
+    x is [B, H, S, D] (any float dtype). The scale is max|x| / 448 over the whole tensor (a
+    one-element float32 tensor), or with `per_head` over each (b, head) slice (a [B, H] float32
+    tensor), so the largest element lands on e4m3's largest finite value; the elements are
+    x / scale rounded to nearest even. The result feeds `attention_fp8` as q, k or v with its
+    scale as the matching descale factor.
+    """
+    if x.dim() != 4:
+        raise ValueError(f"expected [B, H, S, D], got shape {tuple(x.shape)}")
+    xf = x.float()
+    amax = xf.abs().amax(dim=(2, 3), keepdim=True) if per_head else xf.abs().amax()
+    scale = (amax / E4M3_MAX).clamp(min=torch.finfo(torch.float32).tiny)
+    x8 = (xf / scale).clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn)
+    scale = scale.reshape(x.shape[0], x.shape[1]) if per_head else scale.reshape(1)
+    return x8, scale.contiguous()
+
+
+def attention_fp8(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    causal: bool = False,
+    variant: int = -1,
+) -> torch.Tensor:
+    """Fused fp8 attention forward: softmax(sq sk q @ k^T / sqrt(D)) @ (sv v), bf16 out.
+
+    q is [B, H_q, S_q, D], k and v are [B, H_kv, S_kv, D], all float8_e4m3fn and contiguous,
+    with the same heads, mask and GQA rules as `attention`. The scales are float32 CUDA
+    tensors, the descale factors `quantize_fp8` returns: one element each (per tensor), or
+    [B, H_q] for q and [B, H_kv] for k and v (per head). Scores, softmax and accumulation are
+    fp32; the default variant (1) runs both products on the fp8 tensor cores with the
+    probabilities rounded to e4m3, variant 0 is the fp32 baseline. Returns [B, H_q, S_q, D]
+    bfloat16.
+    """
+    return _C.attention_fp8(q, k, v, q_scale, k_scale, v_scale, causal, variant)

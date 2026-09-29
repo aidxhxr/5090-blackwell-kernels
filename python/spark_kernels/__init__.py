@@ -19,6 +19,9 @@ Ops (all run on the current CUDA stream, all accept float32 or bfloat16 unless n
                                              e4m3 GEMM (a @ b_t.T, scaled), bf16 out; with
                                              sfa, sfb: MXFP8 (a ue8m0 scale per 32 k)
     attention(q, k, v, causal=False, variant=-1)  fused attention over [B, H, S, D] (bf16)
+    attention_fp8(q, k, v, q_scale, k_scale, v_scale, causal=False, variant=-1)
+                                             the same over e4m3 q, k, v with descale factors,
+                                             bf16 out; quantize_fp8(x, per_head=False) makes them
     rope_append_(qkv, cos, sin, k_cache, v_cache, pos0, H_q, H_kv)
                                              RoPE on q and k, k and v into the caches; returns q
     rope_append_paged_(qkv, cos, sin, positions, slots, k_cache, v_cache, H_q, H_kv)
@@ -43,6 +46,7 @@ from . import engine, layer, reference
 from .ops import (
     add_rmsnorm_,
     attention,
+    attention_fp8,
     attention_varlen,
     fp8gemm,
     hgemm,
@@ -50,6 +54,7 @@ from .ops import (
     interleave_gate_up,
     num_variants,
     paged_decode,
+    quantize_fp8,
     rmsnorm,
     rope_append_,
     rope_append_paged_,
@@ -61,6 +66,7 @@ from .ops import (
 __all__ = [
     "add_rmsnorm_",
     "attention",
+    "attention_fp8",
     "attention_varlen",
     "engine",
     "fp8gemm",
@@ -70,6 +76,7 @@ __all__ = [
     "layer",
     "num_variants",
     "paged_decode",
+    "quantize_fp8",
     "reference",
     "rmsnorm",
     "rope_append_",
