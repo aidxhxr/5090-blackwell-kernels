@@ -382,6 +382,28 @@ stride in the attention kernels, so a cache with spare capacity is copied before
 reads it: 19 us at 4K tokens, 0.68 ms at 128K), are in
 [docs/design/layer.md](docs/design/layer.md).
 
+## serving a batch
+
+The same kernels on a paged K/V cache run the whole 32-layer model for a batch of sequences of
+different lengths (`spark_kernels.engine`, random bf16 weights). The paged decode kernel cuts
+the keys of the whole batch into equal ranges per warp, so one 32K-token sequence among fifty
+500-token ones reads at 1,501 GB/s, 98% of the copy roof, the rate of equal lengths; the varlen
+prefill takes packed prompts in one launch. Llama-3-8B at a 64 to 2048-token prompt mix, 128
+new tokens each:
+
+| batch | decode ms/step | decode tok/s | vs compiled torch | prefill tok/s | vs torch |
+|---|---|---|---|---|---|
+| 1 | 9.80 | 101 | 1.24x | 16,192 | 1.18x |
+| 8 | 10.36 | 766 | 1.58x | 16,427 | 1.20x |
+| 32 | 11.56 | 2,746 | 2.38x | 16,501 | 1.24x |
+| 64 | 14.26 | 4,453 | 3.52x | 16,401 | 1.23x |
+
+A step at 64 sequences moves 20.6 GB (weights plus every sequence's K/V) at 94% of the copy
+roof. Torch runs the same model on the same paged cache and has to gather the pages for its
+attention, which is where most of the gap at large batches comes from. Details, the
+continuous-batching run and what is not done yet (chunked prefill, preemption, a TMA prefill)
+are in [docs/design/serving.md](docs/design/serving.md).
+
 ## the memory-bound kernels
 
 RMSNorm, SwiGLU and softmax move bytes and do almost no math, so the only question is whether
@@ -506,7 +528,7 @@ numbers, the sweeps that picked the constants, and which Nsight metric moved:
   [swiglu](docs/design/swiglu.md), [softmax](docs/design/softmax.md),
   [sgemm](docs/design/sgemm.md), [hgemm](docs/design/hgemm.md),
   [fp8gemm](docs/design/fp8gemm.md), [attention](docs/design/attention.md),
-  [layer](docs/design/layer.md)
+  [layer](docs/design/layer.md), [serving](docs/design/serving.md)
 
 Things I'd still like to do: a 128-key tile for attention, which would halve how often the
 two warps of a scheduler land in their softmaxes together (the 3% of tensor pipe still idle);

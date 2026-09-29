@@ -239,6 +239,12 @@ elsewhere at the same time.
 
 ## Caveats
 
+The paged K/V cache, the varlen prefill and the 32-layer engine of
+[serving.md](serving.md) remove the first three caveats below for a serving loop: the paged
+decode kernel reads a cache in place at any length, the attention output is token-major so the
+transpose copy is gone, and the positions, slots and lengths are device buffers, so one captured
+graph serves every step. This layer is kept as it is for the one-layer measurements.
+
 - No strided K/V in attention, so a growing cache pays the copy above; the headline decode
   rows are the in-place case.
 - The attention output's transpose is a torch copy (25 to 80 us at prefill, none at decode).

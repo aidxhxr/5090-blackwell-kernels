@@ -93,3 +93,5 @@ docs:
 - [hgemm](design/hgemm.md)
 - [fp8gemm](design/fp8gemm.md)
 - [attention](design/attention.md)
+- [one decoder layer](design/layer.md)
+- [serving: the paged K/V cache, paged decode, varlen prefill and the engine](design/serving.md)
