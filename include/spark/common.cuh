@@ -311,6 +311,66 @@ __device__ __forceinline__ void mma_e4m3_16832_mx(float (&d)[4], const unsigned 
 }
 #endif
 
+// D[16x8] (+)= A[16x64] * B[64x8] in e2m1 (fp4) with block scales, fp32 accumulate: the
+// kind::mxf4nvf4 instruction of sm_120a, the fp4gemm kernels' only mma. The operands are the
+// m16n8k32 fp8 fragments with every byte holding two e2m1 values, lowest k in the low nibble:
+// a[4] = (row g / g+8) x (k 8c..8c+7 / 32+8c..32+8c+7), b[2] = (k 8c..8c+7 / 32+8c..
+// 32+8c+7) x col g, g = lane / 4, c = lane % 4, so the byte-level loads of the fp8 GEMM feed
+// it unchanged (measured with a probe, docs/design/fp4gemm.md).
+//
+// NVFP4 (scale_vec::4X, ue4m3): each lane's scale register holds four e4m3 scale bytes, byte
+// i scaling k 16i..16i+15 of the lane's row of A or column of B. Which lanes the hardware
+// reads is set by the thread-id immediate: TA = 0 reads row g from lane 4g and row g+8 from
+// lane 4g+1, TA = 1 reads them from lanes 4g+2 and 4g+3; TB = 0 reads column g from lane 4g,
+// TB = 1 from lane 4g+1. Byte-id must be 0. So one register serves two m16 tiles of A (the
+// quad's lanes 0-1 hold one tile's rows, lanes 2-3 the other's) or two n8 tiles of B.
+//
+// MXFP4 (scale_vec::2X, ue8m0): two scale bytes per lane per k64, byte BID + i scaling k
+// 32i..32i+31, BID 0 or 2; the same lane selection.
+#if SPARK_HAS_MX_MMA
+template <int TA, int TB>
+__device__ __forceinline__ void mma_e2m1_16864_nvf4(float (&d)[4], const unsigned (&a)[4],
+                                                    const unsigned (&b)[2], unsigned sa,
+                                                    unsigned sb) {
+    static_assert((TA == 0 || TA == 1) && (TB == 0 || TB == 1), "thread-id is 0 or 1");
+    asm volatile(
+        "mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X"
+        ".f32.e2m1.e2m1.f32.ue4m3 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, %10, {0, %12}, %11, {0, %13};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(sa), "r"(sb),
+          "n"(TA), "n"(TB));
+}
+template <int BID, int TA, int TB>
+__device__ __forceinline__ void mma_e2m1_16864_mxf4(float (&d)[4], const unsigned (&a)[4],
+                                                    const unsigned (&b)[2], unsigned sa,
+                                                    unsigned sb) {
+    static_assert(BID == 0 || BID == 2, "byte-id selects the low or the high byte pair");
+    static_assert((TA == 0 || TA == 1) && (TB == 0 || TB == 1), "thread-id is 0 or 1");
+    asm volatile(
+        "mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::2X"
+        ".f32.e2m1.e2m1.f32.ue8m0 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, %10, {%12, %13}, %11, "
+        "{%12, %14};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]), "r"(sa), "r"(sb),
+          "n"(BID), "n"(TA), "n"(TB));
+}
+#else
+// No fp4 instruction on this target: the host refuses fp4gemm (fp4gemm_available) and these
+// bodies are never reached.
+template <int TA, int TB>
+__device__ __forceinline__ void mma_e2m1_16864_nvf4(float (&)[4], const unsigned (&)[4],
+                                                    const unsigned (&)[2], unsigned, unsigned) {
+    __trap();
+}
+template <int BID, int TA, int TB>
+__device__ __forceinline__ void mma_e2m1_16864_mxf4(float (&)[4], const unsigned (&)[4],
+                                                    const unsigned (&)[2], unsigned, unsigned) {
+    __trap();
+}
+#endif
+
 // ---------------------------------------------------------------------------
 // TMA / mbarrier (sm_90+; available on sm_120 / sm_121). Used by the hgemm TMA variant.
 //
@@ -387,6 +447,16 @@ __device__ __forceinline__ void tma_load_3d(void* smem_dst, const CUtensorMap* m
         "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes"
         " [%0], [%1, {%3, %4, %5}], [%2];\n" ::"r"(smem_u32(smem_dst)),
         "l"(reinterpret_cast<uint64_t>(map)), "r"(smem_u32(bar)), "r"(c0), "r"(c1), "r"(c2)
+        : "memory");
+}
+// 1-D bulk copy global -> shared through the copy engine (no tensor map), completion counted
+// on `bar` like a TMA box. `bytes` a multiple of 16, both addresses 16-byte aligned.
+__device__ __forceinline__ void bulk_load(void* smem_dst, const void* gmem_src, unsigned bytes,
+                                          uint64_t* bar) {
+    asm volatile(
+        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, "
+        "[%3];\n" ::"r"(smem_u32(smem_dst)),
+        "l"(gmem_src), "r"(bytes), "r"(smem_u32(bar))
         : "memory");
 }
 // Pull the descriptor into the TMA unit's cache ahead of the first load.
