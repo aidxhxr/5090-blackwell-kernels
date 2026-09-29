@@ -475,11 +475,10 @@ Tensor fp4gemm(const Tensor& a, const Tensor& b_t, const Tensor& sfa, const Tens
     return c;
 }
 
-// O = softmax(q k^T / sqrt(D)) v for q = [B, H_q, S_q, D] and k, v = [B, H_kv, S_kv, D] bf16
-// tensors, H_q a multiple of H_kv (grouped-query attention: query head h reads k/v head
-// h / (H_q / H_kv)); every variant takes any S_q, S_kv >= 1 and D in {64, 128}. The default
-// steps down from the top rung if a future rung ever refuses a shape, as hgemm's does.
-Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, bool causal, int variant) {
+// The checks every attention entry point shares: q = [B, H_q, S_q, D] and k, v =
+// [B, H_kv, S_kv, D] contiguous bf16 CUDA tensors, H_q a multiple of H_kv (grouped-query
+// attention: query head h reads k/v head h / (H_q / H_kv)), D in {64, 128}, 16-byte aligned.
+void check_attention_inputs(const Tensor& q, const Tensor& k, const Tensor& v) {
     check_cuda_contig(q, "q");
     check_cuda_contig(k, "k");
     check_cuda_contig(v, "v");
@@ -500,18 +499,76 @@ Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, bool causal,
         "attention dims too large for int32");
     TORCH_CHECK(aligned16(q) && aligned16(k) && aligned16(v),
                 "attention needs 16-byte aligned q, k, v storage");
-    const c10::cuda::CUDAGuard guard(q.device());
-    Tensor out = at::empty_like(q);
+}
+
+// The forward rung for `variant` (-1: the top rung that accepts the shape).
+int attention_variant(const Tensor& q, const Tensor& k, int variant) {
     int var = resolve_variant(variant, spark::attention_num_variants());
     while (variant < 0 && var > 0 &&
            !spark::attention_supports(static_cast<int>(q.size(2)), static_cast<int>(k.size(2)),
                                       static_cast<int>(q.size(3)), var))
         --var;
-    spark::attention_bf16(
-        bf16_ptr(q), bf16_ptr(k), bf16_ptr(v), bf16_ptr_mut(out), static_cast<int>(q.size(0)),
-        static_cast<int>(q.size(1)), static_cast<int>(k.size(1)), static_cast<int>(q.size(2)),
-        static_cast<int>(k.size(2)), static_cast<int>(q.size(3)), causal, var, current_stream(q));
+    return var;
+}
+
+// O = softmax(q k^T / sqrt(D)) v; every variant takes any S_q, S_kv >= 1. With `lse` the
+// kernel also writes the natural-log log-sum-exp of every row of scaled scores.
+void run_attention(const Tensor& q, const Tensor& k, const Tensor& v, Tensor& out, bool causal,
+                   int variant, float* lse) {
+    const c10::cuda::CUDAGuard guard(q.device());
+    spark::attention_bf16(bf16_ptr(q), bf16_ptr(k), bf16_ptr(v), bf16_ptr_mut(out),
+                          static_cast<int>(q.size(0)), static_cast<int>(q.size(1)),
+                          static_cast<int>(k.size(1)), static_cast<int>(q.size(2)),
+                          static_cast<int>(k.size(2)), static_cast<int>(q.size(3)), causal,
+                          attention_variant(q, k, variant), current_stream(q), lse);
+}
+
+Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, bool causal, int variant) {
+    check_attention_inputs(q, k, v);
+    Tensor out = at::empty_like(q);
+    run_attention(q, k, v, out, causal, variant, nullptr);
     return out;
+}
+
+// The forward for training: (O, lse) with lse fp32 [B, H_q, S_q], what attention_bwd takes.
+std::tuple<Tensor, Tensor> attention_fwd(const Tensor& q, const Tensor& k, const Tensor& v,
+                                         bool causal, int variant) {
+    check_attention_inputs(q, k, v);
+    Tensor out = at::empty_like(q);
+    Tensor lse = at::empty({q.size(0), q.size(1), q.size(2)}, q.options().dtype(at::kFloat));
+    run_attention(q, k, v, out, causal, variant, lse.data_ptr<float>());
+    return {out, lse};
+}
+
+// (dq, dk, dv) of O = attention(q, k, v) for the upstream gradient d_out, from the forward's
+// output `out` and log-sum-exp `lse`. dk and dv have k's shape: under GQA they are summed over
+// the query heads of each group.
+std::tuple<Tensor, Tensor, Tensor> attention_bwd(const Tensor& q, const Tensor& k, const Tensor& v,
+                                                 const Tensor& out, const Tensor& d_out,
+                                                 const Tensor& lse, bool causal, int variant,
+                                                 bool deterministic) {
+    check_attention_inputs(q, k, v);
+    check_cuda_contig(out, "out");
+    check_cuda_contig(d_out, "d_out");
+    check_cuda_contig(lse, "lse");
+    TORCH_CHECK(out.sizes() == q.sizes() && d_out.sizes() == q.sizes(),
+                "out and d_out must have q's shape ", q.sizes());
+    TORCH_CHECK(out.scalar_type() == at::kBFloat16 && d_out.scalar_type() == at::kBFloat16,
+                "attention_bwd expects bfloat16 out and d_out");
+    TORCH_CHECK(lse.scalar_type() == at::kFloat &&
+                    lse.sizes() == at::IntArrayRef({q.size(0), q.size(1), q.size(2)}),
+                "lse must be float32 [B, H_q, S_q]");
+    TORCH_CHECK(aligned16(out) && aligned16(d_out), "attention_bwd needs 16-byte aligned storage");
+    const int var = resolve_variant(variant, spark::attention_bwd_num_variants());
+    const c10::cuda::CUDAGuard guard(q.device());
+    Tensor dq = at::empty_like(q), dk = at::empty_like(k), dv = at::empty_like(v);
+    spark::attention_bwd_bf16(
+        bf16_ptr(q), bf16_ptr(k), bf16_ptr(v), bf16_ptr(out), bf16_ptr(d_out),
+        lse.data_ptr<float>(), bf16_ptr_mut(dq), bf16_ptr_mut(dk), bf16_ptr_mut(dv),
+        static_cast<int>(q.size(0)), static_cast<int>(q.size(1)), static_cast<int>(k.size(1)),
+        static_cast<int>(q.size(2)), static_cast<int>(k.size(2)), static_cast<int>(q.size(3)),
+        causal, deterministic, var, current_stream(q));
+    return {dq, dk, dv};
 }
 
 // The fp8 forward: q = [B, H_q, S_q, D], k, v = [B, H_kv, S_kv, D] float8_e4m3fn, with fp32
@@ -746,6 +803,7 @@ int num_variants(const std::string& name) {
     if (name == "fp4gemm") return spark::fp4gemm_num_variants();
     if (name == "attention") return spark::attention_num_variants();
     if (name == "attention_fp8") return spark::attention_fp8_num_variants();
+    if (name == "attention_bwd") return spark::attention_bwd_num_variants();
     if (name == "bandwidth") return spark::bandwidth_num_variants();
     if (name == "paged_decode") return spark::paged_decode_num_variants();
     if (name == "attention_varlen") return spark::attention_varlen_num_variants();
@@ -798,6 +856,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "factors (per tensor or per (b, head)), bf16 out",
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("q_scale"), py::arg("k_scale"),
           py::arg("v_scale"), py::arg("causal") = false, py::arg("variant") = -1);
+    m.def("attention_fwd", &attention_fwd,
+          "attention forward for training: (out, lse), lse the fp32 [B, H_q, S_q] log-sum-exp of "
+          "each row of scaled scores",
+          py::arg("q"), py::arg("k"), py::arg("v"), py::arg("causal") = false,
+          py::arg("variant") = -1);
+    m.def("attention_bwd", &attention_bwd,
+          "attention backward: (dq, dk, dv) from q, k, v, the forward's out and lse and d_out; "
+          "dk and dv are summed over each K/V head's query heads",
+          py::arg("q"), py::arg("k"), py::arg("v"), py::arg("out"), py::arg("d_out"),
+          py::arg("lse"), py::arg("causal") = false, py::arg("variant") = -1,
+          py::arg("deterministic") = false);
     m.def("rope_append_", &rope_append_,
           "RoPE on the q and k columns of a fused qkv projection, k and v appended to the caches "
           "in place; returns q as [B, H_q, S, D]",

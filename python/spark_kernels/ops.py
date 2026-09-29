@@ -20,7 +20,7 @@ import torch
 from . import _C
 
 KERNELS = ("bandwidth", "rmsnorm", "swiglu", "softmax", "sgemm", "hgemm", "fp8gemm", "fp4gemm",
-           "attention", "paged_decode", "attention_varlen", "attention_fp8")
+           "attention", "attention_bwd", "paged_decode", "attention_varlen", "attention_fp8")
 
 
 def num_variants(name: str) -> int:
@@ -373,3 +373,82 @@ def attention_fp8(
     bfloat16.
     """
     return _C.attention_fp8(q, k, v, q_scale, k_scale, v_scale, causal, variant)
+
+
+def attention_fwd(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool = False, variant: int = -1
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The attention forward for training: returns (out, lse).
+
+    `out` is what `attention` returns. `lse` is float32 [B, H_q, S_q], the natural-log
+    log-sum-exp of each row of scaled scores, log(sum_j exp(q_i . k_j / sqrt(D))) over the keys
+    row i sees: torch's `logsumexp` convention, and what `attention_bwd` recomputes the softmax
+    from. Same inputs and variants as `attention`; a decode shape runs the forward's 64-row
+    tile instead of the flash-decoding kernel, which has no lse output.
+    """
+    return _C.attention_fwd(q, k, v, causal, variant)
+
+
+def attention_bwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    d_out: torch.Tensor,
+    lse: torch.Tensor,
+    causal: bool = False,
+    variant: int = -1,
+    deterministic: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Gradients (dq, dk, dv) of out = attention(q, k, v, causal) for the upstream d_out.
+
+    q, k, v, out, d_out are the forward's bfloat16 tensors, lse its float32 log-sum-exp (from
+    `attention_fwd`). dq has q's shape; dk and dv have k's, summed over the H_q / H_kv query
+    heads that share each k/v head (GQA). fp32 accumulation, bf16 out; D 64 or 128, any S_q and
+    S_kv. Variants (docs/design/attention_bwd.md): 0 scalar reference, 1 FlashAttention-2's
+    key-tile loop on mma.sync, 2 the sm_120-sized version with a cp.async Q/dO pipeline, 3
+    (default) the same with TMA loads and mbarriers in place of the block barrier. Variants 1
+    to 3 add dq with fp32 atomics, so the last bits of dq can differ between runs;
+    `deterministic=True` computes dq in a separate pass instead (about 40% more tensor work),
+    and then two runs agree bit for bit.
+    """
+    return _C.attention_bwd(q, k, v, out, d_out, lse, causal, variant, deterministic)
+
+
+class AttentionFunction(torch.autograd.Function):
+    """torch.autograd wrapper: forward by `attention_fwd`, backward by `attention_bwd`.
+
+    Saves q, k, v, out and lse (not the S x S probabilities), as FlashAttention does. Use
+    `attention_with_grad` rather than calling `apply` directly.
+    """
+
+    @staticmethod
+    def forward(ctx, q, k, v, causal, variant, bwd_variant, deterministic):
+        out, lse = attention_fwd(q, k, v, causal, variant)
+        ctx.save_for_backward(q, k, v, out, lse)
+        ctx.causal, ctx.bwd_variant, ctx.deterministic = causal, bwd_variant, deterministic
+        return out
+
+    @staticmethod
+    def backward(ctx, d_out):
+        q, k, v, out, lse = ctx.saved_tensors
+        dq, dk, dv = attention_bwd(q, k, v, out, d_out.contiguous(), lse, ctx.causal,
+                                   ctx.bwd_variant, ctx.deterministic)
+        return dq, dk, dv, None, None, None, None
+
+
+def attention_with_grad(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    causal: bool = False,
+    variant: int = -1,
+    bwd_variant: int = -1,
+    deterministic: bool = False,
+) -> torch.Tensor:
+    """Differentiable `attention`: same forward, and `.backward()` runs `attention_bwd`.
+
+    The drop-in for `F.scaled_dot_product_attention(q, k, v, is_causal=causal,
+    enable_gqa=True)` in training code, for bfloat16 [B, H, S, D] tensors with D 64 or 128.
+    """
+    return AttentionFunction.apply(q, k, v, causal, variant, bwd_variant, deterministic)

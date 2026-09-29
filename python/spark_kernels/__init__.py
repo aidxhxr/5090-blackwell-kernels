@@ -25,6 +25,10 @@ Ops (all run on the current CUDA stream, all accept float32 or bfloat16 unless n
     attention_fp8(q, k, v, q_scale, k_scale, v_scale, causal=False, variant=-1)
                                              the same over e4m3 q, k, v with descale factors,
                                              bf16 out; quantize_fp8(x, per_head=False) makes them
+    attention_fwd(q, k, v, causal=False)     (out, lse): the forward plus its log-sum-exp
+    attention_bwd(q, k, v, out, d_out, lse, causal=False, deterministic=False)
+                                             (dq, dk, dv), the backward pass
+    attention_with_grad(q, k, v, causal=False)  attention as a torch.autograd.Function
     rope_append_(qkv, cos, sin, k_cache, v_cache, pos0, H_q, H_kv)
                                              RoPE on q and k, k and v into the caches; returns q
     rope_append_paged_(qkv, cos, sin, positions, slots, k_cache, v_cache, H_q, H_kv)
@@ -47,10 +51,14 @@ from importlib.metadata import PackageNotFoundError, version
 
 from . import engine, layer, reference
 from .ops import (
+    AttentionFunction,
     add_rmsnorm_,
     attention,
+    attention_bwd,
     attention_fp8,
+    attention_fwd,
     attention_varlen,
+    attention_with_grad,
     fp4_quantize,
     fp4gemm,
     fp8gemm,
@@ -69,10 +77,14 @@ from .ops import (
 )
 
 __all__ = [
+    "AttentionFunction",
     "add_rmsnorm_",
     "attention",
+    "attention_bwd",
     "attention_fp8",
+    "attention_fwd",
     "attention_varlen",
+    "attention_with_grad",
     "engine",
     "fp4_quantize",
     "fp4gemm",
