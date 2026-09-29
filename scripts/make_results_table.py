@@ -34,7 +34,8 @@ SHEETS = {"RTX 5090": "RTX5090.md", "GB10": "GB10.md"}
 KERNEL_ORDER = ["bandwidth", "rmsnorm", "add_rmsnorm", "swiglu", "softmax", "sgemm", "hgemm",
                 "fp8gemm", "attention", "rope"]
 # The GEMM benches time a library reference next to every variant (ref_ms).
-REFERENCE_NAME = {"sgemm": "cuBLAS", "hgemm": "cuBLAS", "fp8gemm": "cuBLASLt"}
+REFERENCE_NAME = {"sgemm": "cuBLAS", "hgemm": "cuBLAS", "fp8gemm": "cuBLASLt",
+                  "attention_varlen": "dense attention per sequence"}
 
 
 def on_device(r: dict, device: str) -> bool:

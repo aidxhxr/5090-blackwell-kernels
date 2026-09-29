@@ -265,4 +265,44 @@ void attention_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_b
 int attention_num_variants();
 bool attention_supports(int S_q, int S_kv, int D, int variant);
 
+// ---- Attention over a paged K/V cache (src/kernels/attention_paged.cu) ------------------
+// The cache is k_cache, v_cache = [num_pages, H_kv, page, D] bf16, page a power of two >= 16.
+// Sequence b owns pages block_table[b][0..], block_table [B, max_pages] int32 row-major, and
+// has seq_lens[b] keys (0 <= seq_lens[b] <= max_pages * page; not checked, they live on the
+// device): key j is row j % page of page block_table[b][j / page]. GQA as attention_bf16
+// (H_q % H_kv == 0), D in {64, 128}, B <= 512, fp32 softmax and accumulation, 16-byte
+// aligned pointers. The lengths are read on the device, so a launch does not depend on them
+// and can be replayed from a CUDA graph as they change.
+//
+// Decode: Q, O = [B, H_q, D], one query token per sequence, no mask (the token's own key is
+// already in the cache). A sequence with seq_lens[b] == 0 gets zeros.
+// variant 0: one warp per (b, query head), keys one at a time
+// variant 1: flash-decoding with a length-aware split: every (b, kv head) cut into 16-key
+//            slabs, the slabs of the whole batch divided evenly over the warps of a grid of
+//            one block per SM, each warp streaming its range through its own cp.async
+//            pipeline across sequence boundaries; pieces of a (b, kv head) that span warps
+//            are merged by a second kernel. Needs H_q / H_kv <= 16. Uses a per-process
+//            workspace: two launches must not run concurrently on different streams
+void paged_decode_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* k_cache,
+                       const __nv_bfloat16* v_cache, const int* block_table, const int* seq_lens,
+                       __nv_bfloat16* O, int B, int H_q, int H_kv, int D, int page, int max_pages,
+                       int variant, cudaStream_t stream);
+int paged_decode_num_variants();
+
+// Varlen prefill: Q, O = [T, H_q, D], the new tokens of B sequences packed back to back,
+// sequence b's at rows cu_seqlens_q[b] .. cu_seqlens_q[b+1]-1 (cu_seqlens_q [B + 1] int32,
+// cu_seqlens_q[0] = 0, cu_seqlens_q[B] = T). Their keys are already in the paged cache, and
+// seq_lens[b] >= q_len_b counts them together with the context before them. `causal` aligns
+// the mask bottom-right: query i of sequence b sees keys j <= seq_lens[b] - q_len_b + i (the
+// plain causal mask when the cache held nothing before; a prompt chunk otherwise).
+// variant 0: one warp per (token, query head), keys one at a time
+// variant 1: attention variant 2's 128 x 64 mma.sync tile with the K/V rows gathered through
+//            the block table and each block's (sequence, q tile) found on the device
+void attention_varlen_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* k_cache,
+                           const __nv_bfloat16* v_cache, const int* cu_seqlens_q,
+                           const int* seq_lens, const int* block_table, __nv_bfloat16* O, int B,
+                           int T, int H_q, int H_kv, int D, int page, int max_pages, bool causal,
+                           int variant, cudaStream_t stream);
+int attention_varlen_num_variants();
+
 }  // namespace spark

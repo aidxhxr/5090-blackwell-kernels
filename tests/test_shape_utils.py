@@ -206,3 +206,19 @@ def test_device_key_and_peaks_selection():
     assert su.DEVICE_PEAKS["RTX 5090"]["bf16_tflops"] is None  # override does not leak
     with pytest.raises(ValueError, match="mixes devices"):
         su.peaks_for_rows([{"device": "NVIDIA GeForce RTX 5090"}, {"device": "NVIDIA GB10"}])
+
+
+def test_paged_shapes_parse_and_count_the_kv_bytes():
+    # the two spellings bench_paged writes: equal lengths and a mixed batch
+    d = su.parse_shape("paged_decode", "paged_n8_l4096_hq32_hkv8_d128_p16")
+    assert (d["B"], d["keys"], d["max_len"], d["H"], d["H_kv"], d["D"]) == (8, 32768, 4096, 32, 8,
+                                                                           128)
+    m = su.parse_shape("paged_decode", "paged_n51_max32768_sum57768_hq32_hkv8_d128_p16")
+    assert (m["B"], m["keys"], m["max_len"]) == (51, 57768, 32768)
+    # K and V once per K/V head plus a Q and an O row per query head, bf16
+    assert su.traffic_bytes("paged_decode", "bf16", d) == 2.0 * (32768 * 8 + 8 * 32) * 128 * 2
+    assert su.flops("paged_decode", d) == 4.0 * 32 * 32768 * 128
+    v = su.parse_shape("attention_varlen", "varlen_n16_max977_sum8353_hq32_hkv8_d128_p16_causal")
+    assert (v["B"], v["keys"]) == (16, 8353)
+    assert su.is_compute_bound_kernel("attention_varlen")
+    assert not su.is_compute_bound_kernel("paged_decode")

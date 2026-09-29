@@ -45,6 +45,9 @@ PEAK_FILE = "peak.json"
 # against the same layer in PyTorch, prefill and decode. Its rows have their own columns
 # (spark_ms, torch_ms, torch_compiled_ms, spark_graph_ms) and their own section in the table.
 LAYER_FILE = "layer.json"
+# Written by scripts/bench_serve.py: the whole model served by spark_kernels.engine against the
+# same model in PyTorch; rows of their own shape, not bench rows.
+SERVE_FILE = "serve.json"
 
 # The C++ benches name some rows after the entry point they time rather than the kernel family
 # everything here keys on (tables, peaks, traffic, FLOPs, the torch comparison).
@@ -150,7 +153,7 @@ def load_bench_rows(results_dir: Path) -> list[dict]:
     """Every row written by the C++ benches (results/*.json minus the torch comparison)."""
     rows: list[dict] = []
     for p in sorted(results_dir.glob("*.json")):
-        if p.name not in (TORCH_COMPARISON, PEAK_FILE, LAYER_FILE):
+        if p.name not in (TORCH_COMPARISON, PEAK_FILE, LAYER_FILE, SERVE_FILE):
             rows.extend(normalize_row(r) for r in load_jsonl(p))
     return rows
 
@@ -183,6 +186,12 @@ def attention_shape(B: int, H: int, S_q: int, S_kv: int, D: int, causal: bool,
 
 
 ROPE_SHAPE = re.compile(r"^b(\d+)_s(\d+)_hq(\d+)_hkv(\d+)_d(\d+)_pos(\d+)$")
+
+# bench_paged: "paged_n8_l4096_hq32_hkv8_d128_p16" (equal lengths) or
+# "paged_n51_max32768_sum57768_hq32_hkv8_d128_p16" (mixed), "varlen_..._causal" likewise.
+PAGED_SHAPE = re.compile(
+    r"^(?:paged|varlen)_n(\d+)_(?:l(\d+)|max(\d+)_sum(\d+))_hq(\d+)_hkv(\d+)_d(\d+)_p(\d+)"
+    r"(_causal)?$")
 
 ATTENTION_SHAPE = re.compile(
     r"^b(\d+)_(?:h(\d+)|hq(\d+)_hkv(\d+))_(?:s(\d+)|sq(\d+)_skv(\d+))_d(\d+)(_causal)?$")
@@ -224,7 +233,7 @@ def parse_shape(kernel: str, shape: str) -> dict:
             return {"rows": 1, "cols": v[0]}
     if k == "bandwidth":
         return {"n": element_count(shape)}
-    if k == "rope":  # bench_rope: "b1_s4096_hq32_hkv8_d128_pos0"
+    if k in ("rope", "rope_paged"):  # bench_rope: "b1_s4096_hq32_hkv8_d128_pos0"
         m = ROPE_SHAPE.match(shape)
         if not m:
             raise ValueError(f"not a rope shape string: {shape!r}")
@@ -239,6 +248,15 @@ def parse_shape(kernel: str, shape: str) -> dict:
         # the K/V head count, equal to it unless the string spells them apart (GQA).
         return {"B": int(B), "H": int(Hq or H), "H_kv": int(Hkv or H), "S_q": int(Sq or S),
                 "S_kv": int(Skv or S), "D": int(D), "causal": causal is not None}
+    if k in ("paged_decode", "attention_varlen"):
+        m = PAGED_SHAPE.match(shape)
+        if not m:
+            raise ValueError(f"not a paged attention shape string: {shape!r}")
+        n, l_eq, mx, total, Hq, Hkv, D, page, _ = m.groups()
+        keys = int(n) * int(l_eq) if l_eq else int(total)
+        # "n" is the size the tables sort by: the keys of the batch
+        return {"B": int(n), "keys": keys, "max_len": int(l_eq or mx), "H": int(Hq),
+                "H_kv": int(Hkv), "D": int(D), "page": int(page), "n": keys}
     return {"raw": v}
 
 
@@ -261,8 +279,10 @@ def traffic_bytes(kernel: str, dtype: str, dims: dict) -> float:
     if k in GEMM_KERNELS:
         M, N, K = dims["M"], dims["N"], dims["K"]
         return float(M * K + K * N + M * N) * isz
-    if k == "rope":  # the qkv rows read once, q and the k / v cache slots written once
+    if k in ("rope", "rope_paged"):  # the qkv rows read once, q and the k / v slots written once
         return 2.0 * dims["B"] * dims["S"] * (dims["H"] + 2 * dims["H_kv"]) * dims["D"] * isz
+    if k == "paged_decode":  # K and V once per K/V head, one Q and O row per query head
+        return 2.0 * (dims["keys"] * dims["H_kv"] + dims["B"] * dims["H"]) * dims["D"] * isz
     if k == "attention":  # Q and O once (H_q heads), K and V once (H_kv heads under GQA)
         q_rows = dims["B"] * dims["H"] * dims["S_q"]
         kv_rows = dims["B"] * dims.get("H_kv", dims["H"]) * dims["S_kv"]
@@ -277,7 +297,9 @@ def flops(kernel: str, dims: dict) -> float:
     if k == "attention":  # Q K^T and P V, halved under the causal mask as FlashAttention counts it
         fl = 4.0 * dims["B"] * dims["H"] * dims["S_q"] * dims["S_kv"] * dims["D"]
         return fl / 2 if dims["causal"] else fl
-    if k == "rope":  # two muls and an add per rotated element, on the q and k heads
+    if k == "paged_decode":  # one query row per head against every key: Q K^T and P V
+        return 4.0 * dims["H"] * dims["keys"] * dims["D"]
+    if k in ("rope", "rope_paged"):  # two muls and an add per rotated element, q and k heads
         return 3.0 * dims["B"] * dims["S"] * (dims["H"] + dims["H_kv"]) * dims["D"]
     if k in ("rmsnorm", "add_rmsnorm"):
         return 4.0 * dims["rows"] * dims["cols"]
@@ -295,13 +317,14 @@ def arithmetic_intensity(kernel: str, dtype: str, shape: str) -> float:
 
 
 def is_compute_bound_kernel(kernel: str) -> bool:
-    return kernel.lower() in GEMM_KERNELS + ("attention",)
+    return kernel.lower() in GEMM_KERNELS + ("attention", "attention_varlen")
 
 
 def uses_tensor_cores(kernel: str, dtype: str = "") -> bool:
     """Kernels judged against a tensor-core peak (bf16, fp8 or tf32) rather than the fp32 one.
     sgemm is the CUDA-core ladder except for its tf32 / 3xtf32 rows."""
-    return kernel.lower() in ("hgemm", "fp8gemm", "attention") or dtype in TF32_DTYPES
+    return (kernel.lower() in ("hgemm", "fp8gemm", "attention", "attention_varlen")
+            or dtype in TF32_DTYPES)
 
 
 def compute_peak_key(kernel: str, dtype: str = "") -> str:
