@@ -9,6 +9,10 @@
 //   peak_fp8_mma_plain    the plain mma.sync.m16n8k32...e4m3 with fp32 accumulate, which the
 //                   RTX 5090 runs at half that rate, as the GeForce Ada parts did
 //   peak_fp8_mma_f16acc   the plain instruction with fp16 accumulators, the full rate
+//   peak_fp4_mma    e2m1 (fp4) operands, fp32 accumulate, on the NVFP4 instruction the fp4gemm
+//                   kernels use (mma.sync.m16n8k64.kind::mxf4nvf4.block_scale.scale_vec::4X with
+//                   unit ue4m3 scales, sm_120a only): the fp4gemm roof
+//   peak_fp4_mma_mx the MXFP4 form of the same instruction (scale_vec::2X, ue8m0), for the doc
 //   peak_tf32_mma   tf32 tensor-core throughput, fp32 accumulate (mma.sync.m16n8k8): the roof
 //                   of the tensor-core sgemm variants (docs/design/sgemm.md)
 //   peak_fp32_fma   fp32 FMA throughput on the CUDA cores: the roof of the sgemm SIMT rungs
@@ -132,6 +136,50 @@ __global__ void __launch_bounds__(kThreads)
 #pragma unroll
     for (int c = 0; c < kChains; ++c) s += acc[c][0] + acc[c][1];
     if (s == 12345u) sink[threadIdx.x] = static_cast<float>(s);
+}
+
+// One m16n8k64 e2m1 mma per chain per iteration, fp32 accumulators, unit block scales. 0x2 is
+// e2m1 1.0; 0x38 is ue4m3 1.0 and 0x7F ue8m0 1.0. MX selects the MXFP4 form over NVFP4.
+template <bool MX>
+__global__ void __launch_bounds__(kThreads)
+    mma_fp4_peak_kernel(int iters, float* __restrict__ sink, long long* __restrict__ clk) {
+    const unsigned u = 0x22222222u ^ (threadIdx.x & 1);
+    const unsigned a[4] = {u, u, u, u};
+    const unsigned b[2] = {u, u};
+    const unsigned sf = MX ? 0x7F7F7F7Fu : 0x38383838u;
+    float acc[kChains][4];
+#pragma unroll
+    for (int c = 0; c < kChains; ++c) acc[c][0] = acc[c][1] = acc[c][2] = acc[c][3] = 0.f;
+
+    long long c0 = 0, t0 = 0;
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        c0 = clock64();
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    }
+    for (int i = 0; i < iters; ++i) {
+#pragma unroll
+        for (int c = 0; c < kChains; ++c) {
+            if (MX)
+                mma_e2m1_16864_mxf4<0, 0, 0>(acc[c], a, b, sf, sf);
+            else
+                mma_e2m1_16864_nvf4<0, 0>(acc[c], a, b, sf, sf);
+        }
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        long long c1 = clock64(), t1;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t1));
+        clk[0] = c1 - c0;
+        clk[1] = t1 - t0;
+    }
+    float s = 0.f;
+#pragma unroll
+    for (int c = 0; c < kChains; ++c) s += acc[c][0] + acc[c][1] + acc[c][2] + acc[c][3];
+    if (s == 12345.f) sink[threadIdx.x] = s;
+}
+
+// Whether the fp4 peak can run: the block-scaled instructions only exist in an sm_120a build.
+__global__ void has_mx_kernel(int* out) {
+    *out = SPARK_HAS_MX_MMA;
 }
 
 // One m16n8k8 tf32 mma per chain per iteration. 0x3f800000 is 1.0f, already a tf32.
@@ -303,6 +351,48 @@ int main(int argc, char** argv) {
                      (best16.median_ms * 1e-3) / 1e12;
         print_row(r16);
     }
+
+    // ---- fp4 (e2m1) block-scaled mma.sync peaks ---------------------------------------------
+    int has_mx = 0;
+    {
+        int* d = nullptr;
+        SPARK_CUDA_CHECK(cudaMalloc(&d, sizeof(int)));
+        has_mx_kernel<<<1, 1, 0, stream>>>(d);
+        SPARK_CUDA_CHECK(cudaMemcpy(&has_mx, d, sizeof(int), cudaMemcpyDeviceToHost));
+        SPARK_CUDA_CHECK(cudaFree(d));
+    }
+    for (int mx = 0; mx < 2 && has_mx; ++mx) {
+        auto run = [&](int n) {
+            if (mx)
+                mma_fp4_peak_kernel<true><<<blocks, kThreads, 0, stream>>>(n, sink, clk);
+            else
+                mma_fp4_peak_kernel<false><<<blocks, kThreads, 0, stream>>>(n, sink, clk);
+        };
+        int n = 1000;
+        Timing t = time_kernel([&] { run(n); }, stream, 1, 1);
+        n = static_cast<int>(n * target_ms / std::max(0.01, static_cast<double>(t.median_ms)));
+        n = std::max(n, 100);
+        const Timing best = time_best([&] { run(n); });
+        const double flops = fp8_warps * n * kChains * (16.0 * 8.0 * 64.0 * 2.0);
+        long long h[2] = {0, 0};
+        SPARK_CUDA_CHECK(cudaMemcpy(h, clk, sizeof(h), cudaMemcpyDeviceToHost));
+        const double mhz = h[1] > 0 ? static_cast<double>(h[0]) / h[1] * 1e3 : 0.0;
+
+        Row r;
+        r.kernel = mx ? "peak_fp4_mma_mx" : "peak_fp4_mma";
+        r.dtype = mx ? "mxfp4" : "nvfp4";
+        r.variant = 0;
+        r.shape = mx ? "m16n8k64_mxf4_2x_ue8m0" : "m16n8k64_nvf4_4x_ue4m3";
+        r.median_ms = best.median_ms;
+        r.min_ms = best.min_ms;
+        r.tflops = flops / (best.median_ms * 1e-3) / 1e12;
+        r.ref_ms = mhz;  // the clock this loop ran at, MHz, as for sm_clock above
+        print_row(r);
+        std::fprintf(stderr, "    SM clock during the %s fp4 mma loop: %.0f MHz\n",
+                     mx ? "MXFP4" : "NVFP4", mhz);
+    }
+    if (!has_mx)
+        std::fprintf(stderr, "no block-scaled mma in this build: skipping the fp4 peaks\n");
 
     // ---- tf32 mma.sync peak ---------------------------------------------------------------
     {
