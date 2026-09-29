@@ -443,6 +443,127 @@ Tensor rope_append_(const Tensor& qkv, const Tensor& cos, const Tensor& sin, Ten
     return q;
 }
 
+// ---- the paged K/V cache (docs/design/serving.md) ---------------------------------------
+
+void check_int32(const Tensor& t, const char* name) {
+    check_cuda_contig(t, name);
+    TORCH_CHECK(t.scalar_type() == at::kInt, name, " must be int32");
+}
+
+// The caches [num_pages, H_kv, page, D] bf16, the same shape, page a power of two.
+void check_cache(const Tensor& k_cache, const Tensor& v_cache) {
+    check_cuda_contig(k_cache, "k_cache");
+    check_cuda_contig(v_cache, "v_cache");
+    TORCH_CHECK(k_cache.scalar_type() == at::kBFloat16 && v_cache.scalar_type() == at::kBFloat16,
+                "k_cache and v_cache must be bfloat16");
+    TORCH_CHECK(k_cache.dim() == 4 && k_cache.sizes() == v_cache.sizes(),
+                "k_cache and v_cache must be [num_pages, H_kv, page, D] with the same shape");
+    const int64_t page = k_cache.size(2);
+    TORCH_CHECK(page >= 1 && (page & (page - 1)) == 0,
+                "the page size (k_cache.size(2)) must be a "
+                "power of two, got ",
+                page);
+    TORCH_CHECK(aligned16(k_cache) && aligned16(v_cache), "the caches need 16-byte alignment");
+}
+
+// q = rope(qkv[:, :H_q D]) as [T, H_q, D]; token t's rope(k) and v go to slot slots[t] of the
+// paged caches (skipped when slots[t] < 0), rotated at position positions[t].
+Tensor rope_append_paged_(const Tensor& qkv, const Tensor& cos, const Tensor& sin,
+                          const Tensor& positions, const Tensor& slots, Tensor k_cache,
+                          Tensor v_cache, int64_t H_q, int64_t H_kv) {
+    check_cuda_contig(qkv, "qkv");
+    check_cuda_contig(cos, "cos");
+    check_cuda_contig(sin, "sin");
+    check_int32(positions, "positions");
+    check_int32(slots, "slots");
+    check_cache(k_cache, v_cache);
+    TORCH_CHECK(qkv.scalar_type() == at::kBFloat16, "rope_append_paged_ expects bfloat16 qkv");
+    TORCH_CHECK(cos.scalar_type() == at::kFloat && sin.scalar_type() == at::kFloat,
+                "rope_append_paged_ expects float32 cos and sin tables");
+    TORCH_CHECK(qkv.dim() == 2, "qkv must be [T, (H_q + 2 H_kv) * D]");
+    const int64_t T = qkv.size(0), D = k_cache.size(3);
+    TORCH_CHECK(H_q >= 1 && H_kv >= 1 && H_q % H_kv == 0, "H_q must be a multiple of H_kv");
+    TORCH_CHECK(k_cache.size(1) == H_kv, "the caches must have H_kv heads");
+    TORCH_CHECK(qkv.size(1) == (H_q + 2 * H_kv) * D,
+                "qkv's last dim must be (H_q + 2 H_kv) * D = ", (H_q + 2 * H_kv) * D, ", got ",
+                qkv.size(1));
+    TORCH_CHECK(positions.numel() == T && slots.numel() == T,
+                "positions and slots need one entry per token");
+    TORCH_CHECK(cos.dim() == 2 && cos.sizes() == sin.sizes() && cos.size(1) == D,
+                "cos and sin must be [P, D]");
+    TORCH_CHECK(D % 16 == 0, "D must be a multiple of 16");
+    TORCH_CHECK(T * (H_q + 2 * H_kv) * D < (int64_t{1} << 40), "rope_append_paged_ too large");
+    const c10::cuda::CUDAGuard guard(qkv.device());
+    Tensor q = at::empty({T, H_q, D}, qkv.options());
+    spark::rope_append_paged_bf16(
+        bf16_ptr(qkv), cos.data_ptr<float>(), sin.data_ptr<float>(), positions.data_ptr<int>(),
+        slots.data_ptr<int>(), bf16_ptr_mut(q), bf16_ptr_mut(k_cache), bf16_ptr_mut(v_cache),
+        static_cast<int>(T), static_cast<int>(H_q), static_cast<int>(H_kv), static_cast<int>(D),
+        static_cast<int>(k_cache.size(2)), current_stream(qkv));
+    return q;
+}
+
+// o [B, H_q, D] = attention of each sequence's one query token over its seq_lens[b] keys in
+// the paged cache.
+Tensor paged_decode(const Tensor& q, const Tensor& k_cache, const Tensor& v_cache,
+                    const Tensor& block_table, const Tensor& seq_lens, int variant) {
+    check_cuda_contig(q, "q");
+    check_cache(k_cache, v_cache);
+    check_int32(block_table, "block_table");
+    check_int32(seq_lens, "seq_lens");
+    TORCH_CHECK(q.scalar_type() == at::kBFloat16 && q.dim() == 3,
+                "paged_decode expects q as [B, H_q, D] bfloat16");
+    const int64_t B = q.size(0), H_q = q.size(1), D = q.size(2), H_kv = k_cache.size(1);
+    TORCH_CHECK(k_cache.size(3) == D, "q and the caches must agree on D");
+    TORCH_CHECK(H_q % H_kv == 0, "q must have a multiple of the caches' heads");
+    TORCH_CHECK(block_table.dim() == 2 && block_table.size(0) == B,
+                "block_table must be [B, max_pages]");
+    TORCH_CHECK(seq_lens.numel() == B, "seq_lens must have B entries");
+    TORCH_CHECK(aligned16(q), "paged_decode needs 16-byte aligned q");
+    const c10::cuda::CUDAGuard guard(q.device());
+    Tensor out = at::empty_like(q);
+    const int var = resolve_variant(variant, spark::paged_decode_num_variants());
+    spark::paged_decode_bf16(
+        bf16_ptr(q), bf16_ptr(k_cache), bf16_ptr(v_cache), block_table.data_ptr<int>(),
+        seq_lens.data_ptr<int>(), bf16_ptr_mut(out), static_cast<int>(B), static_cast<int>(H_q),
+        static_cast<int>(H_kv), static_cast<int>(D), static_cast<int>(k_cache.size(2)),
+        static_cast<int>(block_table.size(1)), var, current_stream(q));
+    return out;
+}
+
+// o [T, H_q, D] = attention of the packed new tokens (sequence b's at rows
+// cu_seqlens_q[b] .. cu_seqlens_q[b+1]-1) over their sequences' keys in the paged cache.
+Tensor attention_varlen(const Tensor& q, const Tensor& k_cache, const Tensor& v_cache,
+                        const Tensor& cu_seqlens_q, const Tensor& seq_lens,
+                        const Tensor& block_table, bool causal, int variant) {
+    check_cuda_contig(q, "q");
+    check_cache(k_cache, v_cache);
+    check_int32(cu_seqlens_q, "cu_seqlens_q");
+    check_int32(seq_lens, "seq_lens");
+    check_int32(block_table, "block_table");
+    TORCH_CHECK(q.scalar_type() == at::kBFloat16 && q.dim() == 3,
+                "attention_varlen expects q as [T, H_q, D] bfloat16");
+    const int64_t T = q.size(0), H_q = q.size(1), D = q.size(2), H_kv = k_cache.size(1);
+    const int64_t B = seq_lens.numel();
+    TORCH_CHECK(k_cache.size(3) == D, "q and the caches must agree on D");
+    TORCH_CHECK(H_q % H_kv == 0, "q must have a multiple of the caches' heads");
+    TORCH_CHECK(cu_seqlens_q.numel() == B + 1, "cu_seqlens_q must have B + 1 entries");
+    TORCH_CHECK(block_table.dim() == 2 && block_table.size(0) == B,
+                "block_table must be [B, max_pages]");
+    TORCH_CHECK(aligned16(q), "attention_varlen needs 16-byte aligned q");
+    TORCH_CHECK(T * H_q <= INT32_MAX, "attention_varlen dims too large for int32");
+    const c10::cuda::CUDAGuard guard(q.device());
+    Tensor out = at::empty_like(q);
+    const int var = resolve_variant(variant, spark::attention_varlen_num_variants());
+    spark::attention_varlen_bf16(
+        bf16_ptr(q), bf16_ptr(k_cache), bf16_ptr(v_cache), cu_seqlens_q.data_ptr<int>(),
+        seq_lens.data_ptr<int>(), block_table.data_ptr<int>(), bf16_ptr_mut(out),
+        static_cast<int>(B), static_cast<int>(T), static_cast<int>(H_q), static_cast<int>(H_kv),
+        static_cast<int>(D), static_cast<int>(k_cache.size(2)),
+        static_cast<int>(block_table.size(1)), causal, var, current_stream(q));
+    return out;
+}
+
 int num_variants(const std::string& name) {
     if (name == "rmsnorm") return spark::rmsnorm_num_variants();
     if (name == "swiglu") return spark::swiglu_num_variants();
@@ -452,6 +573,8 @@ int num_variants(const std::string& name) {
     if (name == "fp8gemm") return spark::fp8gemm_num_variants();
     if (name == "attention") return spark::attention_num_variants();
     if (name == "bandwidth") return spark::bandwidth_num_variants();
+    if (name == "paged_decode") return spark::paged_decode_num_variants();
+    if (name == "attention_varlen") return spark::attention_varlen_num_variants();
     throw std::invalid_argument("unknown kernel: " + name);
 }
 
@@ -492,6 +615,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "in place; returns q as [B, H_q, S, D]",
           py::arg("qkv"), py::arg("cos"), py::arg("sin"), py::arg("k_cache"), py::arg("v_cache"),
           py::arg("pos0"), py::arg("H_q"), py::arg("H_kv"));
+    m.def("rope_append_paged_", &rope_append_paged_,
+          "RoPE on the q and k columns of packed tokens, k and v written to their slots of the "
+          "paged caches; returns q as [T, H_q, D]",
+          py::arg("qkv"), py::arg("cos"), py::arg("sin"), py::arg("positions"), py::arg("slots"),
+          py::arg("k_cache"), py::arg("v_cache"), py::arg("H_q"), py::arg("H_kv"));
+    m.def("paged_decode", &paged_decode,
+          "one query token per sequence against a paged K/V cache: q [B, H_q, D], block_table "
+          "[B, max_pages], seq_lens [B]",
+          py::arg("q"), py::arg("k_cache"), py::arg("v_cache"), py::arg("block_table"),
+          py::arg("seq_lens"), py::arg("variant") = -1);
+    m.def("attention_varlen", &attention_varlen,
+          "packed prompts (q [T, H_q, D], cu_seqlens_q [B + 1]) against a paged K/V cache, "
+          "causal mask aligned bottom-right",
+          py::arg("q"), py::arg("k_cache"), py::arg("v_cache"), py::arg("cu_seqlens_q"),
+          py::arg("seq_lens"), py::arg("block_table"), py::arg("causal") = true,
+          py::arg("variant") = -1);
     m.def("num_variants", &num_variants, "number of implementation variants for a kernel",
           py::arg("name"));
 }

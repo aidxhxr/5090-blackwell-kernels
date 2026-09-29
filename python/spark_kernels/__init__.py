@@ -21,28 +21,38 @@ Ops (all run on the current CUDA stream, all accept float32 or bfloat16 unless n
     attention(q, k, v, causal=False, variant=-1)  fused attention over [B, H, S, D] (bf16)
     rope_append_(qkv, cos, sin, k_cache, v_cache, pos0, H_q, H_kv)
                                              RoPE on q and k, k and v into the caches; returns q
+    rope_append_paged_(qkv, cos, sin, positions, slots, k_cache, v_cache, H_q, H_kv)
+                                             the same into a paged K/V cache, packed tokens
+    paged_decode(q, k_cache, v_cache, block_table, seq_lens, variant=-1)
+                                             a decode step of a batch of any lengths
+    attention_varlen(q, k_cache, v_cache, cu_seqlens_q, seq_lens, block_table, causal=True)
+                                             packed prompts of any lengths, no padding
     num_variants(name)                       how many implementations exist for `name`
 
 `variant` selects a rung on the optimization ladder described in docs/DESIGN.md; -1 picks
 the fastest one that accepts the input (see ops.py for the two ladders where that is not the
 top rung). `spark_kernels.reference` holds plain-PyTorch implementations used by tests.
 `spark_kernels.layer` is a Llama-3-8B decoder layer built from these ops (prefill and decode
-with a K/V cache) next to the same layer in plain PyTorch.
+with a K/V cache) next to the same layer in plain PyTorch. `spark_kernels.engine` runs the
+whole 32-layer model on a paged K/V cache with batched prefill and continuous batching.
 """
 
 from importlib.metadata import PackageNotFoundError, version
 
-from . import layer, reference
+from . import engine, layer, reference
 from .ops import (
     add_rmsnorm_,
     attention,
+    attention_varlen,
     fp8gemm,
     hgemm,
     hgemm_swiglu,
     interleave_gate_up,
     num_variants,
+    paged_decode,
     rmsnorm,
     rope_append_,
+    rope_append_paged_,
     sgemm,
     softmax,
     swiglu,
@@ -51,15 +61,19 @@ from .ops import (
 __all__ = [
     "add_rmsnorm_",
     "attention",
+    "attention_varlen",
+    "engine",
     "fp8gemm",
     "hgemm",
     "hgemm_swiglu",
     "interleave_gate_up",
     "layer",
     "num_variants",
+    "paged_decode",
     "reference",
     "rmsnorm",
     "rope_append_",
+    "rope_append_paged_",
     "sgemm",
     "softmax",
     "swiglu",

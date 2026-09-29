@@ -19,7 +19,8 @@ import torch
 
 from . import _C
 
-KERNELS = ("bandwidth", "rmsnorm", "swiglu", "softmax", "sgemm", "hgemm", "fp8gemm", "attention")
+KERNELS = ("bandwidth", "rmsnorm", "swiglu", "softmax", "sgemm", "hgemm", "fp8gemm", "attention",
+           "paged_decode", "attention_varlen")
 
 
 def num_variants(name: str) -> int:
@@ -215,3 +216,72 @@ def attention(
     share it. Returns [B, H_q, S_q, D] bfloat16.
     """
     return _C.attention(q, k, v, causal, variant)
+
+
+def rope_append_paged_(
+    qkv: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    positions: torch.Tensor,
+    slots: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    H_q: int,
+    H_kv: int,
+) -> torch.Tensor:
+    """RoPE plus the K/V append for packed tokens into a paged cache, one launch.
+
+    qkv is [T, (H_q + 2 H_kv) * D] bf16, one row per token of any sequence. Token t is rotated
+    at position positions[t] (int32) and its k and v are written to slot slots[t] (int32,
+    page_id * page + row) of k_cache and v_cache, [num_pages, H_kv, page, D] bf16 with page a
+    power of two; a negative slot skips the write (a padding token). Returns the rotated q as
+    [T, H_q, D], the layout `attention_varlen` and `paged_decode` take.
+    """
+    return _C.rope_append_paged_(qkv, cos, sin, positions, slots, k_cache, v_cache, H_q, H_kv)
+
+
+def paged_decode(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    variant: int = -1,
+) -> torch.Tensor:
+    """One decode step of a batch against a paged K/V cache: softmax(q k^T / sqrt(D)) v per
+    sequence, fp32 math, bf16 out.
+
+    q is [B, H_q, D] (one token per sequence), the caches [num_pages, H_kv, page, D] bf16 (page
+    a power of two >= 16), block_table [B, max_pages] int32 (sequence b's key j is row j % page
+    of page block_table[b, j // page]) and seq_lens [B] int32, the keys of each sequence
+    including the token being decoded (append it first). GQA as `attention`. A sequence of
+    length 0 gets zeros, which is how a CUDA graph pads a batch. The default (variant 1)
+    divides the keys of the whole batch evenly over the SMs whatever the lengths; the
+    lengths are read on the device, so a captured step replays correctly as they grow.
+    Returns [B, H_q, D] bfloat16.
+    """
+    return _C.paged_decode(q, k_cache, v_cache, block_table, seq_lens, variant)
+
+
+def attention_varlen(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    causal: bool = True,
+    variant: int = -1,
+) -> torch.Tensor:
+    """Attention for a packed batch of prompts against a paged K/V cache, no padding.
+
+    q is [T, H_q, D] bf16 with sequence b's new tokens at rows cu_seqlens_q[b] ..
+    cu_seqlens_q[b+1]-1 (cu_seqlens_q [B + 1] int32). Their keys must already be in the cache
+    (`rope_append_paged_` first): seq_lens[b] (int32) counts them plus any context before
+    them. With `causal` the mask is aligned bottom-right, so query i of sequence b sees keys
+    j <= seq_lens[b] - q_len_b + i: the usual causal mask for a fresh prompt, and the right
+    one for a chunk of a longer prompt. Returns [T, H_q, D] bfloat16, which is [T, H_q * D]
+    for the output projection without a transpose.
+    """
+    return _C.attention_varlen(q, k_cache, v_cache, cu_seqlens_q, seq_lens, block_table, causal,
+                               variant)
