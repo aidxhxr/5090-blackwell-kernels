@@ -96,6 +96,7 @@ docs:
 - [hgemm](design/hgemm.md)
 - [fp8gemm](design/fp8gemm.md)
 - [fp4gemm](design/fp4gemm.md) (NVFP4 and MXFP4, and the quantizer)
+- [w4gemm](design/w4gemm.md)
 - [attention](design/attention.md)
 - [attention backward](design/attention_bwd.md)
 - [one decoder layer](design/layer.md)

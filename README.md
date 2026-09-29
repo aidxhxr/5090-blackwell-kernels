@@ -499,6 +499,7 @@ default stays on the CUDA cores.
 | `hgemm` bf16 | WMMA, smem tile, cp.async, `mma.sync` + `ldmatrix` with swizzle and split-K, Stream-K, TMA, TMA on Stream-K; a weight-streaming kernel for decode; fused bias / activation / residual / SwiGLU epilogues | cuBLAS GemmEx; eager `addmm`, `F.gelu`, `F.silu * up` |
 | `fp8gemm` e4m3 | naive `mma.sync.m16n8k32`, the swizzled cp.async tile with a 64x64 warp tile and decode configs, TMA; all on the block-scaled instruction, with per-tensor scales or MXFP8 block scales | cuBLASLt, `torch._scaled_mm`, `F.scaled_mm` |
 | `fp4gemm` NVFP4, MXFP4 | naive `mma.sync.m16n8k64.kind::mxf4nvf4`, the swizzled cp.async tile with the block scales staged beside it, TMA with bulk-copied scales; a bf16 -> fp4 quantizer | cuBLASLt NVFP4 (bit-identical), `F.scaled_mm` |
+| `w4gemm` W4A16 | thread per output; a warp per 16 columns with the repacked int4 fragments and the activations straight into registers; warps along K on a cp.async pipeline for M <= 8 and independent warps for M <= 16, Stream-K tiles above; round-to-nearest quantizer and the offline repack | the bf16 `hgemm` on the dequantized weights, cuBLAS |
 | `attention` bf16 | warp per row, CUDA-core flash attention, `mma.sync` flash attention, split-KV tail, TMA mbarrier pipeline, persistent tile queue with a producer warp; GQA and a flash-decoding kernel | `F.scaled_dot_product_attention` |
 | `attention_fp8` e4m3 | warp per row on dequantized inputs, variant 5's persistent TMA kernel with both products on the block-scaled fp8 `mma.sync`, P rounded to e4m3 in registers, V transposed by `ldmatrix.trans` and byte permutes | the bf16 kernel, `F.scaled_dot_product_attention` in bf16 |
 | `attention_bwd` bf16 | warp per row, FlashAttention-2's key-tile loop on `mma.sync`, V in registers with a double-buffered Q/dO tile and a simulated split, TMA and mbarriers with no block barrier; GQA, a deterministic dQ pass, an autograd Function | torch autograd through `F.scaled_dot_product_attention` (flash and cuDNN) |
@@ -558,13 +559,15 @@ a_mx, sfa = sk.reference.quantize_mx(a_bf16)   # MXFP8: e4m3 plus a ue8m0 scale 
 c = sk.fp8gemm(a_mx, w_mx, sfa=sfa, sfb=sfw)   # the scales go into the tensor-core instruction
 a4, sfa4, sa4 = sk.fp4_quantize(a_bf16)    # NVFP4: packed e2m1, e4m3 scale per 16, fp32 per tensor
 c = sk.fp4gemm(a4, w4, sfa4, sfw4, sa4, sw4)  # fmt="mxfp4" for a ue8m0 scale per 32
+wq = sk.W4Weight.quantize(w_bf16)          # int4, one bf16 scale per 128 k of a column, repacked once
+c = sk.w4gemm(a_bf16, wq)                  # a @ w with 4x fewer weight bytes than hgemm streams
 o = sk.attention(q, k, v, causal=True)     # q is [B, H, S, D] bf16; k and v may have fewer heads
 (q8, sq), (k8, sk8), (v8, sv) = (sk.quantize_fp8(x) for x in (q, k, v))   # e4m3 + descale
 o = sk.attention_fp8(q8, k8, v8, sq, sk8, sv, causal=True)   # both products on the fp8 tensor cores
 q = sk.rope_append_(qkv, cos, sin, k_cache, v_cache, pos, 32, 8)  # RoPE; q head-major; k, v into the cache
 
 from spark_kernels import layer as L        # one Llama-3-8B decoder layer
-lyr = L.SparkLayer(L.LayerWeights.random(), L.RoPE(8192))
+lyr = L.SparkLayer(L.LayerWeights.random(), L.RoPE(8192))   # int4=True: W4A16 projections
 cache = L.KVCache(batch=1, capacity=8192)
 x, delta = lyr.prefill(x, cache)           # x is [B, S, 4096]; returns the residual stream and the pending MLP output
 x, delta = lyr.decode(x_next, cache, delta)
@@ -582,7 +585,7 @@ numbers, the sweeps that picked the constants, and which Nsight metric moved:
   [swiglu](docs/design/swiglu.md), [softmax](docs/design/softmax.md),
   [sgemm](docs/design/sgemm.md), [hgemm](docs/design/hgemm.md),
   [fp8gemm](docs/design/fp8gemm.md), [fp4gemm](docs/design/fp4gemm.md),
-  [attention](docs/design/attention.md),
+  [w4gemm](docs/design/w4gemm.md), [attention](docs/design/attention.md),
   [layer](docs/design/layer.md), [serving](docs/design/serving.md)
 
 Things I'd still like to do: a 128-key tile for attention, which would halve how often the
