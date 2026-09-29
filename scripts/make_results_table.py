@@ -32,11 +32,11 @@ OUT_HEADLINE = RESULTS / "headline.md"
 
 SHEETS = {"RTX 5090": "RTX5090.md", "GB10": "GB10.md"}
 KERNEL_ORDER = ["bandwidth", "rmsnorm", "add_rmsnorm", "swiglu", "softmax", "sgemm", "hgemm",
-                "fp8gemm", "attention", "attention_fp8", "rope"]
+                "fp8gemm", "fp4gemm", "fp4quant", "attention", "attention_fp8", "rope"]
 # The GEMM benches time a library reference next to every variant (ref_ms).
 # bench_attention_fp8 times the bf16 attention's top rung on the same shape.
 REFERENCE_NAME = {"sgemm": "cuBLAS", "hgemm": "cuBLAS", "fp8gemm": "cuBLASLt",
-                  "attention_varlen": "dense attention per sequence",
+                  "fp4gemm": "cuBLASLt", "attention_varlen": "dense attention per sequence",
                   "attention_fp8": "bf16 attention v5"}
 
 
@@ -300,6 +300,8 @@ def main() -> int:
             else "bf16 tensor peak TBD (pass --bf16-peak)")
     if peaks.get("fp8_tflops"):
         bf16 += f", {peaks['fp8_tflops']:.1f} TFLOPS fp8 tensor"
+    if peaks.get("fp4_tflops"):
+        bf16 += f", {peaks['fp4_tflops']:.1f} TFLOPS fp4 tensor"
     if peaks.get("tf32_tflops"):
         bf16 += f", {peaks['tf32_tflops']:.1f} TFLOPS tf32 tensor"
     if peaks.get("measured"):

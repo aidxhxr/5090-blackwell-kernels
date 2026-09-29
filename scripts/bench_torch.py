@@ -39,6 +39,11 @@ HGEMM_SHAPES = [(1024, 1024, 1024), (2048, 2048, 2048), (4096, 4096, 4096), (819
                 (1, 4096, 4096), (16, 4096, 4096), (32, 4096, 4096), (64, 4096, 4096),
                 (16, 11008, 4096), (64, 4096, 11008)]
 FP8GEMM_SHAPES = HGEMM_SHAPES  # bench_fp8gemm.cu times bench_hgemm's list
+# bench_fp4gemm.cu: squares, the Llama-3-8B projections at 4096 tokens (qkv, gate|up, down),
+# decode shapes
+FP4GEMM_SHAPES = [(1024, 1024, 1024), (2048, 2048, 2048), (4096, 4096, 4096), (8192, 8192, 8192),
+                  (4096, 6144, 4096), (4096, 28672, 4096), (4096, 4096, 14336), (1, 4096, 4096),
+                  (16, 4096, 4096), (64, 4096, 4096), (16, 28672, 4096), (16, 4096, 14336)]
 # The fused-epilogue rows of bench_hgemm.cu (`fused_rows`): (M, N, K, tag), N the width of
 # b, so the swiglu rows have N = 2 x 11008 and an [M, 11008] output. The torch side is the
 # eager sequence a model runs without the fusion: F.linear + F.gelu, torch.addmm, and two
@@ -298,6 +303,50 @@ def bench_fp8gemm(sk, add, M, N, K):
     add("fp8gemm", "e4m3", gemm_shape(M, N, K), ours, ref, tflops=2.0 * M * N * K / ours / 1e9)
 
 
+def bench_fp4gemm(sk, add, M, N, K):
+    # NVFP4: a [M, K/2] and b_t [N, K/2] packed e2m1 from sk.fp4_quantize, e4m3 block scales
+    # in the blocked layout, per-tensor fp32 scales, bf16 out. torch's side is
+    # F.scaled_mm with the two scale levels (cuBLASLt's NVFP4 kernel, the same bytes and the
+    # same output bits). Skipped where torch has no NVFP4 scaled_mm.
+    a, sfa, sa = sk.fp4_quantize(torch.randn(M, K, device="cuda", dtype=torch.bfloat16))
+    copies = (256 << 20) // (K * N // 2) + 1 if M <= 64 else 1
+    bs = [sk.fp4_quantize(torch.randn(N, K, device="cuda", dtype=torch.bfloat16))
+          for _ in range(copies)]
+    turn = [0]
+
+    def next_b():
+        b = bs[turn[0] % copies]
+        turn[0] += 1
+        return b
+
+    def torch_mm():
+        b_t, sfb, sb = next_b()
+        return F.scaled_mm(a.view(torch.float4_e2m1fn_x2),
+                           b_t.view(torch.float4_e2m1fn_x2).t(),
+                           [sfa.view(torch.float8_e4m3fn), sa.reshape(1)],
+                           [F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
+                           [sfb.view(torch.float8_e4m3fn), sb.reshape(1)],
+                           [F.ScalingType.BlockWise1x16, F.ScalingType.TensorWise],
+                           swizzle_a=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
+                           swizzle_b=[F.SwizzleType.SWIZZLE_32_4_4, F.SwizzleType.NO_SWIZZLE],
+                           output_dtype=torch.bfloat16)
+
+    try:
+        torch_mm()
+    except (AttributeError, RuntimeError, TypeError, ValueError, NotImplementedError):
+        print(f"fp4gemm {M}x{N}x{K}: torch has no NVFP4 scaled_mm here, skipped", file=sys.stderr)
+        return
+
+    def ours():
+        b_t, sfb, sb = next_b()
+        return sk.fp4gemm(a, b_t, sfa, sfb, sa, sb)
+
+    ours_ms = time_ms(ours)
+    ref = time_ms(torch_mm)
+    add("fp4gemm", "nvfp4", gemm_shape(M, N, K), ours_ms, ref,
+        tflops=2.0 * M * N * K / ours_ms / 1e9)
+
+
 def sdpa_backend(fn) -> str:
     """Which kernel torch's SDPA dispatcher picked for `fn`, from the profiler's kernel names:
     "flash" (FlashAttention-2), "cudnn", "efficient" (the CUTLASS memory-efficient kernel) or
@@ -399,7 +448,8 @@ def main() -> int:
     ap.add_argument("--sdpa-backend", choices=["flash", "cudnn", "efficient", "math"],
                     help="force this SDPA kernel for the attention rows instead of torch's own "
                          "choice (the default, which the JSON records as torch_backend)")
-    ap.add_argument("--only", choices=["attention", "attention_fp8", "hgemm_fused", "sgemm"],
+    ap.add_argument("--only", choices=["attention", "attention_fp8", "hgemm_fused", "sgemm",
+                                       "fp4gemm"],
                     help="time only this kernel's rows (with --sdpa-backend: the attention "
                          "rows against that kernel; hgemm_fused: the fused-epilogue rows; "
                          "attention_fp8: the fp8 kernel against torch's bf16 SDPA)")
@@ -459,6 +509,10 @@ def main() -> int:
         for M, N, K in SGEMM_SHAPES:
             bench_sgemm(sk, add, M, N, K)
         return 0
+    if args.only == "fp4gemm":
+        for M, N, K in FP4GEMM_SHAPES:
+            bench_fp4gemm(sk, add, M, N, K)
+        return 0
     if args.only not in ("attention", "attention_fp8"):
         for dtype in (torch.float32, torch.bfloat16):
             for rows, cols in RMSNORM_SHAPES:
@@ -475,6 +529,8 @@ def main() -> int:
             bench_hgemm_fused(sk, add, M, N, K, tag)
         for M, N, K in FP8GEMM_SHAPES:
             bench_fp8gemm(sk, add, M, N, K)
+        for M, N, K in FP4GEMM_SHAPES:
+            bench_fp4gemm(sk, add, M, N, K)
     if args.only != "attention_fp8":
         for B, Hq, Hkv, Sq, Skv, D, causal in ATTENTION_SHAPES:
             bench_attention(sk, add, B, Hq, Hkv, Sq, Skv, D, causal)

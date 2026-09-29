@@ -121,6 +121,28 @@ def test_fp8gemm_rows_use_the_fp8_peak_and_the_cublaslt_label(results):
     assert headline.index("| hgemm |") < headline.index("| fp8gemm |")  # KERNEL_ORDER
 
 
+def test_fp4gemm_rows_use_the_fp4_peak_and_mxfp4_has_no_reference(results):
+    out, write = results
+    write("fp4gemm.json", [
+        bench_row("fp4gemm", "nvfp4", 2, "8192x8192x8192", 0.8, tflops=1374.4, ref_ms=0.76),
+        bench_row("fp4gemm", "mxfp4", 2, "8192x8192x8192", 0.78, tflops=1409.6),
+        bench_row("fp4quant", "nvfp4", 0, "4096x14336", 0.077, gbps=1955.2),
+    ])
+    write("peak.json", [
+        {"device": DEVICE, "kernel": "peak_bf16_mma", "tflops": 258.7},
+        {"device": DEVICE, "kernel": "peak_fp4_mma", "tflops": 2028.7},
+    ])
+    assert mrt.main() == 0
+    md = (out / "RESULTS.md").read_text()
+    fp4 = md.split("## fp4gemm")[1].split("## fp4quant")[0]
+    assert "% of peak (2028.7 TFLOPS)" in fp4 and "% of cuBLASLt" in fp4
+    assert "| nvfp4 | 8192x8192x8192 | 2 | 0.8000 | 0.7840 | 1374.40 | 67.7% | 95.0% |" in fp4
+    assert "| mxfp4 | 8192x8192x8192 | 2 | 0.7800 | 0.7644 | 1409.60 | 69.5% | — |" in fp4
+    assert "2028.7 TFLOPS fp4 tensor" in md
+    quant = md.split("## fp4quant")[1]
+    assert "GB/s" in quant and "| nvfp4 | 4096x14336 | 0 |" in quant
+
+
 def test_torch_rows_from_another_machine_are_ignored(results, capsys):
     out, write = results
     shape = "4096x8192"

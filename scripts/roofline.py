@@ -4,7 +4,7 @@
 Reads results/*.json (from run_all_benches.sh) and writes results/roofline.png. The ceilings
 come from shape_utils.DEVICE_PEAKS for the device named in the rows (RTX 5090: 1792 GB/s DRAM,
 104.8 TFLOPS fp32; GB10: 273 GB/s, 31 TFLOPS fp32, 213 TFLOPS bf16), overridden by the measured
-ones in results/peak.json. The bf16, fp8 and tf32 tensor-core roofs are only drawn when they
+ones in results/peak.json. The bf16, fp8, fp4 and tf32 tensor-core roofs are only drawn when they
 are known: run bench_peak, or pass --bf16-peak=<TFLOPS> for the bf16 one. sgemm's tf32 and
 3xtf32 rows (variants 6 and 7) are plotted as their own series against the tf32 roof.
 """
@@ -35,7 +35,7 @@ OUT = RESULTS / "roofline.png"
 
 MARKERS = {"bandwidth": "P", "rmsnorm": "o", "add_rmsnorm": "D", "swiglu": "s", "softmax": "^",
            "sgemm": "v", "sgemm (tf32)": "<", "sgemm (3xtf32)": ">", "hgemm": "*", "fp8gemm": "h",
-           "attention": "X"}
+           "fp4gemm": "H", "fp4quant": "d", "attention": "X"}
 
 
 def series_of(r: dict) -> str:
@@ -102,7 +102,8 @@ def main() -> int:
     roofs = [("fp32 CUDA cores", peaks["fp32_tflops"], "#444"),
              ("tf32 tensor cores", peaks.get("tf32_tflops"), "#d62728"),
              ("bf16 tensor cores", peaks["bf16_tflops"], "#76b900"),
-             ("fp8 tensor cores", peaks.get("fp8_tflops"), "#1f77b4")]
+             ("fp8 tensor cores", peaks.get("fp8_tflops"), "#1f77b4"),
+             ("fp4 tensor cores", peaks.get("fp4_tflops"), "#9467bd")]
     for label, tflops, color in roofs:
         if not tflops:  # unknown for this device (the tensor peaks until bench_peak has run)
             continue

@@ -113,6 +113,25 @@ def test_fp8gemm_counts_bytes_per_operand_and_uses_the_fp8_peak():
     assert su.DEVICE_PEAKS["RTX 5090"]["fp8_tflops"] is None  # measured, never guessed
 
 
+def test_fp4gemm_counts_half_bytes_plus_scales_and_uses_the_fp4_peak():
+    dims = {"M": 16, "N": 4096, "K": 4096}
+    # e2m1 operands are half a byte each plus one scale byte per 16 (NVFP4) or 32 (MXFP4)
+    # elements, the bf16 output two bytes
+    ops = 16 * 4096 + 4096 * 4096
+    assert su.traffic_bytes("fp4gemm", "nvfp4", dims) == ops * (0.5 + 1 / 16) + 2 * 16 * 4096
+    assert su.traffic_bytes("fp4gemm", "mxfp4", dims) == ops * (0.5 + 1 / 32) + 2 * 16 * 4096
+    assert su.flops("fp4gemm", dims) == 2 * 16 * 4096 * 4096
+    assert su.is_compute_bound_kernel("fp4gemm") and su.uses_tensor_cores("fp4gemm")
+    assert su.compute_peak_key("fp4gemm") == "fp4_tflops"
+    assert su.DEVICE_PEAKS["RTX 5090"]["fp4_tflops"] is None  # measured, never guessed
+    assert su.parse_shape("fp4gemm", "4096x28672x4096") == {"M": 4096, "N": 28672, "K": 4096}
+    # the quantizer: a memory-bound row kernel, bf16 in, packed e2m1 and scales out
+    q = su.parse_shape("fp4quant", "4096x14336")
+    assert q == {"rows": 4096, "cols": 14336}
+    assert su.traffic_bytes("fp4quant", "nvfp4", q) == 4096 * 14336 * (2 + 0.5 + 1 / 16)
+    assert not su.is_compute_bound_kernel("fp4quant")
+
+
 def test_sgemm_tensor_core_rows_use_the_tf32_peak():
     # bench_sgemm files variant 6 under dtype "tf32" and variant 7 under "3xtf32"; both are
     # judged against the tf32 tensor-core peak, 3xTF32 against a third of it (three mmas per
@@ -140,13 +159,15 @@ def test_measured_peaks_reads_the_fp8_roof_and_not_the_documentation_rows(tmp_pa
              "tflops": 517.4},
             {"device": "NVIDIA GeForce RTX 5090", "kernel": "peak_fp8_mma_f16acc",
              "tflops": 1026.8},
+            {"device": "NVIDIA GeForce RTX 5090", "kernel": "peak_fp4_mma", "tflops": 2028.7},
+            {"device": "NVIDIA GeForce RTX 5090", "kernel": "peak_fp4_mma_mx", "tflops": 2028.3},
             {"device": "NVIDIA GeForce RTX 5090", "kernel": "peak_tf32_mma", "tflops": 129.4},
             {"device": "NVIDIA GeForce RTX 5090", "kernel": "peak_fp32_fma", "tflops": 123.4}]
     import json
     (tmp_path / su.PEAK_FILE).write_text("".join(json.dumps(r) + "\n" for r in rows))
     measured = su.measured_peaks(tmp_path)
     assert measured["fp8_tflops"] == 1013.9 and measured["bf16_tflops"] == 258.7
-    assert measured["tf32_tflops"] == 129.4
+    assert measured["tf32_tflops"] == 129.4 and measured["fp4_tflops"] == 2028.7
     key, peaks = su.peaks_for_rows([{"device": "NVIDIA GeForce RTX 5090"}], measured=measured)
     assert peaks["fp8_tflops"] == 1013.9 and peaks["bf16_tflops"] == 258.7
     assert peaks["tf32_tflops"] == 129.4 and peaks["fp32_tflops"] == 123.4

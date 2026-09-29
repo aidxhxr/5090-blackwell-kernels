@@ -11,24 +11,26 @@ from pathlib import Path
 # the benches write into every row. Provenance in docs/RTX5090.md and docs/GB10.md:
 #   RTX 5090  1792 GB/s GDDR7 (512-bit @ 28 Gbps, NVIDIA spec)
 #             104.8 TFLOPS fp32 CUDA cores (21760 cores x 2 FLOP x 2.41 GHz, theoretical)
-#             bf16, fp8 and tf32 tensor-core peaks: not published as dense figures and not
+#             bf16, fp8, fp4 and tf32 tensor-core peaks: not published as dense figures and not
 #             guessed here -> None; bench_peak measures them into results/peak.json, and
 #             --bf16-peak=<TFLOPS> overrides the bf16 one
 #   GB10      273 GB/s LPDDR5X (256-bit @ 8533 MT/s, NVIDIA spec)
 #             31 TFLOPS fp32 CUDA cores (6144 cores x 2 FLOP x 2.42 GHz, theoretical)
 #             213 TFLOPS bf16/fp16 tensor cores, fp32 accumulate, dense (community measurement)
-#             fp8 and tf32 tensor cores: no measurement yet -> None
+#             fp8, fp4 and tf32 tensor cores: no measurement yet -> None
 DEVICE_PEAKS: dict[str, dict[str, float | None]] = {
     "RTX 5090": {"bw_gbps": 1792.0, "fp32_tflops": 104.8, "bf16_tflops": None,
-                 "fp8_tflops": None, "tf32_tflops": None},
+                 "fp8_tflops": None, "fp4_tflops": None, "tf32_tflops": None},
     "GB10": {"bw_gbps": 273.0, "fp32_tflops": 31.0, "bf16_tflops": 213.0, "fp8_tflops": None,
-             "tf32_tflops": None},
+             "fp4_tflops": None, "tf32_tflops": None},
 }
-COMPUTE_PEAK_KEYS = ("bf16_tflops", "fp8_tflops", "tf32_tflops", "fp32_tflops")
+COMPUTE_PEAK_KEYS = ("bf16_tflops", "fp8_tflops", "fp4_tflops", "tf32_tflops", "fp32_tflops")
 DEFAULT_DEVICE = "RTX 5090"  # rows written before the benches recorded a device name
 
 ITEMSIZE = {"f32": 4, "bf16": 2, "fp32": 4, "float32": 4, "bfloat16": 2, "e4m3": 1, "fp8": 1,
-            "tf32": 4, "3xtf32": 4, "mxfp8": 1}
+            "tf32": 4, "3xtf32": 4, "mxfp8": 1, "nvfp4": 0.5, "mxfp4": 0.5}
+# Values per block scale of the fp4 formats (fp4gemm, fp4quant): one scale byte per block.
+FP4_BLOCK = {"nvfp4": 16, "mxfp4": 32}
 # The dtypes of sgemm's tensor-core rows: fp32 in and out, computed in TF32 with one mma per
 # product (variant 6) or three (3xTF32, variant 7). Keyed to the tf32 tensor-core peak.
 TF32_DTYPES = ("tf32", "3xtf32")
@@ -101,6 +103,8 @@ def measured_peaks(results_dir: Path) -> dict:
             out["bf16_tflops"] = r["tflops"]
         elif r.get("kernel") == "peak_fp8_mma":  # the instruction fp8gemm runs; the _plain and
             out["fp8_tflops"] = r["tflops"]      # _f16acc rows are documentation, not roofs
+        elif r.get("kernel") == "peak_fp4_mma":  # NVFP4, the fp4gemm roof (_mx is the doc)
+            out["fp4_tflops"] = r["tflops"]
         elif r.get("kernel") == "peak_tf32_mma":
             out["tf32_tflops"] = r["tflops"]
         elif r.get("kernel") == "peak_fp32_fma":
@@ -163,7 +167,7 @@ def row_shape(rows: int, cols: int) -> str:
     return f"{rows}x{cols}"
 
 
-GEMM_KERNELS = ("sgemm", "hgemm", "fp8gemm", "gemm")
+GEMM_KERNELS = ("sgemm", "hgemm", "fp8gemm", "fp4gemm", "gemm")
 # bench_attention (bf16) and bench_attention_fp8 (e4m3 Q, K, V, bf16 O): same shape strings.
 ATTENTION_KERNELS = ("attention", "attention_fp8")
 
@@ -228,7 +232,7 @@ def parse_shape(kernel: str, shape: str) -> dict:
             return {"M": v[0], "N": v[1], "K": v[2]}
         if len(v) == 1:
             return {"M": v[0], "N": v[0], "K": v[0]}
-    if k in ("rmsnorm", "add_rmsnorm", "softmax", "swiglu"):
+    if k in ("rmsnorm", "add_rmsnorm", "softmax", "swiglu", "fp4quant"):
         if len(v) >= 2:
             return {"rows": v[0], "cols": v[1]}
         if len(v) == 1:
@@ -274,10 +278,15 @@ def traffic_bytes(kernel: str, dtype: str, dims: dict) -> float:
         return 3.0 * dims["rows"] * dims["cols"] * isz
     if k == "bandwidth":
         return 2.0 * dims["n"] * isz
+    if k == "fp4quant":  # bf16 in; packed e2m1 and a scale byte per block out
+        return dims["rows"] * dims["cols"] * (2.0 + 0.5 + 1.0 / FP4_BLOCK.get(dtype, 16))
     if k == "fp8gemm":  # e4m3 operands (one byte each), bf16 output; MX mode adds a scale
         M, N, K = dims["M"], dims["N"], dims["K"]  # byte per 32 elements of each operand
         sf = (M * K + K * N) / 32.0 if dtype.lower() == "mxfp8" else 0.0
         return float(M * K + K * N) + 2.0 * M * N + sf
+    if k == "fp4gemm":  # e2m1 operands (half a byte) plus a scale byte per block, bf16 output
+        M, N, K = dims["M"], dims["N"], dims["K"]
+        return float(M * K + K * N) * (0.5 + 1.0 / FP4_BLOCK.get(dtype, 16)) + 2.0 * M * N
     if k in GEMM_KERNELS:
         M, N, K = dims["M"], dims["N"], dims["K"]
         return float(M * K + K * N + M * N) * isz
@@ -325,10 +334,10 @@ def is_compute_bound_kernel(kernel: str) -> bool:
 
 
 def uses_tensor_cores(kernel: str, dtype: str = "") -> bool:
-    """Kernels judged against a tensor-core peak (bf16, fp8 or tf32) rather than the fp32 one.
-    sgemm is the CUDA-core ladder except for its tf32 / 3xtf32 rows."""
-    return (kernel.lower() in ("hgemm", "fp8gemm", "attention_varlen") + ATTENTION_KERNELS
-            or dtype in TF32_DTYPES)
+    """Kernels judged against a tensor-core peak (bf16, fp8, fp4 or tf32) rather than the fp32
+    one. sgemm is the CUDA-core ladder except for its tf32 / 3xtf32 rows."""
+    return (kernel.lower() in ("hgemm", "fp8gemm", "fp4gemm", "attention_varlen")
+            + ATTENTION_KERNELS or dtype in TF32_DTYPES)
 
 
 def compute_peak_key(kernel: str, dtype: str = "") -> str:
@@ -336,6 +345,8 @@ def compute_peak_key(kernel: str, dtype: str = "") -> str:
     k = kernel.lower()
     if k in ("fp8gemm", "attention_fp8"):
         return "fp8_tflops"
+    if k == "fp4gemm":
+        return "fp4_tflops"
     if dtype in TF32_DTYPES:
         return "tf32_tflops"
     return "bf16_tflops" if uses_tensor_cores(k) else "fp32_tflops"

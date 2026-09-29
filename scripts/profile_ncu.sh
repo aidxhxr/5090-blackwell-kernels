@@ -43,6 +43,7 @@ profile hgemm_v6   'hgemm_v6' "$BUILD_DIR/bench_hgemm" --variant=6 --m=8192 --n=
 profile attention_decode 'attention_decode_kernel' "$BUILD_DIR/bench_attention" --variant=3 --b=1 --hq=32 --hkv=8 --sq=1 --skv=131072 --d=128 --iters=1 --warmup=0
 profile fp8gemm_v2 'fp8gemm_v2' "$BUILD_DIR/bench_fp8gemm" --mode=tensor --variant=2 --m=8192 --n=8192 --k=8192 --iters=1 --warmup=0
 profile fp8gemm_v2_mx 'fp8gemm_v2' "$BUILD_DIR/bench_fp8gemm" --mode=mx --variant=2 --m=8192 --n=8192 --k=8192 --iters=1 --warmup=0
+profile fp4gemm_v2 'fp4gemm_v2' "$BUILD_DIR/bench_fp4gemm" --format=nvfp4 --variant=2 --m=8192 --n=8192 --k=8192 --iters=1 --warmup=0 --quant=0
 profile fp8gemm_v1 'fp8gemm_v1' "$BUILD_DIR/bench_fp8gemm" --mode=tensor --variant=1 --m=8192 --n=8192 --k=8192 --iters=1 --warmup=0
 profile hgemm_v5   'hgemm_v5' "$BUILD_DIR/bench_hgemm" --variant=5 --m=8192 --n=8192 --k=8192 --iters=1 --warmup=0
 profile hgemm_v4   'hgemm_v4' "$BUILD_DIR/bench_hgemm" --variant=4 --m=8192 --n=8192 --k=8192 --iters=1 --warmup=0
