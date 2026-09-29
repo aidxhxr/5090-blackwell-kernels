@@ -305,4 +305,27 @@ void attention_varlen_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* k_cache,
                            int variant, cudaStream_t stream);
 int attention_varlen_num_variants();
 
+// ---- FP8 attention (e4m3 in, bf16 out, forward) ------------------------------------------
+// O = softmax(sq sk Q K^T / sqrt(D)) sv V per (b, h), for Q = [B, H_q, S_q, D] and
+// K, V = [B, H_kv, S_kv, D] e4m3 (the same layout, heads and mask as attention_bf16), O bf16.
+// q_scale, k_scale, v_scale are fp32 descale factors in device memory: one per tensor, or with
+// per_head one per (b, head) of that tensor (B * H_q for q, B * H_kv for k and v, indexed by
+// b * H + h). Scores, softmax and accumulators are fp32; variant 1 rounds the probabilities
+// (times 2^8) to e4m3 for the P V product. D in {64, 128}, any S_q, S_kv >= 1, 16-byte aligned
+// pointers.
+// variant 0: one warp per query row, every element dequantized to fp32, P in fp32 (baseline)
+// variant 1: attention variant 5's persistent TMA + mbarrier kernel on e4m3: both products on
+//            mma.sync.m16n8k32 (block-scaled, unit scales), P quantized in registers, V read
+//            as it lies ([key][d]) through ldmatrix.trans and byte permutes, the O rescale
+//            skipped while no row max moves by more than 0.8 (log2). Same queue and tail split
+//            as attention variant 5 (its own workspace, shared by every stream, and its own
+//            per-stream counters). Built for sm_120a / sm_121a with the fp8 GEMM; a plain
+//            sm_120 build runs the half-rate fp8 instruction
+void attention_fp8(const __nv_fp8_e4m3* Q, const __nv_fp8_e4m3* K, const __nv_fp8_e4m3* V,
+                   __nv_bfloat16* O, int B, int H_q, int H_kv, int S_q, int S_kv, int D,
+                   const float* q_scale, const float* k_scale, const float* v_scale, bool per_head,
+                   bool causal, int variant, cudaStream_t stream);
+int attention_fp8_num_variants();
+bool attention_fp8_supports(int S_q, int S_kv, int D, int variant);
+
 }  // namespace spark
