@@ -266,3 +266,15 @@ def test_attention_bwd_counts_the_five_products_and_the_gradient_traffic():
     # Q, O, dO, dQ per query head and K, V, dK, dV per K/V head, bf16
     assert su.traffic_bytes("attention_bwd", "bf16", dims) == 4 * (32 + 8) * 4096 * 128 * 2
     assert su.is_compute_bound_kernel("attention_bwd") and su.uses_tensor_cores("attention_bwd")
+
+
+def test_w4gemm_traffic_counts_nibbles_scales_and_zero_points():
+    dims = su.parse_shape("w4gemm", "16x4096x4096")
+    assert dims == {"M": 16, "N": 4096, "K": 4096}
+    groups = 4096 // 128 * 4096
+    sym = 2 * 16 * 4096 + 4096 * 4096 / 2 + 2 * groups + 2 * 16 * 4096
+    assert su.traffic_bytes("w4gemm", "w4a16", dims) == sym
+    assert su.traffic_bytes("w4gemm", "w4a16_asym", dims) == sym + groups
+    assert su.flops("w4gemm", dims) == 2 * 16 * 4096 * 4096
+    assert not su.is_compute_bound_kernel("w4gemm")
+    assert su.LLAMA3_8B_PROJECTIONS["gate_up"] == (4096, 28672)

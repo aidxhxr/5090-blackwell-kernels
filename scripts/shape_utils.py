@@ -171,6 +171,24 @@ GEMM_KERNELS = ("sgemm", "hgemm", "fp8gemm", "fp4gemm", "gemm")
 # bench_attention (bf16) and bench_attention_fp8 (e4m3 Q, K, V, bf16 O): same shape strings.
 ATTENTION_KERNELS = ("attention", "attention_fp8")
 
+# Llama-3-8B's four projections as (K, N) = (in_features, out_features) of the [K, N] weights
+# hgemm and w4gemm take: q|k|v fused (4096 + 2 x 1024 columns), o, gate|up fused
+# (2 x 14336), down. bench_w4gemm runs these at M = 1, 4, 16, 64 and 256 tokens.
+LLAMA3_8B_PROJECTIONS: dict[str, tuple[int, int]] = {
+    "qkv": (4096, 6144),
+    "o": (4096, 4096),
+    "gate_up": (4096, 28672),
+    "down": (14336, 4096),
+}
+
+# The W4A16 GEMM (bench_w4gemm): a GEMM shape string, int4 weights with one bf16 scale per
+# W4_GROUP k of a column (and a uint8 zero point in the asymmetric dtype). It is a
+# weight-streaming kernel, so its rows are judged in GB/s against the memory roof, not
+# against a tensor peak, and ref_ms is the bf16 hgemm it replaces.
+W4_KERNEL = "w4gemm"
+W4_GROUP = 128
+W4_DTYPES = ("w4a16", "w4a16_asym")
+
 
 def gemm_shape(M: int, N: int, K: int) -> str:
     """Shape string of an (M x K) @ (K x N) GEMM, as bench_sgemm / bench_hgemm / bench_fp8gemm
@@ -227,7 +245,7 @@ def parse_shape(kernel: str, shape: str) -> dict:
     """
     v = ints_in(shape)
     k = kernel.lower()
-    if k in GEMM_KERNELS:
+    if k in GEMM_KERNELS or k == W4_KERNEL:
         if len(v) >= 3:
             return {"M": v[0], "N": v[1], "K": v[2]}
         if len(v) == 1:
@@ -280,6 +298,11 @@ def traffic_bytes(kernel: str, dtype: str, dims: dict) -> float:
         return 2.0 * dims["n"] * isz
     if k == "fp4quant":  # bf16 in; packed e2m1 and a scale byte per block out
         return dims["rows"] * dims["cols"] * (2.0 + 0.5 + 1.0 / FP4_BLOCK.get(dtype, 16))
+    if k == W4_KERNEL:  # bf16 A and C, 4-bit weights, a bf16 scale (+ a zero byte) per group
+        M, N, K = dims["M"], dims["N"], dims["K"]
+        groups = (K // W4_GROUP) * N
+        meta = groups * (3 if dtype.lower().endswith("asym") else 2)
+        return 2.0 * M * K + K * N / 2.0 + meta + 2.0 * M * N
     if k == "fp8gemm":  # e4m3 operands (one byte each), bf16 output; MX mode adds a scale
         M, N, K = dims["M"], dims["N"], dims["K"]  # byte per 32 elements of each operand
         sf = (M * K + K * N) / 32.0 if dtype.lower() == "mxfp8" else 0.0
@@ -309,7 +332,7 @@ def traffic_bytes(kernel: str, dtype: str, dims: dict) -> float:
 
 def flops(kernel: str, dims: dict) -> float:
     k = kernel.lower()
-    if k in GEMM_KERNELS:
+    if k in GEMM_KERNELS or k == W4_KERNEL:
         return 2.0 * dims["M"] * dims["N"] * dims["K"]
     if k in ATTENTION_KERNELS + ("attention_bwd",):
         # forward: Q K^T and P V; backward: those two again plus dP, dQ and dK (2.5x); halved

@@ -32,8 +32,8 @@ OUT_HEADLINE = RESULTS / "headline.md"
 
 SHEETS = {"RTX 5090": "RTX5090.md", "GB10": "GB10.md"}
 KERNEL_ORDER = ["bandwidth", "rmsnorm", "add_rmsnorm", "swiglu", "softmax", "sgemm", "hgemm",
-                "fp8gemm", "fp4gemm", "fp4quant", "attention", "attention_bwd", "attention_fp8",
-                "rope"]
+                "fp8gemm", "fp4gemm", "fp4quant", "w4gemm", "attention", "attention_bwd",
+                "attention_fp8", "rope"]
 # The GEMM benches time a library reference next to every variant (ref_ms).
 # bench_attention_fp8 times the bf16 attention's top rung on the same shape.
 REFERENCE_NAME = {"sgemm": "cuBLAS", "hgemm": "cuBLAS", "fp8gemm": "cuBLASLt",
@@ -196,11 +196,24 @@ def peak_label(kernel: str, peaks: dict, dtypes: list[str]) -> str:
     return ", ".join(f"{d} {p:.1f}" for d, p in known.items()) + f" {unit}"
 
 
+# Memory-bound kernels whose ref_ms is not the naive rung or the copy.
+SPEEDUP_LABEL = {"w4gemm": "speedup vs bf16 hgemm"}
+
+
 def ref_label(kernel: str) -> str:
     """Header of the reference column: % of the library for the GEMMs, a speedup otherwise."""
     if is_compute_bound_kernel(kernel):
         return f"% of {REFERENCE_NAME.get(kernel, 'cuBLAS')}"
-    return "speedup vs ref"
+    return SPEEDUP_LABEL.get(kernel, "speedup vs ref")
+
+
+def headline_size(kernel: str, shape: str) -> float:
+    """What the headline row maximizes: the problem size, except for the W4A16 GEMM, whose
+    point is decode: the largest weight at the fewest tokens."""
+    if kernel == "w4gemm":
+        d = parse_shape(kernel, shape)
+        return d["N"] * d["K"] * 1e4 - d["M"]
+    return shape_size(kernel, shape)
 
 
 def table_for(kernel: str, rows: list[dict], torch_rows: dict, peaks: dict) -> str:
@@ -261,8 +274,8 @@ def headline(by_kernel: dict[str, list[dict]], torch_rows: dict, peaks: dict) ->
                      if r["dtype"] == dtype and r.get("ok", True) and not is_reference(r)]
             if not drows:
                 continue
-            biggest = max(shape_size(kernel, r["shape"]) for r in drows)
-            cands = [r for r in drows if shape_size(kernel, r["shape"]) == biggest]
+            biggest = max(headline_size(kernel, r["shape"]) for r in drows)
+            cands = [r for r in drows if headline_size(kernel, r["shape"]) == biggest]
             best = min(cands, key=lambda r: r["median_ms"])
             val = best.get("tflops", 0) if unit == "TFLOPS" else best.get("gbps", 0)
             t = torch_rows.get((kernel, dtype, best["shape"]))

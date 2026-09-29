@@ -265,3 +265,19 @@ def test_rope_rows_are_memory_bound_and_the_largest_shape_is_the_headline(result
     assert "| bf16 | b1_s8192_hq32_hkv8_d128_pos0 | 0 | 0.1380 |" in md
     headline = (out / "headline.md").read_text()
     assert "| rope | bf16 | b1_s8192_hq32_hkv8_d128_pos0 | v0 |" in headline
+
+
+def test_w4gemm_rows_are_memory_bound_with_the_bf16_speedup_and_a_decode_headline(results):
+    out, write = results
+    write("w4gemm.json", [
+        bench_row("w4gemm", "w4a16", 2, "1x28672x4096", 0.04, gbps=1500.0, ref_ms=0.15),
+        bench_row("w4gemm", "w4a16", 2, "256x28672x4096", 0.3, gbps=240.0, ref_ms=0.3),
+        bench_row("w4gemm", "w4a16", 2, "1x4096x4096", 0.009, gbps=950.0, ref_ms=0.0235),
+    ])
+    assert mrt.main() == 0
+    md = (out / "RESULTS.md").read_text()
+    w4 = md.split("## w4gemm")[1]
+    assert "GB/s" in w4 and "speedup vs bf16 hgemm" in w4
+    assert "| w4a16 | 1x28672x4096 | 2 | 0.0400 |" in w4 and "3.75×" in w4
+    headline = (out / "headline.md").read_text()
+    assert "| w4gemm | w4a16 | 1x28672x4096 | v2 |" in headline
