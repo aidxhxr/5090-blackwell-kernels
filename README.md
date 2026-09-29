@@ -2,19 +2,24 @@
 
 I have an RTX 5090 and a copy of cuBLAS, and I wanted to know how close I could get to it by
 hand. So I wrote the pieces of a Llama-style decoder block from scratch: RMSNorm, SwiGLU,
-softmax, an fp32 GEMM, a bf16 tensor-core GEMM, fp8 and fp4 tensor-core GEMMs and fused
-attention with grouped-query heads. Each kernel is a ladder. Variant 0 is the naive version. Every rung
-after it changes one thing, gets benchmarked against cuBLAS, cuBLASLt or PyTorch on the same
-shapes in the same timing loop, and gets profiled in Nsight Compute so the ladder says what
-each change bought.
+softmax, an fp32 GEMM, a bf16 tensor-core GEMM, fp8 and fp4 tensor-core GEMMs, a GEMM for
+int4 weights, and fused attention with grouped-query heads, in bf16 and fp8, with its
+backward pass and a paged K/V cache. Each kernel is a ladder. Variant 0 is the naive
+version. Every rung after it changes one thing, gets benchmarked against cuBLAS, cuBLASLt or
+PyTorch on the same shapes in the same timing loop, and gets profiled in Nsight Compute so
+the ladder says what each change bought.
 
 Where it ended up: the bf16 GEMM is ahead of cuBLAS on every shape from 2048 cubed up and at
 the memory floor on decode shapes. The fp8 GEMM is level with cuBLASLt at 4096 cubed, and the
-fp4 GEMM gives cuBLASLt's NVFP4 bits at 96 to 98% of its speed on the big squares. The
+fp4 GEMM gives cuBLASLt's NVFP4 bits at 96% of its speed on the big squares. The
 attention kernel is 18 to 38% ahead of PyTorch's FlashAttention-2 on prefill and streams a
-128K-token cache faster than `cudaMemcpy` copies it, and its backward pass is 2 to 41% ahead
-of FlashAttention-2's backward. And four things about this card turned out
-to be different from the spec sheet, which is the part I'd read first.
+128K-token cache faster than `cudaMemcpy` copies it, and its backward pass is 1 to 40% ahead
+of FlashAttention-2's backward. The fp8 attention runs at 630 TFLOPS, 2.6 times the bf16
+kernel. With int4 weights a batch-1 decode GEMM is 3.7 times the bf16 one, because a decode
+step is a weight stream and the weights got four times smaller. Put together on a paged
+cache, the kernels run the whole 32-layer Llama-3-8B for a batch of mixed-length requests,
+and a decode step at 64 sequences is 3.5 times `torch.compile`'s. And four things about this
+card turned out to be different from the spec sheet, which is the part I'd read first.
 
 This started as spark-kernels, for a DGX Spark that hasn't shipped, and the Python package still
 carries that name. The 5090 is what the numbers come from. The same source builds for the GB10
@@ -22,7 +27,7 @@ with `ARCH=121`.
 
 ## numbers
 
-Measured 2026-09-28 on one card. Driver 595.58, CUDA 13.2, PyTorch 2.14+cu130; the GPU state
+Measured 2026-09-29 on one card. Driver 595.58, CUDA 13.2, PyTorch 2.14+cu130; the GPU state
 during the run is in `results/env.txt`. Every row is the median of 100 launches (50 for the
 GEMMs and attention) between CUDA events, after a 300 ms clock ramp, and every variant is
 checked against a reference before it is timed: CPU double precision for the row kernels,
@@ -31,22 +36,28 @@ PyTorch" column is eager PyTorch on the same shapes through the extension.
 
 | kernel | shape | best | time | achieved | vs the library | vs PyTorch |
 |---|---|---|---|---|---|---|
-| bf16 GEMM | 4096 x 4096 x 4096 | v6 | 0.550 ms | 250 TFLOPS | 110.8% of cuBLAS | 1.12x |
-| bf16 GEMM | 8192 x 8192 x 8192 | v6 | 4.52 ms | 243 TFLOPS | 104.7% of cuBLAS | 1.07x |
-| bf16 GEMM, decode | 16 x 4096 x 4096 | v6 | 23.5 us | 1,442 GB/s | 122% of cuBLAS | 1.28x |
-| fp8 GEMM | 4096 x 4096 x 4096 | v2 | 0.195 ms | 704 TFLOPS | 99.6% of cuBLASLt | 1.29x |
-| fp8 GEMM | 8192 x 8192 x 8192 | v2 | 1.61 ms | 685 TFLOPS | 92.6% of cuBLASLt | 1.02x |
-| fp8 GEMM, decode | 16 x 4096 x 4096 | v1 | 13.3 us | 1,278 GB/s | 125% of cuBLASLt | 1.63x |
-| attention | 32 heads, 4096 x 128, causal | v5 | 0.580 ms | 237 TFLOPS | | 1.33x over flash |
-| attention | 32 heads, 8192 x 128, causal | v5 | 2.30 ms | 239 TFLOPS | | 1.18x over flash |
-| attention, decode | 1 query, 4096 keys, 32 heads | v3 | 46 us | 1,462 GB/s | | 1.43x over flash |
-| attention, GQA decode | 1 query, 128K keys, 32/8 heads | v3 | 327 us | 1,640 GB/s | | 1.08x over flash |
-| fp32 GEMM, TF32 | 4096 x 4096 x 4096 | v6 | 1.29 ms | 107 TFLOPS | 101.5% of cuBLAS TF32 | 1.02x |
-| fp32 GEMM | 4096 x 11008 x 4096 | v5 | 6.45 ms | 57 TFLOPS | 84.5% of cuBLAS | 0.86x |
-| rmsnorm bf16 | 16384 x 8192 | v4 | 0.351 ms | 1,529 GB/s | 10.4x over naive | 1.07x |
-| add + rmsnorm bf16 | 16384 x 8192 | fused | 0.712 ms | 1,509 GB/s | | 1.24x |
-| softmax bf16 | 4096 x 16384 | v3 | 0.175 ms | 1,536 GB/s | 25.3x over naive | 1.00x |
-| swiglu bf16 | 4096 x 14336 | v0 | 0.224 ms | 1,572 GB/s | | 1.60x |
+| bf16 GEMM | 4096 x 4096 x 4096 | v6 | 0.549 ms | 250 TFLOPS | 111.0% of cuBLAS | 1.12x |
+| bf16 GEMM | 8192 x 8192 x 8192 | v6 | 4.51 ms | 244 TFLOPS | 104.8% of cuBLAS | 1.07x |
+| bf16 GEMM, decode | 16 x 4096 x 4096 | v6 | 23.4 us | 1,446 GB/s | 123% of cuBLAS | 1.21x |
+| fp8 GEMM | 4096 x 4096 x 4096 | v2 | 0.195 ms | 703 TFLOPS | 99.6% of cuBLASLt | 1.35x |
+| fp8 GEMM | 8192 x 8192 x 8192 | v2 | 1.59 ms | 693 TFLOPS | 93.9% of cuBLASLt | 1.03x |
+| fp8 GEMM, decode | 16 x 4096 x 4096 | v1 | 13.2 us | 1,291 GB/s | 126% of cuBLASLt | 1.62x |
+| fp4 GEMM, NVFP4 | 8192 x 8192 x 8192 | v2 | 0.803 ms | 1,369 TFLOPS | 96.2% of cuBLASLt | 1.10x |
+| fp4 GEMM, NVFP4 decode | 16 x 4096 x 4096 | v1 | 9.1 us | 1,061 GB/s | 228% of cuBLASLt | 3.78x |
+| int4 weights, decode | 1 x 28672 x 4096 | v2 | 39.7 us | 1,525 GB/s | 3.70x over bf16 `hgemm` | |
+| attention | 32 heads, 4096 x 128, causal | v5 | 0.582 ms | 236 TFLOPS | | 1.34x over flash |
+| attention | 32 heads, 8192 x 128, causal | v5 | 2.30 ms | 240 TFLOPS | | 1.18x over flash |
+| attention, fp8 | 32 heads, 8192 x 128, causal | v1 | 0.873 ms | 630 TFLOPS | 2.63x over bf16 v5 | 3.06x over flash |
+| attention, backward | 32 heads, 4096 x 128, causal | v3 | 1.64 ms | 209 TFLOPS | | 1.13x over flash |
+| attention, decode | 1 query, 4096 keys, 32 heads | v3 | 46 us | 1,461 GB/s | | 1.43x over flash |
+| attention, GQA decode | 1 query, 128K keys, 32/8 heads | v3 | 324 us | 1,655 GB/s | | 1.09x over flash |
+| paged decode | 64 sequences of 1 to 8K keys, 32/8 heads | v1 | 755 us | 1,627 GB/s | | |
+| fp32 GEMM, TF32 | 4096 x 4096 x 4096 | v6 | 1.29 ms | 107 TFLOPS | 101.0% of cuBLAS TF32 | 1.02x |
+| fp32 GEMM | 4096 x 11008 x 4096 | v5 | 6.40 ms | 58 TFLOPS | 86.5% of cuBLAS | 0.86x |
+| rmsnorm bf16 | 16384 x 8192 | v4 | 0.349 ms | 1,538 GB/s | 10.4x over naive | 1.07x |
+| add + rmsnorm bf16 | 16384 x 8192 | fused | 0.713 ms | 1,505 GB/s | | 1.25x |
+| softmax bf16 | 4096 x 16384 | v3 | 0.173 ms | 1,551 GB/s | 25.6x over naive | 1.00x |
+| swiglu bf16 | 4096 x 14336 | v0 | 0.224 ms | 1,572 GB/s | | 1.61x |
 
 `cudaMemcpy` device to device does 1,532 GB/s on this card. The spec sheet says 1,792. The
 memory-bound rows are at the copy number, and nothing reaches the spec.
@@ -93,10 +104,10 @@ C = A B in bf16 with fp32 accumulation, row-major. The ladder, one change per ru
 | rung | what changed | 4096 cubed |
 |---|---|---|
 | v0 | WMMA, fragments straight from global memory | 25 TFLOPS |
-| v1 | 128 x 128 x 32 tile staged through padded shared memory | 153 |
-| v2 | two-stage `cp.async` pipeline | 182 |
-| v3 | raw `mma.sync.m16n8k16` + `ldmatrix`, XOR swizzle, three stages, register epilogue, split-K on the last wave | 231 |
-| v4 | Stream-K: a persistent grid, grouped tile order, a deterministic memset-free fixup | 232 |
+| v1 | 128 x 128 x 32 tile staged through padded shared memory | 151 |
+| v2 | two-stage `cp.async` pipeline | 183 |
+| v3 | raw `mma.sync.m16n8k16` + `ldmatrix`, XOR swizzle, three stages, register epilogue, split-K on the last wave | 230 |
+| v4 | Stream-K: a persistent grid, grouped tile order, a deterministic memset-free fixup | 231 |
 | v5 | TMA: one producer warp, eight consumer warps on mbarriers, no barrier in the k-loop | 246 |
 | v6 | v5's mainloop on v4's schedule | **250** |
 
@@ -153,8 +164,10 @@ tiles and in the decode kernel, so every shape the default variant takes gets it
 | 16 x 4096 x 4096 | bias + gelu | 23.5 us | 23.5 us | 24.4 us | 35.2 us | 1.34x |
 | 16 x 22016 x 4096 | swiglu, C is [16][11008] | 113.5 us | 113.3 us | 114.5 us | 123.9 us | 1.08x |
 
-"unfused, ours" is the plain GEMM followed by a separate pass, or two GEMMs and the swiglu
-kernel; "torch eager" is `F.gelu(F.linear(...))`, `torch.addmm` and `F.silu(a @ g) * (a @ u)`.
+This table is from the epilogue's own measurement session in the design note; the fused rows
+of the full run are in docs/RESULTS.md. "unfused, ours" is the plain GEMM followed by a
+separate pass, or two GEMMs and the swiglu kernel; "torch eager" is `F.gelu(F.linear(...))`,
+`torch.addmm` and `F.silu(a @ g) * (a @ u)`.
 The epilogue costs 1.5 to 3% of a prefill GEMM (the residual read and the activation) and
 nothing measurable on a decode shape, where the saving is the launch that is gone. The
 SwiGLU form is free at prefill and saves the second GEMM's read of A and the two intermediate
@@ -164,16 +177,16 @@ was restructured.
 
 | M x N x K | v0 | v1 | v2 | v3 | v4 | v5 | v6 | cuBLAS | v6 / cuBLAS | vs torch |
 |---|---|---|---|---|---|---|---|---|---|---|
-| 1024 x 1024 x 1024 | 30 | 49 | 54 | 123 | 122 |  | **125** | 122 | 102.0% | 1.05x |
-| 2048 x 2048 x 2048 | 26 | 127 | 166 | 166 | 208 | 181 | **224** | 173 | 129.8% | 1.29x |
-| 4096 x 4096 x 4096 | 25 | 153 | 182 | 231 | 232 | 245 | **250** | 226 | 110.8% | 1.12x |
-| 8192 x 8192 x 8192 | 24 | 169 | 203 | 225 | 228 | 236 | **243** | 233 | 104.7% | 1.07x |
-| 4096 x 4096 x 11008 | 23 | 154 | 181 | 229 | 230 | 245 | **246** | 228 | 107.8% | 1.10x |
-| 4096 x 11008 x 4096 | 24 | 167 | 200 | 230 | 230 | 240 | **246** | 239 | 102.9% | 1.06x |
+| 1024 x 1024 x 1024 | 30 | 49 | 54 | 122 | 123 |  | **124** | 121 | 102.3% | 1.00x |
+| 2048 x 2048 x 2048 | 26 | 127 | 166 | 166 | 207 | 181 | **224** | 172 | 129.9% | 1.28x |
+| 4096 x 4096 x 4096 | 25 | 151 | 183 | 230 | 231 | 246 | **250** | 225 | 111.0% | 1.12x |
+| 8192 x 8192 x 8192 | 24 | 169 | 203 | 224 | 228 | 237 | **244** | 233 | 104.8% | 1.07x |
+| 4096 x 4096 x 11008 | 23 | 154 | 181 | 230 | 229 | 246 | **246** | 227 | 108.3% | 1.10x |
+| 4096 x 11008 x 4096 | 24 | 167 | 200 | 231 | 228 | 242 | **248** | 239 | 103.6% | 1.06x |
 
 TFLOPS, all from one run. Variant 5 only takes grids of at least one 128 x 128 tile per SM;
-at 1024 cubed variant 6 runs variant 4's smaller tiles. The 0.87x there is the extension's
-host path on a 17 us kernel, not the kernel: the C++ bench has it at 101.9% of cuBLAS.
+at 1024 cubed variant 6 runs variant 4's smaller tiles. On a 17 us kernel the extension's
+host path is a visible share of the torch column; the C++ bench has it at 102.3% of cuBLAS.
 
 ### decode
 
@@ -186,12 +199,12 @@ launch with nothing waiting on a reduction at the end.
 
 | M x N x K | time | ours | cuBLAS | ours / cuBLAS | vs torch |
 |---|---|---|---|---|---|
-| 1 x 4096 x 4096 | 23.4 us | 1,433 GB/s | 839 GB/s | 171% | 1.69x |
-| 16 x 4096 x 4096 | 23.5 us | 1,442 GB/s | 1,181 GB/s | 122% | 1.28x |
-| 32 x 4096 x 4096 | 23.5 us | 1,453 GB/s | 1,144 GB/s | 127% | 1.28x |
-| 64 x 4096 x 4096 | 25.2 us | 1,372 GB/s | 1,122 GB/s | 122% | 1.23x |
-| 16 x 11008 x 4096 | 56.3 us | 1,612 GB/s | 1,497 GB/s | 108% | 1.08x |
-| 64 x 4096 x 11008 | 58.4 us | 1,578 GB/s | 1,433 GB/s | 110% | 1.09x |
+| 1 x 4096 x 4096 | 23.5 us | 1,429 GB/s | 839 GB/s | 170% | 1.68x |
+| 16 x 4096 x 4096 | 23.4 us | 1,446 GB/s | 1,173 GB/s | 123% | 1.21x |
+| 32 x 4096 x 4096 | 23.4 us | 1,457 GB/s | 1,181 GB/s | 123% | 1.26x |
+| 64 x 4096 x 4096 | 25.2 us | 1,374 GB/s | 1,121 GB/s | 123% | 1.23x |
+| 16 x 11008 x 4096 | 56.2 us | 1,612 GB/s | 1,497 GB/s | 108% | 1.07x |
+| 64 x 4096 x 11008 | 58.3 us | 1,581 GB/s | 1,435 GB/s | 110% | 1.08x |
 
 A read-only kernel that streams 32 MB and does nothing else takes 23.6 us timed this way, so
 the 4096-wide rows are at the floor of a single launch. Queued back to back the same launches
@@ -212,12 +225,12 @@ block-scaled instruction from the section above.
 
 | M x N x K | v0 | v1 | v2 | cuBLASLt | best / cuBLASLt | vs torch |
 |---|---|---|---|---|---|---|
-| 1024 x 1024 x 1024 | 63 | 235 |  | 205 | 114.3% | 1.57x |
-| 2048 x 2048 x 2048 | 73 | 410 | 583 | 418 | 139.5% | 1.24x |
-| 4096 x 4096 x 4096 | 65 | 642 | 704 | 707 | 99.6% | 1.29x |
-| 8192 x 8192 x 8192 | 63 | 638 | 685 | 739 | 92.6% | 1.02x |
-| 4096 x 4096 x 11008 | 49 | 665 | 735 | 579 | 126.9% | 1.28x |
-| 4096 x 11008 x 4096 | 64 | 653 | 688 | 670 | 102.7% | 1.21x |
+| 1024 x 1024 x 1024 | 63 | 234 |  | 205 | 114.1% | 1.54x |
+| 2048 x 2048 x 2048 | 73 | 410 | 582 | 410 | 142.0% | 1.25x |
+| 4096 x 4096 x 4096 | 65 | 638 | 703 | 706 | 99.6% | 1.35x |
+| 8192 x 8192 x 8192 | 63 | 639 | 693 | 738 | 93.9% | 1.03x |
+| 4096 x 4096 x 11008 | 49 | 665 | 738 | 580 | 127.2% | 1.29x |
+| 4096 x 11008 x 4096 | 64 | 653 | 698 | 672 | 103.9% | 1.21x |
 
 TFLOPS. Every row is bit-identical to cuBLASLt: e4m3 products are multiples of 2^-18 and the
 fp32 partial sums stay exact. At 8192 cubed Nsight has variant 2 and cuBLASLt at the same
@@ -228,12 +241,12 @@ path lands well under a direct cuBLASLt call.
 
 | M x N x K | time | ours | ours / cuBLASLt | vs torch |
 |---|---|---|---|---|
-| 1 x 4096 x 4096 | 13.2 us | 1,277 GB/s | 141% | 1.69x |
-| 16 x 4096 x 4096 | 13.3 us | 1,278 GB/s | 125% | 1.63x |
-| 32 x 4096 x 4096 | 13.2 us | 1,306 GB/s | 126% | 1.62x |
-| 64 x 4096 x 4096 | 13.2 us | 1,329 GB/s | 125% | 1.56x |
-| 16 x 11008 x 4096 | 29.5 us | 1,541 GB/s | 111% | 1.27x |
-| 64 x 4096 x 11008 | 31.7 us | 1,462 GB/s | 119% | 1.50x |
+| 1 x 4096 x 4096 | 13.2 us | 1,267 GB/s | 140% | 1.63x |
+| 16 x 4096 x 4096 | 13.2 us | 1,291 GB/s | 126% | 1.62x |
+| 32 x 4096 x 4096 | 13.1 us | 1,309 GB/s | 126% | 1.62x |
+| 64 x 4096 x 4096 | 13.2 us | 1,332 GB/s | 126% | 1.62x |
+| 16 x 11008 x 4096 | 29.6 us | 1,537 GB/s | 111% | 1.28x |
+| 64 x 4096 x 11008 | 31.6 us | 1,464 GB/s | 117% | 1.51x |
 
 fp8 weights are half the bytes, so a 16 MB launch has a 13.3 us read-only floor and the
 4096-wide rows sit on it.
@@ -251,19 +264,123 @@ stage's words into place. `sk.fp8gemm(a, b_t, sfa=sfa, sfb=sfb)`, and
 
 | M x N x K | MX v1 | MX v2 | cuBLASLt MXFP8 | best / cuBLASLt | MX / per-tensor |
 |---|---|---|---|---|---|
-| 2048 x 2048 x 2048 | 392 | 506 | 453 | 110.7% | 86.8% |
-| 4096 x 4096 x 4096 | 625 | 626 | 688 | 90.9% | 89.0% |
-| 8192 x 8192 x 8192 | 616 | 627 | 657 | 95.2% | 91.9% |
-| 4096 x 4096 x 11008 | 576 | 570 | 685 | 83.9% | 78.0% |
-| 4096 x 11008 x 4096 | 591 | 576 | 710 | 83.3% | 84.5% |
-| 16 x 4096 x 4096 | 15.0 us, 1,169 GB/s | | 27.8 us | 184% | 87.8% |
+| 2048 x 2048 x 2048 | 388 | 506 | 453 | 111.8% | 86.9% |
+| 4096 x 4096 x 4096 | 625 | 630 | 688 | 91.6% | 89.6% |
+| 8192 x 8192 x 8192 | 623 | 628 | 655 | 95.9% | 90.6% |
+| 4096 x 4096 x 11008 | 553 | 560 | 688 | 81.4% | 75.9% |
+| 4096 x 11008 x 4096 | 593 | 573 | 709 | 83.7% | 85.0% |
+| 16 x 4096 x 4096 | 14.8 us, 1,184 GB/s | | 27.8 us | 188% | 89.2% |
 
-TFLOPS. Variant 0 is bit-identical to cuBLASLt's MXFP8 kernel. The MX mode costs 8 to 11%
-against the per-tensor kernel on the large shapes: at a fixed clock it is 3.8% more cycles
+TFLOPS. Variant 0 is bit-identical to cuBLASLt's MXFP8 kernel. The MX mode costs 9 to 10%
+against the per-tensor kernel on the large squares: at a fixed clock it is 3.8% more cycles
 (the shuffles on the MIO queue, 23% more shared-memory wavefronts) and the rest is clock, 24%
 more instructions at the same 600 W. On the outlier inputs where MX is supposed to help, the
 GEMM error of both schemes is the 3-bit mantissa, 3.7 to 3.8% relative; the table and the
 reasons are in the design note.
+
+## the fp4 GEMM
+
+fp4 is the densest format the tensor cores here take, and NVFP4 is the one Blackwell inference
+stacks ship weights in: e2m1 values (a sign, two exponent bits, one mantissa bit) packed two to
+a byte, an e4m3 scale per 16 of them, and an fp32 scale per tensor on top. MXFP4 is the OCP
+version, a power-of-two scale per 32. On this card both run through one instruction,
+`mma.sync.m16n8k64.kind::mxf4nvf4.block_scale`, which exists only on `sm_120a`, like the
+block-scaled fp8 one. `bench_peak` measures it at 2,029 TFLOPS: the fp8 instruction's issue
+rate with twice the multiply-adds in it. I found the fragment and scale-register layouts with a
+probe, as for MXFP8, and took cuBLASLt's blocked scale layout as the API's, because one 4-byte
+word of it turned out to be exactly one lane's scale register for one k64 step.
+
+| rung | what changed |
+|---|---|
+| v0 | one warp per 16 x 8 tile, fragment and scale words straight from global memory |
+| v1 | the fp8 GEMM's variant 1 on fp4 bytes: a 128 x 128 swizzled tile, the scale tiles copied behind the operand tiles by the same `cp.async` pipeline, a self-cleaning split-K workspace for the last wave, strips of Bt for decode |
+| v2 | TMA boxes for the operands and one bulk copy per stage for the scales, a warp-specialized mbarrier pipeline, the consumer loop unrolled by the stage count with no proxy fence per stage |
+
+| M x N x K | v0 | v1 | v2 | cuBLASLt | v2 / cuBLASLt | MXFP4 v2 | vs torch |
+|---|---|---|---|---|---|---|---|
+| 2048 x 2048 x 2048 | 141 | 621 | **807** | 695 | 116.2% | 876 | 1.98x |
+| 4096 x 4096 x 4096 | 155 | 1,171 | **1,236** | 1,278 | 96.7% | 1,277 | 1.13x |
+| 8192 x 8192 x 8192 | 138 | 1,299 | **1,369** | 1,423 | 96.2% | 1,407 | 1.10x |
+| 4096 x 6144 x 4096 | 155 | 1,180 | **1,222** | 1,317 | 92.8% | 1,265 | 1.11x |
+| 4096 x 28672 x 4096 | 154 | 1,222 | **1,272** | 1,381 | 92.1% | 1,286 | 1.03x |
+| 4096 x 4096 x 14336 | 105 | 1,324 | **1,348** | 1,346 | 100.2% | 1,427 | 1.18x |
+
+TFLOPS, NVFP4 unless marked. Every NVFP4 output of every rung is bit-identical to cuBLASLt's
+NVFP4 matmul; cuBLASLt and torch have no MXFP4 kernel on this card, so that column has no
+reference. The last three rows are Llama-3-8B's qkv, gate/up and down projections at 4096
+tokens. The gap to cuBLASLt is clock, not work: at 8192 cubed my kernel takes 1.4% fewer SM
+cycles than cuBLASLt, but at 600 W it runs at 2.15 GHz to cuBLASLt's 2.21. The full run
+reaches qkv and gate/up after a minute at the power cap; one shape per process, v2 reads 96 to
+98% of cuBLASLt on the squares and 96 to 97% on those two. MXFP4 is 1 to 6% faster than NVFP4
+on the large shapes, because its scale words cover twice as many k and the consumers issue
+half the scale loads. Against the fp8 GEMM the 8192 cube is 2x, the instruction ratio.
+
+| M x N x K | time | GB/s | cuBLASLt | ours / cuBLASLt | vs torch |
+|---|---|---|---|---|---|
+| 1 x 4096 x 4096 | 9.0 us | 1,051 | 21.6 us | 241% | 3.85x |
+| 16 x 4096 x 4096 | 9.1 us | 1,061 | 20.6 us | 228% | 3.78x |
+| 64 x 4096 x 4096 | 10.9 us | 924 | 20.7 us | 189% | 3.75x |
+| 16 x 28672 x 4096 | 41.9 us | 1,600 | 61.6 us | 147% | 1.95x |
+| 16 x 4096 x 14336 | 24.8 us | 1,344 | 40.1 us | 162% | 2.61x |
+
+Decode is v1's strips of Bt. A 4096 square NVFP4 weight is 9.4 MB with its scales, and it
+reads in 9.1 us where the fp8 kernel takes 13.2 us for its 16 MB. One mantissa bit is not
+free: on Gaussian inputs the GEMM's relative error is 13.4% for NVFP4 against 3.75% for
+per-tensor e4m3, and 16.2% for MXFP4, whose power-of-two scale wastes part of e2m1's small
+range. The e4m3 block scale is what keeps NVFP4 there with outlier channels in the input. The
+probe, the layouts, the power readings and what did not help are in
+[the design note](docs/design/fp4gemm.md).
+
+## int4 weights for decode
+
+At batch 1 a decode step is a weight stream, and the bf16 decode kernel already reads its
+weights at the copy roof. The only way left to go faster is fewer bytes per weight. `w4gemm`
+takes bf16 activations and int4 weights with one bf16 scale (and optionally a zero point) per
+128 k of a column, GPTQ's packing, and multiplies exactly the bf16 matrix a
+dequantize-then-GEMM reference would: 0.516 bytes per weight instead of 2, so 3.88x is the
+ceiling at M = 1. The weights are repacked once so that a lane's 16 bytes are its four
+tensor-core fragments for 64 k, dequantized in registers with the lop3 magic-number trick, and
+k is permuted inside each group on both operands so a lane's activations are 16 contiguous
+bytes too.
+
+| rung | what changed |
+|---|---|
+| v0 | one thread per output, scalar dequant |
+| v1 | one warp per 16-column strip over the whole K, repacked weights and activations straight into registers, `mma.sync` |
+| v2 | the block shape picked per call: four warps along K on a `cp.async` pipeline for M = 1, independent warps with the next four groups in flight for M <= 16, Stream-K tiles above that |
+
+| projection | M | int4 | GB/s | bf16 `hgemm` | speedup |
+|---|---|---|---|---|---|
+| qkv, 4096 to 6144 | 1 | 11.2 us | 1,157 | 33.7 us | 3.00x |
+| | 16 | 13.3 us | 1,002 | 33.7 us | 2.53x |
+| | 64 | 27.6 us | | 35.7 us | 1.29x |
+| | 256 | 74.7 us | | 60.4 us | 0.81x |
+| o, 4096 to 4096 | 1 | 9.1 us | 957 | 23.5 us | 2.59x |
+| | 16 | 11.1 us | 805 | 23.4 us | 2.11x |
+| | 64 | 21.5 us | | 25.1 us | 1.17x |
+| | 256 | 52.1 us | | 50.0 us | 0.96x |
+| gate/up, 4096 to 28672 | 1 | 39.7 us | 1,525 | 147.2 us | **3.70x** |
+| | 16 | 41.8 us | 1,473 | 148.2 us | 3.54x |
+| | 64 | 90.2 us | | 166.7 us | 1.85x |
+| | 256 | 311.3 us | | 266.9 us | 0.86x |
+| down, 14336 to 4096 | 1 | 23.3 us | 1,303 | 72.4 us | 3.11x |
+| | 16 | 25.5 us | 1,210 | 74.4 us | 2.92x |
+| | 64 | 50.0 us | | 79.7 us | 1.59x |
+| | 256 | 156.5 us | | 131.7 us | 0.84x |
+
+Weights rotated past L2, single launches, GB/s over the traffic floor. gate/up reads its
+weights at the copy roof and gets 3.70x of the 3.88x the bytes allow. The smaller matrices
+stop at 2.6 to 3.1x because a 9 to 23 us launch carries the same 1 to 3 us of launch and
+ramp as a 150 us one: a read-only probe of the same bytes needs 8.3 us single launch. The
+int4 GEMM is ahead of `hgemm` up to 96 tokens, level at 128, and behind at 256, where both are
+tensor-bound and the int4 tile does more work per weight.
+
+In the decoder layer (`SparkLayer(..., int4=True)`, weights quantized once), the int4 layer
+takes 0.093 ms per decode step at 4,096 cached tokens against 0.298 for bf16, 3.2x, or 335
+tokens/s for 32 layers against 105. At 131,072 cached tokens attention is most of the step and
+the gain drops to 1.47x. Round-to-nearest int4 has the format's error, up to half a step per
+weight; GPTQ or AWQ change the codes and scales, not the kernel. Details in
+[the design note](docs/design/w4gemm.md).
 
 ## attention
 
@@ -302,8 +419,8 @@ it still beat the version that issues from a compute warp's lane by 1.6%, becaus
 waits for the slowest warp before every load.
 
 `attention_fp8` is the same forward on e4m3 Q, K and V with fp32 descale factors, both
-products on the block-scaled fp8 `mma.sync`: 620 to 636 TFLOPS at 4K and 8K tokens, 2.6 times
-the bf16 kernel and 3 to 3.8 times torch's bf16 SDPA. The two layout problems cancel: the fp8
+products on the block-scaled fp8 `mma.sync`: 613 to 630 TFLOPS at 4K and 8K tokens, 2.6 times
+the bf16 kernel and 3 to 3.7 times torch's bf16 SDPA. The two layout problems cancel: the fp8
 B operand wants four keys per register and V is stored by key, so `ldmatrix.trans` plus two
 byte permutes per register pair deliver V with its keys in the order {2c, 2c+1, 8+2c, 9+2c},
 which is exactly the order the S accumulators already hold P in, so P goes from the first
@@ -313,14 +430,31 @@ bf16 rate the softmax no longer hides under the other warp's products, and the c
 16 times the bf16 kernel's; the design note has the tables and the five things that did not
 make it faster.
 
+| shape (B x H x S x D) | bf16 v5 | fp8 v1 | fp8 / bf16 | flash, bf16 | fp8 / flash |
+|---|---|---|---|---|---|
+| 1 x 32 x 1024 x 128 | 173 | 412 | 2.38x | 141 | 2.95x |
+| 1 x 32 x 2048 x 128, causal | 209 | 503 | 2.41x | 138 | 3.72x |
+| 1 x 32 x 4096 x 128 | 242 | 626 | 2.58x | 188 | 3.27x |
+| 1 x 32 x 4096 x 128, causal | 237 | 613 | 2.59x | 173 | 3.46x |
+| 1 x 32 x 8192 x 128, causal | 239 | **630** | 2.63x | 198 | 3.06x |
+| 1 x 32 x 16384 x 128, causal | 235 | 576 | 2.45x | 212 | 2.64x |
+| 1 x 32/8 x 4096 x 128, causal | 237 | 614 | 2.59x | 174 | 3.44x |
+| 4 x 32 x 2048 x 128, causal | 226 | 561 | 2.48x | 180 | 3.08x |
+| 1 x 32 x 4096 x 64, causal | 234 | 498 | 2.13x | 164 | 3.01x |
+
+TFLOPS. The bf16 column is variant 5 timed in the same process on the same shape; torch has no
+fp8 attention for this card, so the flash column is its bf16 kernel. A sustained fp8 loop holds
+the card at its power cap near 2.4 GHz, and the 16K rows, 4 to 8 ms a launch, are long enough
+to show it.
+
 | shape (B x H x S x D) | v0 | v1 | v2 | v3 | v4 | v5 | flash | v5 / flash |
 |---|---|---|---|---|---|---|---|---|
-| 1 x 32 x 4096 x 128 | 10 | 55 | 194 | 223 | 237 | **239** | 189 | 1.26x |
-| 1 x 32 x 4096 x 128, causal | 10 | 54 | 216 | 215 | 228 | **237** | 174 | 1.33x |
-| 1 x 32 x 8192 x 128, causal | 10 | 50 | 221 | 221 | 236 | **239** | 198 | 1.18x |
-| 4 x 32 x 2048 x 128, causal | 11 | 54 | 198 | 200 | 213 | **227** | 180 | 1.23x |
-| 1 x 32 x 4096 x 64, causal | 7 | 52 | 208 | 208 | 216 | **235** | 164 | 1.38x |
-| 1 x 32/8 x 4096 x 128, causal | 10 | 56 | 214 | 216 | 230 | **237** | 174 | 1.34x |
+| 1 x 32 x 4096 x 128 | 10 | 50 | 195 | 222 | 236 | **239** | 188 | 1.26x |
+| 1 x 32 x 4096 x 128, causal | 10 | 56 | 216 | 214 | 228 | **236** | 174 | 1.34x |
+| 1 x 32 x 8192 x 128, causal | 10 | 49 | 222 | 222 | 235 | **240** | 198 | 1.18x |
+| 4 x 32 x 2048 x 128, causal | 11 | 53 | 200 | 201 | 213 | **227** | 180 | 1.22x |
+| 1 x 32 x 4096 x 64, causal | 7 | 51 | 204 | 203 | 216 | **234** | 165 | 1.38x |
+| 1 x 32/8 x 4096 x 128, causal | 10 | 55 | 214 | 217 | 230 | **237** | 174 | 1.33x |
 
 TFLOPS, causal counted as half the products the way FlashAttention reports it. The 32/8 row is
 grouped-query attention and matches its multi-head twin, as it should: it is the same math
@@ -337,10 +471,10 @@ past L2 when they fit in it; at 128K tokens they do not.
 
 | shape | v2 | v3 | achieved | flash | v3 / flash |
 |---|---|---|---|---|---|
-| 1 query, 4096 keys, 32 heads | 199 us | **46 us** | 1,462 GB/s | 71 us | 1.43x |
-| 1 query, 4096 keys, 32/8 heads | 200 us | **17 us** | 972 GB/s | 38 us | 1.83x |
-| 1 query, 128K keys, 32 heads | 6270 us | **1267 us** | 1,695 GB/s | 1298 us | 1.02x |
-| 1 query, 128K keys, 32/8 heads | 6265 us | **327 us** | 1,640 GB/s | 357 us | 1.08x |
+| 1 query, 4096 keys, 32 heads | 200 us | **46 us** | 1,461 GB/s | 71 us | 1.43x |
+| 1 query, 4096 keys, 32/8 heads | 200 us | **17 us** | 974 GB/s | 38 us | 1.82x |
+| 1 query, 128K keys, 32 heads | 6251 us | **1275 us** | 1,685 GB/s | 1299 us | 1.02x |
+| 1 query, 128K keys, 32/8 heads | 6249 us | **324 us** | 1,655 GB/s | 358 us | 1.09x |
 | batch 8, 4096 keys, 32/8 heads | 398 us | **87 us** | 1,550 GB/s | 105 us | 1.16x |
 
 GB/s counts each K/V head once for its whole group of query heads. Past 16K tokens both
@@ -367,12 +501,12 @@ to an fp32 buffer with atomics. What made it fast on this card:
 
 | shape (B x H x S x D) | v1 | v2 | v3 | flash | v3 / flash |
 |---|---|---|---|---|---|
-| 1 x 32 x 1024 x 128, causal | 125 | 148 | **154** | 104 | 1.41x |
-| 1 x 32 x 4096 x 128 | 157 | 212 | **224** | 196 | 1.11x |
-| 1 x 32 x 4096 x 128, causal | 162 | 200 | **209** | 177 | 1.14x |
-| 1 x 32 x 8192 x 128, causal | 162 | 209 | **216** | 202 | 1.04x |
-| 1 x 32/8 x 4096 x 128, causal | 155 | 194 | **202** | 175 | 1.12x |
-| 1 x 32 x 4096 x 64, causal | 207 | 204 | **217** | 166 | 1.27x |
+| 1 x 32 x 1024 x 128, causal | 125 | 148 | **155** | 104 | 1.40x |
+| 1 x 32 x 4096 x 128 | 156 | 212 | **223** | 195 | 1.10x |
+| 1 x 32 x 4096 x 128, causal | 162 | 198 | **209** | 178 | 1.13x |
+| 1 x 32 x 8192 x 128, causal | 164 | 206 | **214** | 202 | 1.04x |
+| 1 x 32/8 x 4096 x 128, causal | 154 | 193 | **201** | 173 | 1.12x |
+| 1 x 32 x 4096 x 64, causal | 207 | 204 | **217** | 169 | 1.24x |
 
 TFLOPS with the backward counted as 2.5 times the forward's FLOPs, halved under the mask. The
 split mattered most for GQA: 256 key tiles on 170 SMs is two waves with the second half
@@ -396,13 +530,13 @@ weights are 436 MB in bf16, so a decode step streams them from DRAM with no help
 
 | shape | ours | torch eager | torch compiled | ours, graph | tokens/s, 32 layers |
 |---|---|---|---|---|---|
-| prefill B=1, S=4096 | 8.43 ms | 9.59 | 8.93 | | 15,190 |
-| prefill B=1, S=8192 | 18.11 ms | 20.73 | 18.80 | | 14,140 |
-| prefill B=4, S=2048 | 16.41 ms | 18.80 | 16.86 | | 15,610 |
-| decode B=1, L=4096 | 0.298 ms | 0.352 | 0.326 | 0.297 | 105 |
-| decode B=1, L=16384 | 0.328 ms | 0.371 | 0.344 | 0.326 | 96 |
-| decode B=1, L=131072 | 0.604 ms | 0.682 | 0.650 | 0.603 | 52 |
-| decode B=8, L=4096 | 0.370 ms | 0.417 | 0.376 | 0.369 | 678 |
+| prefill B=1, S=4096 | 8.42 ms | 9.63 | 8.96 | | 15,200 |
+| prefill B=1, S=8192 | 18.11 ms | 20.78 | 18.84 | | 14,130 |
+| prefill B=4, S=2048 | 16.40 ms | 18.86 | 16.89 | | 15,610 |
+| decode B=1, L=4096 | 0.299 ms | 0.350 | 0.324 | 0.298 | 105 |
+| decode B=1, L=16384 | 0.329 ms | 0.370 | 0.345 | 0.328 | 95 |
+| decode B=1, L=131072 | 0.606 ms | 0.681 | 0.649 | 0.605 | 52 |
+| decode B=8, L=4096 | 0.370 ms | 0.417 | 0.377 | 0.369 | 675 |
 
 ms per layer; a decode row is one token per sequence against a cache of L - 1 tokens,
 appended in place; tokens/s is 32 copies of this layer and nothing else. Where a decode step
@@ -411,20 +545,20 @@ goes, kernel time from the torch profiler:
 | stage | B=1, L=4096 | B=1, L=131072 | B=8, L=4096 |
 |---|---|---|---|
 | qkv GEMM, 50 MB | 31 us | 31 | 31 |
-| o GEMM, 34 MB | 21 us | 22 | 22 |
-| gate/up GEMM, 235 MB | 145 us | 145 | 146 |
-| down GEMM, 117 MB | 71 us | 71 | 73 |
-| attention | 16 us | 324 | 84 |
+| o GEMM, 34 MB | 21 us | 21 | 21 |
+| gate/up GEMM, 235 MB | 146 us | 146 | 147 |
+| down GEMM, 117 MB | 72 us | 71 | 71 |
+| attention | 16 us | 325 | 84 |
 | two norms, RoPE + append, swiglu | 12 us | 12 | 13 |
-| total | 296 us | 605 | 370 |
+| total | 299 us | 606 | 367 |
 
 The four GEMMs are 91% of a 4K-context step and run at 1,575 to 1,650 GB/s, the
 back-to-back rate of the decode kernel; the whole layer moves its 436 MB at 96% of the
 `cudaMemcpy` rate. At 128K tokens the cache is 512 MB and attention is more than half the
 step. The graph buys 1 us per layer: the ten launches are queued back to back by a host that
-issues a step in 52 us while the GPU runs it in 297, so there is no launch gap left for a
-graph to close. Prefill is 88% GEMM at 246 to 254 TFLOPS. Torch eager is 14 to 18% behind on
-every row and compiled torch 2 to 10%. The reading of it, and the honest caveats (no head
+issues a step in 52 us while the GPU runs it in 298, so there is no launch gap left for a
+graph to close. Prefill is 88% GEMM at 246 to 254 TFLOPS. Torch eager is 12 to 17% behind on
+every row and compiled torch 2 to 8%. The reading of it, and the honest caveats (no head
 stride in the attention kernels, so a cache with spare capacity is copied before the kernel
 reads it: 19 us at 4K tokens, 0.68 ms at 128K), are in
 [docs/design/layer.md](docs/design/layer.md).
@@ -435,21 +569,38 @@ The same kernels on a paged K/V cache run the whole 32-layer model for a batch o
 different lengths (`spark_kernels.engine`, random bf16 weights). The paged decode kernel cuts
 the keys of the whole batch into equal ranges per warp, so one 32K-token sequence among fifty
 500-token ones reads at 1,501 GB/s, 98% of the copy roof, the rate of equal lengths; the varlen
-prefill takes packed prompts in one launch. Llama-3-8B at a 64 to 2048-token prompt mix, 128
-new tokens each:
+prefill takes packed prompts in one launch.
+
+| batch | K+V lengths | paged v1 | GB/s | % of copy roof | contiguous kernel |
+|---|---|---|---|---|---|
+| 1 | 4,096 | 18.4 us | 913 | 60% | 17.3 us |
+| 1 | 32,768 | 92.1 us | 1,458 | 95% | 86.9 us |
+| 8 | 4,096 each | 91.9 us | 1,460 | 95% | 85.0 us |
+| 64 | 1,024 each | 174.8 us | 1,536 | 100% | 164.8 us |
+| 51 | one of 32,768, fifty of 500 | 157.6 us | 1,502 | 98% | |
+| 64 | uniform in 1 to 8,192 | 755.4 us | 1,627 | 106% | |
+| 32 | uniform in 100 to 2,000 | 92.6 us | 1,441 | 94% | |
+
+GQA 32/8, D = 128, pages of 16 tokens. The contiguous kernel is attention variant 3's
+flash-decoding on a cache of equal lengths; the 6 to 8% it keeps is the paged kernel's second
+launch, which merges the pieces of a sequence that span warps. Past 1,532 GB/s the reads are
+the same read-only stream the decode section describes.
+
+Llama-3-8B at a 64 to 2048-token prompt mix, 128 new tokens each:
 
 | batch | decode ms/step | decode tok/s | vs compiled torch | prefill tok/s | vs torch |
 |---|---|---|---|---|---|
-| 1 | 9.80 | 101 | 1.24x | 16,192 | 1.18x |
-| 8 | 10.36 | 766 | 1.58x | 16,427 | 1.20x |
-| 32 | 11.56 | 2,746 | 2.38x | 16,501 | 1.24x |
-| 64 | 14.26 | 4,453 | 3.52x | 16,401 | 1.23x |
+| 1 | 9.78 | 101 | 1.24x | 16,053 | 1.17x |
+| 8 | 10.34 | 768 | 1.58x | 16,368 | 1.19x |
+| 32 | 11.57 | 2,744 | 2.37x | 16,442 | 1.24x |
+| 64 | 14.27 | 4,448 | 3.51x | 16,340 | 1.23x |
 
 A step at 64 sequences moves 20.6 GB (weights plus every sequence's K/V) at 94% of the copy
 roof. Torch runs the same model on the same paged cache and has to gather the pages for its
-attention, which is where most of the gap at large batches comes from. Details, the
-continuous-batching run and what is not done yet (chunked prefill, preemption, a TMA prefill)
-are in [docs/design/serving.md](docs/design/serving.md).
+attention, which is where most of the gap at large batches comes from. With continuous
+batching, 256 requests through 64 slots, the engine generates 1,862 tokens/s against 797 for
+compiled torch on the same schedule, 2.3x. Details and what is not done yet (chunked
+prefill, preemption, a TMA prefill) are in [docs/design/serving.md](docs/design/serving.md).
 
 ## the memory-bound kernels
 
@@ -459,8 +610,8 @@ a shuffle reduction, 128-bit loads, a block per row for wide rows. Each of those
 twice, once for the statistic and once for the output. The top rung of rmsnorm and softmax
 holds the row in registers: a group of 32 to 1,024 threads owns one row, sized so no thread
 holds more than 32 elements, and the row is read once, exponentiated once and written once.
-That is 1,529 GB/s for rmsnorm and 1,536 for softmax on inputs bigger than L2, the copy number.
-The fused residual add plus rmsnorm is 1.24x PyTorch running the two ops and swiglu is 1.6x
+That is 1,538 GB/s for rmsnorm and 1,551 for softmax on inputs bigger than L2, the copy number.
+The fused residual add plus rmsnorm is 1.25x PyTorch running the two ops and swiglu is 1.6x
 `F.silu(g) * u`, because PyTorch's version is two kernels.
 
 One thing the 96 MB L2 does to you: a 4096 x 1024 bf16 input is 8 MB and never leaves L2
