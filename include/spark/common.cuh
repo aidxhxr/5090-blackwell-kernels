@@ -460,26 +460,38 @@ inline CUtensorMap make_tensor_map_2d_u8(const void* base, uint64_t rows, uint64
                               box_cols, swizzle);
 }
 
-// 3-D map for a [d2][d1][d0] bf16 tensor (d0 contiguous) with a box of box1 x box0 in the two
+// 3-D map for a [d2][d1][d0] tensor (d0 contiguous) with a box of box1 x box0 in the two
 // inner dimensions and 1 in the outer one, so a box never crosses from one d2 slice into the
 // next and rows past d1 are zero-filled.
-inline CUtensorMap make_tensor_map_3d_bf16(const void* base, uint64_t d0, uint64_t d1, uint64_t d2,
-                                           uint32_t box0, uint32_t box1,
-                                           CUtensorMapSwizzle swizzle) {
+inline CUtensorMap make_tensor_map_3d(CUtensorMapDataType type, size_t elem_bytes, const void* base,
+                                      uint64_t d0, uint64_t d1, uint64_t d2, uint32_t box0,
+                                      uint32_t box1, CUtensorMapSwizzle swizzle) {
     CUtensorMap map;
     const cuuint64_t dims[3] = {d0, d1, d2};
-    const cuuint64_t strides[2] = {d0 * sizeof(__nv_bfloat16), d1 * d0 * sizeof(__nv_bfloat16)};
+    const cuuint64_t strides[2] = {d0 * elem_bytes, d1 * d0 * elem_bytes};
     const cuuint32_t box[3] = {box0, box1, 1};
     const cuuint32_t elem_strides[3] = {1, 1, 1};
-    const CUresult r = tensor_map_encoder()(
-        &map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, const_cast<void*>(base), dims, strides, box,
-        elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
-        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    const CUresult r =
+        tensor_map_encoder()(&map, type, 3, const_cast<void*>(base), dims, strides, box,
+                             elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle,
+                             CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
     if (r != CUDA_SUCCESS) {
         throw std::runtime_error("cuTensorMapEncodeTiled (3-D) failed with CUresult " +
                                  std::to_string(static_cast<int>(r)));
     }
     return map;
+}
+inline CUtensorMap make_tensor_map_3d_bf16(const void* base, uint64_t d0, uint64_t d1, uint64_t d2,
+                                           uint32_t box0, uint32_t box1,
+                                           CUtensorMapSwizzle swizzle) {
+    return make_tensor_map_3d(CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, sizeof(__nv_bfloat16), base, d0, d1,
+                              d2, box0, box1, swizzle);
+}
+// Same for 8-bit elements (the fp8 attention kernel moves e4m3 as raw bytes).
+inline CUtensorMap make_tensor_map_3d_u8(const void* base, uint64_t d0, uint64_t d1, uint64_t d2,
+                                         uint32_t box0, uint32_t box1, CUtensorMapSwizzle swizzle) {
+    return make_tensor_map_3d(CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, base, d0, d1, d2, box0, box1,
+                              swizzle);
 }
 
 }  // namespace spark
