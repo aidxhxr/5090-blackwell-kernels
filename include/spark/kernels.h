@@ -309,9 +309,15 @@ void rope_append_paged_bf16(const __nv_bfloat16* qkv, const float* cos, const fl
 //            during the current one's last tiles. The tail split stays on for the non-causal
 //            shapes, where the queue alone cannot fix 1,024 equal tiles on 170 SMs; same
 //            decode paths as variant 3
+//
+// `lse`, when not null, receives the natural-log log-sum-exp of every row of scaled scores,
+// fp32 [B, H_q, S_q]: lse_i = log(sum_j exp(q_i . k_j / sqrt(D))), the quantity the backward
+// pass recomputes P from (torch calls it logsumexp). Every variant writes it; a decode shape
+// that would run the flash-decoding kernel runs variant 3's 64-row tile instead, since that
+// kernel does not produce it. With lse null nothing changes.
 void attention_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_bfloat16* V,
                     __nv_bfloat16* O, int B, int H_q, int H_kv, int S_q, int S_kv, int D,
-                    bool causal, int variant, cudaStream_t stream);
+                    bool causal, int variant, cudaStream_t stream, float* lse = nullptr);
 int attention_num_variants();
 bool attention_supports(int S_q, int S_kv, int D, int variant);
 

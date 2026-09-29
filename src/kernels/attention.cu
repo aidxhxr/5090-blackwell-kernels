@@ -40,6 +40,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <mutex>
+#include <type_traits>
 #include <unordered_map>
 
 #include "attention_internal.cuh"
@@ -56,6 +57,15 @@ using attn::kLog2e;
 using attn::kv_index;
 using attn::pack_bf16x2;
 using attn::swz;
+
+constexpr float kLn2 = 0.6931471805599453f;
+
+// Natural-log log-sum-exp of a row from the kernels' running state: m is the row max of the
+// scores in the log2(e)/sqrt(D) domain and l the row sum of 2^(s - m), so
+// log(sum_j exp(s_j / sqrt(D))) = (m + log2 l) ln 2. The backward pass recomputes P from it.
+__device__ __forceinline__ float row_lse(float m, float l) {
+    return (m + __log2f(l)) * kLn2;
+}
 
 // 8 bf16 (one 16-byte chunk) to 8 floats.
 __device__ __forceinline__ void unpack8(const uint4& u, float (&f)[8]) {
@@ -102,8 +112,8 @@ __device__ __forceinline__ void load_vec(const bf16* p, float (&f)[VEC]) {
 template <int D>
 __global__ void __launch_bounds__(THREADS)
     attention_v0_kernel(const bf16* __restrict__ Q, const bf16* __restrict__ K,
-                        const bf16* __restrict__ V, bf16* __restrict__ O, int H_q, int H_kv,
-                        int S_q, int S_kv, float scale_log2, int causal) {
+                        const bf16* __restrict__ V, bf16* __restrict__ O, float* __restrict__ lse,
+                        int H_q, int H_kv, int S_q, int S_kv, float scale_log2, int causal) {
     constexpr int VEC = D / 32;
     const int lane = threadIdx.x & 31;
     const int row = blockIdx.x * (THREADS / 32) + (threadIdx.x >> 5);
@@ -150,6 +160,7 @@ __global__ void __launch_bounds__(THREADS)
     for (int i = 0; i < VEC / 2; ++i)
         ov.h[i] = __floats2bfloat162_rn(o[2 * i] * inv, o[2 * i + 1] * inv);
     *reinterpret_cast<Vec<VEC>*>(out) = ov;
+    if (lse != nullptr && lane == 0) lse[static_cast<size_t>(bh) * S_q + row] = row_lse(m, l);
 }
 
 }  // namespace v0
@@ -180,8 +191,8 @@ constexpr int smem_bytes() {
 template <int D>
 __global__ void __launch_bounds__(THREADS, 1)
     attention_v1_kernel(const bf16* __restrict__ Q, const bf16* __restrict__ K,
-                        const bf16* __restrict__ V, bf16* __restrict__ O, int H_q, int H_kv,
-                        int S_q, int S_kv, float scale_log2, int causal) {
+                        const bf16* __restrict__ V, bf16* __restrict__ O, float* __restrict__ lse,
+                        int H_q, int H_kv, int S_q, int S_kv, float scale_log2, int causal) {
     constexpr int CH = D / 8;                    // 16-byte chunks per bf16 row
     constexpr int DD = D / 32;                   // float4 chunks of O per lane
     constexpr int Q_ITERS = BM * CH / THREADS;   // 8 (D = 128), 4 (D = 64)
@@ -389,6 +400,8 @@ __global__ void __launch_bounds__(THREADS, 1)
         const float inv = 1.f / ls;
         const int row = q0 + warp * 16 + rg + 4 * rr;
         if (row >= S_q) continue;
+        if (lse != nullptr && kl == 0)
+            lse[static_cast<size_t>(bh) * S_q + row] = row_lse(m[rr], ls);
 #pragma unroll
         for (int dd = 0; dd < DD; ++dd) {
             uint2 u;
@@ -430,7 +443,8 @@ struct Sched {
     int q_tiles;    // ceil(S_q / BM)
     int dp_tiles;
     int split;
-    float* ws;  // (tiles - dp_tiles) * split partials of BM * (D + 2) floats each
+    float* ws;   // (tiles - dp_tiles) * split partials of BM * (D + 2) floats each
+    float* lse;  // optional [bh][S_q] fp32 log-sum-exp output (natural log), or nullptr
 };
 
 template <int D>
@@ -659,6 +673,8 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
             for (int dj = 0; dj < DT; ++dj)
                 *reinterpret_cast<__nv_bfloat162*>(out + dj * 8) =
                     __floats2bfloat162_rn(o[dj][2 * r] * inv, o[dj][2 * r + 1] * inv);
+            if (sched.lse != nullptr && (lane & 3) == 0)
+                sched.lse[static_cast<size_t>(bh) * S_q + row] = row_lse(m[r], ls);
         } else {
             float* part = sched.ws + (static_cast<size_t>(tile - sched.dp_tiles) * split + slice) *
                                          partial_floats<D, WARPS>();
@@ -716,6 +732,8 @@ __global__ void attention_combine_kernel(bf16* __restrict__ O, int S_q, int caus
         acc[7] = fmaf(b.w, w, acc[7]);
     }
     const float inv = 1.f / L;
+    if (sched.lse != nullptr && ch == 0)
+        sched.lse[static_cast<size_t>(bh) * S_q + row] = row_lse(M, L);
     uint4 u;
     u.x = pack_bf16x2(acc[0] * inv, acc[1] * inv);
     u.y = pack_bf16x2(acc[2] * inv, acc[3] * inv);
@@ -759,6 +777,7 @@ Sched whole_tiles(int B, int H_q, int H_kv, int S_q) {
     s.dp_tiles = s.bh_count * s.q_tiles;
     s.split = 1;
     s.ws = nullptr;
+    s.lse = nullptr;
     return s;
 }
 
@@ -801,11 +820,13 @@ void launch_combine(bf16* O, int S_q, bool causal, const Sched& s, cudaStream_t 
 // `split_tail`: variant 3. Variant 2 runs every tile whole on the 8-warp tile.
 template <int D, int WARPS>
 void launch(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv, int S_q,
-            int S_kv, float scale_log2, bool causal, bool split_tail, cudaStream_t stream) {
+            int S_kv, float scale_log2, bool causal, bool split_tail, float* lse,
+            cudaStream_t stream) {
     constexpr int bytes = smem_bytes<D, STAGES>();
     const int resident = resident_blocks<D, WARPS>();
 
     Sched s = whole_tiles<WARPS>(B, H_q, H_kv, S_q);
+    s.lse = lse;
     if (split_tail) split_tail_tiles<D, WARPS>(s, resident, S_kv, causal);
     const int grid = grid_blocks(s);
     attention_v2_kernel<D, WARPS, STAGES>
@@ -1162,6 +1183,8 @@ __global__ void __launch_bounds__(THREADS, 1)
             for (int dj = 0; dj < DT; ++dj)
                 *reinterpret_cast<__nv_bfloat162*>(out + dj * 8) =
                     __floats2bfloat162_rn(o[dj][2 * r] * inv, o[dj][2 * r + 1] * inv);
+            if (sched.lse != nullptr && (lane & 3) == 0)
+                sched.lse[static_cast<size_t>(bh) * S_q + row] = row_lse(m[r], ls);
         } else {
             float* part = sched.ws + (static_cast<size_t>(tile - sched.dp_tiles) * split + slice) *
                                          v2::partial_floats<D, WARPS>();
@@ -1197,7 +1220,8 @@ int resident_blocks() {
 
 template <int D, int MODE, int PAIR, int OPT>
 void launch_mode(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv,
-                 int S_q, int S_kv, float scale_log2, bool causal, cudaStream_t stream) {
+                 int S_q, int S_kv, float scale_log2, bool causal, float* lse,
+                 cudaStream_t stream) {
     constexpr int bytes = smem_bytes<D, STAGES>();
     const int resident = resident_blocks<D, MODE, PAIR, OPT>();
     // [B*H][S][D] maps with boxes of 64 columns (one 128-byte swizzle span): 128 rows for Q,
@@ -1212,6 +1236,7 @@ void launch_mode(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, in
         make_tensor_map_3d_bf16(V, D, S_kv, BHkv, BOX_COLS, BN, CU_TENSOR_MAP_SWIZZLE_128B);
 
     Sched s = v2::whole_tiles<WARPS>(B, H_q, H_kv, S_q);
+    s.lse = lse;
     v2::split_tail_tiles<D, WARPS>(s, resident, S_kv, causal);
     attention_v4_kernel<D, STAGES, MODE, PAIR, OPT><<<v2::grid_blocks(s), THREADS, bytes, stream>>>(
         tmQ, tmK, tmV, O, S_q, S_kv, scale_log2, causal ? 1 : 0, s);
@@ -1220,7 +1245,7 @@ void launch_mode(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, in
 
 template <int D>
 void launch(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv, int S_q,
-            int S_kv, float scale_log2, bool causal, cudaStream_t stream) {
+            int S_kv, float scale_log2, bool causal, float* lse, cudaStream_t stream) {
 #ifdef SPARK_ATTN_V4_EXPERIMENTS
     // SPARK_ATTN_V4_MODE = MODE + 10 * PAIR + 100 * OPT (see the kernel).
     static int mode = -1;
@@ -1230,38 +1255,38 @@ void launch(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q
     }
     switch (mode) {
         case 1:
-            launch_mode<D, 1, 0, 0>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal,
+            launch_mode<D, 1, 0, 0>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, lse,
                                     stream);
             return;
         case 11:
-            launch_mode<D, 1, 1, 0>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal,
+            launch_mode<D, 1, 1, 0>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, lse,
                                     stream);
             return;
         case 2:
-            launch_mode<D, 2, 0, 0>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal,
+            launch_mode<D, 2, 0, 0>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, lse,
                                     stream);
             return;
         case 12:
-            launch_mode<D, 2, 1, 0>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal,
+            launch_mode<D, 2, 1, 0>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, lse,
                                     stream);
             return;
         case 100:
-            launch_mode<D, 0, 0, 1>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal,
+            launch_mode<D, 0, 0, 1>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, lse,
                                     stream);
             return;
         case 200:
-            launch_mode<D, 0, 0, 2>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal,
+            launch_mode<D, 0, 0, 2>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, lse,
                                     stream);
             return;
         case 300:
-            launch_mode<D, 0, 0, 3>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal,
+            launch_mode<D, 0, 0, 3>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, lse,
                                     stream);
             return;
         default:
             break;
     }
 #endif
-    launch_mode<D, 0, 0, 0>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, stream);
+    launch_mode<D, 0, 0, 0>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, lse, stream);
 }
 
 }  // namespace v4
@@ -1665,6 +1690,8 @@ __global__ void __launch_bounds__(CONSUMERS + (PWARP ? 32 : 0), 1)
                 for (int dj = 0; dj < DT; ++dj)
                     *reinterpret_cast<__nv_bfloat162*>(out + dj * 8) =
                         __floats2bfloat162_rn(o[dj][2 * rr] * inv, o[dj][2 * rr + 1] * inv);
+                if (sched.lse != nullptr && (lane & 3) == 0)
+                    sched.lse[static_cast<size_t>(bh) * S_q + row] = row_lse(m[rr], ls);
             } else {
                 float* part =
                     sched.ws + (static_cast<size_t>(tile - sched.dp_tiles) * split + slice) *
@@ -1750,7 +1777,7 @@ int resident_blocks() {
 // balance.
 template <int D, bool PWARP>
 void launch_cfg(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv,
-                int S_q, int S_kv, float scale_log2, bool causal, int split_mode,
+                int S_q, int S_kv, float scale_log2, bool causal, int split_mode, float* lse,
                 cudaStream_t stream) {
     constexpr int bytes = smem_bytes<D>();
     constexpr int threads = CONSUMERS + (PWARP ? 32 : 0);
@@ -1765,6 +1792,7 @@ void launch_cfg(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int
         make_tensor_map_3d_bf16(V, D, S_kv, BHkv, BOX_COLS, BN, CU_TENSOR_MAP_SWIZZLE_128B);
 
     Sched s = v2::whole_tiles<CONSUMER_WARPS>(B, H_q, H_kv, S_q);
+    s.lse = lse;
     const bool split_tail = split_mode < 0 ? !causal || s.dp_tiles < resident : split_mode != 0;
     if (split_tail) v2::split_tail_tiles<D, CONSUMER_WARPS>(s, resident, S_kv, causal);
     const int n_items = v2::grid_blocks(s);
@@ -1777,20 +1805,20 @@ void launch_cfg(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int
 
 template <int D>
 void launch(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv, int S_q,
-            int S_kv, float scale_log2, bool causal, cudaStream_t stream) {
+            int S_kv, float scale_log2, bool causal, float* lse, cudaStream_t stream) {
     if (env().pwarp)
         launch_cfg<D, true>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, env().split,
-                            stream);
+                            lse, stream);
     else
         launch_cfg<D, false>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, env().split,
-                             stream);
+                             lse, stream);
 }
 
 }  // namespace v5
 
 template <int D>
 void launch_v1(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv,
-               int S_q, int S_kv, float scale_log2, bool causal, cudaStream_t stream) {
+               int S_q, int S_kv, float scale_log2, bool causal, float* lse, cudaStream_t stream) {
     constexpr int bytes = v1::smem_bytes<D>();
     static bool opted_in = false;
     if (!opted_in) {
@@ -1800,15 +1828,15 @@ void launch_v1(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int 
     }
     const dim3 grid(B * H_q, cdiv(S_q, v1::BM));
     v1::attention_v1_kernel<D><<<grid, v1::THREADS, bytes, stream>>>(
-        Q, K, V, O, H_q, H_kv, S_q, S_kv, scale_log2, causal ? 1 : 0);
+        Q, K, V, O, lse, H_q, H_kv, S_q, S_kv, scale_log2, causal ? 1 : 0);
 }
 
 template <int D>
 void launch_v0(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv,
-               int S_q, int S_kv, float scale_log2, bool causal, cudaStream_t stream) {
+               int S_q, int S_kv, float scale_log2, bool causal, float* lse, cudaStream_t stream) {
     const dim3 grid(cdiv(S_q, v0::THREADS / 32), B * H_q);
-    v0::attention_v0_kernel<D><<<grid, v0::THREADS, 0, stream>>>(Q, K, V, O, H_q, H_kv, S_q, S_kv,
-                                                                 scale_log2, causal ? 1 : 0);
+    v0::attention_v0_kernel<D><<<grid, v0::THREADS, 0, stream>>>(Q, K, V, O, lse, H_q, H_kv, S_q,
+                                                                 S_kv, scale_log2, causal ? 1 : 0);
 }
 
 // SPARK_ATTENTION_DECODE=0 keeps decode shapes on the 64-row tile of variant 3 (the path
@@ -1823,16 +1851,19 @@ bool use_decode_kernel() {
 }
 
 // Variant 3's dispatch by shape: the flash-decoding kernel when the query rows sharing a
-// K/V head fit its 16-row tile, the 64-row tile for other short queries, else 128 rows.
+// K/V head fit its 16-row tile, the 64-row tile for other short queries, else 128 rows. The
+// flash-decoding kernel has no log-sum-exp output, so a call that asks for one takes the tiles.
 template <int D>
 void launch_v3(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv,
-               int S_q, int S_kv, float scale_log2, bool causal, cudaStream_t stream) {
-    if (use_decode_kernel() && attn::decode_fits(H_q, H_kv, S_q)) {
+               int S_q, int S_kv, float scale_log2, bool causal, float* lse, cudaStream_t stream) {
+    if (lse == nullptr && use_decode_kernel() && attn::decode_fits(H_q, H_kv, S_q)) {
         attn::decode_launch(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, D, scale_log2, causal, 0, stream);
     } else if (S_q <= 64) {
-        v2::launch<D, 4>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, true, stream);
+        v2::launch<D, 4>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, true, lse,
+                         stream);
     } else {
-        v2::launch<D, 8>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, true, stream);
+        v2::launch<D, 8>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, true, lse,
+                         stream);
     }
 }
 
@@ -1850,7 +1881,7 @@ bool attention_supports(int S_q, int S_kv, int D, int variant) {
 
 void attention_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_bfloat16* V,
                     __nv_bfloat16* O, int B, int H_q, int H_kv, int S_q, int S_kv, int D,
-                    bool causal, int variant, cudaStream_t stream) {
+                    bool causal, int variant, cudaStream_t stream, float* lse) {
     SPARK_REQUIRE(Q != nullptr && K != nullptr && V != nullptr && O != nullptr,
                   "attention: null pointer");
     SPARK_REQUIRE(B > 0 && H_q > 0 && H_kv > 0 && S_q > 0 && S_kv > 0,
@@ -1864,67 +1895,49 @@ void attention_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_b
                   "attention: tensor too large");
 
     const float scale_log2 = kLog2e / std::sqrt(static_cast<float>(D));
-    switch (variant) {
-        case 0:
-            if (D == 64)
-                launch_v0<64>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, stream);
-            else
-                launch_v0<128>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, stream);
-            break;
-        case 1:
-            if (D == 64)
-                launch_v1<64>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, stream);
-            else
-                launch_v1<128>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, stream);
-            break;
-        case 2:
-            if (D == 64)
-                v2::launch<64, 8>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, false,
+    auto run = [&](auto d) {
+        constexpr int DD = decltype(d)::value;
+        switch (variant) {
+            case 0:
+                launch_v0<DD>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, lse, stream);
+                break;
+            case 1:
+                launch_v1<DD>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, lse, stream);
+                break;
+            case 2:
+                v2::launch<DD, 8>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, false,
+                                  lse, stream);
+                break;
+            case 3:
+                launch_v3<DD>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, lse, stream);
+                break;
+            case 4:
+                // Short queries take variant 3's paths (the flash-decoding kernel or the 64-row
+                // tile); the TMA kernel takes every 128-row tile.
+                if (S_q <= 64)
+                    launch_v3<DD>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, lse,
                                   stream);
-            else
-                v2::launch<128, 8>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, false,
+                else
+                    v4::launch<DD>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, lse,
                                    stream);
-            break;
-        case 3:
-            if (D == 64)
-                launch_v3<64>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, stream);
-            else
-                launch_v3<128>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, stream);
-            break;
-        case 4:
-            // Short queries take variant 3's paths (the flash-decoding kernel or the 64-row
-            // tile); the TMA kernel takes every 128-row tile.
-            if (S_q <= 64) {
-                if (D == 64)
-                    launch_v3<64>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, stream);
+                break;
+            case 5:
+                // Variant 4's routing for short queries; the persistent kernel for the rest.
+                if (S_q <= 64)
+                    launch_v3<DD>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, lse,
+                                  stream);
                 else
-                    launch_v3<128>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, stream);
-            } else {
-                if (D == 64)
-                    v4::launch<64>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, stream);
-                else
-                    v4::launch<128>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal,
-                                    stream);
-            }
-            break;
-        case 5:
-            // Variant 4's routing for short queries; the persistent kernel for the rest.
-            if (S_q <= 64) {
-                if (D == 64)
-                    launch_v3<64>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, stream);
-                else
-                    launch_v3<128>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, stream);
-            } else {
-                if (D == 64)
-                    v5::launch<64>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, stream);
-                else
-                    v5::launch<128>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal,
-                                    stream);
-            }
-            break;
-        default:
-            break;
-    }
+                    v5::launch<DD>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, lse,
+                                   stream);
+                break;
+            default:
+                break;
+        }
+    };
+    if (D == 64)
+        run(std::integral_constant<int, 64>{});
+    else
+        run(std::integral_constant<int, 128>{});
     SPARK_CHECK_LAUNCH();
 }
 
