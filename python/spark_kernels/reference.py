@@ -239,3 +239,122 @@ def fp4gemm(
     if scale_a is not None:
         c = c * (scale_a.float() * scale_b.float())
     return c.to(torch.bfloat16)
+
+
+# ---- W4A16: int4 weights, one scale (and zero point) per 128 k of a column ----------------
+
+W4_GROUP = 128
+
+
+def w4_quantize(w: torch.Tensor, asym: bool = False
+                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """The round-to-nearest quantizer of `spark_kernels.w4_quantize` in plain PyTorch, same
+    fp32 operations: (codes [K, N] uint8 in 0..15, scales [K/128, N] bf16, zeros or None).
+    Codes are unpacked here; `w4_pack_gptq` packs them."""
+    K, N = w.shape
+    wf = w.float().reshape(K // W4_GROUP, W4_GROUP, N)
+    if asym:
+        lo = wf.amin(dim=1).clamp(max=0.0)
+        hi = wf.amax(dim=1).clamp(min=0.0)
+        s = ((hi - lo) / 15.0).to(torch.bfloat16)
+    else:
+        s = (wf.abs().amax(dim=1) / 7.0).to(torch.bfloat16)
+    sf = s.float()
+    safe = torch.where(sf > 0, sf, torch.ones_like(sf))
+    if asym:
+        z = torch.where(sf > 0, torch.round(-lo / safe).clamp(0, 15), torch.zeros_like(sf))
+        q = (torch.round(wf / safe[:, None]) + z[:, None]).clamp(0, 15)
+        q = torch.where(sf[:, None] > 0, q, z[:, None].expand_as(q))
+    else:
+        z = None
+        q = torch.round(wf / safe[:, None]).clamp(-8, 7) + 8
+        q = torch.where(sf[:, None] > 0, q, torch.full_like(q, 8.0))
+    zeros = z.to(torch.uint8) if z is not None else None
+    return q.reshape(K, N).to(torch.uint8), s, zeros
+
+
+def w4_dequantize(q: torch.Tensor, scales: torch.Tensor, zeros: torch.Tensor | None = None
+                  ) -> torch.Tensor:
+    """bf16((q - z) * s) for codes [K, N], the weight w4gemm multiplies (z = 8 if no zeros)."""
+    K, N = q.shape
+    z = zeros.float() if zeros is not None else torch.full_like(scales, 8.0, dtype=torch.float32)
+    qf = q.float().reshape(K // W4_GROUP, W4_GROUP, N)
+    w = (qf - z[:, None]) * scales.float()[:, None]
+    return w.reshape(K, N).to(torch.bfloat16)
+
+
+def w4_pack_gptq(q: torch.Tensor) -> torch.Tensor:
+    """Codes [K, N] -> qweight [K/8, N] int32, eight consecutive k per word, lowest k lowest."""
+    K, N = q.shape
+    words = torch.zeros(K // 8, N, dtype=torch.int64, device=q.device)
+    qv = q.to(torch.int64).reshape(K // 8, 8, N)
+    for i in range(8):
+        words |= qv[:, i] << (4 * i)
+    return _as_int32(words)
+
+
+def w4_unpack_gptq(qweight: torch.Tensor) -> torch.Tensor:
+    """qweight [K/8, N] int32 -> codes [K, N] uint8."""
+    words = qweight.to(torch.int64) & 0xFFFFFFFF
+    shifts = torch.arange(8, device=qweight.device, dtype=torch.int64) * 4
+    q = (words[:, None, :] >> shifts[None, :, None]) & 0xF
+    return q.reshape(-1, qweight.shape[1]).to(torch.uint8)
+
+
+def _as_int32(words: torch.Tensor) -> torch.Tensor:
+    """uint32 values held in int64 -> the same bits as int32."""
+    words = words & 0xFFFFFFFF
+    return torch.where(words >= 2**31, words - 2**32, words).to(torch.int32)
+
+
+def w4_group_k(j: torch.Tensor, kappa: torch.Tensor) -> torch.Tensor:
+    """Matrix k inside a 128-k group that mma step j (0..7) feeds at mma index kappa (0..15):
+    the k order of src/kernels/w4gemm_internal.cuh, which makes each lane's activations for
+    two steps eight consecutive k."""
+    c = (kappa % 8) // 2
+    return 32 * (j // 2) + 8 * c + 4 * (j % 2) + 2 * (kappa // 8) + kappa % 2
+
+
+def _w4_nibble_coords(device) -> tuple[torch.Tensor, torch.Tensor]:
+    """(row within 16 columns, k within the 128-k group) of nibble p of word j of lane in the
+    unit of parity h (h = 0, 1 are the two 64-k units of a group), as [2, 32, 4, 8] tensors."""
+    h = torch.arange(2, device=device)[:, None, None, None]
+    lane = torch.arange(32, device=device)[None, :, None, None]
+    j = torch.arange(4, device=device)[None, None, :, None]
+    p = torch.arange(8, device=device)[None, None, None, :]
+    g, c = lane // 4, lane % 4
+    dn = (g + 8 * (p & 1) + 0 * j + 0 * h).expand(2, 32, 4, 8)
+    dk = w4_group_k(4 * h + j, 8 * ((p >> 1) & 1) + 2 * c + (p >> 2)).expand(2, 32, 4, 8)
+    return dn, dk
+
+
+def w4_repack(qweight: torch.Tensor) -> torch.Tensor:
+    """The permutation of `spark_kernels.w4_repack`: qweight [K/8, N] -> int32 [N/16, 2K],
+    blocks of 16 columns x 64 k in strip-major order, 32 lanes x 4 words per block."""
+    q = w4_unpack_gptq(qweight)
+    K, N = q.shape
+    dn, dk = _w4_nibble_coords(q.device)
+    groups = q.reshape(K // 128, 128, N // 16, 16).permute(2, 0, 1, 3)  # [N/16, K/128, 128, 16]
+    vals = groups[:, :, dk, dn].to(torch.int64)  # [N/16, K/128, 2, 32, 4, 8]
+    shifts = torch.arange(8, device=q.device, dtype=torch.int64) * 4
+    words = (vals << shifts).sum(dim=-1)
+    return _as_int32(words).reshape(N // 16, 2 * K)
+
+
+def w4_unpack(packed: torch.Tensor) -> torch.Tensor:
+    """Inverse of w4_repack: packed [N/16, 2K] -> codes [K, N] uint8."""
+    T, twoK = packed.shape
+    K, N = twoK // 2, T * 16
+    words = packed.to(torch.int64).reshape(T, K // 128, 2, 32, 4) & 0xFFFFFFFF
+    shifts = torch.arange(8, device=packed.device, dtype=torch.int64) * 4
+    vals = (words[..., None] >> shifts) & 0xF  # [T, K/128, 2, 32, 4, 8]
+    dn, dk = _w4_nibble_coords(packed.device)
+    groups = torch.zeros(T, K // 128, 128, 16, dtype=torch.int64, device=packed.device)
+    groups[:, :, dk, dn] = vals
+    return groups.permute(1, 2, 0, 3).reshape(K, N).to(torch.uint8)
+
+
+def w4gemm(a: torch.Tensor, q: torch.Tensor, scales: torch.Tensor,
+           zeros: torch.Tensor | None = None) -> torch.Tensor:
+    """a @ the dequantized weight, fp32 sum, one bf16 rounding."""
+    return (a.float() @ w4_dequantize(q, scales, zeros).float()).to(torch.bfloat16)

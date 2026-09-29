@@ -20,7 +20,8 @@ import torch
 from . import _C
 
 KERNELS = ("bandwidth", "rmsnorm", "swiglu", "softmax", "sgemm", "hgemm", "fp8gemm", "fp4gemm",
-           "attention", "attention_bwd", "paged_decode", "attention_varlen", "attention_fp8")
+           "w4gemm", "attention", "attention_bwd", "paged_decode", "attention_varlen",
+           "attention_fp8")
 
 
 def num_variants(name: str) -> int:
@@ -220,6 +221,76 @@ def fp4gemm(
     tile per SM. The default steps down to the highest variant that takes the shape.
     """
     return _C.fp4gemm(a, b_t, sfa, sfb, scale_a, scale_b, fmt, variant)
+
+
+W4_GROUP = 128  # k per scale (and zero point) of the int4 weights
+
+
+def w4_quantize(w: torch.Tensor, asym: bool = False
+                ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Round-to-nearest int4 quantization of a [K, N] bfloat16 weight (the [K, N] layout of
+    `hgemm`, x @ w), one scale per 128 consecutive k of a column, computed in fp32.
+
+    Symmetric: s = bf16(max|w| / 7), q = clamp(rint(w / s), -8, 7) + 8, w ~ (q - 8) * s.
+    Asymmetric (asym=True): lo = min(min w, 0), hi = max(max w, 0), s = bf16((hi - lo) / 15),
+    z = clamp(rint(-lo / s), 0, 15), q = clamp(rint(w / s) + z, 0, 15), w ~ (q - z) * s.
+
+    Returns (qweight [K/8, N] int32 with eight consecutive k per word, lowest k in the lowest
+    nibble, as GPTQ packs it; scales [K/128, N] bfloat16; zeros [K/128, N] uint8 or None).
+    Needs K a multiple of 128 and N a multiple of 16.
+    """
+    return _C.w4_quantize(w, asym)
+
+
+def w4_repack(qweight: torch.Tensor) -> torch.Tensor:
+    """qweight [K/8, N] int32 (GPTQ packing) -> the layout `w4gemm` reads, int32 [N/16, 2K]:
+    per 16 columns x 64 k, 32 lanes x 16 bytes, each lane's bytes the mma.sync fragments it
+    dequantizes (docs/design/w4gemm.md). Done once per weight, at load time."""
+    return _C.w4_repack(qweight)
+
+
+class W4Weight:
+    """An int4 weight ready for `w4gemm`: the repacked codes, the scales and the optional zero
+    points of a [K, N] (in_features x out_features) matrix."""
+
+    def __init__(self, packed: torch.Tensor, scales: torch.Tensor,
+                 zeros: torch.Tensor | None = None):
+        self.packed = packed
+        self.scales = scales
+        self.zeros = zeros
+
+    @staticmethod
+    def quantize(w: torch.Tensor, asym: bool = False) -> W4Weight:
+        """Quantize (w4_quantize) and repack (w4_repack) a [K, N] bfloat16 weight."""
+        qweight, scales, zeros = w4_quantize(w, asym)
+        return W4Weight(w4_repack(qweight), scales, zeros)
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        """(K, N) of the weight it replaces."""
+        return self.packed.shape[1] // 2, self.packed.shape[0] * 16
+
+    def nbytes(self) -> int:
+        return sum(t.numel() * t.element_size()
+                   for t in (self.packed, self.scales, self.zeros) if t is not None)
+
+
+def w4gemm(a: torch.Tensor, w: W4Weight | torch.Tensor, scales: torch.Tensor | None = None,
+           zeros: torch.Tensor | None = None, variant: int = -1) -> torch.Tensor:
+    """W4A16 GEMM: a [M, K] bfloat16 @ int4 weight [K, N] -> [M, N] bfloat16, fp32 accumulate.
+
+    `w` is a `W4Weight`, or the packed codes with `scales` (and `zeros`) passed separately.
+    The weight each product uses is bf16((q - z) * s), rounded once, bit for bit what
+    `reference.w4_dequantize` returns. Needs K a multiple of 128, N a multiple of 16, any
+    M >= 1. Variant 2 (the default) is the pipelined kernel; 0 and 1 are the ladder below it.
+    """
+    if isinstance(w, W4Weight):
+        if scales is not None or zeros is not None:
+            raise ValueError("pass scales and zeros inside the W4Weight, not separately")
+        w, scales, zeros = w.packed, w.scales, w.zeros
+    if scales is None:
+        raise ValueError("w4gemm needs the scales of the packed weight")
+    return _C.w4gemm(a, w, scales, zeros, variant)
 
 
 def rope_append_(

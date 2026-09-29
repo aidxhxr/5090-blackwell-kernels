@@ -13,6 +13,8 @@ Ops (all run on the current CUDA stream, all accept float32 or bfloat16 unless n
     hgemm(a, b, variant=-1, bias=, act=, residual=, out=)
                                              bf16 tensor-core GEMM (a @ b), fp32 accumulate,
                                              with a fused act(a @ b + bias) + residual epilogue
+    w4gemm(a, W4Weight.quantize(w))          bf16 activations times an int4 weight (one scale
+                                             per 128 k), fp32 accumulate
     hgemm_swiglu(a, w_gate_up, ...)          silu(a @ w_gate) * (a @ w_up) in one GEMM from the
                                              interleaved weight of interleave_gate_up(g, u)
     fp8gemm(a, b_t, scale_a, scale_b, variant=-1, sfa=None, sfb=None)
@@ -52,6 +54,7 @@ from importlib.metadata import PackageNotFoundError, version
 from . import engine, layer, reference
 from .ops import (
     AttentionFunction,
+    W4Weight,
     add_rmsnorm_,
     attention,
     attention_bwd,
@@ -74,10 +77,14 @@ from .ops import (
     sgemm,
     softmax,
     swiglu,
+    w4_quantize,
+    w4_repack,
+    w4gemm,
 )
 
 __all__ = [
     "AttentionFunction",
+    "W4Weight",
     "add_rmsnorm_",
     "attention",
     "attention_bwd",
@@ -103,6 +110,9 @@ __all__ = [
     "sgemm",
     "softmax",
     "swiglu",
+    "w4_quantize",
+    "w4_repack",
+    "w4gemm",
 ]
 
 try:

@@ -475,6 +475,88 @@ Tensor fp4gemm(const Tensor& a, const Tensor& b_t, const Tensor& sfa, const Tens
     return c;
 }
 
+// ---- W4A16 ----------------------------------------------------------------------------------
+
+// Round-to-nearest int4 quantization of w [K, N] bf16 (the [K, N] layout hgemm takes), one
+// scale per 128 k of a column: (qweight [K/8, N] int32 in GPTQ's packing, scales [K/128, N]
+// bf16, zeros [K/128, N] uint8 or None). The formulas are in include/spark/kernels.h.
+std::tuple<Tensor, Tensor, std::optional<Tensor>> w4_quantize(const Tensor& w, bool asym) {
+    check_cuda_contig(w, "w");
+    TORCH_CHECK(w.scalar_type() == at::kBFloat16, "w4_quantize expects a bfloat16 weight");
+    TORCH_CHECK(w.dim() == 2, "w4_quantize expects a 2-D [K, N] weight");
+    const int64_t K = w.size(0), N = w.size(1);
+    TORCH_CHECK(K % spark::kW4GroupSize == 0 && N % 16 == 0 && K <= INT32_MAX && N <= INT32_MAX,
+                "w4_quantize needs K a multiple of 128 and N a multiple of 16, got ", K, "x", N);
+    const c10::cuda::CUDAGuard guard(w.device());
+    Tensor q = at::empty({K / 8, N}, w.options().dtype(at::kInt));
+    Tensor sc = at::empty({K / spark::kW4GroupSize, N}, w.options());
+    std::optional<Tensor> z;
+    if (asym) z = at::empty({K / spark::kW4GroupSize, N}, w.options().dtype(at::kByte));
+    spark::w4_quantize_bf16(bf16_ptr(w), q.data_ptr<int32_t>(), bf16_ptr_mut(sc),
+                            z ? z->data_ptr<uint8_t>() : nullptr, static_cast<int>(K),
+                            static_cast<int>(N), current_stream(w));
+    return {q, sc, z};
+}
+
+// qweight [K/8, N] int32 -> the kernel layout, int32 [N/16, 2K].
+Tensor w4_repack(const Tensor& qweight) {
+    check_cuda_contig(qweight, "qweight");
+    TORCH_CHECK(qweight.scalar_type() == at::kInt && qweight.dim() == 2,
+                "w4_repack expects a 2-D int32 qweight [K/8, N]");
+    const int64_t K = qweight.size(0) * 8, N = qweight.size(1);
+    TORCH_CHECK(K % 64 == 0 && N % 16 == 0 && K <= INT32_MAX && N <= INT32_MAX,
+                "w4_repack needs K a multiple of 64 and N a multiple of 16, got ", K, "x", N);
+    const c10::cuda::CUDAGuard guard(qweight.device());
+    Tensor packed = at::empty({N / 16, 2 * K}, qweight.options());
+    spark::w4_repack(qweight.data_ptr<int32_t>(), packed.data_ptr<int32_t>(), static_cast<int>(K),
+                     static_cast<int>(N), current_stream(qweight));
+    return packed;
+}
+
+// a [M, K] bf16 times the weight in `packed` [N/16, 2K] int32 (w4_repack), `scales`
+// [K/128, N] bf16 and `zeros` [K/128, N] uint8 (None: symmetric) -> [M, N] bf16.
+Tensor w4gemm(const Tensor& a, const Tensor& packed, const Tensor& scales,
+              const std::optional<Tensor>& zeros, int variant) {
+    check_cuda_contig(a, "a");
+    check_cuda_contig(packed, "packed");
+    check_cuda_contig(scales, "scales");
+    TORCH_CHECK(a.scalar_type() == at::kBFloat16 && a.dim() == 2,
+                "w4gemm expects a 2-D bfloat16 a");
+    TORCH_CHECK(packed.scalar_type() == at::kInt && packed.dim() == 2,
+                "w4gemm expects packed as the int32 [N/16, 2K] tensor from w4_repack");
+    const int64_t M = a.size(0), K = a.size(1), N = packed.size(0) * 16;
+    TORCH_CHECK(packed.size(1) == 2 * K, "packed is [", packed.size(0), ", ", packed.size(1),
+                "], expected [N/16, 2K] = [", packed.size(0), ", ", 2 * K, "] for K = ", K);
+    TORCH_CHECK(K % spark::kW4GroupSize == 0, "w4gemm needs K a multiple of 128, got ", K);
+    TORCH_CHECK(M <= INT32_MAX && N <= INT32_MAX && K <= INT32_MAX, "w4gemm dims too large");
+    TORCH_CHECK(scales.scalar_type() == at::kBFloat16 && scales.dim() == 2 &&
+                    scales.size(0) == K / spark::kW4GroupSize && scales.size(1) == N,
+                "scales must be bfloat16 [", K / spark::kW4GroupSize, ", ", N, "], got ",
+                scales.sizes());
+    const uint8_t* zp = nullptr;
+    if (zeros) {
+        check_cuda_contig(*zeros, "zeros");
+        TORCH_CHECK(zeros->scalar_type() == at::kByte && zeros->dim() == 2 &&
+                        zeros->size(0) == K / spark::kW4GroupSize && zeros->size(1) == N,
+                    "zeros must be uint8 [", K / spark::kW4GroupSize, ", ", N, "], got ",
+                    zeros->sizes());
+        TORCH_CHECK(zeros->device() == a.device(), "zeros must be on a's device");
+        zp = zeros->data_ptr<uint8_t>();
+    }
+    TORCH_CHECK(packed.device() == a.device() && scales.device() == a.device(),
+                "packed and scales must be on a's device");
+    TORCH_CHECK(
+        aligned16(a) && aligned16(packed) && aligned16(scales) && (!zeros || aligned16(*zeros)),
+        "w4gemm needs 16-byte aligned a, packed, scales and zeros storage");
+    const c10::cuda::CUDAGuard guard(a.device());
+    Tensor c = at::empty({M, N}, a.options());
+    const int v = resolve_variant(variant, spark::w4gemm_num_variants());
+    spark::w4gemm_bf16(bf16_ptr(a), packed.data_ptr<int32_t>(), bf16_ptr(scales), zp,
+                       bf16_ptr_mut(c), static_cast<int>(M), static_cast<int>(N),
+                       static_cast<int>(K), v, current_stream(a));
+    return c;
+}
+
 // The checks every attention entry point shares: q = [B, H_q, S_q, D] and k, v =
 // [B, H_kv, S_kv, D] contiguous bf16 CUDA tensors, H_q a multiple of H_kv (grouped-query
 // attention: query head h reads k/v head h / (H_q / H_kv)), D in {64, 128}, 16-byte aligned.
@@ -804,6 +886,7 @@ int num_variants(const std::string& name) {
     if (name == "attention") return spark::attention_num_variants();
     if (name == "attention_fp8") return spark::attention_fp8_num_variants();
     if (name == "attention_bwd") return spark::attention_bwd_num_variants();
+    if (name == "w4gemm") return spark::w4gemm_num_variants();
     if (name == "bandwidth") return spark::bandwidth_num_variants();
     if (name == "paged_decode") return spark::paged_decode_num_variants();
     if (name == "attention_varlen") return spark::attention_varlen_num_variants();
@@ -847,6 +930,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fp4_quantize", &fp4_quantize,
           "bf16 [rows, K] -> (packed e2m1 [rows, K/2], blocked block scales, per-tensor scale)",
           py::arg("x"), py::arg("fmt") = "nvfp4", py::arg("scale") = py::none());
+    m.def("w4_quantize", &w4_quantize,
+          "round-to-nearest int4 quantization of a [K, N] bf16 weight, one scale per 128 k: "
+          "(qweight [K/8, N] int32, scales [K/128, N] bf16, zeros [K/128, N] uint8 or None)",
+          py::arg("w"), py::arg("asym") = false);
+    m.def("w4_repack", &w4_repack, "qweight [K/8, N] int32 -> the w4gemm layout [N/16, 2K]",
+          py::arg("qweight"));
+    m.def("w4gemm", &w4gemm,
+          "a [M, K] bf16 @ the int4 weight (packed, scales, zeros) -> [M, N] bf16, fp32 accumulate",
+          py::arg("a"), py::arg("packed"), py::arg("scales"), py::arg("zeros") = py::none(),
+          py::arg("variant") = -1);
     m.def("attention", &attention,
           "softmax(q k^T / sqrt(D)) v over [B, H, S, D] bf16 tensors (k, v may have fewer heads)",
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("causal") = false,
