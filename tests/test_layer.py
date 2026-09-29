@@ -140,3 +140,30 @@ def test_weights_are_one_layer_of_llama_3_8b(sk, weights):
     assert weights.bytes() == 2 * (4096 * 6144 + 4096 * 4096 + 4096 * 28672 + 14336 * 4096
                                    + 2 * 4096)
     assert weights.bytes() > 96 << 20  # bigger than the L2 on its own: no rotation needed
+
+
+@pytest.mark.parametrize("asym", [False, True], ids=["sym", "asym"])
+@pytest.mark.parametrize("b,n", [(1, 500), (4, 4096)])
+def test_int4_decode_matches_torch_on_the_dequantized_weights(sk, weights, rope, b, n, asym):
+    # SparkLayer(int4=True) against the torch layer on the bf16 weights the int4 ones stand
+    # for (LayerWeights.w4_dequantized): the same check as the bf16 decode, with the int4
+    # GEMMs where hgemm was.
+    torch.manual_seed(b * 1000 + n)
+    deq = weights.w4_dequantized(asym)
+    caches = [L.KVCache(b, n, dtype=dt) for dt in (torch.bfloat16, torch.bfloat16, torch.float32)]
+    k0 = torch.randn(b, L.N_KV_HEADS, n - 1, L.HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    v0 = torch.randn_like(k0)
+    for c in caches:
+        c.k[:, :, :n - 1] = k0.to(c.k.dtype)
+        c.v[:, :, :n - 1] = v0.to(c.v.dtype)
+        c.length = n - 1
+    x = torch.randn(b, 1, L.HIDDEN, device="cuda", dtype=torch.bfloat16)
+    d = torch.randn_like(x) * 0.5
+    ours = L.SparkLayer(weights, rope, int4=True, asym=asym)
+    theirs, truth = L.TorchLayer(deq, rope), L.TorchLayer(deq.to_float(), rope)
+    (xo, do), (xt, dt), (xf, df) = _run("decode", ours, theirs, truth, x, d, caches)
+    _check(xo, do, xt, dt, xf, df)
+    # packed int4 + one bf16 scale (and one zero byte) per 128 weights
+    per_weight = 0.5 + (3 if asym else 2) / 128
+    assert ours.weight_bytes() == int(per_weight * (4096 * 6144 + 4096 * 4096 + 4096 * 28672
+                                                    + 14336 * 4096))

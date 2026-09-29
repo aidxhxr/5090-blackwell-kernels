@@ -21,6 +21,11 @@ add a model does after its last layer. With `delta=None` the first norm is a pla
     decode(x, cache, delta=None)   x is [B, 1, 4096]; attention over the cache plus this
                                    token; appends it to the cache
 
+`SparkLayer(weights, rope, int4=True)` runs the four projections as W4A16 GEMMs (`w4gemm`)
+on the weights quantized once at construction (round to nearest, one bf16 scale per 128 k
+of a column; `LayerWeights.w4_dequantized` gives the bf16 weights they stand for, which is
+what the int4 layer is checked against). A decode step then streams 4x fewer weight bytes.
+
 `KVCache` holds K and V as [B, 8, capacity, 128] tensors, the layout the attention kernel
 reads. The kernel takes a contiguous [B, H_kv, S_kv, D] tensor and has no head stride, so a
 step whose cache is not full attends over a contiguous copy of the filled part (an O(L)
@@ -96,6 +101,19 @@ class LayerWeights:
         return sum(t.numel() * t.element_size() for t in
                    (self.attn_norm, self.w_qkv, self.w_o, self.mlp_norm, self.w_gate_up,
                     self.w_down))
+
+    def w4_dequantized(self, asym: bool = False) -> LayerWeights:
+        """The same layer with each projection replaced by the bf16 weight its int4
+        quantization stands for (reference.w4_quantize, then w4_dequantize): what
+        SparkLayer(int4=True) multiplies, bit for bit."""
+        from . import reference
+
+        def deq(w):
+            return reference.w4_dequantize(*reference.w4_quantize(w, asym))
+
+        return LayerWeights(attn_norm=self.attn_norm, w_qkv=deq(self.w_qkv), w_o=deq(self.w_o),
+                            mlp_norm=self.mlp_norm, w_gate_up=deq(self.w_gate_up),
+                            w_down=deq(self.w_down))
 
     def to_float(self) -> LayerWeights:
         return LayerWeights(*(t.float() for t in
@@ -187,11 +205,29 @@ def _split_qkv(qkv: torch.Tensor, b: int, s: int):
 class SparkLayer:
     """The layer on this package's kernels: rmsnorm / add_rmsnorm_, hgemm, rope_append_,
     attention (GQA, the flash-decoding kernel at decode), swiglu. The attention output's head
-    transpose is the one torch copy left."""
+    transpose is the one torch copy left. With int4=True the projections are W4A16 GEMMs on
+    weights quantized once here (asym picks zero points over the symmetric code)."""
 
-    def __init__(self, weights: LayerWeights, rope: RoPE):
+    def __init__(self, weights: LayerWeights, rope: RoPE, int4: bool = False,
+                 asym: bool = False):
         self.w = weights
         self.rope = rope
+        self.w4 = None
+        if int4:
+            self.w4 = {name: sk.W4Weight.quantize(getattr(weights, name), asym)
+                       for name in ("w_qkv", "w_o", "w_gate_up", "w_down")}
+
+    def _proj(self, a: torch.Tensor, name: str) -> torch.Tensor:
+        if self.w4 is not None:
+            return sk.w4gemm(a, self.w4[name])
+        return sk.hgemm(a, getattr(self.w, name))
+
+    def weight_bytes(self) -> int:
+        """Bytes of the projection weights one step streams: bf16, or packed int4 + scales."""
+        if self.w4 is not None:
+            return sum(w.nbytes() for w in self.w4.values())
+        return sum(getattr(self.w, n).numel() * 2
+                   for n in ("w_qkv", "w_o", "w_gate_up", "w_down"))
 
     def _forward(self, x: torch.Tensor, cache: KVCache, delta: torch.Tensor | None,
                  causal: bool):
@@ -207,7 +243,7 @@ class SparkLayer:
                     d2 = d2.contiguous()
                 h = sk.add_rmsnorm_(d2, x2, w.attn_norm, EPS)
         with _stage("qkv_gemm"):
-            qkv = sk.hgemm(h, w.w_qkv)  # [B*S, 6144]
+            qkv = self._proj(h, "w_qkv")  # [B*S, 6144]
         with _stage("rope_append"):
             # RoPE on q and k, q into [B, 32, S, 128], k and v into the cache: one launch
             pos0 = cache.reserve(s)
@@ -220,15 +256,15 @@ class SparkLayer:
         with _stage("o_transpose"):
             o = o.transpose(1, 2).reshape(b * s, Q_WIDTH)
         with _stage("o_gemm"):
-            attn = sk.hgemm(o, w.w_o)
+            attn = self._proj(o, "w_o")
         with _stage("norm2"):
             h2 = sk.add_rmsnorm_(attn, x2, w.mlp_norm, EPS)  # x += attn, then the norm
         with _stage("gate_up_gemm"):
-            gu = sk.hgemm(h2, w.w_gate_up)  # [B*S, 28672]
+            gu = self._proj(h2, "w_gate_up")  # [B*S, 28672]
         with _stage("swiglu"):
             a = sk.swiglu(gu[:, :INTERMEDIATE], gu[:, INTERMEDIATE:])  # strided halves
         with _stage("down_gemm"):
-            down = sk.hgemm(a, w.w_down)
+            down = self._proj(a, "w_down")
         return x, down.view(b, s, HIDDEN)
 
     def prefill(self, x: torch.Tensor, cache: KVCache, delta: torch.Tensor | None = None):

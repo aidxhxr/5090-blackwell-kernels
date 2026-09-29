@@ -14,7 +14,13 @@ A prefill row is one layer over B sequences of S tokens from an empty cache. A d
 one layer over B tokens against a cache holding L - 1 tokens, appended in place (the cache's
 capacity is L, so the attention kernel reads it where it is; `spark_copy_ms` is the same
 step against a cache with spare capacity, where the filled part is copied out contiguous
-first). Every step is the steady-state form: the previous layer's MLP output comes in as
+first). With the int4 path on (the default; --no-int4 skips it), every decode row also
+times the same step with the four projections as W4A16 GEMMs (SparkLayer(int4=True):
+`spark_int4_ms` eager, `spark_int4_graph_ms` from a CUDA graph) and prints its per-stage
+breakdown. One layer's int4 weights (107 MiB) would mostly stay in the 96 MB L2 from one
+step to the next, which a 32-layer model never sees, so the int4 steps rotate over
+INT4_COPIES separately quantized copies (428 MiB) and the graph holds one step per copy.
+Every step is the steady-state form: the previous layer's MLP output comes in as
 `delta` and both residual adds run inside the norm kernels. Timings are the median over
 rounds of `iters` back-to-back steps between two CUDA events, so a host-bound eager step is
 reported as what it costs a loop that queues layers as fast as it can.
@@ -39,6 +45,7 @@ PREFILL_SHAPES = [(1, 4096), (1, 8192), (4, 2048)]
 # (B, L): the cache holds L - 1 tokens and the step appends the L-th
 DECODE_SHAPES = [(1, 4096), (1, 16384), (1, 131072), (8, 4096)]
 N_LAYERS = 32  # Llama-3-8B, for the tokens/s a whole model implies
+INT4_COPIES = 4  # int4 layers the int4 decode rotates over: 4 x 107 MiB, past the L2
 PREFILL_COMPILE = "max-autotune-no-cudagraphs"
 DECODE_COMPILE = "reduce-overhead"
 STAGES = ["norm1", "qkv_gemm", "rope_append", "attention", "o_transpose", "o_gemm", "norm2",
@@ -266,13 +273,18 @@ def bench_prefill(sk, L, weights, rope, b: int, s: int, args) -> dict:
 # ---------------------------------------------------------------------------
 def capture_decode(layer, x, x0, cache, delta, length: int):
     """Warm the kernels' workspaces up on a side stream, then capture one step into a
-    CUDA graph. The capture runs in torch's default "global" error mode, so a cudaMalloc
-    or any other capture-unsafe call inside a launch path would raise here instead of
-    being silently recorded."""
+    CUDA graph (one step per layer when `layer` is a list, run one after the other). The
+    capture runs in torch's default "global" error mode, so a cudaMalloc or any other
+    capture-unsafe call inside a launch path would raise here instead of being silently
+    recorded."""
+    layers = layer if isinstance(layer, list) else [layer]
+
     def step():
-        cache.length = length
-        x.copy_(x0)
-        return layer.decode(x, cache, delta)
+        for lyr in layers:
+            cache.length = length
+            x.copy_(x0)
+            out = lyr.decode(x, cache, delta)
+        return out
 
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
@@ -287,7 +299,7 @@ def capture_decode(layer, x, x0, cache, delta, length: int):
     return g, out
 
 
-def bench_decode(sk, L, weights, rope, b: int, n: int, args) -> dict:
+def bench_decode(sk, L, weights, rope, b: int, n: int, args, ours4=()) -> dict:
     torch.manual_seed(2)
     x0 = torch.randn(b, 1, L.HIDDEN, device="cuda", dtype=torch.bfloat16)
     delta = torch.randn_like(x0) * 0.5
@@ -319,6 +331,26 @@ def bench_decode(sk, L, weights, rope, b: int, n: int, args) -> dict:
         torch.cuda.synchronize()
         graph_ok &= torch.equal(gx, ref_x) and torch.equal(gd, ref_d)
     graph_ms = time_ms(graph.replay, args.warmup, args.iters)
+
+    # the int4 layer: the same step with the projections as W4A16 GEMMs, rotating over
+    # INT4_COPIES copies of the weights so that they come from DRAM as in a full model
+    int4_ms = int4_graph_ms = 0.0
+    int4_breakdown: dict = {}
+    if ours4:
+        turn = [0]
+
+        def int4_step():
+            cache.length = n - 1
+            x.copy_(x0)
+            lyr = ours4[turn[0] % len(ours4)]
+            turn[0] += 1
+            return lyr.decode(x, cache, delta)
+
+        int4_ms = time_ms(int4_step, args.warmup, args.iters)
+        int4_breakdown = stage_breakdown(int4_step)
+        graph4, _ = capture_decode(ours4, x, x0, cache, delta, n - 1)
+        int4_graph_ms = time_ms(graph4.replay, args.warmup, args.iters) / len(ours4)
+        del graph4
 
     torch_ms = time_ms(torch_step, args.warmup, args.iters)
     compiled_ms = 0.0
@@ -362,6 +394,7 @@ def bench_decode(sk, L, weights, rope, b: int, n: int, args) -> dict:
            "torch_compiled_ms": compiled_ms, "torch_compile_mode": DECODE_COMPILE,
            "tokens_per_s_32_layers": tokens_per_s(b, ours_ms),
            "tokens_per_s_32_layers_graph": tokens_per_s(b, graph_ms),
+           "spark_int4_ms": int4_ms, "spark_int4_graph_ms": int4_graph_ms,
            "gpu_busy_ms": breakdown.get("total_us", 0.0) / 1e3,
            "breakdown_us": {s: breakdown[s]["us"] for s in STAGES + ["other"] if s in breakdown}}
     print(f"decode  b{b} L{n:6d}: ours {ours_ms:8.3f} ms  graph {graph_ms:8.3f} ms"
@@ -369,6 +402,12 @@ def bench_decode(sk, L, weights, rope, b: int, n: int, args) -> dict:
           f"{compiled_ms:8.3f} ms  copy {copy_ms:8.3f} ms  ({tokens_per_s(b, graph_ms):,.0f} "
           f"tok/s over {N_LAYERS} layers from the graph)", file=sys.stderr)
     print_breakdown(row["shape"], breakdown, ours_ms)
+    if ours4:
+        print(f"decode  b{b} L{n:6d} int4: ours {int4_ms:8.3f} ms  graph {int4_graph_ms:8.3f} ms"
+              f"  ({graph_ms / int4_graph_ms:.2f}x the bf16 graph, "
+              f"{tokens_per_s(b, int4_graph_ms):,.0f} tok/s over {N_LAYERS} layers)",
+              file=sys.stderr)
+        print_breakdown(row["shape"] + " int4", int4_breakdown, int4_ms)
     return row
 
 
@@ -382,6 +421,8 @@ def main() -> int:
                     help="skip the torch.compile columns (compiling takes minutes)")
     ap.add_argument("--no-copy", dest="copy", action="store_false",
                     help="skip the spare-capacity (copied cache) decode timing")
+    ap.add_argument("--no-int4", dest="int4", action="store_false",
+                    help="skip the int4 (W4A16 projections) decode timings")
     ap.add_argument("--shapes",
                     help="comma-separated subset, e.g. prefill_b1_s4096,decode_b1_L4096")
     ap.add_argument("--out", type=Path, default=OUT)
@@ -398,6 +439,11 @@ def main() -> int:
     print(f"one layer's weights: {weights.bytes() / 2**20:.0f} MiB", file=sys.stderr)
     max_pos = max(max(s for _, s in PREFILL_SHAPES), max(n for _, n in DECODE_SHAPES)) + 1
     rope = L.RoPE(max_pos)
+    ours4 = ([L.SparkLayer(weights, rope, int4=True) for _ in range(INT4_COPIES)]
+             if args.int4 else [])
+    if ours4:
+        print(f"int4 projections: {ours4[0].weight_bytes() / 2**20:.0f} MiB per layer, "
+              f"{INT4_COPIES} copies", file=sys.stderr)
     wanted = set(args.shapes.split(",")) if args.shapes else None
     rows = []
     if args.only != "decode":
@@ -410,7 +456,8 @@ def main() -> int:
         for b, n in DECODE_SHAPES:
             if wanted and shape_name("decode", b, n) not in wanted:
                 continue
-            rows.append({"device": device, **bench_decode(sk, L, weights, rope, b, n, args)})
+            rows.append({"device": device,
+                         **bench_decode(sk, L, weights, rope, b, n, args, ours4)})
             torch.cuda.empty_cache()
     if wanted or args.only or not args.compile:
         print("partial run: results/layer.json not written", file=sys.stderr)
