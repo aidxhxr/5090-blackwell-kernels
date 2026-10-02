@@ -32,6 +32,9 @@ results/headline.md
 !results/llm_parity.json
 # scripts/llm_parity.py's dumps of logits and hidden states (gigabytes)
 parity_work/
+# the real-checkpoint serving comparison (docs/design/llm_serving.md) needs vLLM's venv and
+# a downloaded checkpoint to regenerate, so its rows are kept
+!results/llm_serve.json
 
 # editors / OS
 .vscode/
