@@ -181,14 +181,21 @@ class SparkModel:
     output is added by the MLP norm, the down output by the next layer's attention norm) and
     the SwiGLU as its own launch on the [gate | up] halves (the gate/up weight is
     de-interleaved before it is quantized): nine launches plus the activation quantizers.
-    `head_format` does the same for lm_head (freeing its bf16 copy unless `keep_bf16`)."""
+    `head_format` does the same for lm_head (freeing its bf16 copy unless `keep_bf16`).
+
+    `prefill_variant` is the hgemm variant of the prefill GEMMs, the bf16 projections and a
+    bf16 lm_head (decode steps and the quantized GEMMs are not affected). 4 keeps the prefill
+    off the TMA kernels, whose first launch takes 3.4 GiB of device memory outside torch's
+    allocator: what a 100K-token cache next to the bf16 weights on a 32 GB card does not
+    have (docs/design/llm_models.md)."""
 
     context_prefill = True  # prefill rows may continue a cached context (attention_varlen)
 
     def __init__(self, weights: ModelWeights, rope: RoPE, weights_format: str = "bf16",
-                 keep_bf16: bool = False, head_format: str = "bf16"):
+                 keep_bf16: bool = False, head_format: str = "bf16", prefill_variant: int = -1):
         self.w = weights
         self.rope = rope
+        self.prefill_variant = prefill_variant
         # set to a list to collect the residual stream [T, 4096] after every layer (a parity
         # check against another implementation reads it); None, the default, costs nothing
         self.trace: list[torch.Tensor] | None = None
@@ -261,15 +268,16 @@ class SparkModel:
     def _layers(self, x: torch.Tensor, b: Batch, cache: PagedKVCache, decode: bool):
         if self.lin is not None:
             return self._layers_quant(x, b, cache, decode)
+        v = -1 if decode else self.prefill_variant
         for layer, w in enumerate(self.w.layers):
             kc, vc = cache.k[layer], cache.v[layer]
             h = sk.rmsnorm(x, w.attn_norm, EPS)
-            qkv = sk.hgemm(h, w.w_qkv)
+            qkv = sk.hgemm(h, w.w_qkv, v)
             o = self._attention(qkv, x, b, kc, vc, decode)
-            sk.hgemm(o, w.w_o, residual=x, out=x)
+            sk.hgemm(o, w.w_o, v, residual=x, out=x)
             h2 = sk.rmsnorm(x, w.mlp_norm, EPS)
-            a = sk.hgemm_swiglu(h2, w.w_gate_up)
-            sk.hgemm(a, w.w_down, residual=x, out=x)
+            a = sk.hgemm_swiglu(h2, w.w_gate_up, v)
+            sk.hgemm(a, w.w_down, v, residual=x, out=x)
             if self.trace is not None:
                 self.trace.append(x.clone())  # x is updated in place by the next layer
         return x
@@ -305,9 +313,9 @@ class SparkModel:
             x.add_(delta)
         return x
 
-    def _logits(self, x: torch.Tensor) -> torch.Tensor:
+    def _logits(self, x: torch.Tensor, variant: int = -1) -> torch.Tensor:
         h = sk.rmsnorm(x, self.w.final_norm, EPS)
-        return self.head(h) if self.head is not None else sk.hgemm(h, self.w.lm_head)
+        return self.head(h) if self.head is not None else sk.hgemm(h, self.w.lm_head, variant)
 
     def warm_workspaces(self, max_m: int = GRAPH_MAX) -> None:
         """Every GEMM shape of the model once at each M from max_m down to 1. hgemm's M <= 64
@@ -329,7 +337,7 @@ class SparkModel:
         `all_logits`; the prompts' K/V land in the cache."""
         x = F.embedding(b.ids, self.w.embed)
         x = self._layers(x, b, cache, decode=False)
-        return self._logits(x if all_logits else x[b.last])
+        return self._logits(x if all_logits else x[b.last], self.prefill_variant)
 
     def decode(self, b: Batch, cache: PagedKVCache) -> torch.Tensor:
         """Logits [B, V] of one token per sequence, appended to the cache first."""
