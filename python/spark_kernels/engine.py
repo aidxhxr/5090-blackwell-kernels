@@ -166,32 +166,91 @@ class SparkModel:
     """The model on this package's kernels. Per layer: rmsnorm, the qkv GEMM, RoPE + the
     paged append, attention (varlen at prefill, paged decode at decode), the o GEMM with the
     residual add in its epilogue, rmsnorm, the gate/up GEMM with SwiGLU in its epilogue, the
-    down GEMM with the residual add in its epilogue: eight launches."""
+    down GEMM with the residual add in its epilogue: eight launches.
+
+    `weights_format` other than "bf16" (see `quant.FORMATS`) quantizes the four projections of
+    every layer at construction and frees their bf16 copies: the LayerWeights objects of
+    `weights` lose w_qkv, w_o, w_gate_up and w_down (set to None) unless `keep_bf16`. The
+    embedding, the norms and lm_head stay bf16. The quantized GEMMs have no fused epilogue,
+    so those layers run the residual adds inside the norms instead (`add_rmsnorm_`: the o
+    output is added by the MLP norm, the down output by the next layer's attention norm) and
+    the SwiGLU as its own launch on the [gate | up] halves (the gate/up weight is
+    de-interleaved before it is quantized): nine launches plus the activation quantizers."""
 
     context_prefill = True  # prefill rows may continue a cached context (attention_varlen)
 
-    def __init__(self, weights: ModelWeights, rope: RoPE):
+    def __init__(self, weights: ModelWeights, rope: RoPE, weights_format: str = "bf16",
+                 keep_bf16: bool = False):
         self.w = weights
         self.rope = rope
         # set to a list to collect the residual stream [T, 4096] after every layer (a parity
         # check against another implementation reads it); None, the default, costs nothing
         self.trace: list[torch.Tensor] | None = None
+        self.format = weights_format
+        self.lin = None
+        if weights_format != "bf16":
+            from .quant import make_linear
+
+            self.lin = []
+            for lw in weights.layers:
+                gu = lw.w_gate_up
+                gu = torch.cat([gu[:, 0::2], gu[:, 1::2]], dim=1)  # [gate | up]
+                self.lin.append({"qkv": make_linear(lw.w_qkv, weights_format),
+                                 "o": make_linear(lw.w_o, weights_format),
+                                 "gate_up": make_linear(gu, weights_format),
+                                 "down": make_linear(lw.w_down, weights_format)})
+                del gu
+                if not keep_bf16:
+                    lw.w_qkv = lw.w_o = lw.w_gate_up = lw.w_down = None
+            torch.cuda.empty_cache()
+
+    def weight_bytes(self) -> int:
+        """Bytes of every weight the model holds: the projections in their format, plus the
+        bf16 embedding, norms and lm_head."""
+        w = self.w
+        rest = (w.embed.numel() + w.lm_head.numel() + w.final_norm.numel()) * 2
+        rest += sum((lw.attn_norm.numel() + lw.mlp_norm.numel()) * 2 for lw in w.layers)
+        if self.lin is None:
+            return rest + sum(getattr(lw, n).numel() * 2 for lw in w.layers
+                              for n in ("w_qkv", "w_o", "w_gate_up", "w_down"))
+        return rest + sum(m.nbytes() for d in self.lin for m in d.values())
+
+    def dequantized(self) -> ModelWeights:
+        """The bf16 weights the quantized projections stand for, in the engine's layout
+        (gate/up interleaved again): what a reference model on these weights multiplies."""
+        if self.lin is None:
+            return self.w
+        layers = []
+        for lw, d in zip(self.w.layers, self.lin, strict=True):
+            gu = d["gate_up"].dequantize()
+            layers.append(LayerWeights(
+                attn_norm=lw.attn_norm, w_qkv=d["qkv"].dequantize(), w_o=d["o"].dequantize(),
+                mlp_norm=lw.mlp_norm,
+                w_gate_up=sk.interleave_gate_up(gu[:, :INTERMEDIATE], gu[:, INTERMEDIATE:]),
+                w_down=d["down"].dequantize()))
+        return ModelWeights(embed=self.w.embed, layers=layers, final_norm=self.w.final_norm,
+                            lm_head=self.w.lm_head)
+
+    def _attention(self, qkv, x, b: Batch, kc, vc, decode: bool):
+        q = sk.rope_append_paged_(qkv, self.rope.cos, self.rope.sin, b.positions, b.slots,
+                                  kc, vc, N_HEADS, N_KV_HEADS)
+        if decode:
+            o = sk.paged_decode(q, kc, vc, b.block_table, b.seq_lens)
+        elif b.n_dec:
+            o = self._mixed_attention(q, kc, vc, b)
+        else:
+            o = sk.attention_varlen(q, kc, vc, b.cu_seqlens, b.seq_lens, b.block_table)
+        return o.view(x.shape[0], Q_WIDTH)
 
     def _layers(self, x: torch.Tensor, b: Batch, cache: PagedKVCache, decode: bool):
-        T = x.shape[0]
+        if self.lin is not None:
+            return self._layers_quant(x, b, cache, decode)
         for layer, w in enumerate(self.w.layers):
             kc, vc = cache.k[layer], cache.v[layer]
             h = sk.rmsnorm(x, w.attn_norm, EPS)
             qkv = sk.hgemm(h, w.w_qkv)
-            q = sk.rope_append_paged_(qkv, self.rope.cos, self.rope.sin, b.positions, b.slots,
-                                      kc, vc, N_HEADS, N_KV_HEADS)
-            if decode:
-                o = sk.paged_decode(q, kc, vc, b.block_table, b.seq_lens)
-            elif b.n_dec:
-                o = self._mixed_attention(q, kc, vc, b)
-            else:
-                o = sk.attention_varlen(q, kc, vc, b.cu_seqlens, b.seq_lens, b.block_table)
-            sk.hgemm(o.view(T, Q_WIDTH), w.w_o, residual=x, out=x)
+            o = self._attention(qkv, x, b, kc, vc, decode)
+            sk.hgemm(o, w.w_o, residual=x, out=x)
             h2 = sk.rmsnorm(x, w.mlp_norm, EPS)
             a = sk.hgemm_swiglu(h2, w.w_gate_up)
             sk.hgemm(a, w.w_down, residual=x, out=x)
@@ -211,6 +270,24 @@ class SparkModel:
                                      b.block_table[:nb])
         o[tp:] = sk.paged_decode(q[tp:], kc, vc, b.block_table[nb:], b.seq_lens[nb:])
         return o
+
+    def _layers_quant(self, x: torch.Tensor, b: Batch, cache: PagedKVCache, decode: bool):
+        delta = None  # the previous layer's down output, not yet added to x
+        for layer, (w, lin) in enumerate(zip(self.w.layers, self.lin, strict=True)):
+            kc, vc = cache.k[layer], cache.v[layer]
+            if delta is None:
+                h = sk.rmsnorm(x, w.attn_norm, EPS)
+            else:
+                h = sk.add_rmsnorm_(delta, x, w.attn_norm, EPS)  # x += delta, then the norm
+            o = self._attention(lin["qkv"](h), x, b, kc, vc, decode)
+            h2 = sk.add_rmsnorm_(lin["o"](o), x, w.mlp_norm, EPS)
+            gu = lin["gate_up"](h2)
+            delta = lin["down"](sk.swiglu(gu[:, :INTERMEDIATE], gu[:, INTERMEDIATE:]))
+            if self.trace is not None:
+                self.trace.append(x + delta)
+        if delta is not None:
+            x.add_(delta)
+        return x
 
     def _logits(self, x: torch.Tensor) -> torch.Tensor:
         return sk.hgemm(sk.rmsnorm(x, self.w.final_norm, EPS), self.w.lm_head)

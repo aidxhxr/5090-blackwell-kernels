@@ -1,14 +1,37 @@
-"""The quantized projections of spark_kernels.quant: each format's projection against the GEMM
-on its own dequantized weight (and, for the formats that quantize activations, on the
-activation quantized by the reference quantizer)."""
+"""The quantized projections of spark_kernels.quant and the engine's quantized SparkModel on a
+two-layer model with a small vocabulary.
+
+Each format's projection is checked against the GEMM on its own dequantized weight (and, for
+the formats that quantize activations, on the activation quantized by the reference
+quantizer); the whole model against TorchModel on the dequantized weights, at prefill and at
+decode, which leaves only the activation quantization (W8A8, W4A4) between the two; and the
+CUDA-graph decode of a quantized model against its eager decode, token for token."""
 
 import pytest
 import torch
 
+E = pytest.importorskip("spark_kernels.engine")
+L = pytest.importorskip("spark_kernels.layer")
 Q = pytest.importorskip("spark_kernels.quant")
 from spark_kernels import reference as ref  # noqa: E402
 
+N_LAYERS, VOCAB = 2, 1024
 QUANT = [f for f in Q.FORMATS if f != "bf16"]
+# relative error of the model's logits against TorchModel on the dequantized weights: int4 is
+# weight only, so the gap is rounding; the others also quantize every activation
+MODEL_TOL = {"int4": 2e-2, "int4-asym": 2e-2, "fp8": 0.08, "fp8-tok": 0.08, "mxfp8": 0.08,
+             "nvfp4": 0.25, "mxfp4": 0.3}
+
+
+def _rel(a, b):
+    return ((a.float() - b.float()).norm() / b.float().norm()).item()
+
+
+@pytest.fixture(scope="module")
+def weights():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA GPU required")
+    return E.ModelWeights.random(N_LAYERS, VOCAB, seed=1)
 
 
 def _act_ref(a, fmt):
@@ -55,3 +78,70 @@ def test_mx_bf16_quantizer_matches_reference(sk):
     q_ref, sf_ref = ref.quantize_mx(a)
     assert torch.equal(sf, sf_ref)
     assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+
+
+def _prefill_and_decode(model, prompts, toks):
+    """Packed prefill logits, then three teacher-forced decode steps' logits."""
+    eng = E.Engine(model, N_LAYERS, max_batch=4, max_seq=512, num_pages=128, graphs=False)
+    for p in prompts:
+        eng.submit(p, max_new=8)
+    seqs = eng._admit()
+    outs = [model.prefill(eng._prefill_batch(seqs), eng.cache)]
+    for s in seqs:
+        s.length = s.prompt.numel()
+    for t in toks:
+        pos = [s.length for s in seqs]
+        eng.ids[:4] = t
+        eng.positions[:4] = torch.tensor(pos, dtype=torch.int32)
+        slots = [s.pages[p // eng.page] * eng.page + p % eng.page
+                 for s, p in zip(seqs, pos, strict=True)]
+        eng.slots[:4] = torch.tensor(slots, dtype=torch.int32)
+        eng.seq_lens[:4] = torch.tensor([p + 1 for p in pos], dtype=torch.int32)
+        outs.append(model.decode(eng._decode_batch(4, max(pos) + 1), eng.cache))
+        for s in seqs:
+            s.length += 1
+    return outs
+
+
+@pytest.mark.parametrize("fmt", QUANT)
+def test_quant_model_matches_torch_on_dequantized(sk, weights, fmt):
+    rope = L.RoPE(1024)
+    g = torch.Generator().manual_seed(0)
+    prompts = [torch.randint(0, VOCAB, (n,), generator=g) for n in (37, 200, 1, 64)]
+    toks = [torch.randint(0, VOCAB, (4,), generator=g).cuda() for _ in range(3)]
+    spark = E.SparkModel(weights, rope, weights_format=fmt, keep_bf16=True)
+    torch_ = E.TorchModel(spark.dequantized(), rope)
+    a = _prefill_and_decode(spark, prompts, toks)
+    b = _prefill_and_decode(torch_, prompts, toks)
+    for i, (x, y) in enumerate(zip(a, b, strict=True)):
+        assert _rel(x, y) < MODEL_TOL[fmt], f"{fmt} step {i}: {_rel(x, y)}"
+
+
+def test_quant_model_frees_bf16(sk):
+    w = E.ModelWeights.random(1, VOCAB, seed=2)
+    bf16 = E.SparkModel(w, L.RoPE(64)).weight_bytes()
+    m = E.SparkModel(w, L.RoPE(64), weights_format="int4")
+    lw = w.layers[0]
+    assert lw.w_qkv is None and lw.w_o is None and lw.w_gate_up is None and lw.w_down is None
+    # 4.25 bits per projection weight (int4 plus a bf16 scale per 128) against 16
+    proj = bf16 - m.weight_bytes()
+    assert proj > 0.7 * (bf16 - (w.embed.numel() + w.lm_head.numel()) * 2)
+
+
+@pytest.mark.parametrize("fmt", ["int4", "fp8", "fp8-tok", "mxfp8", "nvfp4"])
+def test_quant_graph_decode_matches_eager(sk, weights, fmt):
+    rope = L.RoPE(1024)
+    g = torch.Generator().manual_seed(3)
+    lens = [5, 90, 17, 300, 1, 44]
+    news = [6, 3, 9, 4, 12, 5]
+    outs = []
+    for graphs in (False, True):
+        model = E.SparkModel(weights, rope, weights_format=fmt, keep_bf16=True)
+        eng = E.Engine(model, N_LAYERS, max_batch=4, max_seq=512, num_pages=160,
+                       graphs=graphs, log_tokens=True, prefill_tokens=256)
+        g.manual_seed(3)
+        for n, m in zip(lens, news, strict=True):
+            eng.submit(torch.randint(0, VOCAB, (n,), generator=g), m)
+        eng.run()
+        outs.append(eng.outputs())
+    assert outs[0] == outs[1]
