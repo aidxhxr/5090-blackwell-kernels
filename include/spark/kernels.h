@@ -254,6 +254,20 @@ size_t fp4_scale_bytes(int rows, int K, int format);
 void fp4_quantize(const __nv_bfloat16* x, unsigned char* q, unsigned char* sf, int rows, int K,
                   const float* scale, int format, cudaStream_t stream);
 
+// ---- fp8 activation quantizer (src/kernels/fp8quant.cu) -----------------------------------
+// x [rows][K] bf16 -> q [rows][K] e4m3 bytes plus scales, x ~ scale * q:
+//   FP8Q_TENSOR: one scale, `scale` a device float; `work` one device unsigned that is zero on
+//                entry (the amax cell; left holding max|x|'s bits). Two launches.
+//   FP8Q_ROW:    one scale per row, `scale` rows device floats. One launch.
+//   FP8Q_MX:     the OCP MX recipe, one e8m0 byte per 32 values of a row, `scale` rows * K/32
+//                bytes (row-major, the layout fp8gemm's sfa takes). One launch.
+// The tensor and row scales are the smallest power of two 2^e (e in [-126, 127]) with
+// max|x| / 2^e <= 448; elements are e4m3(x / scale), round to nearest even, saturating.
+// K % 8 == 0 (K % 32 == 0 for MX), x 16-byte and q 8-byte aligned.
+enum Fp8QuantMode { FP8Q_TENSOR = 0, FP8Q_ROW = 1, FP8Q_MX = 2 };
+void fp8_quantize(const __nv_bfloat16* x, unsigned char* q, void* scale, unsigned* work,
+                  int rows, int K, int mode, cudaStream_t stream);
+
 // ---- W4A16 GEMM (int4 weights, bf16 activations) ------------------------------------------
 // C[M,N] = A[M,K] * dequant(W)[K,N] for bf16 A and C, int4 weights with one bf16 scale (and,
 // optionally, one zero point) per group of 128 consecutive k of a column, fp32 accumulation.

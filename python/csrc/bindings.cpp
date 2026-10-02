@@ -432,6 +432,45 @@ std::tuple<Tensor, Tensor, std::optional<Tensor>> fp4_quantize(const Tensor& x,
     return {q, sf, s};
 }
 
+// bf16 [rows, K] -> (e4m3 [rows, K], scales): one fp32 scale ("tensor", shape [1]), one per
+// row ("row", [rows, 1]) or one e8m0 byte per 32 values ("mx", [rows, K / 32] uint8).
+std::tuple<Tensor, Tensor> fp8_quantize(const Tensor& x, const std::string& mode) {
+    check_cuda_contig(x, "x");
+    TORCH_CHECK(x.scalar_type() == at::kBFloat16, "fp8_quantize expects bfloat16 x");
+    TORCH_CHECK(x.dim() == 2, "fp8_quantize expects a 2-D [rows, K] tensor");
+    TORCH_CHECK(aligned16(x), "fp8_quantize needs 16-byte aligned x storage");
+    TORCH_CHECK(x.size(0) <= INT32_MAX && x.size(1) <= INT32_MAX, "fp8_quantize dims too large");
+    const int rows = static_cast<int>(x.size(0)), K = static_cast<int>(x.size(1));
+    int m;
+    if (mode == "tensor") {
+        m = spark::FP8Q_TENSOR;
+    } else if (mode == "row") {
+        m = spark::FP8Q_ROW;
+    } else {
+        TORCH_CHECK(mode == "mx", "fp8_quantize mode must be 'tensor', 'row' or 'mx', got ", mode);
+        m = spark::FP8Q_MX;
+    }
+    TORCH_CHECK(K % (m == spark::FP8Q_MX ? 32 : 8) == 0,
+                "fp8_quantize needs K a multiple of 8 (32 for mx), got ", K);
+    TORCH_CHECK(rows > 0 && K > 0, "fp8_quantize needs a non-empty x");
+    const c10::cuda::CUDAGuard guard(x.device());
+    Tensor q = at::empty({rows, K}, x.options().dtype(at::kFloat8_e4m3fn));
+    Tensor scale;
+    Tensor work;
+    if (m == spark::FP8Q_TENSOR) {
+        work = at::zeros({2}, x.options().dtype(at::kFloat));  // [amax bits, scale]
+        scale = work.narrow(0, 1, 1);
+    } else if (m == spark::FP8Q_ROW) {
+        scale = at::empty({rows, 1}, x.options().dtype(at::kFloat));
+    } else {
+        scale = at::empty({rows, K / 32}, x.options().dtype(at::kByte));
+    }
+    spark::fp8_quantize(bf16_ptr(x), static_cast<unsigned char*>(q.data_ptr()), scale.data_ptr(),
+                        work.defined() ? static_cast<unsigned*>(work.data_ptr()) : nullptr, rows,
+                        K, m, current_stream(x));
+    return {q, scale};
+}
+
 // C = scale_a * scale_b * sum_k (sfa a)(sfb b_t) with a [M, K/2] and b_t [N, K/2] packed
 // e2m1, block scales in the blocked layout, per-tensor fp32 scales optional (1.0), bf16 out.
 Tensor fp4gemm(const Tensor& a, const Tensor& b_t, const Tensor& sfa, const Tensor& sfb,
@@ -930,6 +969,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fp4_quantize", &fp4_quantize,
           "bf16 [rows, K] -> (packed e2m1 [rows, K/2], blocked block scales, per-tensor scale)",
           py::arg("x"), py::arg("fmt") = "nvfp4", py::arg("scale") = py::none());
+    m.def("fp8_quantize", &fp8_quantize,
+          "bf16 [rows, K] -> (e4m3 [rows, K], power-of-two scales per tensor or row, or MX "
+          "e8m0 scales per 32)",
+          py::arg("x"), py::arg("mode") = "tensor");
     m.def("w4_quantize", &w4_quantize,
           "round-to-nearest int4 quantization of a [K, N] bf16 weight, one scale per 128 k: "
           "(qweight [K/8, N] int32, scales [K/128, N] bf16, zeros [K/128, N] uint8 or None)",

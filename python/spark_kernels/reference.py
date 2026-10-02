@@ -93,6 +93,19 @@ def quantize_per_tensor(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return q, scale
 
 
+def quantize_fp8_pow2(x: torch.Tensor, per_row: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+    """`spark_kernels.fp8_quantize` in modes "tensor" and "row": e4m3 elements and the
+    smallest power-of-two scale 2^e, e in [-126, 127], with max|x| / 2^e <= 448, per tensor
+    ([1]) or per row ([rows, 1]), float32."""
+    xf = x.float()
+    amax = xf.abs().amax(dim=1, keepdim=True) if per_row else xf.abs().amax().reshape(1)
+    m, p = torch.frexp(amax.clamp(min=torch.finfo(torch.float32).tiny) / E4M3_MAX)
+    e = torch.where(m == 0.5, p - 1, p).clamp(-126, 127)
+    s = torch.exp2(e.float())
+    q = (xf / s).clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn)
+    return q, s
+
+
 def fp8gemm_mx(
     a: torch.Tensor, sfa: torch.Tensor, b_t: torch.Tensor, sfb: torch.Tensor
 ) -> torch.Tensor:

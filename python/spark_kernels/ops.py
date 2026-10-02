@@ -180,6 +180,21 @@ def fp8gemm(
     return _C.fp8gemm(a, b_t, scale_a, scale_b, variant, sfa, sfb)
 
 
+def fp8_quantize(x: torch.Tensor, mode: str = "tensor") -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a bfloat16 activation x [rows, K] to e4m3 for `fp8gemm`: (q, scale).
+
+    mode="tensor": one float32 scale, shape [1], the smallest power of two 2^e with
+    max|x| / 2^e <= 448 (e clamped to [-126, 127]); two launches (an amax pass, then the
+    conversion). mode="row": the same per row, shape [rows, 1]; one launch. mode="mx": the
+    OCP MX recipe of `reference.quantize_mx`, a uint8 e8m0 scale per 32 values of a row,
+    shape [rows, K // 32], what fp8gemm takes as sfa; one launch. Elements are x / scale
+    rounded to nearest even, saturating at 448. A power-of-two scale makes the division
+    exact, so the e4m3 rounding is the only one; `reference.quantize_fp8_pow2` is the same
+    arithmetic. Needs K a multiple of 8 (32 for "mx").
+    """
+    return _C.fp8_quantize(x, mode)
+
+
 def fp4_quantize(
     x: torch.Tensor, fmt: str = "nvfp4", scale: torch.Tensor | None = None
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:

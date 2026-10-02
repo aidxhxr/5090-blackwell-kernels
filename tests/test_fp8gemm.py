@@ -360,3 +360,45 @@ def test_mx_against_per_tensor_on_outliers():
         err_pt, err_floor, err_ceil = errors(a)
         assert err_ceil <= err_pt * 1.03, (outlier, err_pt, err_floor, err_ceil)
         assert err_pt < err_floor <= err_pt * 1.6, (outlier, err_pt, err_floor, err_ceil)
+
+
+@pytest.mark.parametrize("shape", [(1, 4096), (3, 72), (64, 14336), (300, 1024), (2048, 4096)],
+                         ids=lambda s: f"{s[0]}x{s[1]}")
+@pytest.mark.parametrize("mode", ["tensor", "row", "mx"])
+def test_fp8_quantize_matches_reference(sk, shape, mode):
+    """The activation quantizer against reference.quantize_fp8_pow2 / quantize_mx, byte for
+    byte: an outlier, an all-zero row, tiny and large values."""
+    rows, K = shape
+    if mode == "mx" and K % 32:
+        pytest.skip("mx needs K % 32 == 0")
+    g = torch.Generator(device="cpu").manual_seed(rows * K)
+    x = (torch.randn(rows, K, generator=g) * 3).to("cuda", torch.bfloat16)
+    x[0, K // 2] = 900.0
+    if rows > 2:
+        x[1] = 0
+        x[2] *= 1e-30
+    q, s = sk.fp8_quantize(x, mode)
+    assert q.dtype == torch.float8_e4m3fn and q.shape == x.shape
+    if mode == "mx":
+        q_ref, s_ref = sk.reference.quantize_mx(x)
+        assert torch.equal(s, s_ref)
+    else:
+        q_ref, s_ref = sk.reference.quantize_fp8_pow2(x, per_row=mode == "row")
+        assert s.shape == s_ref.shape and torch.equal(s, s_ref)
+    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+
+
+def test_fp8_quantize_feeds_fp8gemm(sk):
+    """Per-tensor and MX quantized activations through fp8gemm against the dequantized GEMM."""
+    a = torch.randn(48, 512, device="cuda").to(torch.bfloat16)
+    w = torch.randn(256, 512, device="cuda").to(torch.bfloat16)
+    wq, ws = sk.reference.quantize_per_tensor(w)
+    q, s = sk.fp8_quantize(a, "tensor")
+    out = sk.fp8gemm(q, wq, s, ws.reshape(1))
+    want = (q.float() * s) @ (wq.float() * ws).t()
+    torch.testing.assert_close(out.float(), want, atol=2e-2, rtol=2e-2)
+    qm, sfa = sk.fp8_quantize(a, "mx")
+    wm, sfb = sk.reference.quantize_mx(w)
+    out = sk.fp8gemm(qm, wm, sfa=sfa, sfb=sfb)
+    want = sk.reference.dequantize_mx(qm, sfa) @ sk.reference.dequantize_mx(wm, sfb).t()
+    torch.testing.assert_close(out.float(), want, atol=2e-2, rtol=2e-2)
