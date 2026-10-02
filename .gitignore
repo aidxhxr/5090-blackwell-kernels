@@ -28,6 +28,8 @@ results/headline.md
 # env.txt (the GPU state it was measured in) goes with it
 !results/roofline.png
 !results/env.txt
+# scripts/llm_parity.py's dumps of logits and hidden states (gigabytes)
+parity_work/
 
 # editors / OS
 .vscode/
