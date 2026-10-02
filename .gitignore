@@ -35,6 +35,7 @@ parity_work/
 # the real-checkpoint serving comparison (docs/design/llm_serving.md) needs vLLM's venv and
 # a downloaded checkpoint to regenerate, so its rows are kept
 !results/llm_serve.json
+!results/llm_quant.json
 
 # editors / OS
 .vscode/
