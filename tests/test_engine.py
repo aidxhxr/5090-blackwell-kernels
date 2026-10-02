@@ -201,3 +201,33 @@ def test_mixed_step_same_tokens(sk, weights):
     assert stats[1].mixed_rows > 0 and stats[0].mixed_rows == 0
     assert (stats[1].decode_steps + stats[1].prefill_batches <
             stats[0].decode_steps + stats[0].prefill_batches)
+
+
+def test_stop_ids(sk, weights):
+    """With a stop id each sequence ends at its first occurrence of it: the outputs are the
+    unstopped run's outputs cut there, the sequences that stopped early are counted, and
+    every page comes back. The stop check reads the tokens behind the GPU, so this also
+    covers a sequence that ran a few tokens past its stop before it retired."""
+    rope = L.RoPE(1024)
+    g = torch.Generator().manual_seed(13)
+    lens = [int(x) for x in torch.randint(1, 200, (10,), generator=g)]
+    news = [int(x) for x in torch.randint(8, 40, (10,), generator=g)]
+    prompts = [torch.randint(0, VOCAB, (n,), generator=g) for n in lens]
+
+    def run(stop_ids):
+        eng = E.Engine(E.SparkModel(weights, rope), N_LAYERS, max_batch=4, max_seq=512,
+                       num_pages=160, graphs=True, log_tokens=True, stop_ids=stop_ids)
+        for p, m in zip(prompts, news, strict=True):
+            eng.submit(p, m)
+        st = eng.run()
+        assert len(eng.cache.free) == eng.cache.num_pages - 1
+        return eng.outputs(), st
+
+    full, _ = run(None)
+    counts = torch.bincount(torch.tensor([t for o in full.values() for t in o[1:]]))
+    stop = int(counts.argmax())
+    want = {sid: o[:o.index(stop) + 1] if stop in o else o for sid, o in full.items()}
+    got, st = run([stop])
+    assert got == want
+    early = sum(len(want[i]) < news[i] for i in range(len(news)))
+    assert early > 0 and st.stopped == early

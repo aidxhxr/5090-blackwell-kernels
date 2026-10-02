@@ -349,6 +349,7 @@ class Sequence:
     slot: int = -1
     length: int = 0  # tokens in the cache
     generated: int = 0
+    stopped: int = 0  # with stop ids: how many tokens it had when one of them came out
 
 
 @dataclass
@@ -360,6 +361,7 @@ class Stats:
     decode_rows: int = 0  # rows the decode steps computed, the bucket's padding included
     moved: int = 0  # sequences moved to a lower slot by _compact
     mixed_rows: int = 0  # decode tokens produced inside a prefill forward (Engine.mixed)
+    stopped: int = 0  # sequences finished by a stop token before max_new
     generated: int = 0  # every generated token, the prefill's first one included
     finished: int = 0
 
@@ -377,7 +379,8 @@ class Engine:
     def __init__(self, model, n_layers: int, max_batch: int = 64, max_seq: int = 4096,
                  num_pages: int | None = None, page: int = PAGE, cache_bytes: int | None = None,
                  prefill_tokens: int = 8192, graphs: bool = True, log_tokens: bool = False,
-                 compact: bool = True, mixed: bool | None = None, device="cuda"):
+                 compact: bool = True, mixed: bool | None = None,
+                 stop_ids: list[int] | None = None, device="cuda"):
         if max_batch > BUCKETS[-1]:
             raise ValueError(f"max_batch is at most {BUCKETS[-1]}")
         # a decode step runs a whole bucket, so the per-slot buffers are bucket sized
@@ -394,6 +397,12 @@ class Engine:
         self.max_pages = cdiv(max_seq, page)
         self.prefill_tokens = prefill_tokens
         self.compact = compact
+        # stop tokens: each forward's new tokens are copied to pinned host memory behind an
+        # event, and read once the event has passed, so the loop never waits for the GPU
+        self.stop_ids = set(stop_ids or ())
+        self.pending: deque[tuple[torch.cuda.Event, list[Sequence], list[int], list[int],
+                                  torch.Tensor]] = deque()
+        self.stop_counts: dict[int, int] = {}  # sid -> tokens up to and with its stop token
         # decode rows inside a prefill forward need the model's prefill to take a chunk after
         # a cached context (attention_varlen does; TorchModel's per-prompt SDPA does not)
         self.mixed = getattr(model, "context_prefill", False) if mixed is None else mixed
@@ -539,15 +548,45 @@ class Engine:
         for s in dec:
             s.length += 1
             s.generated += 1
+        self._watch(both, list(range(len(both))), new)
         self.stats.prefill_tokens += sum(q_lens)
         self.stats.prefill_batches += 1
         self.stats.decode_tokens += len(dec)
         self.stats.mixed_rows += len(dec)
         self.stats.generated += len(both)
 
+    def _watch(self, seqs: list[Sequence], rows: list[int], toks: torch.Tensor) -> None:
+        """Queues the copy of a forward's new tokens to the host for the stop check:
+        toks[rows[j]] is the token seqs[j] just generated (call after their counts moved)."""
+        if not self.stop_ids or not seqs:
+            return
+        host = torch.empty(toks.shape, dtype=toks.dtype, pin_memory=True)
+        host.copy_(toks, non_blocking=True)
+        ev = torch.cuda.Event()
+        ev.record()
+        self.pending.append((ev, seqs, rows, [s.generated for s in seqs], host))
+
+    def _check_stops(self, wait: bool = False) -> None:
+        """Marks the sequences whose new token was a stop id, for every forward the GPU has
+        finished (every queued one with `wait`). The check trails the GPU by the steps the
+        host runs ahead, so a stopped sequence may have generated a few more tokens; it
+        retires at the next step and outputs() cuts them off."""
+        while self.pending and (wait or self.pending[0][0].query()):
+            ev, seqs, rows, counts, host = self.pending.popleft()
+            ev.synchronize()
+            toks = host.tolist()
+            for s, r, n in zip(seqs, rows, counts, strict=True):
+                if not s.stopped and toks[r] in self.stop_ids:
+                    s.stopped = n
+                    self.stop_counts[s.sid] = n
+
     def _retire(self) -> None:
+        if self.stop_ids:
+            self._check_stops()
         for i, s in enumerate(self.running):
-            if s is not None and s.generated >= s.max_new:
+            if s is not None and (s.generated >= s.max_new or s.stopped):
+                if s.stopped and s.stopped < s.max_new:
+                    self.stats.stopped += 1
                 self.cache.release(s.pages)
                 self.running[i] = None
                 self.stats.finished += 1
@@ -614,6 +653,7 @@ class Engine:
             s = self.running[i]
             s.length += 1
             s.generated += 1
+        self._watch([self.running[i] for i in live], live, self.ids[:bp])
         self.stats.decode_steps += 1
         self.stats.decode_tokens += len(live)
         self.stats.decode_rows += bp
@@ -668,11 +708,16 @@ class Engine:
         return list(logits.split([p.numel() for p in prompts]))
 
     def outputs(self) -> dict[int, list[int]]:
-        """Generated tokens per sequence id, in order (needs log_tokens=True)."""
+        """Generated tokens per sequence id, in order (needs log_tokens=True); a sequence
+        that stopped ends with its stop token."""
+        self._check_stops(wait=True)
         out: dict[int, list[int]] = {}
         for sids, toks in self.log or []:
             for sid, t in zip(sids, toks.tolist(), strict=True):
                 out.setdefault(sid, []).append(t)
+        for sid, n in self.stop_counts.items():
+            if sid in out:
+                del out[sid][n:]
         return out
 
     def run(self) -> Stats:

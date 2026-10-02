@@ -6,8 +6,7 @@ printed with the decode rate.
     python scripts/generate.py ~/models/llama3-8b-instruct "why is the sky blue?" "hi"
     python scripts/generate.py MODEL --new 256 --torch     # the same on engine.TorchModel
 
-The engine has no stop tokens, so every request runs --new tokens; the printed reply is cut
-at the first end-of-turn token.
+A request stops at the tokenizer's end-of-text or end-of-turn token, or after --new tokens.
 """
 
 from __future__ import annotations
@@ -44,8 +43,10 @@ def main() -> None:
           f"{time.perf_counter() - t0:.1f} s")
     rope = cfg.rope(8192)
     model = E.TorchModel(w, rope) if args.torch else E.SparkModel(w, rope)
+    stop = {tok.eos_token_id, tok.convert_tokens_to_ids("<|eot_id|>")}
     eng = E.Engine(model, cfg.n_layers, max_batch=max(1, len(args.prompts)), max_seq=8192,
-                   cache_bytes=4 << 30, graphs=not args.torch, log_tokens=True)
+                   cache_bytes=4 << 30, graphs=not args.torch, log_tokens=True,
+                   stop_ids=sorted(stop))
     ids = []
     for p in args.prompts:
         if args.raw:
@@ -60,12 +61,12 @@ def main() -> None:
     t0 = time.perf_counter()
     stats = eng.run()
     dt = time.perf_counter() - t0
-    stop = {tok.eos_token_id, tok.convert_tokens_to_ids("<|eot_id|>")}
-    for sid, out in sorted(eng.outputs().items()):
-        cut = next((i for i, t in enumerate(out) if t in stop), len(out))
-        print(f"\n### {args.prompts[sid]}\n{tok.decode(out[:cut])}")
-    print(f"\n{stats.generated} tokens in {dt:.2f} s, {stats.generated / dt:.1f} tok/s "
-          f"({len(args.prompts)} requests)")
+    outs = eng.outputs()
+    for sid, out in sorted(outs.items()):
+        print(f"\n### {args.prompts[sid]}\n{tok.decode(out[:-1] if out[-1] in stop else out)}")
+    n = sum(map(len, outs.values()))
+    print(f"\n{n} tokens in {dt:.2f} s, {n / dt:.1f} tok/s ({len(args.prompts)} requests, "
+          f"{stats.stopped} stopped before --new)")
 
 
 if __name__ == "__main__":
