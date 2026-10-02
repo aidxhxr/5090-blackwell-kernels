@@ -139,3 +139,33 @@ def test_w4gemm_rejects_bad_input(sk):
     with pytest.raises(RuntimeError):
         sk.w4gemm(a, ww, variant=sk.num_variants("w4gemm"))
     assert ww.shape == (256, 64)
+
+
+def test_w4gemm_graph_survives_workspace_growth(sk):
+    """A CUDA graph captured with the Stream-K workspace at a decode size still replays
+    correctly after a prefill-sized call has grown the workspace and the memory has been
+    handed out again (the old buffer has to stay alive: the graph launches with its
+    pointer; when it was freed this replay hit an illegal address). The fp32 partial sums
+    land in any order, so the comparison has a tolerance."""
+    K, N, M = 4096, 4096, 64
+    ww = sk.W4Weight.quantize(_weight(K, N))
+    a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    want = sk.w4gemm(a, ww)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        sk.w4gemm(a, ww)
+    torch.cuda.current_stream().wait_stream(side)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        out = sk.w4gemm(a, ww)
+    big = sk.W4Weight.quantize(_weight(K, 8192, seed=1))
+    sk.w4gemm(torch.randn(2048, K, device="cuda", dtype=torch.bfloat16), big)  # grows it
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    junk = [torch.full((1 << 20,), 7.0, device="cuda") for _ in range(64)]
+    for _ in range(3):
+        g.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, want, **W4_TOL)
+    del junk

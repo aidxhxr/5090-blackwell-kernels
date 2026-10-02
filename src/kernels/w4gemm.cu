@@ -652,19 +652,22 @@ struct Args {
 };
 
 // The workspace and counters of the Fixup: M x N fp32 and one counter per tile, zeroed when
-// allocated and left zero by every launch. One per process, grown on demand.
+// allocated and left zero by every launch. One per process, grown on demand. A buffer that
+// is outgrown is not freed: a CUDA graph captured before the growth (the engine's decode
+// steps, captured before the first prefill grows this to M x N of a long prompt) still
+// launches with the old pointer, and every launch leaves it zeroed, so it stays valid for
+// the shapes it was captured with. Growth doubles, so what is kept is at most the size of
+// the live buffer again.
 Fixup workspace(size_t floats, size_t count) {
     static float* ws = nullptr;
     static int* counters = nullptr;
     static size_t have_floats = 0, have_count = 0;
     if (have_floats < floats) {
-        if (ws) SPARK_CUDA_CHECK(cudaFree(ws));
         have_floats = std::max(floats, have_floats * 2);
         SPARK_CUDA_CHECK(cudaMalloc(&ws, have_floats * sizeof(float)));
         SPARK_CUDA_CHECK(cudaMemset(ws, 0, have_floats * sizeof(float)));
     }
     if (have_count < count) {
-        if (counters) SPARK_CUDA_CHECK(cudaFree(counters));
         have_count = std::max(count, have_count * 2);
         SPARK_CUDA_CHECK(cudaMalloc(&counters, have_count * sizeof(int)));
         SPARK_CUDA_CHECK(cudaMemset(counters, 0, have_count * sizeof(int)));
