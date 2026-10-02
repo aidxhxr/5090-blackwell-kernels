@@ -70,7 +70,8 @@ def engine_scorer(args):
     if args.backend == "torch":
         model = E.TorchModel(w, rope)
     else:
-        model = E.SparkModel(w, rope, weights_format=args.format)
+        model = E.SparkModel(w, rope, weights_format=args.format,
+                             head_format=args.head_format)
         del w
         print(f"weights: {model.weight_bytes() / 2**30:.2f} GiB ({args.format})", file=sys.stderr)
     eng = E.Engine(model, cfg.n_layers, max_batch=args.batch, max_seq=args.ctx + 1,
@@ -118,6 +119,7 @@ def main() -> None:
     ap.add_argument("--windows", type=int, default=None, help="score only the first N")
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--format", default="bf16", help="weights format of the spark backend")
+    ap.add_argument("--head-format", default="bf16", help="lm_head format (spark backend)")
     ap.add_argument("--awq", default=None, help="fold these scales in first (awq_search.py)")
     ap.add_argument("--save-ref", default=None, help="store the first windows' logits here")
     ap.add_argument("--ref", default=None, help="KL and top-1 agreement against these logits")
@@ -150,10 +152,12 @@ def main() -> None:
                     kl, agree, kl_count = kl + k, agree + a, kl_count + lg.shape[0]
     dt = time.perf_counter() - t0
     ppl = math.exp(total / count)
-    label = args.label or (args.format + ("-awq" if args.awq else "")
+    label = args.label or (args.format + ("-awq" if args.awq else "") +
+                           ("" if args.head_format == "bf16" else f"-head-{args.head_format}")
                            if args.backend == "spark" else args.backend)
     row = dict(model=Path(args.model).name, backend=args.backend, format=args.format,
-               awq=bool(args.awq), label=label, ctx=args.ctx, windows=len(wins), tokens=count,
+               awq=bool(args.awq), head_format=args.head_format, label=label, ctx=args.ctx,
+               windows=len(wins), tokens=count,
                nll=total / count, ppl=ppl, seconds=dt)
     if refs is not None:
         row.update(kl=kl / kl_count, top1=agree / kl_count, kl_tokens=kl_count)

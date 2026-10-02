@@ -20,8 +20,8 @@ prompt under torch.profiler and prints the GPU time per kernel family, which say
 format's step spends on GEMMs, on quantizing activations and on the rest.
 
 Each run updates the format's entry of --out (results/llm_quant.json), a dict keyed by
-format, and fills in that entry's perplexity row from --ppl (results/llm_ppl.jsonl) if one
-is there.
+format (plus "+head-<format>" with --head-format), and copies that format's perplexity rows
+from --ppl (results/llm_ppl.jsonl) into it.
 """
 
 from __future__ import annotations
@@ -80,6 +80,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("model")
     ap.add_argument("--format", default="bf16")
+    ap.add_argument("--head-format", default="bf16", help="lm_head format")
     ap.add_argument("--batches", default="1,8,32")
     ap.add_argument("--context", type=int, default=512, help="prompt tokens of a decode row")
     ap.add_argument("--new", type=int, default=129, help="tokens per request (decode steps + 1)")
@@ -101,12 +102,14 @@ def main() -> int:
     rope = cfg.rope(max_seq)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
-    model = E.SparkModel(w, rope, weights_format=args.format)
+    model = E.SparkModel(w, rope, weights_format=args.format, head_format=args.head_format)
     torch.cuda.synchronize()
     quant_s = time.perf_counter() - t0
     del w
     torch.cuda.empty_cache()
-    row = {"format": args.format, "weight_bytes": model.weight_bytes(),
+    key = args.format + ("" if args.head_format == "bf16" else f"+head-{args.head_format}")
+    row = {"format": args.format, "head_format": args.head_format,
+           "weight_bytes": model.weight_bytes(),
            "allocated_bytes": torch.cuda.memory_allocated(), "quantize_s": quant_s}
     print(f"{args.format}: weights {row['weight_bytes'] / 2**30:.2f} GiB, allocated "
           f"{row['allocated_bytes'] / 2**30:.2f} GiB, quantized in {quant_s:.1f} s",
@@ -170,15 +173,17 @@ def main() -> int:
                 print(f"  {fam:32s} {us / 1e3:8.3f} ms {100 * us / tot:5.1f}%", file=sys.stderr)
 
     ppl_path = Path(args.ppl)
-    if ppl_path.exists():
+    if ppl_path.exists():  # every perplexity row of this format and head (with --awq or not)
+        row["ppl"] = []
         for line in ppl_path.read_text().splitlines():
             r = json.loads(line)
-            if r.get("format", "bf16") == args.format and r.get("backend") == "spark":
-                row["ppl"] = {k: r[k] for k in ("ppl", "windows", "ctx", "kl", "top1")
-                              if k in r}
+            if (r.get("backend") == "spark" and r.get("format", "bf16") == args.format
+                    and r.get("head_format", "bf16") == args.head_format):
+                row["ppl"].append({k: r[k] for k in ("label", "ppl", "windows", "ctx", "kl",
+                                                     "top1", "awq") if k in r})
     out = Path(args.out)
     data = json.loads(out.read_text()) if out.exists() else {}
-    data[args.format] = row
+    data[key] = row
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(data, indent=1) + "\n")
     print(f"wrote {out}", file=sys.stderr)
