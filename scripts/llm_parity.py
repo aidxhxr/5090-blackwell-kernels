@@ -19,6 +19,7 @@ them back on the CPU (no GPU) and writes the tables and results/llm_parity.json.
     python scripts/llm_parity.py MODEL torch    # logits + hidden only
     python scripts/llm_parity.py MODEL ref      # logits + hidden + margins, fp32
     python scripts/llm_parity.py MODEL report
+    python scripts/llm_parity.py MODEL ppl      # wikitext-2 perplexity of the fp32 reference
 
 hf runs first: the logit set is the first --chats chat prompts followed by hf's greedy reply
 (so the scored positions are a model predicting its own reply), plus two wikitext-2 windows of
@@ -394,6 +395,39 @@ def stage_ref(args, work: Path) -> None:
                                         for (i, _, h, s), x in zip(pre, lg, strict=True)])
 
 
+def stage_ppl(args, work: Path) -> None:
+    """Wikitext-2 perplexity of the fp32 reference, in eval_ppl.py's windows and row format,
+    --group windows per streamed pass over the layers."""
+    from spark_kernels import hf
+
+    tok = tokenizer(args.model)
+    ids = tok(TEXT.read_text(), return_tensors="pt").input_ids[0]
+    wins = [ids[i:i + args.ctx] for i in range(0, ids.numel() - args.ctx + 1, args.ctx)]
+    head = hf._Tensors(Path(args.model), "cuda")["lm_head.weight"].float()
+    total, count = 0.0, 0
+    t0 = time.perf_counter()
+    for g in range(0, len(wins), args.group):
+        group = wins[g:g + args.group]
+        with torch.no_grad():
+            xn = ref_forward(args.model, group)
+            r = 0
+            for w in group:
+                for s in range(0, w.numel() - 1, 1024):
+                    e = min(s + 1024, w.numel() - 1)
+                    lg = F.linear(xn[r + s:r + e], head)
+                    total += F.cross_entropy(lg, w[s + 1:e + 1].cuda(), reduction="sum").item()
+                count += w.numel() - 1
+                r += w.numel()
+        del xn
+        print(f"{g + len(group)}/{len(wins)} windows, ppl so far {math.exp(total / count):.4f}")
+    row = dict(model=Path(args.model).name, backend="ref", label="ref fp32", ctx=args.ctx,
+               windows=len(wins), tokens=count, nll=total / count, ppl=math.exp(total / count),
+               seconds=time.perf_counter() - t0)
+    print(json.dumps(row))
+    with open(args.ppl_out, "a") as f:
+        f.write(json.dumps(row) + "\n")
+
+
 # ---- report ------------------------------------------------------------------------------------
 
 def q(x: torch.Tensor, p: float) -> float:
@@ -568,16 +602,19 @@ def stage_report(args, work: Path) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("model")
-    ap.add_argument("stage", choices=("hf", "spark", "torch", "ref", "report"))
+    ap.add_argument("stage", choices=("hf", "spark", "torch", "ref", "ppl", "report"))
     ap.add_argument("--work", default=str(ROOT / "parity_work"))
     ap.add_argument("--chats", type=int, default=6, help="chat replies in the logit set")
     ap.add_argument("--new", type=int, default=256, help="greedy tokens per prompt")
     ap.add_argument("--out", default=str(ROOT / "results" / "llm_parity.json"))
+    ap.add_argument("--ctx", type=int, default=2048, help="ppl: window length")
+    ap.add_argument("--group", type=int, default=16, help="ppl: windows per pass")
+    ap.add_argument("--ppl-out", default=str(ROOT / "results" / "llm_ppl.jsonl"))
     args = ap.parse_args()
     work = Path(args.work)
     work.mkdir(parents=True, exist_ok=True)
     {"hf": stage_hf, "spark": stage_engine, "torch": stage_engine, "ref": stage_ref,
-     "report": stage_report}[args.stage](args, work)
+     "ppl": stage_ppl, "report": stage_report}[args.stage](args, work)
 
 
 if __name__ == "__main__":
