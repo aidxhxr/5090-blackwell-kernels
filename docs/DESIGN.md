@@ -103,3 +103,4 @@ docs:
 - [serving: the paged K/V cache, paged decode, varlen prefill and the engine](design/serving.md)
 - [parity on real weights: the engine against transformers and an fp32 reference](design/llm_parity.md)
 - [low-precision weights on a real Llama-3-8B: int4, fp8 and fp4 quality and speed](design/llm_quant.md)
+- [more models and long context: Llama 3.1 rope scaling, Mistral, chunked prefill, 100K tokens](design/llm_models.md)
