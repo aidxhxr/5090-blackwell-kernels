@@ -175,6 +175,66 @@ def test_attention_varlen_matches_sdpa(sk, case, causal, variant):
         t0 += n
 
 
+@pytest.mark.parametrize("variant", _variants("paged_decode"))
+def test_paged_decode_long_context(sk, variant):
+    # 128K keys (Llama 3.1's context) next to shorter ones: the 64-bit offsets and the split
+    lens = [131072, 70001, 17]
+    kc, vc, bt, sl, ks, vs = _paged_cache(lens, 2, 128, 16, seed=4)
+    torch.manual_seed(5)
+    q = torch.randn(len(lens), 8, 128, device="cuda", dtype=torch.bfloat16)
+    got = sk.paged_decode(q, kc, vc, bt, sl, variant=variant)
+    for b in range(len(lens)):
+        ref = _sdpa(q[b][:, None], ks[b], vs[b])[:, 0]
+        torch.testing.assert_close(got[b].float(), ref, **TOL)
+
+
+@pytest.mark.parametrize("variant", _variants("attention_varlen"))
+def test_attention_varlen_long_context(sk, variant):
+    # the last chunk of a 128K-token prompt (bottom-right causal over 130816 cached keys)
+    # packed with a chunk of a 5K one
+    q_lens, ctx = [256, 64], [130816, 5000]
+    lens = [a + b for a, b in zip(q_lens, ctx, strict=True)]
+    kc, vc, bt, sl, ks, vs = _paged_cache(lens, 2, 128, 16, seed=6)
+    torch.manual_seed(7)
+    q = torch.randn(sum(q_lens), 8, 128, device="cuda", dtype=torch.bfloat16)
+    cu = torch.tensor([0, q_lens[0], sum(q_lens)], dtype=torch.int32, device="cuda")
+    got = sk.attention_varlen(q, kc, vc, cu, sl, bt, causal=True, variant=variant)
+    t0 = 0
+    for b, (n, c) in enumerate(zip(q_lens, ctx, strict=True)):
+        i = torch.arange(n, device="cuda")[:, None]
+        mask = torch.arange(n + c, device="cuda")[None, :] <= c + i
+        ref = _sdpa(q[t0:t0 + n].transpose(0, 1), ks[b], vs[b], mask).transpose(0, 1)
+        torch.testing.assert_close(got[t0:t0 + n].float(), ref, **TOL)
+        t0 += n
+
+
+def test_rope_append_paged_long_positions(sk):
+    # positions past 64K on Llama 3.1's scaled tables
+    L = pytest.importorskip("spark_kernels.layer")
+    scaling = {"factor": 8.0, "high_freq_factor": 4.0, "low_freq_factor": 1.0,
+               "original_max_position_embeddings": 8192, "rope_type": "llama3"}
+    rope = L.RoPE(131072, scaling=scaling)
+    hq, hkv, d, page = 32, 8, 128, 16
+    positions = [65535, 65536, 100000, 131071]
+    slots = [0, 1, 2, 3]
+    T = len(positions)
+    torch.manual_seed(8)
+    qkv = torch.randn(T, (hq + 2 * hkv) * d, device="cuda", dtype=torch.bfloat16)
+    kc = torch.zeros(1, hkv, page, d, device="cuda", dtype=torch.bfloat16)
+    vc = torch.zeros_like(kc)
+    pos_t = torch.tensor(positions, dtype=torch.int32, device="cuda")
+    q = sk.rope_append_paged_(qkv, rope.cos, rope.sin, pos_t,
+                              torch.tensor(slots, dtype=torch.int32, device="cuda"), kc, vc,
+                              hq, hkv)
+    cos, sin = rope.cos[pos_t.long()], rope.sin[pos_t.long()]
+    x = qkv.view(T, hq + 2 * hkv, d).float()
+    r = torch.cat([-x[..., d // 2:], x[..., :d // 2]], dim=-1)
+    ref = x * cos[:, None] + r * sin[:, None]
+    tol = dict(atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(q.float(), ref[:, :hq], **tol)
+    torch.testing.assert_close(kc[0, :, :T].transpose(0, 1).float(), ref[:, hq:hq + hkv], **tol)
+
+
 @pytest.mark.parametrize("page", [16, 32])
 def test_rope_append_paged_matches_torch(sk, page):
     L = pytest.importorskip("spark_kernels.layer")
