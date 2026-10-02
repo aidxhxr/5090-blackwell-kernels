@@ -175,12 +175,13 @@ class SparkModel:
     so those layers run the residual adds inside the norms instead (`add_rmsnorm_`: the o
     output is added by the MLP norm, the down output by the next layer's attention norm) and
     the SwiGLU as its own launch on the [gate | up] halves (the gate/up weight is
-    de-interleaved before it is quantized): nine launches plus the activation quantizers."""
+    de-interleaved before it is quantized): nine launches plus the activation quantizers.
+    `head_format` does the same for lm_head (freeing its bf16 copy unless `keep_bf16`)."""
 
     context_prefill = True  # prefill rows may continue a cached context (attention_varlen)
 
     def __init__(self, weights: ModelWeights, rope: RoPE, weights_format: str = "bf16",
-                 keep_bf16: bool = False):
+                 keep_bf16: bool = False, head_format: str = "bf16"):
         self.w = weights
         self.rope = rope
         # set to a list to collect the residual stream [T, 4096] after every layer (a parity
@@ -188,6 +189,13 @@ class SparkModel:
         self.trace: list[torch.Tensor] | None = None
         self.format = weights_format
         self.lin = None
+        self.head = None
+        if head_format != "bf16":
+            from .quant import make_linear
+
+            self.head = make_linear(weights.lm_head, head_format)
+            if not keep_bf16:
+                weights.lm_head = None
         if weights_format != "bf16":
             from .quant import make_linear
 
@@ -208,7 +216,8 @@ class SparkModel:
         """Bytes of every weight the model holds: the projections in their format, plus the
         bf16 embedding, norms and lm_head."""
         w = self.w
-        rest = (w.embed.numel() + w.lm_head.numel() + w.final_norm.numel()) * 2
+        rest = w.embed.numel() * 2 + w.final_norm.numel() * 2
+        rest += self.head.nbytes() if self.head is not None else w.lm_head.numel() * 2
         rest += sum((lw.attn_norm.numel() + lw.mlp_norm.numel()) * 2 for lw in w.layers)
         if self.lin is None:
             return rest + sum(getattr(lw, n).numel() * 2 for lw in w.layers
@@ -218,8 +227,10 @@ class SparkModel:
     def dequantized(self) -> ModelWeights:
         """The bf16 weights the quantized projections stand for, in the engine's layout
         (gate/up interleaved again): what a reference model on these weights multiplies."""
+        head = self.head.dequantize() if self.head is not None else self.w.lm_head
         if self.lin is None:
-            return self.w
+            return ModelWeights(embed=self.w.embed, layers=self.w.layers,
+                                final_norm=self.w.final_norm, lm_head=head)
         layers = []
         for lw, d in zip(self.w.layers, self.lin, strict=True):
             gu = d["gate_up"].dequantize()
@@ -229,7 +240,7 @@ class SparkModel:
                 w_gate_up=sk.interleave_gate_up(gu[:, :INTERMEDIATE], gu[:, INTERMEDIATE:]),
                 w_down=d["down"].dequantize()))
         return ModelWeights(embed=self.w.embed, layers=layers, final_norm=self.w.final_norm,
-                            lm_head=self.w.lm_head)
+                            lm_head=head)
 
     def _attention(self, qkv, x, b: Batch, kc, vc, decode: bool):
         q = sk.rope_append_paged_(qkv, self.rope.cos, self.rope.sin, b.positions, b.slots,
@@ -290,7 +301,8 @@ class SparkModel:
         return x
 
     def _logits(self, x: torch.Tensor) -> torch.Tensor:
-        return sk.hgemm(sk.rmsnorm(x, self.w.final_norm, EPS), self.w.lm_head)
+        h = sk.rmsnorm(x, self.w.final_norm, EPS)
+        return self.head(h) if self.head is not None else sk.hgemm(h, self.w.lm_head)
 
     def warm_workspaces(self, max_m: int = GRAPH_MAX) -> None:
         """Every GEMM shape of the model once at each M from max_m down to 1. hgemm's M <= 64

@@ -145,3 +145,20 @@ def test_quant_graph_decode_matches_eager(sk, weights, fmt):
                 break
             same += 1
     assert same >= 0.6 * sum(news), f"{same} of {sum(news)} tokens agree"
+
+
+@pytest.mark.parametrize("head", ["int4", "fp8"])
+def test_quant_head(sk, weights, head):
+    """lm_head in a low-precision format, against TorchModel on its dequantized weights."""
+    rope = L.RoPE(1024)
+    g = torch.Generator().manual_seed(4)
+    prompts = [torch.randint(0, VOCAB, (n,), generator=g) for n in (37, 200, 1, 64)]
+    toks = [torch.randint(0, VOCAB, (4,), generator=g).cuda() for _ in range(2)]
+    spark = E.SparkModel(weights, rope, weights_format="int4", head_format=head,
+                         keep_bf16=True)
+    assert spark.weight_bytes() < E.SparkModel(weights, rope, weights_format="int4",
+                                               keep_bf16=True).weight_bytes()
+    a = _prefill_and_decode(spark, prompts, toks)
+    b = _prefill_and_decode(E.TorchModel(spark.dequantized(), rope), prompts, toks)
+    for x, y in zip(a, b, strict=True):
+        assert _rel(x, y) < MODEL_TOL[head]
