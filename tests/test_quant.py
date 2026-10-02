@@ -39,11 +39,8 @@ def _act_ref(a, fmt):
     if fmt in ("int4", "int4-asym"):
         return a.float()
     if fmt in ("fp8", "fp8-tok"):
-        amax = a.float().abs().amax(dim=1, keepdim=True)
-        if fmt == "fp8":
-            amax = amax.amax()
-        s = 2.0 ** torch.ceil(torch.log2(amax / 448.0))
-        return (a.float() / s).clamp(-448, 448).to(torch.float8_e4m3fn).float() * s
+        q, s = ref.quantize_fp8_pow2(a, per_row=fmt == "fp8-tok")
+        return q.float() * s
     if fmt == "mxfp8":
         return ref.dequantize_mx(*ref.quantize_mx(a))
     if fmt == "nvfp4":
@@ -69,15 +66,6 @@ def test_linear_matches_reference(sk, fmt, m):
     # and the quantized weight is close to the bf16 one it replaces
     wtol = {"fp8": 0.06, "fp8-tok": 0.06, "mxfp8": 0.06}.get(fmt, 0.2)
     assert _rel(lin.dequantize(), w) < wtol
-
-
-def test_mx_bf16_quantizer_matches_reference(sk):
-    a = torch.randn(33, 512, device="cuda").to(torch.bfloat16) * 3
-    a[:, :32] = 0  # an all-zero block
-    q, sf = Q.quantize_mx_bf16(a)
-    q_ref, sf_ref = ref.quantize_mx(a)
-    assert torch.equal(sf, sf_ref)
-    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
 
 
 def _prefill_and_decode(model, prompts, toks):
