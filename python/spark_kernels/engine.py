@@ -339,6 +339,8 @@ class Stats:
     prefill_batches: int = 0
     decode_steps: int = 0
     decode_tokens: int = 0  # tokens produced by decode steps (padding slots excluded)
+    decode_rows: int = 0  # rows the decode steps computed, the bucket's padding included
+    moved: int = 0  # sequences moved to a lower slot by _compact
     generated: int = 0  # every generated token, the prefill's first one included
     finished: int = 0
 
@@ -353,7 +355,7 @@ class Engine:
     def __init__(self, model, n_layers: int, max_batch: int = 64, max_seq: int = 4096,
                  num_pages: int | None = None, page: int = PAGE, cache_bytes: int | None = None,
                  prefill_tokens: int = 8192, graphs: bool = True, log_tokens: bool = False,
-                 device="cuda"):
+                 compact: bool = True, device="cuda"):
         if max_batch > BUCKETS[-1]:
             raise ValueError(f"max_batch is at most {BUCKETS[-1]}")
         # a decode step runs a whole bucket, so the per-slot buffers are bucket sized
@@ -369,6 +371,7 @@ class Engine:
         self.max_seq = max_seq
         self.max_pages = cdiv(max_seq, page)
         self.prefill_tokens = prefill_tokens
+        self.compact = compact
         self.device = device
         i32 = dict(device=device, dtype=torch.int32)
         # per-slot decode inputs; slot i of a Bp-bucket step reads row i
@@ -505,7 +508,35 @@ class Engine:
                 self.running[i] = None
                 self.stats.finished += 1
 
+    def _compact(self) -> None:
+        """Moves the sequences in the highest slots into the lowest free ones when the decode
+        step would otherwise run a larger bucket than the number of live sequences needs.
+        Sequences retire in any order, so without this a few long requests left in high
+        slots keep every later step at the bucket of the highest one (a 64-row step for six
+        sequences). A move is two device copies, the slot's next token id and its block table
+        row; the other per-slot inputs are rewritten every step."""
+        live = [i for i, s in enumerate(self.running) if s is not None]
+        if not live:
+            return
+        want = next(x for x in BUCKETS if x >= len(live))
+        if live[-1] < want:
+            return
+        src = [i for i in live if i >= want]
+        dst = [i for i in range(want) if self.running[i] is None][:len(src)]
+        idx = torch.tensor(src + dst, dtype=torch.long).pin_memory().to(self.device,
+                                                                         non_blocking=True)
+        s_idx, d_idx = idx[:len(src)], idx[len(src):]
+        self.ids[d_idx] = self.ids[s_idx]
+        self.block_table[d_idx] = self.block_table[s_idx]
+        for a, b in zip(src, dst, strict=True):
+            seq = self.running[a]
+            seq.slot = b
+            self.running[b], self.running[a] = seq, None
+        self.stats.moved += len(src)
+
     def _decode(self) -> None:
+        if self.compact:
+            self._compact()
         live = [i for i, s in enumerate(self.running) if s is not None]
         if not live:
             return
@@ -541,6 +572,7 @@ class Engine:
             s.generated += 1
         self.stats.decode_steps += 1
         self.stats.decode_tokens += len(live)
+        self.stats.decode_rows += bp
         self.stats.generated += len(live)
 
     def prefill_waiting(self) -> None:

@@ -149,3 +149,29 @@ def test_graph_decode_after_workspace_growth(sk, weights):
         eng.run()
         outs.append(eng.outputs())
     assert outs[0] == outs[1]
+
+
+def test_compact_keeps_tokens_and_shrinks_steps(sk, weights):
+    """Requests of very different output lengths through eight slots: with compaction the
+    long ones left in high slots move down, the steps run smaller buckets, and every
+    sequence's tokens are the same as without it (graphs on, so a moved slot also has to be
+    read correctly by the captured steps)."""
+    rope = L.RoPE(1024)
+    g = torch.Generator().manual_seed(7)
+    lens = [int(x) for x in torch.randint(1, 200, (20,), generator=g)]
+    news = [40 if i % 7 == 6 else int(x)
+            for i, x in enumerate(torch.randint(1, 8, (20,), generator=g))]
+    prompts = [torch.randint(0, VOCAB, (n,), generator=g) for n in lens]
+    outs, stats = [], []
+    for compact in (False, True):
+        eng = E.Engine(E.SparkModel(weights, rope), N_LAYERS, max_batch=8, max_seq=512,
+                       num_pages=256, graphs=True, log_tokens=True, compact=compact)
+        for p, m in zip(prompts, news, strict=True):
+            eng.submit(p, m)
+        stats.append(eng.run())
+        outs.append(eng.outputs())
+        assert len(eng.cache.free) == eng.cache.num_pages - 1
+    assert outs[0] == outs[1]
+    assert stats[1].moved > 0
+    assert stats[1].decode_rows < stats[0].decode_rows
+    assert stats[1].decode_tokens == stats[0].decode_tokens
