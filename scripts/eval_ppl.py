@@ -8,12 +8,15 @@ people quote.
     python scripts/eval_ppl.py MODEL --backend torch --ctx 4096 --windows 20
     python scripts/eval_ppl.py MODEL --save-ref ref.pt                      # bf16 logits
     python scripts/eval_ppl.py MODEL --format int4 --ref ref.pt             # + KL vs bf16
+    python scripts/eval_ppl.py ~/models/llama3.1-8b-instruct --ctx 32768 --batch 1
 
 The text is tokenized once (with the BOS token the tokenizer adds) and cut into
 non-overlapping windows of --ctx tokens; every token of a window except its first is scored
 given the ones before it in that window. Windows are prefilled --batch at a time in one packed
-batch (the engine) or as one padded-free batch of equal lengths (transformers). Writes one
-JSON line per run to --out.
+batch (the engine) or as one padded-free batch of equal lengths (transformers). The engine
+runs forwards of at most --chunk tokens (a longer window is a chunked prefill) and
+transformers runs the lm_head --chunk rows at a time, so a 32K window never holds 32K rows of
+logits. Writes one JSON line per run to --out.
 
 --format runs the engine's SparkModel with its projections in a low-precision format
 (spark_kernels.quant); --awq folds activation-aware scales from scripts/awq_search.py into
@@ -62,7 +65,9 @@ def engine_scorer(args):
     from spark_kernels import hf
 
     w, cfg = hf.load(args.model)
-    rope = cfg.rope(max(args.ctx, 8192))
+    if args.no_rope_scaling:
+        cfg.rope_scaling = None
+    rope = cfg.rope(max(args.ctx + 1, 8192))
     if args.awq:
         from spark_kernels import awq
 
@@ -76,11 +81,12 @@ def engine_scorer(args):
         print(f"weights: {model.weight_bytes() / 2**30:.2f} GiB ({args.format})", file=sys.stderr)
     eng = E.Engine(model, cfg.n_layers, max_batch=args.batch, max_seq=args.ctx + 1,
                    num_pages=args.batch * E.cdiv(args.ctx + 1, E.PAGE) + 1,
-                   prefill_tokens=args.batch * args.ctx, graphs=False)
+                   prefill_tokens=args.chunk, graphs=False)
 
     def score(batch):
+        """(window index, first row, logits of rows first..) pieces of a batch of windows."""
         with torch.no_grad():
-            return eng.prompt_logits(batch)
+            yield from eng.prompt_logits_chunks(batch)
 
     return score
 
@@ -93,8 +99,10 @@ def hf_scorer(args):
 
     def score(batch):
         with torch.no_grad():
-            x = torch.stack(batch).cuda()
-            return list(m(x).logits)
+            h = m.model(torch.stack(batch).cuda(), use_cache=False).last_hidden_state
+            for i, x in enumerate(h):
+                for a in range(0, x.shape[0], args.chunk):
+                    yield i, a, m.lm_head(x[a:a + args.chunk])
 
     return score
 
@@ -118,6 +126,10 @@ def main() -> None:
     ap.add_argument("--ctx", type=int, default=2048)
     ap.add_argument("--windows", type=int, default=None, help="score only the first N")
     ap.add_argument("--batch", type=int, default=4)
+    ap.add_argument("--chunk", type=int, default=8192,
+                    help="tokens per engine forward, rows per lm_head call")
+    ap.add_argument("--no-rope-scaling", action="store_true",
+                    help="engine only: ignore the config's rope_scaling (to see what it buys)")
     ap.add_argument("--format", default="bf16", help="weights format of the spark backend")
     ap.add_argument("--head-format", default="bf16", help="lm_head format (spark backend)")
     ap.add_argument("--awq", default=None, help="fold these scales in first (awq_search.py)")
@@ -140,29 +152,33 @@ def main() -> None:
     kl, agree, kl_count = 0.0, 0, 0
     t0 = time.perf_counter()
     for i in range(0, len(wins), args.batch):
-        batch = wins[i:i + args.batch]
-        for j, (w, lg) in enumerate(zip(batch, score([b.cuda() for b in batch]), strict=True)):
-            total += nll_sum(lg, w)
-            count += w.numel() - 1
+        batch = [b.cuda() for b in wins[i:i + args.batch]]
+        for j, a, lg in score(batch):
+            w = batch[j]
+            m = min(lg.shape[0], w.numel() - 1 - a)  # rows a..a+m-1 predict a+1..a+m
+            total += nll_sum(lg[:m], w[a:a + m + 1])
             if i + j < args.kl_windows:
                 if args.save_ref:
-                    saved.append(lg.to(torch.bfloat16).cpu())
+                    if a == 0:
+                        saved.append([])
+                    saved[-1].append(lg.to(torch.bfloat16).cpu())
                 if refs is not None:
-                    k, a = kl_top1(lg, refs[i + j])
-                    kl, agree, kl_count = kl + k, agree + a, kl_count + lg.shape[0]
+                    k, n = kl_top1(lg, refs[i + j][a:a + lg.shape[0]])
+                    kl, agree, kl_count = kl + k, agree + n, kl_count + lg.shape[0]
+        count += sum(w.numel() - 1 for w in batch)
     dt = time.perf_counter() - t0
     ppl = math.exp(total / count)
     label = args.label or (args.format + ("-awq" if args.awq else "") +
                            ("" if args.head_format == "bf16" else f"-head-{args.head_format}")
                            if args.backend == "spark" else args.backend)
-    row = dict(model=Path(args.model).name, backend=args.backend, format=args.format,
-               awq=bool(args.awq), head_format=args.head_format, label=label, ctx=args.ctx,
-               windows=len(wins), tokens=count,
+    row = dict(model=Path(args.model).name, text=Path(args.text).stem, backend=args.backend,
+               format=args.format, awq=bool(args.awq), head_format=args.head_format,
+               label=label, ctx=args.ctx, chunk=args.chunk, windows=len(wins), tokens=count,
                nll=total / count, ppl=ppl, seconds=dt)
     if refs is not None:
         row.update(kl=kl / kl_count, top1=agree / kl_count, kl_tokens=kl_count)
     if args.save_ref:
-        torch.save(saved, args.save_ref)
+        torch.save([torch.cat(x) for x in saved], args.save_ref)
     print(json.dumps(row))
     with open(args.out, "a") as f:
         f.write(json.dumps(row) + "\n")
