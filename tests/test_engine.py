@@ -79,3 +79,13 @@ def test_graph_decode_matches_eager(sk, weights):
         outs.append(eng.outputs())
     assert outs[0] == outs[1]
     assert [len(outs[1][i]) for i in range(len(lens))] == news
+
+
+def test_engine_max_batch_not_a_bucket(sk, weights):
+    """Three slots asked for, so decode steps run the bucket of four."""
+    eng = E.Engine(E.SparkModel(weights, L.RoPE(512)), N_LAYERS, max_batch=3, max_seq=256,
+                   num_pages=64, graphs=False, log_tokens=True)
+    for n in (5, 9, 13):
+        eng.submit(torch.randint(0, VOCAB, (n,)), max_new=4)
+    eng.run()
+    assert sorted(len(t) for t in eng.outputs().values()) == [4, 4, 4]

@@ -330,6 +330,8 @@ class Engine:
                  device="cuda"):
         if max_batch > BUCKETS[-1]:
             raise ValueError(f"max_batch is at most {BUCKETS[-1]}")
+        # a decode step runs a whole bucket, so the per-slot buffers are bucket sized
+        max_batch = next(x for x in BUCKETS if x >= max_batch)
         if num_pages is None:
             if cache_bytes is None:
                 raise ValueError("give num_pages or cache_bytes")
