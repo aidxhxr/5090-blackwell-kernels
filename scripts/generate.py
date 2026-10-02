@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""Chat with a real Llama-3-8B checkpoint on the engine: the prompts go through the
-tokenizer's chat template, are prefilled together and decoded greedily, and the replies are
-printed with the decode rate.
+"""Chat with a real checkpoint on the engine (Llama-3-8B, Llama-3.1-8B, Mistral-7B-v0.3 or
+anything else of their shape): the prompts go through the tokenizer's chat template, are
+prefilled together and decoded greedily, and the replies are printed with the decode rate.
 
     python scripts/generate.py ~/models/llama3-8b-instruct "why is the sky blue?" "hi"
     python scripts/generate.py MODEL --new 256 --torch     # the same on engine.TorchModel
 
-A request stops at the tokenizer's end-of-text or end-of-turn token, or after --new tokens.
+A request stops at a stop token (the tokenizer's eos, the generation config's eos ids and
+Llama 3's <|eot_id|> when the vocabulary has it), or after --new tokens.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -43,7 +45,13 @@ def main() -> None:
           f"{time.perf_counter() - t0:.1f} s")
     rope = cfg.rope(8192)
     model = E.TorchModel(w, rope) if args.torch else E.SparkModel(w, rope)
-    stop = {tok.eos_token_id, tok.convert_tokens_to_ids("<|eot_id|>")}
+    stop = {tok.eos_token_id}
+    gen = Path(args.model) / "generation_config.json"
+    if gen.exists():
+        eos = json.loads(gen.read_text()).get("eos_token_id", [])
+        stop.update(eos if isinstance(eos, list) else [eos])
+    if "<|eot_id|>" in tok.get_vocab():
+        stop.add(tok.convert_tokens_to_ids("<|eot_id|>"))
     eng = E.Engine(model, cfg.n_layers, max_batch=max(1, len(args.prompts)), max_seq=8192,
                    cache_bytes=4 << 30, graphs=not args.torch, log_tokens=True,
                    stop_ids=sorted(stop))
