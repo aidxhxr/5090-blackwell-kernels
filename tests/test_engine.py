@@ -89,3 +89,21 @@ def test_engine_max_batch_not_a_bucket(sk, weights):
         eng.submit(torch.randint(0, VOCAB, (n,)), max_new=4)
     eng.run()
     assert sorted(len(t) for t in eng.outputs().values()) == [4, 4, 4]
+
+
+def test_prompt_logits_last_row_is_prefill(sk, weights):
+    """prompt_logits' last row of each prompt is what the normal prefill returns."""
+    rope = L.RoPE(512)
+    eng = E.Engine(E.SparkModel(weights, rope), N_LAYERS, max_batch=4, max_seq=256,
+                   num_pages=64, graphs=False)
+    prompts = [torch.randint(0, VOCAB, (n,)) for n in (7, 33)]
+    free = len(eng.cache.free)
+    full = eng.prompt_logits(prompts)
+    assert [f.shape for f in full] == [(7, VOCAB), (33, VOCAB)]
+    assert len(eng.cache.free) == free and all(s is None for s in eng.running)
+    for p in prompts:
+        eng.submit(p, 2)
+    seqs = eng._admit()
+    last = eng.model.prefill(eng._prefill_batch(seqs), eng.cache)
+    for f, row in zip(full, last, strict=True):
+        assert _rel(f[-1], row) < 1e-2

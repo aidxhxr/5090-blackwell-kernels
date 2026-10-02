@@ -190,11 +190,12 @@ class SparkModel:
     def _logits(self, x: torch.Tensor) -> torch.Tensor:
         return sk.hgemm(sk.rmsnorm(x, self.w.final_norm, EPS), self.w.lm_head)
 
-    def prefill(self, b: Batch, cache: PagedKVCache) -> torch.Tensor:
-        """Logits [B, V] of each prompt's last token; the prompts' K/V land in the cache."""
+    def prefill(self, b: Batch, cache: PagedKVCache, all_logits: bool = False) -> torch.Tensor:
+        """Logits [B, V] of each prompt's last token, or [T, V] of every packed token with
+        `all_logits`; the prompts' K/V land in the cache."""
         x = F.embedding(b.ids, self.w.embed)
         x = self._layers(x, b, cache, decode=False)
-        return self._logits(x[b.last])
+        return self._logits(x if all_logits else x[b.last])
 
     def decode(self, b: Batch, cache: PagedKVCache) -> torch.Tensor:
         """Logits [B, V] of one token per sequence, appended to the cache first."""
@@ -287,9 +288,9 @@ class TorchModel:
     def _logits(self, x):
         return F.rms_norm(x, (HIDDEN,), self.w.final_norm, EPS) @ self.w.lm_head
 
-    def prefill(self, b: Batch, cache: PagedKVCache) -> torch.Tensor:
-        x = F.embedding(b.ids, self.w.embed)
-        return self._logits(self._forward(x, b, cache, decode=False)[b.last])
+    def prefill(self, b: Batch, cache: PagedKVCache, all_logits: bool = False) -> torch.Tensor:
+        x = self._forward(F.embedding(b.ids, self.w.embed), b, cache, decode=False)
+        return self._logits(x if all_logits else x[b.last])
 
     def decode(self, b: Batch, cache: PagedKVCache) -> torch.Tensor:
         x = F.embedding(b.ids, self.w.embed)
@@ -524,6 +525,28 @@ class Engine:
             self._prefill(admitted)
             self._retire()  # max_new == 1 finishes at the prefill
         self._decode()
+
+    def prompt_logits(self, prompts: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Logits [P, V] at every position of each prompt, from one packed prefill on empty
+        slots (the batch must be idle); the pages are released afterwards. What a perplexity
+        or a parity check against another implementation reads."""
+        if any(s is not None for s in self.running) or self.waiting:
+            raise RuntimeError("prompt_logits needs an idle engine")
+        seqs = [self.submit(p, 1) for p in prompts]
+        admitted = self._admit()
+        if len(admitted) != len(seqs):
+            self.waiting.clear()
+            for s in admitted:
+                self.cache.release(s.pages)
+                self.running[s.slot] = None
+            raise RuntimeError("prompts do not fit the slots or the cache in one prefill")
+        try:
+            logits = self.model.prefill(self._prefill_batch(seqs), self.cache, all_logits=True)
+        finally:
+            for s in seqs:
+                self.cache.release(s.pages)
+                self.running[s.slot] = None
+        return list(logits.split([p.numel() for p in prompts]))
 
     def outputs(self) -> dict[int, list[int]]:
         """Generated tokens per sequence id, in order (needs log_tokens=True)."""
