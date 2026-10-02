@@ -28,6 +28,8 @@ results/headline.md
 # env.txt (the GPU state it was measured in) goes with it
 !results/roofline.png
 !results/env.txt
+# the parity run on real weights (docs/design/llm_parity.md) is small and quoted in the docs
+!results/llm_parity.json
 # scripts/llm_parity.py's dumps of logits and hidden states (gigabytes)
 parity_work/
 

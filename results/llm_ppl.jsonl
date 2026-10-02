@@ -1,0 +1,9 @@
+{"model": "llama3-8b-instruct", "backend": "spark", "label": "spark", "ctx": 2048, "windows": 141, "tokens": 288627, "nll": 2.1147205040987966, "ppl": 8.287269184627517, "seconds": 19.463661062065512}
+{"model": "llama3-8b-instruct", "backend": "hf", "label": "hf", "ctx": 2048, "windows": 141, "tokens": 288627, "nll": 2.1149122143811745, "ppl": 8.288858091643084, "seconds": 24.70773181808181}
+{"model": "llama3-8b-instruct", "backend": "torch", "label": "torch", "ctx": 2048, "windows": 141, "tokens": 288627, "nll": 2.114684544093945, "ppl": 8.286971179745592, "seconds": 23.466453665983863}
+{"model": "llama3-8b-instruct", "backend": "spark", "label": "spark", "ctx": 4096, "windows": 70, "tokens": 286650, "nll": 2.0466610177474434, "ppl": 7.742007475616773, "seconds": 20.239186475984752}
+{"model": "llama3-8b-instruct", "backend": "hf", "label": "hf", "ctx": 4096, "windows": 70, "tokens": 286650, "nll": 2.0467709470356654, "ppl": 7.742858595768636, "seconds": 24.728152336087078}
+{"model": "llama3-8b-instruct", "backend": "spark", "label": "spark", "ctx": 8192, "windows": 35, "tokens": 286685, "nll": 2.0098719258302338, "ppl": 7.462361550353992, "seconds": 21.64600695495028}
+{"model": "llama3-8b-instruct", "backend": "hf", "label": "hf", "ctx": 8192, "windows": 35, "tokens": 286685, "nll": 2.010105891126013, "ppl": 7.464107688241199, "seconds": 26.299676227965392}
+{"model": "llama3-8b-instruct", "backend": "ref", "label": "ref fp32", "ctx": 2048, "windows": 141, "tokens": 288627, "nll": 2.1143280839110687, "ppl": 8.284017730908099, "seconds": 108.54246782709379}
+{"model": "llama3-8b-instruct", "backend": "ref", "label": "ref fp32", "ctx": 4096, "windows": 70, "tokens": 286650, "nll": 2.0463356468138136, "ppl": 7.7394888611804475, "seconds": 126.81507757701911}
