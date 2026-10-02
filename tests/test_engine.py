@@ -128,3 +128,24 @@ def test_trace_collects_the_residual_stream(sk, weights):
         traces.append(tr)
     for a, b in zip(*traces, strict=True):
         assert _rel(a, b) < 2e-2
+
+
+def test_graph_decode_after_workspace_growth(sk, weights):
+    """128 slots and prompts of up to 2000 tokens: the prefill GEMMs and the 128-slot step
+    run Stream-K schedules that grow the kernels' per-process workspaces after the graphs are
+    captured. A graph that kept a freed workspace replays into an illegal address; with the
+    workspaces grown first and the Stream-K buckets eager, graphs match eager decode."""
+    rope = L.RoPE(4096)
+    g = torch.Generator().manual_seed(5)
+    lens = [int(x) for x in torch.randint(1, 2000, (150,), generator=g)]
+    news = [int(x) for x in torch.randint(1, 24, (150,), generator=g)]
+    prompts = [torch.randint(0, VOCAB, (n,), generator=g) for n in lens]
+    outs = []
+    for graphs in (False, True):
+        eng = E.Engine(E.SparkModel(weights, rope), N_LAYERS, max_batch=128, max_seq=4096,
+                       num_pages=16384, graphs=graphs, log_tokens=True, prefill_tokens=8192)
+        for p, m in zip(prompts, news, strict=True):
+            eng.submit(p, m)
+        eng.run()
+        outs.append(eng.outputs())
+    assert outs[0] == outs[1]

@@ -60,6 +60,8 @@ N_LAYERS = 32
 VOCAB = 128256  # a multiple of 64, as hgemm needs for N
 PAGE = 16
 BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256)
+# the largest decode bucket captured into a CUDA graph; larger ones run eagerly (_capture_all)
+GRAPH_MAX = 64
 
 
 def cdiv(a: int, b: int) -> int:
@@ -194,6 +196,21 @@ class SparkModel:
 
     def _logits(self, x: torch.Tensor) -> torch.Tensor:
         return sk.hgemm(sk.rmsnorm(x, self.w.final_norm, EPS), self.w.lm_head)
+
+    def warm_workspaces(self, max_m: int = GRAPH_MAX) -> None:
+        """Every GEMM shape of the model once at each M from max_m down to 1. hgemm's M <= 64
+        kernel keeps its split-K partials in one buffer per process that it frees and
+        reallocates when a launch needs more, so a CUDA graph captured before the largest
+        launch would keep the address of a freed buffer. After this the buffer has its final
+        size for every M a graphed decode step (and any prefill of <= 64 tokens) runs."""
+        w = self.w.layers[0]
+        for m in range(max_m, 0, -1):
+            x = torch.zeros(m, HIDDEN, device=w.w_qkv.device, dtype=torch.bfloat16)
+            sk.hgemm(x, w.w_qkv)
+            sk.hgemm(x.new_zeros(m, Q_WIDTH), w.w_o, residual=x, out=x.clone())
+            sk.hgemm_swiglu(x, w.w_gate_up)
+            sk.hgemm(x.new_zeros(m, INTERMEDIATE), w.w_down, residual=x, out=x.clone())
+            sk.hgemm(x, self.w.lm_head)
 
     def prefill(self, b: Batch, cache: PagedKVCache, all_logits: bool = False) -> torch.Tensor:
         """Logits [B, V] of each prompt's last token, or [T, V] of every packed token with
@@ -388,12 +405,22 @@ class Engine:
         self.ids[:bp].copy_(torch.argmax(logits, dim=-1))
 
     def _capture_all(self) -> None:
-        """One graph per bucket, captured with every slot empty (length 0, writing the scratch
-        page), all sharing one memory pool since they never run concurrently."""
+        """One graph per bucket up to GRAPH_MAX, captured with every slot empty (length 0,
+        writing the scratch page), all sharing one memory pool since they never run
+        concurrently. The kernels' split-K workspaces are per-process buffers that grow (free
+        and reallocate) on demand, and a graph keeps the address it was captured with. So the
+        model's workspaces are grown to their final size first, and only buckets whose GEMMs
+        run the M <= 64 kernel are captured: from M = 128 hgemm runs the Stream-K schedule,
+        whose workspace a later prefill can grow, which freed the buffer a captured 128 or 256
+        bucket still pointed at (an illegal address on replay). Those buckets run eagerly; the
+        graph saves under 1% of a step (docs/design/serving.md)."""
+        warm = getattr(self.model, "warm_workspaces", None)
+        if warm is not None:
+            warm()
         pool = torch.cuda.graph_pool_handle()
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
-        for bp in (x for x in BUCKETS if x <= self.max_batch):
+        for bp in (x for x in BUCKETS if x <= min(self.max_batch, GRAPH_MAX)):
             with torch.cuda.stream(side):
                 for _ in range(2):  # grows every workspace before the capture
                     self._decode_once(bp)
