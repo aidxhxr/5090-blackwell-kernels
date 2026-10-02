@@ -140,6 +140,17 @@ __global__ void __launch_bounds__(kThreads)
 
 }  // namespace
 
+void absmax_bits(const __nv_bfloat16* x, long long n, unsigned* work, cudaStream_t stream) {
+    SPARK_REQUIRE(x != nullptr && work != nullptr, "absmax_bits: null pointer");
+    SPARK_REQUIRE(n > 0 && n % 8 == 0 && is_aligned16(x),
+                  "absmax_bits: n must be a positive multiple of 8 and x 16-byte aligned");
+    const long long chunks = n / 8;
+    const int grid = static_cast<int>(std::min<long long>(cdiv64(chunks, kThreads),
+                                                          4LL * num_sms()));
+    amax_kernel<<<grid, kThreads, 0, stream>>>(x, chunks, work);
+    SPARK_CHECK_LAUNCH();
+}
+
 void fp8_quantize(const __nv_bfloat16* x, unsigned char* q, void* scale, unsigned* work,
                   int rows, int K, int mode, cudaStream_t stream) {
     SPARK_REQUIRE(x != nullptr && q != nullptr && scale != nullptr, "fp8_quantize: null pointer");
@@ -152,10 +163,7 @@ void fp8_quantize(const __nv_bfloat16* x, unsigned char* q, void* scale, unsigne
     if (mode == FP8Q_TENSOR) {
         SPARK_REQUIRE(work != nullptr, "fp8_quantize: the tensor mode needs a zeroed work cell");
         const long long chunks = n / 8;
-        const int grid_a = static_cast<int>(std::min<long long>(cdiv64(chunks, kThreads),
-                                                                4LL * num_sms()));
-        amax_kernel<<<grid_a, kThreads, 0, stream>>>(x, chunks, work);
-        SPARK_CHECK_LAUNCH();
+        absmax_bits(x, n, work, stream);
         quantize_tensor_kernel<<<static_cast<unsigned>(cdiv64(chunks, kThreads)), kThreads, 0,
                                  stream>>>(x, q, chunks, work, static_cast<float*>(scale));
     } else if (mode == FP8Q_ROW) {

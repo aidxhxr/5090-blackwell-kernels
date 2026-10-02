@@ -251,8 +251,12 @@ size_t fp4_scale_bytes(int rows, int K, int format);
 //   MXFP4: the OCP recipe, `scale` ignored: a block of 32 gets 2^e with
 //          e = floor(log2(max|block|)) - 2 (e2m1's largest exponent), stored as e + 127, and
 //          its elements e2m1(x / 2^e), saturating at 6.
+// With `work` (NVFP4 only; one device unsigned, zero on entry) s is computed on the device
+// instead: max(max|x| / (6 * 448), FLT_MIN) from an amax pass (absmax_bits), written to
+// `scale_out`, and `scale` is ignored. Two launches.
 void fp4_quantize(const __nv_bfloat16* x, unsigned char* q, unsigned char* sf, int rows, int K,
-                  const float* scale, int format, cudaStream_t stream);
+                  const float* scale, int format, cudaStream_t stream, unsigned* work = nullptr,
+                  float* scale_out = nullptr);
 
 // ---- fp8 activation quantizer (src/kernels/fp8quant.cu) -----------------------------------
 // x [rows][K] bf16 -> q [rows][K] e4m3 bytes plus scales, x ~ scale * q:
@@ -265,6 +269,9 @@ void fp4_quantize(const __nv_bfloat16* x, unsigned char* q, unsigned char* sf, i
 // max|x| / 2^e <= 448; elements are e4m3(x / scale), round to nearest even, saturating.
 // K % 8 == 0 (K % 32 == 0 for MX), x 16-byte and q 8-byte aligned.
 enum Fp8QuantMode { FP8Q_TENSOR = 0, FP8Q_ROW = 1, FP8Q_MX = 2 };
+// atomicMax of max|x| over x [n] bf16 (n % 8 == 0, 16-byte aligned) into *work as float bits
+// (non-negative floats order like their bits); *work must hold zero or a smaller amax.
+void absmax_bits(const __nv_bfloat16* x, long long n, unsigned* work, cudaStream_t stream);
 void fp8_quantize(const __nv_bfloat16* x, unsigned char* q, void* scale, unsigned* work,
                   int rows, int K, int mode, cudaStream_t stream);
 

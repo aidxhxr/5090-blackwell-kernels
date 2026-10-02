@@ -80,9 +80,17 @@ __device__ __forceinline__ void store_codes(unsigned char* q, const unsigned (&c
 __global__ void __launch_bounds__(kThreads)
     quantize_nvfp4_kernel(const __nv_bfloat16* __restrict__ x, unsigned char* __restrict__ q,
                           unsigned char* __restrict__ sf, int rows, int padded_rows, int K,
-                          const float* __restrict__ scale) {
+                          const float* __restrict__ scale, const unsigned* __restrict__ amax_bits,
+                          float* __restrict__ scale_out) {
     const int cols = K / 16;
     const long long idx = static_cast<long long>(blockIdx.x) * kThreads + threadIdx.x;
+    // With amax_bits the per-tensor scale is the recipe's max|x| / (6 * 448) from the amax
+    // pass (absmax_bits), clamped to the smallest normal float, and block 0 publishes it.
+    const float s = amax_bits != nullptr
+                        ? fmaxf(__uint_as_float(*amax_bits) / (6.0f * 448.0f), 1.17549435e-38f)
+                    : scale != nullptr ? *scale
+                                       : 1.0f;
+    if (amax_bits != nullptr && idx == 0) *scale_out = s;
     if (idx >= static_cast<long long>(padded_rows) * cols) return;
     const int r = static_cast<int>(idx / cols);
     const int j = static_cast<int>(idx % cols);
@@ -95,7 +103,6 @@ __global__ void __launch_bounds__(kThreads)
     float amax = 0.f;
 #pragma unroll
     for (int i = 0; i < 16; ++i) amax = fmaxf(amax, fabsf(f[i]));
-    const float s = scale != nullptr ? *scale : 1.0f;
     // The block scale: the e4m3 value nearest max / 6 / s, so the largest element maps to
     // about 6 (the top of e2m1) after dividing by s * scale. The constructor rounds to
     // nearest even and saturates at 448.
@@ -142,7 +149,8 @@ __global__ void __launch_bounds__(kThreads)
 }  // namespace
 
 void fp4_quantize(const __nv_bfloat16* x, unsigned char* q, unsigned char* sf, int rows, int K,
-                  const float* scale, int format, cudaStream_t stream) {
+                  const float* scale, int format, cudaStream_t stream, unsigned* work,
+                  float* scale_out) {
     SPARK_REQUIRE(x != nullptr && q != nullptr && sf != nullptr, "fp4_quantize: null pointer");
     SPARK_REQUIRE(format == FP4_NVFP4 || format == FP4_MXFP4, "fp4_quantize: unknown format");
     SPARK_REQUIRE(rows > 0 && K > 0, "fp4_quantize: rows and K must be positive");
@@ -154,8 +162,12 @@ void fp4_quantize(const __nv_bfloat16* x, unsigned char* q, unsigned char* sf, i
     const int cols = K / (format == FP4_MXFP4 ? 32 : 16);
     const long long threads = static_cast<long long>(padded) * cols;
     const unsigned grid = static_cast<unsigned>((threads + kThreads - 1) / kThreads);
+    SPARK_REQUIRE(work == nullptr || (format == FP4_NVFP4 && scale_out != nullptr),
+                  "fp4_quantize: a dynamic scale needs NVFP4 and a scale_out");
+    if (work != nullptr) absmax_bits(x, static_cast<long long>(rows) * K, work, stream);
     if (format == FP4_NVFP4)
-        quantize_nvfp4_kernel<<<grid, kThreads, 0, stream>>>(x, q, sf, rows, padded, K, scale);
+        quantize_nvfp4_kernel<<<grid, kThreads, 0, stream>>>(x, q, sf, rows, padded, K, scale,
+                                                             work, scale_out);
     else
         quantize_mxfp4_kernel<<<grid, kThreads, 0, stream>>>(x, q, sf, rows, padded, K);
     SPARK_CHECK_LAUNCH();

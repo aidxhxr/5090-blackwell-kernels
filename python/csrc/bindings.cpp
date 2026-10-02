@@ -418,17 +418,22 @@ std::tuple<Tensor, Tensor, std::optional<Tensor>> fp4_quantize(const Tensor& x,
                             scale->numel() == 1 && scale->device() == x.device(),
                         "scale must be a float32 CUDA tensor with one element on x's device");
             s = scale->reshape({}).contiguous();
-        } else {
-            s = (x.abs().amax().to(at::kFloat) / (6.0f * 448.0f))
-                    .clamp_min(std::numeric_limits<float>::min());
         }
+    }
+    // no scale given: max|x| / (6 * 448) on the device, an amax pass into a zeroed cell
+    Tensor work;
+    if (format == spark::FP4_NVFP4 && !scale.has_value()) {
+        work = at::zeros({2}, x.options().dtype(at::kFloat));  // [amax bits, scale]
+        s = work.narrow(0, 1, 1).reshape({});
     }
     Tensor q = at::empty({rows, K / 2}, x.options().dtype(at::kByte));
     Tensor sf = at::empty({static_cast<int64_t>(spark::fp4_scale_bytes(rows, K, format))},
                           x.options().dtype(at::kByte));
     spark::fp4_quantize(bf16_ptr(x), static_cast<unsigned char*>(q.data_ptr()),
                         static_cast<unsigned char*>(sf.data_ptr()), rows, K,
-                        s.has_value() ? s->data_ptr<float>() : nullptr, format, current_stream(x));
+                        s.has_value() ? s->data_ptr<float>() : nullptr, format, current_stream(x),
+                        work.defined() ? static_cast<unsigned*>(work.data_ptr()) : nullptr,
+                        work.defined() ? s->data_ptr<float>() : nullptr);
     return {q, sf, s};
 }
 
