@@ -175,3 +175,29 @@ def test_compact_keeps_tokens_and_shrinks_steps(sk, weights):
     assert stats[1].moved > 0
     assert stats[1].decode_rows < stats[0].decode_rows
     assert stats[1].decode_tokens == stats[0].decode_tokens
+
+
+def test_mixed_step_same_tokens(sk, weights):
+    """Decode rows inside the prefill forward (a one-token chunk after each running
+    sequence's context, through attention_varlen) against the separate prefill and decode
+    steps: the same tokens for every request, in fewer forwards."""
+    rope = L.RoPE(1024)
+    g = torch.Generator().manual_seed(11)
+    lens = [int(x) for x in torch.randint(1, 300, (12,), generator=g)]
+    news = [int(x) for x in torch.randint(1, 10, (12,), generator=g)]
+    prompts = [torch.randint(0, VOCAB, (n,), generator=g) for n in lens]
+    outs, stats = [], []
+    for mixed in (False, True):
+        eng = E.Engine(E.SparkModel(weights, rope), N_LAYERS, max_batch=4, max_seq=512,
+                       num_pages=160, graphs=True, log_tokens=True, prefill_tokens=256,
+                       mixed=mixed)
+        for p, m in zip(prompts, news, strict=True):
+            eng.submit(p, m)
+        stats.append(eng.run())
+        outs.append(eng.outputs())
+        assert len(eng.cache.free) == eng.cache.num_pages - 1
+    assert outs[0] == outs[1]
+    assert [len(outs[1][i]) for i in range(len(lens))] == news
+    assert stats[1].mixed_rows > 0 and stats[0].mixed_rows == 0
+    assert (stats[1].decode_steps + stats[1].prefill_batches <
+            stats[0].decode_steps + stats[0].prefill_batches)

@@ -152,6 +152,7 @@ class Batch:
     last: torch.Tensor | None = None  # [B] int64: each prompt's last row (prefill)
     q_lens: list[int] | None = None  # host copy of the prompt lengths (the torch model's loop)
     max_len: int = 0  # host copy of max(seq_lens) (the torch model's gather)
+    n_dec: int = 0  # prefill: the last n_dec sequences are one-token decode rows (mixed step)
 
 
 def _rope_tokens(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -166,6 +167,8 @@ class SparkModel:
     paged append, attention (varlen at prefill, paged decode at decode), the o GEMM with the
     residual add in its epilogue, rmsnorm, the gate/up GEMM with SwiGLU in its epilogue, the
     down GEMM with the residual add in its epilogue: eight launches."""
+
+    context_prefill = True  # prefill rows may continue a cached context (attention_varlen)
 
     def __init__(self, weights: ModelWeights, rope: RoPE):
         self.w = weights
@@ -184,6 +187,8 @@ class SparkModel:
                                       kc, vc, N_HEADS, N_KV_HEADS)
             if decode:
                 o = sk.paged_decode(q, kc, vc, b.block_table, b.seq_lens)
+            elif b.n_dec:
+                o = self._mixed_attention(q, kc, vc, b)
             else:
                 o = sk.attention_varlen(q, kc, vc, b.cu_seqlens, b.seq_lens, b.block_table)
             sk.hgemm(o.view(T, Q_WIDTH), w.w_o, residual=x, out=x)
@@ -193,6 +198,19 @@ class SparkModel:
             if self.trace is not None:
                 self.trace.append(x.clone())  # x is updated in place by the next layer
         return x
+
+    @staticmethod
+    def _mixed_attention(q, kc, vc, b: Batch) -> torch.Tensor:
+        """A mixed step's attention: the prompts' rows through attention_varlen and the
+        decode rows (one per sequence, at the end) through paged_decode. attention_varlen
+        would give each decode row a whole 128-row query tile, 128x the work it needs."""
+        nb = b.seq_lens.shape[0] - b.n_dec
+        tp = q.shape[0] - b.n_dec
+        o = torch.empty_like(q)
+        o[:tp] = sk.attention_varlen(q[:tp], kc, vc, b.cu_seqlens[:nb + 1], b.seq_lens[:nb],
+                                     b.block_table[:nb])
+        o[tp:] = sk.paged_decode(q[tp:], kc, vc, b.block_table[nb:], b.seq_lens[nb:])
+        return o
 
     def _logits(self, x: torch.Tensor) -> torch.Tensor:
         return sk.hgemm(sk.rmsnorm(x, self.w.final_norm, EPS), self.w.lm_head)
@@ -341,6 +359,7 @@ class Stats:
     decode_tokens: int = 0  # tokens produced by decode steps (padding slots excluded)
     decode_rows: int = 0  # rows the decode steps computed, the bucket's padding included
     moved: int = 0  # sequences moved to a lower slot by _compact
+    mixed_rows: int = 0  # decode tokens produced inside a prefill forward (Engine.mixed)
     generated: int = 0  # every generated token, the prefill's first one included
     finished: int = 0
 
@@ -349,13 +368,16 @@ class Engine:
     """Continuous batching over a paged cache. `submit` queues a request; `step` admits what
     fits (free slots, free pages, the prefill token budget), prefills the admitted prompts as
     one packed batch, then runs one decode step over every running sequence; `run` steps
-    until the queue and the batch are empty. With `graphs` (SparkModel only) each decode
-    bucket is captured into a CUDA graph at construction."""
+    until the queue and the batch are empty. With `mixed` (the default for SparkModel) the
+    running sequences' decode rows ride in the prefill forward instead, so a step that admits
+    is one forward, not two. With `graphs` (SparkModel only) each decode bucket up to
+    GRAPH_MAX is captured into a CUDA graph at construction. With `compact` a decode step
+    first moves sequences out of high slots so it runs the smallest bucket that fits."""
 
     def __init__(self, model, n_layers: int, max_batch: int = 64, max_seq: int = 4096,
                  num_pages: int | None = None, page: int = PAGE, cache_bytes: int | None = None,
                  prefill_tokens: int = 8192, graphs: bool = True, log_tokens: bool = False,
-                 compact: bool = True, device="cuda"):
+                 compact: bool = True, mixed: bool | None = None, device="cuda"):
         if max_batch > BUCKETS[-1]:
             raise ValueError(f"max_batch is at most {BUCKETS[-1]}")
         # a decode step runs a whole bucket, so the per-slot buffers are bucket sized
@@ -372,6 +394,9 @@ class Engine:
         self.max_pages = cdiv(max_seq, page)
         self.prefill_tokens = prefill_tokens
         self.compact = compact
+        # decode rows inside a prefill forward need the model's prefill to take a chunk after
+        # a cached context (attention_varlen does; TorchModel's per-prompt SDPA does not)
+        self.mixed = getattr(model, "context_prefill", False) if mixed is None else mixed
         self.device = device
         i32 = dict(device=device, dtype=torch.int32)
         # per-slot decode inputs; slot i of a Bp-bucket step reads row i
@@ -467,39 +492,58 @@ class Engine:
             budget -= n
         return out
 
-    def _prefill_batch(self, seqs: list[Sequence]) -> Batch:
+    def _prefill_batch(self, seqs: list[Sequence], dec: list[Sequence] = ()) -> Batch:
         """The packed prefill inputs of admitted sequences: their prompts back to back,
-        positions from 0, each token's cache slot from its sequence's pages."""
+        positions from 0, each token's cache slot from its sequence's pages. Each running
+        sequence in `dec` adds one row after them: its next token (already on the device in
+        its slot's id) at its current length, a one-token chunk after its cached context."""
         page = self.page
-        q_lens = [s.prompt.numel() for s in seqs]
-        ids = torch.cat([s.prompt for s in seqs])
+        q_lens = [s.prompt.numel() for s in seqs] + [1] * len(dec)
+        kv_lens = q_lens[:len(seqs)] + [s.length + 1 for s in dec]
+        parts = [s.prompt for s in seqs]
+        if dec:
+            parts.append(self.ids[torch.tensor([s.slot for s in dec]).to(self.device)])
+        ids = torch.cat(parts)
         pos, slots = [], []
-        for s, n in zip(seqs, q_lens, strict=True):
+        for s, n in zip(seqs, q_lens, strict=False):
             p = torch.arange(n, dtype=torch.int32)
             pos.append(p)
             slots.append(torch.tensor(s.pages, dtype=torch.int32)[p // page] * page + p % page)
+        if dec:
+            p = [s.length for s in dec]
+            pos.append(torch.tensor(p, dtype=torch.int32))
+            slots.append(torch.tensor([s.pages[x // page] * page + x % page
+                                       for s, x in zip(dec, p, strict=True)], dtype=torch.int32))
         cu = torch.tensor([0] + q_lens, dtype=torch.int32).cumsum(0, dtype=torch.int32)
         dev = dict(device=self.device, non_blocking=True)
         b = Batch(ids=ids, positions=torch.cat(pos).to(**dev), slots=torch.cat(slots).to(**dev),
-                  seq_lens=torch.tensor(q_lens, dtype=torch.int32).to(**dev),
-                  block_table=self.block_table[torch.tensor([s.slot for s in seqs])],
+                  seq_lens=torch.tensor(kv_lens, dtype=torch.int32).to(**dev),
+                  block_table=self.block_table[torch.tensor([s.slot for s in [*seqs, *dec]])],
                   cu_seqlens=cu.to(**dev), last=(cu[1:] - 1).long().to(**dev), q_lens=q_lens,
-                  max_len=max(q_lens))
+                  max_len=max(kv_lens), n_dec=len(dec))
         return b
 
-    def _prefill(self, seqs: list[Sequence]) -> None:
+    def _prefill(self, seqs: list[Sequence], dec: list[Sequence] = ()) -> None:
+        """One packed forward over the admitted prompts and, with `dec`, one decode row per
+        running sequence; the next token of each lands in its slot's id."""
         q_lens = [s.prompt.numel() for s in seqs]
-        logits = self.model.prefill(self._prefill_batch(seqs), self.cache)
+        both = [*seqs, *dec]
+        logits = self.model.prefill(self._prefill_batch(seqs, dec), self.cache)
         new = torch.argmax(logits, dim=-1)
-        self.ids[torch.tensor([s.slot for s in seqs], device=self.device)] = new
+        self.ids[torch.tensor([s.slot for s in both], device=self.device)] = new
         if self.log is not None:
-            self.log.append(([s.sid for s in seqs], new))
+            self.log.append(([s.sid for s in both], new))
         for s, n in zip(seqs, q_lens, strict=True):
             s.length = n
             s.generated = 1
+        for s in dec:
+            s.length += 1
+            s.generated += 1
         self.stats.prefill_tokens += sum(q_lens)
         self.stats.prefill_batches += 1
-        self.stats.generated += len(seqs)
+        self.stats.decode_tokens += len(dec)
+        self.stats.mixed_rows += len(dec)
+        self.stats.generated += len(both)
 
     def _retire(self) -> None:
         for i, s in enumerate(self.running):
@@ -586,8 +630,16 @@ class Engine:
         self._retire()
 
     def step(self) -> None:
+        """Retire, admit, then one forward: with `mixed`, a step that admits prompts runs
+        the running sequences' decode rows inside the prefill forward and has no decode step;
+        otherwise the prefill is followed by a decode step over every running sequence."""
         self._retire()
+        running = [s for s in self.running if s is not None]
         admitted = self._admit()
+        if admitted and self.mixed:
+            self._prefill(admitted, running)
+            self._retire()
+            return
         if admitted:
             self._prefill(admitted)
             self._retire()  # max_new == 1 finishes at the prefill
