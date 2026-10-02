@@ -38,6 +38,7 @@ and the attention output's head transpose is a torch copy (docs/design/layer.md)
 from __future__ import annotations
 
 import contextlib
+import math
 from dataclasses import dataclass
 
 import torch
@@ -161,12 +162,38 @@ class KVCache:
         return k.contiguous(), v.contiguous(), True
 
 
+def llama3_inv_freq(inv_freq: torch.Tensor, scaling: dict) -> torch.Tensor:
+    """Llama 3.1's long-context frequency adjustment (rope_type "llama3"): wavelengths shorter
+    than original_max_position_embeddings / high_freq_factor keep their frequency, ones longer
+    than original / low_freq_factor are slowed down by `factor`, and the band between is a
+    linear blend of the two in original / wavelength. The same arithmetic as transformers'
+    `_compute_llama3_parameters`, in fp32."""
+    factor = float(scaling["factor"])
+    lo, hi = float(scaling["low_freq_factor"]), float(scaling["high_freq_factor"])
+    old = float(scaling["original_max_position_embeddings"])
+    wavelen = 2 * math.pi / inv_freq
+    out = torch.where(wavelen > old / lo, inv_freq / factor, inv_freq)
+    smooth = (old / wavelen - lo) / (hi - lo)
+    blend = (1 - smooth) * out / factor + smooth * out
+    medium = (wavelen >= old / hi) & (wavelen <= old / lo)
+    return torch.where(medium, blend, out)
+
+
 class RoPE:
     """cos and sin tables for positions 0..max_pos-1 in the rotate-half convention Llama
-    uses (the first half of the head pairs with the second half), fp32."""
+    uses (the first half of the head pairs with the second half), fp32. `scaling` is a
+    config's rope_scaling dict; rope_type "llama3" (Llama 3.1 and later) is the one
+    supported, None or rope_type "default" is plain RoPE."""
 
-    def __init__(self, max_pos: int, device="cuda", theta: float = ROPE_THETA):
+    def __init__(self, max_pos: int, device="cuda", theta: float = ROPE_THETA,
+                 scaling: dict | None = None):
         inv_freq = 1.0 / (theta ** (torch.arange(0, HEAD_DIM, 2, device=device).float() / HEAD_DIM))
+        kind = scaling.get("rope_type", scaling.get("type", "default")) if scaling else "default"
+        if kind == "llama3":
+            inv_freq = llama3_inv_freq(inv_freq, scaling)
+        elif kind != "default":
+            raise ValueError(f"rope_type {kind!r} is not supported")
+        self.inv_freq = inv_freq
         pos = torch.arange(max_pos, device=device).float()
         freqs = torch.outer(pos, inv_freq)  # [max_pos, 64]
         emb = torch.cat([freqs, freqs], dim=-1)  # [max_pos, 128]

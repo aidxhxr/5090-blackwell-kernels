@@ -37,6 +37,7 @@ class ModelConfig:
     eps: float
     max_pos: int
     tie_embeddings: bool
+    rope_scaling: dict | None = None
 
     @staticmethod
     def from_dir(path: str | Path) -> ModelConfig:
@@ -48,8 +49,10 @@ class ModelConfig:
             bad["head_dim"] = (cfg["head_dim"], HEAD_DIM)
         if bad:
             raise ValueError(f"not a Llama-3-8B-shaped model: (got, need) {bad}")
-        if cfg.get("rope_scaling"):
-            raise ValueError(f"rope_scaling {cfg['rope_scaling']} is not supported")
+        scaling = cfg.get("rope_scaling") or None
+        kind = scaling.get("rope_type", scaling.get("type")) if scaling else "default"
+        if kind not in ("default", "llama3"):
+            raise ValueError(f"rope_scaling {scaling} is not supported")
         if abs(cfg.get("rms_norm_eps", EPS) - EPS) > 1e-12:
             raise ValueError(f"rms_norm_eps {cfg['rms_norm_eps']} != {EPS}")
         if cfg["vocab_size"] % 64:
@@ -58,10 +61,12 @@ class ModelConfig:
                            rope_theta=float(cfg.get("rope_theta", 10000.0)),
                            eps=cfg.get("rms_norm_eps", EPS),
                            max_pos=cfg.get("max_position_embeddings", 8192),
-                           tie_embeddings=bool(cfg.get("tie_word_embeddings", False)))
+                           tie_embeddings=bool(cfg.get("tie_word_embeddings", False)),
+                           rope_scaling=scaling)
 
     def rope(self, max_pos: int | None = None, device="cuda") -> RoPE:
-        return RoPE(max_pos or self.max_pos, device=device, theta=self.rope_theta)
+        return RoPE(max_pos or self.max_pos, device=device, theta=self.rope_theta,
+                    scaling=self.rope_scaling)
 
 
 class _Tensors:

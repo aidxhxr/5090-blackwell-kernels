@@ -64,9 +64,43 @@ def test_load_matches_hf_layout(tmp_path):
 
 
 @pytest.mark.parametrize("bad", [dict(hidden_size=3584), dict(num_key_value_heads=4),
-                                 dict(rope_scaling={"rope_type": "llama3"}),
+                                 dict(rope_scaling={"rope_type": "yarn", "factor": 4.0}),
                                  dict(vocab_size=32001)])
 def test_config_refuses_other_shapes(tmp_path, bad):
     (tmp_path / "config.json").write_text(json.dumps(_config(**bad)))
     with pytest.raises(ValueError):
         hf.ModelConfig.from_dir(tmp_path)
+
+
+LLAMA31_SCALING = {"factor": 8.0, "high_freq_factor": 4.0, "low_freq_factor": 1.0,
+                   "original_max_position_embeddings": 8192, "rope_type": "llama3"}
+
+
+def test_config_reads_llama3_rope_scaling(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps(_config(
+        rope_scaling=LLAMA31_SCALING, max_position_embeddings=131072)))
+    cfg = hf.ModelConfig.from_dir(tmp_path)
+    assert cfg.rope_scaling == LLAMA31_SCALING and cfg.max_pos == 131072
+
+
+def test_llama3_rope_matches_transformers():
+    """inv_freq of the llama3 rope type against transformers' own init, and the tables built
+    from it: high frequencies untouched, low ones divided by the factor."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA GPU required")
+    rope_utils = pytest.importorskip("transformers.modeling_rope_utils")
+    from transformers import LlamaConfig
+
+    hcfg = LlamaConfig(hidden_size=4096, num_attention_heads=32, num_key_value_heads=8,
+                       rope_theta=500000.0, max_position_embeddings=131072,
+                       rope_scaling=LLAMA31_SCALING)
+    want, _ = rope_utils.ROPE_INIT_FUNCTIONS["llama3"](hcfg, "cpu")
+    rope = L.RoPE(4096, theta=500000.0, scaling=LLAMA31_SCALING)
+    plain = L.RoPE(4096, theta=500000.0)
+    torch.testing.assert_close(rope.inv_freq.cpu(), want.float(), rtol=1e-6, atol=0)
+    assert torch.equal(rope.inv_freq[:8], plain.inv_freq[:8])
+    torch.testing.assert_close(rope.inv_freq[-8:], plain.inv_freq[-8:] / 8)
+    pos = torch.arange(4096, device="cuda").float()
+    # fp32 angles up to ~4000 rad: a one-ulp inv_freq difference moves cos by ~1e-4
+    torch.testing.assert_close(rope.cos[:, :64], torch.outer(pos, want.cuda().float()).cos(),
+                               rtol=0, atol=1e-3)
