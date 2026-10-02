@@ -16,11 +16,12 @@ batch (the engine) or as one padded-free batch of equal lengths (transformers). 
 JSON line per run to --out.
 
 --format runs the engine's SparkModel with its projections in a low-precision format
-(spark_kernels.quant). --save-ref stores the logits of the first --kl-windows windows (bf16,
-on the CPU, then to a file); a later run with --ref compares its own logits on those windows
-with them: the mean KL divergence KL(ref || this) per token in nats and the fraction of
-tokens whose argmax agrees, the two numbers that say how far a quantized model moved from
-the reference beyond the one perplexity.
+(spark_kernels.quant); --awq folds activation-aware scales from scripts/awq_search.py into
+the bf16 weights before they are quantized. --save-ref stores the logits of the first
+--kl-windows windows (bf16, on the CPU, then to a file); a later run with --ref compares its
+own logits on those windows with them: the mean KL divergence KL(ref || this) per token in
+nats and the fraction of tokens whose argmax agrees, the two numbers that say how far a
+quantized model moved from the reference beyond the one perplexity.
 """
 
 from __future__ import annotations
@@ -62,6 +63,10 @@ def engine_scorer(args):
 
     w, cfg = hf.load(args.model)
     rope = cfg.rope(max(args.ctx, 8192))
+    if args.awq:
+        from spark_kernels import awq
+
+        awq.apply(w, torch.load(args.awq)["scales"])
     if args.backend == "torch":
         model = E.TorchModel(w, rope)
     else:
@@ -113,6 +118,7 @@ def main() -> None:
     ap.add_argument("--windows", type=int, default=None, help="score only the first N")
     ap.add_argument("--batch", type=int, default=4)
     ap.add_argument("--format", default="bf16", help="weights format of the spark backend")
+    ap.add_argument("--awq", default=None, help="fold these scales in first (awq_search.py)")
     ap.add_argument("--save-ref", default=None, help="store the first windows' logits here")
     ap.add_argument("--ref", default=None, help="KL and top-1 agreement against these logits")
     ap.add_argument("--kl-windows", type=int, default=4)
@@ -144,10 +150,11 @@ def main() -> None:
                     kl, agree, kl_count = kl + k, agree + a, kl_count + lg.shape[0]
     dt = time.perf_counter() - t0
     ppl = math.exp(total / count)
-    label = args.label or (args.format if args.backend == "spark" else args.backend)
+    label = args.label or (args.format + ("-awq" if args.awq else "")
+                           if args.backend == "spark" else args.backend)
     row = dict(model=Path(args.model).name, backend=args.backend, format=args.format,
-               label=label, ctx=args.ctx, windows=len(wins), tokens=count, nll=total / count,
-               ppl=ppl, seconds=dt)
+               awq=bool(args.awq), label=label, ctx=args.ctx, windows=len(wins), tokens=count,
+               nll=total / count, ppl=ppl, seconds=dt)
     if refs is not None:
         row.update(kl=kl / kl_count, top1=agree / kl_count, kl_tokens=kl_count)
     if args.save_ref:
