@@ -168,6 +168,9 @@ class SparkModel:
     def __init__(self, weights: ModelWeights, rope: RoPE):
         self.w = weights
         self.rope = rope
+        # set to a list to collect the residual stream [T, 4096] after every layer (a parity
+        # check against another implementation reads it); None, the default, costs nothing
+        self.trace: list[torch.Tensor] | None = None
 
     def _layers(self, x: torch.Tensor, b: Batch, cache: PagedKVCache, decode: bool):
         T = x.shape[0]
@@ -185,6 +188,8 @@ class SparkModel:
             h2 = sk.rmsnorm(x, w.mlp_norm, EPS)
             a = sk.hgemm_swiglu(h2, w.w_gate_up)
             sk.hgemm(a, w.w_down, residual=x, out=x)
+            if self.trace is not None:
+                self.trace.append(x.clone())  # x is updated in place by the next layer
         return x
 
     def _logits(self, x: torch.Tensor) -> torch.Tensor:
@@ -220,6 +225,7 @@ class TorchModel:
     def __init__(self, weights: ModelWeights, rope: RoPE, compile: bool = False):
         self.w = weights
         self.rope = rope
+        self.trace: list[torch.Tensor] | None = None  # see SparkModel.trace
         self.pre_d, self.post_d = self._pre, self._post
         if compile:
             mode = "max-autotune-no-cudagraphs"
@@ -283,6 +289,8 @@ class TorchModel:
                     t0 += n
                 o = torch.cat(outs)
             x = post(x, o, w.w_o, w.mlp_norm, w.w_gate_up, w.w_down)
+            if self.trace is not None:
+                self.trace.append(x)
         return x
 
     def _logits(self, x):

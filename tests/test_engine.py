@@ -107,3 +107,24 @@ def test_prompt_logits_last_row_is_prefill(sk, weights):
     last = eng.model.prefill(eng._prefill_batch(seqs), eng.cache)
     for f, row in zip(full, last, strict=True):
         assert _rel(f[-1], row) < 1e-2
+
+
+def test_trace_collects_the_residual_stream(sk, weights):
+    """trace holds the residual stream after each layer, the last one is what the logits are
+    computed from, and turning it on changes nothing."""
+    rope = L.RoPE(1024)
+    g = torch.Generator().manual_seed(5)
+    prompts = [torch.randint(0, VOCAB, (n,), generator=g) for n in (19, 70)]
+    traces = []
+    for m in (E.SparkModel(weights, rope), E.TorchModel(weights, rope)):
+        eng = E.Engine(m, N_LAYERS, max_batch=2, max_seq=128, num_pages=16, graphs=False)
+        plain = torch.cat(eng.prompt_logits(prompts))
+        m.trace = []
+        traced = torch.cat(eng.prompt_logits(prompts))
+        tr, m.trace = m.trace, None
+        assert torch.equal(plain, traced)
+        assert len(tr) == N_LAYERS and tr[0].shape == (89, L.HIDDEN)
+        assert torch.equal(m._logits(tr[-1]), traced)
+        traces.append(tr)
+    for a, b in zip(*traces, strict=True):
+        assert _rel(a, b) < 2e-2
