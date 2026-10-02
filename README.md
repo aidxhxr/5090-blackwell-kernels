@@ -18,8 +18,10 @@ of FlashAttention-2's backward. The fp8 attention runs at 630 TFLOPS, 2.6 times 
 kernel. With int4 weights a batch-1 decode GEMM is 3.7 times the bf16 one, because a decode
 step is a weight stream and the weights got four times smaller. Put together on a paged
 cache, the kernels run the whole 32-layer Llama-3-8B for a batch of mixed-length requests,
-and a decode step at 64 sequences is 3.5 times `torch.compile`'s. And four things about this
-card turned out to be different from the spec sheet, which is the part I'd read first.
+and a decode step at 64 sequences is 3.5 times `torch.compile`'s. On real Llama-3-8B
+weights that engine is closer to an fp32 reference than transformers is, and it matches or
+beats vLLM on every static batch, decode and prefill row I measured. And four things about
+this card turned out to be different from the spec sheet, which is the part I'd read first.
 
 This started as spark-kernels, for a DGX Spark that hasn't shipped, and the Python package still
 carries that name. The 5090 is what the numbers come from. The same source builds for the GB10
@@ -599,8 +601,113 @@ A step at 64 sequences moves 20.6 GB (weights plus every sequence's K/V) at 94% 
 roof. Torch runs the same model on the same paged cache and has to gather the pages for its
 attention, which is where most of the gap at large batches comes from. With continuous
 batching, 256 requests through 64 slots, the engine generates 1,862 tokens/s against 797 for
-compiled torch on the same schedule, 2.3x. Details and what is not done yet (chunked
-prefill, preemption, a TMA prefill) are in [docs/design/serving.md](docs/design/serving.md).
+compiled torch on the same schedule, 2.3x. Details and what is not done yet (preemption,
+a TMA prefill) are in [docs/design/serving.md](docs/design/serving.md).
+
+## real models
+
+Everything above ran on random weights. So I loaded real checkpoints into the engine
+(`spark_kernels.hf`, any Hugging Face Llama-3-8B-shaped model) and checked three things: is
+it right, is it fast next to the stacks people actually use, and what do the low-precision
+GEMMs cost on weights that aren't Gaussian. Llama-3-8B-Instruct, Llama-3.1-8B-Instruct and
+Mistral-7B-Instruct-v0.3, all measured 2026-10-02 on the same card.
+
+```
+python scripts/generate.py ~/models/llama3-8b-instruct "What is 17 * 23?"   # 391
+python scripts/eval_ppl.py ~/models/llama3-8b-instruct --format nvfp4        # wikitext-2
+python scripts/bench_llm.py run spark ~/models/llama3-8b-instruct --out rows.jsonl
+python scripts/needle.py ~/models/llama3.1-8b-instruct --lengths 8192 32768   # long context
+```
+
+**Is it right.** I compared the engine and transformers (both bf16) against an fp32 run of
+the same weights. The engine is the closer of the two, on the logits, at every one of the 32
+layers, and in perplexity. It rounds to bf16 less often: RMSNorm and RoPE stay in fp32, and
+the residual adds and SwiGLU happen in the fp32 GEMM epilogue.
+
+| wikitext-2, ctx 2048 | ppl | logit error vs fp32 (median) | KL vs fp32 |
+|---|---|---|---|
+| fp32 reference | 8.2840 | | |
+| this engine | 8.2873 | 0.98% | 3.3e-4 |
+| transformers | 8.2889 | 1.18% | 3.9e-4 |
+
+Greedy outputs still split from transformers', in 12 of 16 replies within 256 tokens. Every
+split I looked at was a tie or one bf16 step between the top two logits, and the fp32
+reference sided with each implementation six times. The engine is also not batch invariant:
+hgemm picks its schedule by M, so the same prompt can take a different near-tie at a
+different batch size. Details in [docs/design/llm_parity.md](docs/design/llm_parity.md).
+
+**Is it fast.** I ran the same token ids through vLLM 0.30 and transformers 5.18, all bf16,
+greedy, no early stop.
+
+| Llama-3-8B-Instruct | this engine | vLLM 0.30 | transformers |
+|---|---|---|---|
+| batch 1 decode, tok/s | 101.8 | 100.7 | 85.1 |
+| batch 1, weight stream, % of copy roof | 99.8% | 98.7% | 83% |
+| batch 8, 512 in / 256 out, tok/s | 716 | 652 | 505 |
+| batch 32, tok/s | 2,064 | 1,938 | 1,507 |
+| batch 64, tok/s | 2,923 | 2,853 | 1,959 |
+| TTFT, 2K prompt | 127 ms | 144 ms | 154 ms |
+| TTFT, 8K prompt | 553 ms | 607 ms | 666 ms |
+| 256 chat requests, continuous batching | 2,478 tok/s | 2,561 tok/s | 362 tok/s |
+
+At batch 1, both engines stream the weights at the copy roof, so there is nothing left there.
+Batch 8 is the biggest gap, because cuBLAS leaves its GEMV there for an sm80 CUTLASS kernel that is
+10% slower than our decode GEMM. Continuous batching is the one row I lose, by 3%, and it's the
+scheduler. I reserve every page a request could need at admission and never preempt, so
+about 90 requests run at once against vLLM's 207. Give the engine 10 GiB of cache instead of
+8.5 and it does 2,589. Getting there also fixed a real bug: a CUDA graph captured before a
+prefill kept the address of a split-K workspace that the prefill then freed. Details in
+[docs/design/llm_serving.md](docs/design/llm_serving.md).
+
+**Low-precision weights on real weights.** Full wikitext-2, ctx 2048, the four projections of
+every layer in the format, embedding and lm_head in bf16:
+
+| format | weights | ppl | decode B=1 | decode B=32 | prefill 4x2048 |
+|---|---|---|---|---|---|
+| bf16 | 14.96 GiB | 8.287 | 102 tok/s | 2,799 tok/s | 16,196 tok/s |
+| fp8 e4m3, per-tensor | 8.46 GiB | 8.320 | 165 | 4,183 | 26,221 |
+| MXFP8 | 8.66 GiB | 8.399 | 166 | 4,165 | 26,819 |
+| int4 g128, round to nearest | 5.31 GiB | 9.136 | 271 | 5,008 | 12,526 |
+| int4 g128 asym + AWQ scales | 5.31 GiB | 8.562 | 271 | 5,008 | 12,526 |
+| NVFP4 (W4A4) | 5.61 GiB | 8.976 | 224 | 5,297 | 50,809 |
+| MXFP4 (W4A4) | 5.41 GiB | 12.17 | 239 | 5,524 | 54,057 |
+
+fp8 costs 0.03 perplexity and is 1.6x faster at both ends. int4 is 2.6x faster at batch 1,
+since a decode step is a weight stream and every quantized GEMM reads at the copy roof.
+Round to nearest costs 0.85 perplexity, which a 20-second activation-aware scale search on
+calibration text cuts to 0.27. NVFP4 is the prefill format: the fp4 GEMM runs a 2048-token
+prompt at 1,227 TFLOPS, 3.1x bf16's prefill throughput, and it is closer to bf16 than plain
+int4 even with 4-bit activations. MXFP4's power-of-two scales lose 3.9 perplexity. Int4 prefill is
+slower than bf16, because w4gemm is a decode kernel. Details in
+[docs/design/llm_quant.md](docs/design/llm_quant.md).
+
+**Other models and long context.** Llama 3.1 needed its rope scaling. Mistral needed nothing
+but its own stop token. On all three models the engine's perplexity is within 0.02% of
+transformers', a hair lower each time.
+
+| model | engine | transformers |
+|---|---|---|
+| Llama-3-8B-Instruct | 8.5298 | 8.5311 |
+| Llama-3.1-8B-Instruct | 7.4370 | 7.4386 |
+| Mistral-7B-Instruct-v0.3 | 5.5235 | 5.5240 |
+
+(wikitext-2, the first 16 windows of 2048.) Llama 3.1 with a chunked prefill went out to 100K
+tokens next to the weights on one 32 GB card. The engine found a planted number in the
+haystack 3 of 3 times at every length up to 100K. transformers' `generate` ran out of memory
+from 64K on.
+
+| context | TTFT, engine | TTFT, transformers | decode B=1, engine | decode B=1, transformers |
+|---|---|---|---|---|
+| 2K | 0.133 s | 0.157 s | 99.7 tok/s | 83.1 tok/s |
+| 8K | 0.583 s | 0.680 s | 94.1 | 75.9 |
+| 32K | 3.32 s | 3.66 s | 79.9 | 52.5 |
+| 64K | 9.33 s | 9.83 s | 66.5 | out of memory |
+| 100K | 20.6 s | 19.1 s | 56.5 | out of memory |
+
+100K is the one loss, and it has a cause I haven't found yet. The first launch of the TMA
+GEMMs takes 3.4 GiB of device memory outside torch's allocator. Next to 15 GiB of weights and
+a 12 GiB cache, that doesn't fit, so the 100K run uses the Stream-K GEMM for prefill. Details in
+[docs/design/llm_models.md](docs/design/llm_models.md).
 
 ## the memory-bound kernels
 
@@ -656,6 +763,7 @@ default stays on the CUDA cores.
 | `attention_bwd` bf16 | warp per row, FlashAttention-2's key-tile loop on `mma.sync`, V in registers with a double-buffered Q/dO tile and a simulated split, TMA and mbarriers with no block barrier; GQA, a deterministic dQ pass, an autograd Function | torch autograd through `F.scaled_dot_product_attention` (flash and cuDNN) |
 | `rope_append` bf16 | RoPE on q and k plus the K/V cache append from a fused q\|k\|v projection, one launch | the torch spelling, ten kernels |
 | `layer` | one Llama-3-8B decoder layer from the kernels above, prefill and decode with a K/V cache, our decode step as a CUDA graph | the same layer in PyTorch, eager and `torch.compile` |
+| `engine` | the 32-layer model on a paged cache: packed and chunked prefill, mixed prefill and decode steps, CUDA-graph decode, stop ids; bf16, fp8, MXFP8, int4 (with AWQ scales), NVFP4 and MXFP4 weights; Hugging Face checkpoints through `spark_kernels.hf` | vLLM 0.30, transformers 5.18, the same model in PyTorch |
 | `bench_peak` | | the card's real `mma.sync` (bf16, fp8 plain and block-scaled, fp4, tf32) and FMA peaks and the clock they ran at |
 
 Every kernel takes a `variant` argument so each rung can be run, timed and tested on its own.
