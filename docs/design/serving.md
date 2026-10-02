@@ -322,6 +322,11 @@ roughly 260 launches faster than the GPU runs them, so the queue never drains an
 the back-to-back rate. The graph is kept because it costs nothing and removes the host from the
 critical path, which matters on a slower host or with a smaller model.
 
+llm_serving.md has what changed after this: graphs only for buckets up to 64 (a larger one
+could keep a kernel workspace that a prefill had freed), slot compaction, prefill and decode
+rows in one forward, stop ids, and the engine against vLLM and transformers on the real
+checkpoint.
+
 ## Correctness
 
 - `tests/test_paged.py`: `paged_decode` (both variants) against SDPA in fp32 per sequence on the
