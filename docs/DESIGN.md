@@ -101,3 +101,4 @@ docs:
 - [attention backward](design/attention_bwd.md)
 - [one decoder layer](design/layer.md)
 - [serving: the paged K/V cache, paged decode, varlen prefill and the engine](design/serving.md)
+- [parity on real weights: the engine against transformers and an fp32 reference](design/llm_parity.md)
