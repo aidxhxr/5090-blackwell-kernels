@@ -231,3 +231,52 @@ def test_stop_ids(sk, weights):
     assert got == want
     early = sum(len(want[i]) < news[i] for i in range(len(news)))
     assert early > 0 and st.stopped == early
+
+
+def test_chunked_prefill_matches_whole(sk, weights):
+    """Prompts prefilled in forwards of 96 tokens (split across forwards, packed with the
+    next prompt's head) give the logits of one whole forward, and a chunked run gives every
+    page back."""
+    rope = L.RoPE(2048)
+    g = torch.Generator().manual_seed(5)
+    prompts = [torch.randint(0, VOCAB, (n,), generator=g) for n in (300, 37, 1000, 5)]
+    out = []
+    for budget in (4096, 96):
+        eng = E.Engine(E.SparkModel(weights, rope), N_LAYERS, max_batch=4, max_seq=1100,
+                       num_pages=300, graphs=False, prefill_tokens=budget)
+        chunks = list(eng.prompt_logits_chunks(prompts))
+        assert all(lg.shape[0] <= budget for _, _, lg in chunks)
+        out.append(eng.prompt_logits(prompts))
+        assert len(eng.cache.free) == eng.cache.num_pages - 1
+    assert len(chunks) > len(prompts)
+    for a, b in zip(*out, strict=True):
+        assert a.shape == b.shape and _rel(b, a) < 2e-2
+
+
+def test_chunked_prefill_with_mixed_steps(sk, weights):
+    """Long prompts chunked under a 96-token budget while other sequences decode (their
+    rows ride in the first chunk's forward of a mixed step): the same tokens as whole-prompt
+    prefills with separate decode steps, and every page comes back."""
+    rope = L.RoPE(1024)
+    g = torch.Generator().manual_seed(17)
+    lens = [int(x) for x in torch.randint(1, 400, (10,), generator=g)]
+    news = [int(x) for x in torch.randint(1, 10, (10,), generator=g)]
+    prompts = [torch.randint(0, VOCAB, (n,), generator=g) for n in lens]
+    outs, stats = [], []
+    for budget, mixed in ((4096, False), (96, True)):
+        eng = E.Engine(E.SparkModel(weights, rope), N_LAYERS, max_batch=4, max_seq=512,
+                       num_pages=160, graphs=True, log_tokens=True, prefill_tokens=budget,
+                       mixed=mixed)
+        for p, m in zip(prompts, news, strict=True):
+            eng.submit(p, m)
+        stats.append(eng.run())
+        outs.append(eng.outputs())
+        assert len(eng.cache.free) == eng.cache.num_pages - 1
+    assert outs[0] == outs[1]
+    assert stats[1].mixed_rows > 0 and stats[1].prefill_batches > stats[0].prefill_batches
+
+
+def test_engine_refuses_rope_shorter_than_max_seq(sk, weights):
+    with pytest.raises(ValueError):
+        E.Engine(E.SparkModel(weights, L.RoPE(512)), N_LAYERS, max_batch=1, max_seq=1024,
+                 num_pages=80, graphs=False)

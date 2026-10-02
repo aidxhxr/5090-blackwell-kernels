@@ -16,7 +16,11 @@ The pieces (docs/design/serving.md):
     Engine         the scheduler: requests wait in a queue, are admitted into free batch
                    slots while pages last, prefilled together in one packed batch, then
                    decoded one token per step with the other running sequences until they
-                   have their tokens; a finished sequence frees its slot and pages at once
+                   have their tokens; a finished sequence frees its slot and pages at once.
+                   A prompt longer than the prefill token budget is prefilled in chunks of
+                   the budget, each attending to the keys the earlier ones cached (the
+                   bottom-right causal mask of attention_varlen), so a 100K-token prompt
+                   never needs 100K rows of activations at once
 
 A sequence keeps its batch slot from admission to the end, so the decode step's inputs
 (token ids, positions, cache slots, lengths, block table rows) live in per-slot device
@@ -153,6 +157,7 @@ class Batch:
     q_lens: list[int] | None = None  # host copy of the prompt lengths (the torch model's loop)
     max_len: int = 0  # host copy of max(seq_lens) (the torch model's gather)
     n_dec: int = 0  # prefill: the last n_dec sequences are one-token decode rows (mixed step)
+    chunked: bool = False  # prefill: some prompt continues a context already in the cache
 
 
 def _rope_tokens(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -402,6 +407,8 @@ class TorchModel:
                                                    attn_mask=mask)
                 o = o.reshape(T, Q_WIDTH)
             else:
+                if b.chunked:
+                    raise NotImplementedError("TorchModel prefills whole prompts only")
                 outs, t0 = [], 0
                 for n in b.q_lens:
                     qs = q[t0:t0 + n].transpose(0, 1)[None]
@@ -478,6 +485,9 @@ class Engine:
             if cache_bytes is None:
                 raise ValueError("give num_pages or cache_bytes")
             num_pages = cache_bytes // PagedKVCache.page_bytes(n_layers, page)
+        rope_len = model.rope.cos.shape[0]
+        if rope_len < max_seq:  # the rope kernel reads the table at any position it is given
+            raise ValueError(f"the RoPE tables cover {rope_len} positions, max_seq is {max_seq}")
         self.model = model
         self.cache = PagedKVCache(n_layers, num_pages, page, device)
         self.page = page
@@ -570,9 +580,10 @@ class Engine:
         self.waiting.append(seq)
         return seq
 
-    def _admit(self) -> list[Sequence]:
+    def _admit(self, budget: int | None = None) -> list[Sequence]:
         free_slots = [i for i, s in enumerate(self.running) if s is None]
-        out, budget = [], self.prefill_tokens
+        out = []
+        budget = self.prefill_tokens if budget is None else budget
         while self.waiting and free_slots:
             seq = self.waiting[0]
             n = seq.prompt.numel()
@@ -590,21 +601,24 @@ class Engine:
             budget -= n
         return out
 
-    def _prefill_batch(self, seqs: list[Sequence], dec: list[Sequence] = ()) -> Batch:
-        """The packed prefill inputs of admitted sequences: their prompts back to back,
-        positions from 0, each token's cache slot from its sequence's pages. Each running
-        sequence in `dec` adds one row after them: its next token (already on the device in
-        its slot's id) at its current length, a one-token chunk after its cached context."""
+    def _prefill_batch(self, seqs: list, dec: list[Sequence] = ()) -> Batch:
+        """The packed prefill inputs of admitted sequences: their prompts back to back, each
+        token at its position with its cache slot from its sequence's pages. An item of
+        `seqs` is a Sequence (its whole prompt) or a piece (sequence, start, end): tokens
+        start..end-1 of its prompt, after the start keys an earlier forward cached. Each
+        running sequence in `dec` adds one row after them: its next token (already on the
+        device in its slot's id) at its current length, a one-token chunk after its cached
+        context."""
         page = self.page
-        q_lens = [s.prompt.numel() for s in seqs] + [1] * len(dec)
-        kv_lens = q_lens[:len(seqs)] + [s.length + 1 for s in dec]
-        parts = [s.prompt for s in seqs]
+        parts = [x if isinstance(x, tuple) else (x, 0, x.prompt.numel()) for x in seqs]
+        q_lens = [e - a for _, a, e in parts] + [1] * len(dec)
+        kv_lens = [e for _, _, e in parts] + [s.length + 1 for s in dec]
+        ids = [s.prompt[a:e] for s, a, e in parts]
         if dec:
-            parts.append(self.ids[torch.tensor([s.slot for s in dec]).to(self.device)])
-        ids = torch.cat(parts)
+            ids.append(self.ids[torch.tensor([s.slot for s in dec]).to(self.device)])
         pos, slots = [], []
-        for s, n in zip(seqs, q_lens, strict=False):
-            p = torch.arange(n, dtype=torch.int32)
+        for s, a, e in parts:
+            p = torch.arange(a, e, dtype=torch.int32)
             pos.append(p)
             slots.append(torch.tensor(s.pages, dtype=torch.int32)[p // page] * page + p % page)
         if dec:
@@ -614,35 +628,64 @@ class Engine:
                                        for s, x in zip(dec, p, strict=True)], dtype=torch.int32))
         cu = torch.tensor([0] + q_lens, dtype=torch.int32).cumsum(0, dtype=torch.int32)
         dev = dict(device=self.device, non_blocking=True)
-        b = Batch(ids=ids, positions=torch.cat(pos).to(**dev), slots=torch.cat(slots).to(**dev),
+        rows = [s for s, _, _ in parts] + list(dec)
+        b = Batch(ids=torch.cat(ids), positions=torch.cat(pos).to(**dev),
+                  slots=torch.cat(slots).to(**dev),
                   seq_lens=torch.tensor(kv_lens, dtype=torch.int32).to(**dev),
-                  block_table=self.block_table[torch.tensor([s.slot for s in [*seqs, *dec]])],
+                  block_table=self.block_table[torch.tensor([s.slot for s in rows])],
                   cu_seqlens=cu.to(**dev), last=(cu[1:] - 1).long().to(**dev), q_lens=q_lens,
-                  max_len=max(kv_lens), n_dec=len(dec))
+                  max_len=max(kv_lens), n_dec=len(dec),
+                  chunked=any(a > 0 for _, a, _ in parts))
         return b
 
+    def _pieces(self, seqs: list[Sequence]):
+        """The prefill of `seqs` as forwards of at most prefill_tokens prompt tokens: yields
+        the (sequence, start, end) pieces of each forward. Prompts are packed in order and a
+        prompt longer than what is left of a forward's budget is split, so a 100K-token prompt
+        runs as chunks that each attend to the cache the previous ones filled."""
+        done = {s.sid: 0 for s in seqs}
+        todo = list(seqs)
+        while todo:
+            parts, budget = [], self.prefill_tokens
+            for s in todo:
+                if budget == 0:
+                    break
+                a = done[s.sid]
+                e = min(s.prompt.numel(), a + budget)
+                parts.append((s, a, e))
+                budget -= e - a
+                done[s.sid] = e
+            todo = [s for s in todo if done[s.sid] < s.prompt.numel()]
+            yield parts
+
     def _prefill(self, seqs: list[Sequence], dec: list[Sequence] = ()) -> None:
-        """One packed forward over the admitted prompts and, with `dec`, one decode row per
-        running sequence; the next token of each lands in its slot's id."""
-        q_lens = [s.prompt.numel() for s in seqs]
-        both = [*seqs, *dec]
-        logits = self.model.prefill(self._prefill_batch(seqs, dec), self.cache)
-        new = torch.argmax(logits, dim=-1)
-        self.ids[torch.tensor([s.slot for s in both], device=self.device)] = new
-        if self.log is not None:
-            self.log.append(([s.sid for s in both], new))
-        for s, n in zip(seqs, q_lens, strict=True):
-            s.length = n
-            s.generated = 1
-        for s in dec:
-            s.length += 1
-            s.generated += 1
-        self._watch(both, list(range(len(both))), new)
-        self.stats.prefill_tokens += sum(q_lens)
-        self.stats.prefill_batches += 1
-        self.stats.decode_tokens += len(dec)
-        self.stats.mixed_rows += len(dec)
-        self.stats.generated += len(both)
+        """The admitted prompts in forwards of at most prefill_tokens tokens (`_pieces`) and,
+        with `dec`, one decode row per running sequence in the first of them; the next token
+        of each prompt that finished and of each decode row lands in its slot's id."""
+        for k, parts in enumerate(self._pieces(seqs)):
+            rows_dec = list(dec) if k == 0 else []
+            logits = self.model.prefill(self._prefill_batch(parts, rows_dec), self.cache)
+            self.stats.prefill_batches += 1
+            fin = [i for i, (s, _, e) in enumerate(parts) if e == s.prompt.numel()]
+            rows = fin + list(range(len(parts), len(parts) + len(rows_dec)))
+            if not rows:
+                continue
+            both = [parts[i][0] for i in fin] + rows_dec
+            new = torch.argmax(logits[torch.tensor(rows, device=self.device)], dim=-1)
+            self.ids[torch.tensor([s.slot for s in both], device=self.device)] = new
+            if self.log is not None:
+                self.log.append(([s.sid for s in both], new))
+            for s in both[:len(fin)]:
+                s.length = s.prompt.numel()
+                s.generated = 1
+            for s in rows_dec:
+                s.length += 1
+                s.generated += 1
+            self._watch(both, list(range(len(both))), new)
+            self.stats.decode_tokens += len(rows_dec)
+            self.stats.mixed_rows += len(rows_dec)
+            self.stats.generated += len(both)
+        self.stats.prefill_tokens += sum(s.prompt.numel() for s in seqs)
 
     def _watch(self, seqs: list[Sequence], rows: list[int], toks: torch.Tensor) -> None:
         """Queues the copy of a forward's new tokens to the host for the stop check:
@@ -774,27 +817,42 @@ class Engine:
             self._retire()  # max_new == 1 finishes at the prefill
         self._decode()
 
-    def prompt_logits(self, prompts: list[torch.Tensor]) -> list[torch.Tensor]:
-        """Logits [P, V] at every position of each prompt, from one packed prefill on empty
-        slots (the batch must be idle); the pages are released afterwards. What a perplexity
-        or a parity check against another implementation reads."""
+    def prompt_logits_chunks(self, prompts: list[torch.Tensor]):
+        """Logits at every position of each prompt, prefilled on empty slots (the engine must
+        be idle) in forwards of at most prefill_tokens tokens: yields (i, start, logits
+        [n, V]) for rows start..start+n-1 of prompt i, in order. A long prompt's logits never
+        exist all at once, which is what a perplexity at 32K context needs (32K rows of a
+        128K vocabulary are 8 GB). The pages are released at the end."""
         if any(s is not None for s in self.running) or self.waiting:
             raise RuntimeError("prompt_logits needs an idle engine")
         seqs = [self.submit(p, 1) for p in prompts]
-        admitted = self._admit()
+        admitted = self._admit(budget=sum(p.numel() for p in prompts))
         if len(admitted) != len(seqs):
             self.waiting.clear()
             for s in admitted:
                 self.cache.release(s.pages)
                 self.running[s.slot] = None
             raise RuntimeError("prompts do not fit the slots or the cache in one prefill")
+        index = {s.sid: i for i, s in enumerate(seqs)}
         try:
-            logits = self.model.prefill(self._prefill_batch(seqs), self.cache, all_logits=True)
+            for parts in self._pieces(seqs):
+                logits = self.model.prefill(self._prefill_batch(parts), self.cache,
+                                            all_logits=True)
+                for (s, a, _), lg in zip(parts, logits.split([e - a for _, a, e in parts]),
+                                         strict=True):
+                    yield index[s.sid], a, lg
         finally:
             for s in seqs:
                 self.cache.release(s.pages)
                 self.running[s.slot] = None
-        return list(logits.split([p.numel() for p in prompts]))
+
+    def prompt_logits(self, prompts: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Logits [P, V] at every position of each prompt (`prompt_logits_chunks` joined):
+        what a perplexity or a parity check against another implementation reads."""
+        rows: list[list[torch.Tensor]] = [[] for _ in prompts]
+        for i, _, lg in self.prompt_logits_chunks(prompts):
+            rows[i].append(lg)
+        return [torch.cat(r) for r in rows]
 
     def outputs(self) -> dict[int, list[int]]:
         """Generated tokens per sequence id, in order (needs log_tokens=True); a sequence
