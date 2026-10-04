@@ -262,9 +262,11 @@ eight mixed prompts and 1.85x on the sixteen short ones.
 - `Engine` keeps a queue of requests, a fixed number of batch slots and the page free list. A
   step retires finished sequences (their pages go back at once), admits waiting requests into
   free slots while pages and a prefill token budget last (16,384 tokens), prefills the admitted
-  prompts as one packed batch, and then runs one decode step over every occupied slot. Pages are
-  reserved for the prompt plus the requested tokens at admission, so a running sequence never
-  needs a page it cannot get and there is no preemption.
+  prompts as one packed batch, and then runs one decode step over every occupied slot. Pages
+  are taken as the tokens arrive (the prompt's at admission, one more every 16 decode steps);
+  a step that finds none free preempts the youngest running sequence, whose prompt and tokens
+  so far go back to the head of the queue. `preempt=False` reserves the prompt plus the
+  requested tokens at admission instead, so nothing ever runs out.
 - A sequence keeps its slot from admission to the end, so the decode inputs are per-slot device
   buffers: token id, position, cache slot, length, block table row. A step uses the first `Bp`
   slots, `Bp` the next power of two over the highest occupied slot; empty slots have length 0
@@ -364,6 +366,7 @@ checkpoint.
   into each decode step (vLLM's chunked prefill) needs a kernel that takes decode rows and
   prefill rows in one launch.
 - **Preemption and a smaller page reservation.** Pages for all requested tokens are taken at
-  admission. A server that reserves as it goes needs to preempt or swap when the pool runs out.
+  admission. A server that reserves as it goes needs to preempt or swap when the pool runs
+  out, which is what `Engine(preempt=True)` does now (llm_serving.md).
 - **Sampling** is greedy argmax; the logits of a 64-sequence step are 16 MB and a top-p sampler
   would read them once more.

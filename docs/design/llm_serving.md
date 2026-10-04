@@ -196,10 +196,15 @@ Four commits, each with a test in `tests/test_engine.py`:
 
 - **Ours.** At B = 1 the step is the weight read at the roof; nothing is left there without
   smaller weights (int4, w4gemm.md). At B = 64 the M = 64 GEMM and the paged decode combine
-  cost about 0.75 ms per step against vLLM. Under load the limit is the scheduler: whole-request
-  page reservation with no preemption, so fewer requests run at once and long requests
-  finish in a thin tail. Chunked prefill is still missing too, so an 8K prompt holds the
-  running batch for 0.55 s.
+  cost about 0.75 ms per step against vLLM. Under load the limit was the scheduler:
+  whole-request page reservation with no preemption, so fewer requests ran at once and long
+  requests finished in a thin tail. The engine now takes pages as the tokens arrive and
+  preempts the youngest running sequence when they run out (`Engine(preempt=True)`, the
+  default; the tokens it has so far go back to the queue with its prompt, from a per-slot
+  buffer the decode step writes on the device), which is the policy that let vLLM run 207
+  requests where this engine ran 90. The table above is the reservation scheduler; the run
+  with preemption is not in it yet. Chunked prefill is still missing too, so an 8K prompt
+  holds the running batch for 0.55 s.
 - **vLLM.** Its decode kernels are at the roof like ours. It loses where cuBLAS picks a weak
   kernel for small M (B = 8, 32) and on prefill GEMMs. Its scheduler favors admission, which
   buys throughput and TTFT at the cost of a 68 ms mean ITL under load.
