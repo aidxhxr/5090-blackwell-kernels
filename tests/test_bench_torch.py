@@ -59,10 +59,11 @@ def test_clock_ramp_spins_once_for_the_whole_process(monkeypatch):
 
 
 def test_attention_shapes_match_the_cpp_defaults():
-    # (B, H_q, H_kv, S_q, S_kv, D, causal) in both files
+    # (B, H_q, H_kv, S_q, S_kv, D, causal, kv_cap) in the C++ file; bench_torch lists the
+    # first seven (its caches are packed, kv_cap 0)
     flat = ints_after("bench_attention", r"shapes =")
-    assert len(flat) % 7 == 0
-    cpp = [tuple(flat[i:i + 7]) for i in range(0, len(flat), 7)]
+    assert len(flat) % 8 == 0
+    cpp = [tuple(flat[i:i + 7]) for i in range(0, len(flat), 8) if flat[i + 7] == 0]
     # bench_torch times the large shapes only; every one of them must be in the C++ list
     for shape in bench_torch.ATTENTION_SHAPES:
         assert shape in cpp, f"{shape} is timed by bench_torch.py but not by bench_attention.cu"

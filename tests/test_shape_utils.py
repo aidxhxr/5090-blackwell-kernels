@@ -23,13 +23,17 @@ import shape_utils as su  # noqa: E402
         ("bandwidth", "n=64M", {"n": 64 << 20}),
         ("bandwidth", "", {"n": 0}),
         ("attention", "b1_h32_s4096_d128_causal",
-         {"B": 1, "H": 32, "H_kv": 32, "S_q": 4096, "S_kv": 4096, "D": 128, "causal": True}),
+         {"B": 1, "H": 32, "H_kv": 32, "S_q": 4096, "S_kv": 4096, "D": 128, "causal": True,
+          "kv_cap": 0}),
         ("attention", "b1_h32_sq1_skv4096_d128",
-         {"B": 1, "H": 32, "H_kv": 32, "S_q": 1, "S_kv": 4096, "D": 128, "causal": False}),
+         {"B": 1, "H": 32, "H_kv": 32, "S_q": 1, "S_kv": 4096, "D": 128, "causal": False,
+          "kv_cap": 0}),
         ("attention", "b1_hq32_hkv8_sq1_skv131072_d128",
-         {"B": 1, "H": 32, "H_kv": 8, "S_q": 1, "S_kv": 131072, "D": 128, "causal": False}),
+         {"B": 1, "H": 32, "H_kv": 8, "S_q": 1, "S_kv": 131072, "D": 128, "causal": False,
+          "kv_cap": 0}),
         ("attention", "b1_hq32_hkv8_s4096_d128_causal",
-         {"B": 1, "H": 32, "H_kv": 8, "S_q": 4096, "S_kv": 4096, "D": 128, "causal": True}),
+         {"B": 1, "H": 32, "H_kv": 8, "S_q": 4096, "S_kv": 4096, "D": 128, "causal": True,
+          "kv_cap": 0}),
     ],
 )
 def test_parse_shape(kernel, shape, expected):
@@ -42,7 +46,8 @@ def test_attention_shape_round_trips_and_counts_flops_and_bytes():
     assert su.attention_shape(1, 32, 1, 4096, 128, False) == "b1_h32_sq1_skv4096_d128"
     dims = su.parse_shape("attention", su.attention_shape(4, 32, 2048, 2048, 128, True))
     assert dims == {"B": 4, "H": 32, "H_kv": 32, "S_q": 2048, "S_kv": 2048, "D": 128,
-                    "causal": True}
+                    "causal": True,
+          "kv_cap": 0}
     # 4 B H S_q S_kv D, halved under the causal mask; Q, K, V, O each once in bf16
     assert su.flops("attention", dims) == 2 * 4 * 32 * 2048 * 2048 * 128
     assert su.traffic_bytes("attention", "bf16", dims) == 4 * 32 * (2048 + 2048) * 128 * 2 * 2
@@ -66,6 +71,19 @@ def test_attention_gqa_shape_keeps_mha_keys_and_scales_kv_bytes_with_kv_heads():
     assert su.traffic_bytes("attention", "bf16", dims) == q_bytes + kv_bytes
     with pytest.raises(ValueError):
         su.parse_shape("attention", "b1_hq32_s4096_d128")  # hq without hkv
+
+
+def test_attention_shape_with_a_cache_capacity_keeps_the_traffic_of_the_rows_read():
+    # bench_attention --kvcap: K and V are the first S_kv rows of heads allocated kv_cap rows
+    s = su.attention_shape(1, 32, 1, 4096, 128, False, H_kv=8, kv_cap=4352)
+    assert s == "b1_hq32_hkv8_sq1_skv4096_d128_cap4352"
+    dims = su.parse_shape("attention", s)
+    packed = su.parse_shape("attention", su.attention_shape(1, 32, 1, 4096, 128, False, H_kv=8))
+    assert dims["kv_cap"] == 4352 and packed["kv_cap"] == 0
+    assert su.traffic_bytes("attention", "bf16", dims) == su.traffic_bytes("attention", "bf16",
+                                                                            packed)
+    assert su.flops("attention", dims) == su.flops("attention", packed)
+    assert su.parse_shape("attention", "b1_h32_s4096_d128_causal_cap4352")["causal"]
 
 
 def test_shape_strings_match_the_cpp_benches_and_round_trip():
@@ -260,7 +278,8 @@ def test_attention_bwd_counts_the_five_products_and_the_gradient_traffic():
     # bench_attention_bwd.cu uses the forward's shape strings; FLOPs are 2.5x the forward's
     dims = su.parse_shape("attention_bwd", "b1_hq32_hkv8_s4096_d128_causal")
     assert dims == {"B": 1, "H": 32, "H_kv": 8, "S_q": 4096, "S_kv": 4096, "D": 128,
-                    "causal": True}
+                    "causal": True,
+          "kv_cap": 0}
     assert su.flops("attention_bwd", dims) == 2.5 * su.flops("attention", dims)
     assert su.flops("attention_bwd", dims) == 10 * 32 * 4096 * 4096 * 128 / 2
     # Q, O, dO, dQ per query head and K, V, dK, dV per K/V head, bf16

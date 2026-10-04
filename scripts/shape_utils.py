@@ -198,15 +198,16 @@ def gemm_shape(M: int, N: int, K: int) -> str:
 
 
 def attention_shape(B: int, H: int, S_q: int, S_kv: int, D: int, causal: bool,
-                    H_kv: int | None = None) -> str:
+                    H_kv: int | None = None, kv_cap: int = 0) -> str:
     """Shape string of bench_attention: "b1_h32_s4096_d128_causal", or sq/skv when the query
     and key lengths differ ("b1_h32_sq1_skv4096_d128", a decode step), and hq/hkv when the
     K/V head count differs from the query head count ("b1_hq32_hkv8_sq1_skv4096_d128", GQA).
     `H` is the query head count; `H_kv` defaults to it (MHA), and an equal value keeps the
-    old "h32" spelling so existing rows keep their keys."""
+    old "h32" spelling so existing rows keep their keys. `kv_cap` adds "_cap4352": K and V
+    are the first S_kv rows of heads allocated kv_cap rows (a cache read in place)."""
     heads = f"h{H}" if H_kv is None or H_kv == H else f"hq{H}_hkv{H_kv}"
     s = f"b{B}_{heads}_s{S_q}" if S_q == S_kv else f"b{B}_{heads}_sq{S_q}_skv{S_kv}"
-    return f"{s}_d{D}" + ("_causal" if causal else "")
+    return f"{s}_d{D}" + ("_causal" if causal else "") + (f"_cap{kv_cap}" if kv_cap else "")
 
 
 ROPE_SHAPE = re.compile(r"^b(\d+)_s(\d+)_hq(\d+)_hkv(\d+)_d(\d+)_pos(\d+)$")
@@ -218,7 +219,8 @@ PAGED_SHAPE = re.compile(
     r"(_causal)?$")
 
 ATTENTION_SHAPE = re.compile(
-    r"^b(\d+)_(?:h(\d+)|hq(\d+)_hkv(\d+))_(?:s(\d+)|sq(\d+)_skv(\d+))_d(\d+)(_causal)?$")
+    r"^b(\d+)_(?:h(\d+)|hq(\d+)_hkv(\d+))_(?:s(\d+)|sq(\d+)_skv(\d+))_d(\d+)(_causal)?"
+    r"(?:_cap(\d+))?$")
 
 
 def ints_in(s: str) -> list[int]:
@@ -267,11 +269,14 @@ def parse_shape(kernel: str, shape: str) -> dict:
         m = ATTENTION_SHAPE.match(shape)
         if not m:
             raise ValueError(f"not an attention shape string: {shape!r}")
-        B, H, Hq, Hkv, S, Sq, Skv, D, causal = m.groups()
+        B, H, Hq, Hkv, S, Sq, Skv, D, causal, cap = m.groups()
         # "H" is the query head count (what the FLOPs and the Q/O bytes scale with); "H_kv"
-        # the K/V head count, equal to it unless the string spells them apart (GQA).
+        # the K/V head count, equal to it unless the string spells them apart (GQA). "kv_cap"
+        # is the rows each K/V head is allocated when the bench read a cache in place (the
+        # traffic is still the S_kv rows the kernel reads), 0 when packed.
         return {"B": int(B), "H": int(Hq or H), "H_kv": int(Hkv or H), "S_q": int(Sq or S),
-                "S_kv": int(Skv or S), "D": int(D), "causal": causal is not None}
+                "S_kv": int(Skv or S), "D": int(D), "causal": causal is not None,
+                "kv_cap": int(cap or 0)}
     if k in ("paged_decode", "attention_varlen"):
         m = PAGED_SHAPE.match(shape)
         if not m:
