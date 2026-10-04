@@ -174,3 +174,46 @@ def test_attention_rejects_bad_inputs(sk):
         sk.attention(q[0], k[0], v[0])  # 3-D
     with pytest.raises(RuntimeError):
         sk.attention(q.transpose(2, 3).contiguous().transpose(2, 3), k, v)  # not contiguous
+
+
+# the filled part of a K/V cache with spare capacity, k[:, :, :S_kv] of a [B, H_kv, cap, D]
+# tensor: every variant reads it in place through the capacity stride (the pointer variants
+# in their head offset, the TMA variants in their tensor maps' outer stride, the decode
+# kernel in its head offset), and must match the packed copy bit for bit
+CACHE_SHAPES = [(1, 8, 2, 300, 300, 128), (2, 4, 4, 1000, 1000, 64), (1, 32, 8, 1, 4096, 128),
+                (1, 16, 2, 2, 1000, 128), (1, 2, 2, 7, 300, 64), (1, 8, 2, 7, 300, 128)]
+
+
+@pytest.mark.parametrize("variant", _variants())
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+@pytest.mark.parametrize("shape", CACHE_SHAPES, ids=_shape_id)
+def test_attention_reads_a_cache_slice_in_place(sk, shape, causal, variant):
+    B, Hq, Hkv, Sq, Skv, D = shape
+    q, k, v = _inputs(*shape)
+    cap = Skv + 37
+    kc = torch.randn(B, Hkv, cap, D, device="cuda", dtype=torch.bfloat16)
+    vc = torch.randn_like(kc)
+    kc[:, :, :Skv] = k
+    vc[:, :, :Skv] = v
+    ks, vs = kc[:, :, :Skv], vc[:, :, :Skv]
+    assert not ks.is_contiguous()
+    want = sk.attention(q, k, v, causal=causal, variant=variant)
+    got = sk.attention(q, ks, vs, causal=causal, variant=variant)
+    torch.testing.assert_close(got, want, atol=0, rtol=0)
+    # the training forward takes the same slices
+    out, lse = sk.attention_fwd(q, ks, vs, causal=causal, variant=variant)
+    out2, lse2 = sk.attention_fwd(q, k, v, causal=causal, variant=variant)
+    torch.testing.assert_close(out, out2, atol=0, rtol=0)
+    torch.testing.assert_close(lse, lse2, atol=0, rtol=0)
+
+
+def test_attention_rejects_other_strided_kv(sk):
+    q, k, v = _inputs(1, 4, 4, 64, 256, 128)
+    big = torch.randn(1, 4, 300, 128, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError):
+        sk.attention(q, big[:, :, 10:266], v)  # k and v with different strides
+    with pytest.raises(RuntimeError):
+        sk.attention(q, k.transpose(2, 3), v.transpose(2, 3))  # D not contiguous
+    kt = torch.randn(1, 300, 4, 128, device="cuda", dtype=torch.bfloat16).transpose(1, 2)
+    with pytest.raises(RuntimeError):
+        sk.attention(q, kt[:, :, :256], kt[:, :, :256])  # heads inside the rows
