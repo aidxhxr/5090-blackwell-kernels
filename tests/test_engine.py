@@ -280,3 +280,75 @@ def test_engine_refuses_rope_shorter_than_max_seq(sk, weights):
     with pytest.raises(ValueError):
         E.Engine(E.SparkModel(weights, L.RoPE(512)), N_LAYERS, max_batch=1, max_seq=1024,
                  num_pages=80, graphs=False)
+
+
+def test_preemption_keeps_tokens_in_a_small_cache(sk, weights):
+    """More requests than the cache can hold at their full lengths: pages are taken as the
+    tokens come, sequences are preempted when they run out and prefilled again from their
+    tokens so far, and every request ends with the tokens it gets from a cache that holds
+    everything (graphs on, so the token record the preemption reads is the captured step's).
+    Every page comes back, and the small cache really did preempt."""
+    rope = L.RoPE(1024)
+    g = torch.Generator().manual_seed(23)
+    lens = [int(x) for x in torch.randint(1, 120, (16,), generator=g)]
+    news = [int(x) for x in torch.randint(20, 90, (16,), generator=g)]
+    prompts = [torch.randint(0, VOCAB, (n,), generator=g) for n in lens]
+    outs, stats = [], []
+    for pages in (1024, 48):
+        eng = E.Engine(E.SparkModel(weights, rope), N_LAYERS, max_batch=8, max_seq=512,
+                       num_pages=pages, graphs=True, log_tokens=True)
+        for p, m in zip(prompts, news, strict=True):
+            eng.submit(p, m)
+        stats.append(eng.run())
+        outs.append(eng.outputs())
+        assert len(eng.cache.free) == eng.cache.num_pages - 1
+    assert outs[0] == outs[1]
+    assert [len(outs[1][i]) for i in range(len(lens))] == news
+    assert stats[0].preempted == 0 and stats[1].preempted > 0
+    assert stats[1].recomputed_tokens > 0
+    assert stats[1].finished == stats[0].finished == len(lens)
+
+
+def test_preemption_with_stop_ids_and_mixed_steps(sk, weights):
+    """The same under stop ids (a stopped sequence may be preempted before its stop is
+    seen) and with decode rows riding in prefill forwards: the outputs match the big
+    cache's, cut at the stop token."""
+    rope = L.RoPE(1024)
+    g = torch.Generator().manual_seed(29)
+    lens = [int(x) for x in torch.randint(1, 100, (12,), generator=g)]
+    news = [int(x) for x in torch.randint(30, 80, (12,), generator=g)]
+    prompts = [torch.randint(0, VOCAB, (n,), generator=g) for n in lens]
+
+    def run(pages, stop_ids):
+        eng = E.Engine(E.SparkModel(weights, rope), N_LAYERS, max_batch=4, max_seq=512,
+                       num_pages=pages, graphs=True, log_tokens=True, stop_ids=stop_ids,
+                       prefill_tokens=128)
+        for p, m in zip(prompts, news, strict=True):
+            eng.submit(p, m)
+        st = eng.run()
+        assert len(eng.cache.free) == eng.cache.num_pages - 1
+        return eng.outputs(), st
+
+    full, _ = run(1024, None)
+    counts = torch.bincount(torch.tensor([t for o in full.values() for t in o[1:]]))
+    stop = int(counts.argmax())
+    want = {sid: o[:o.index(stop) + 1] if stop in o else o for sid, o in full.items()}
+    got, st = run(32, [stop])
+    assert got == want
+    assert st.preempted > 0 and st.finished == len(lens)
+
+
+def test_reserve_mode_never_preempts(sk, weights):
+    """preempt=False is the old scheduler: every page of prompt + max_new reserved at
+    admission, so a cache that holds two requests at a time runs them two at a time with
+    no preemption, and a request the cache cannot hold is refused at submit."""
+    rope = L.RoPE(1024)
+    eng = E.Engine(E.SparkModel(weights, rope), N_LAYERS, max_batch=8, max_seq=1024,
+                   num_pages=33, graphs=False, log_tokens=True, preempt=False)
+    for n in (100, 100, 100, 100):
+        eng.submit(torch.randint(0, VOCAB, (n,)), 140)  # 15 pages each, 32 to give
+    st = eng.run()
+    assert st.preempted == 0 and st.finished == 4
+    assert st.decode_rows == st.decode_tokens  # two at a time in the 2-bucket
+    with pytest.raises(ValueError):
+        eng.submit(torch.randint(0, VOCAB, (400,)), 120)  # 33 pages: never fits beside scratch
