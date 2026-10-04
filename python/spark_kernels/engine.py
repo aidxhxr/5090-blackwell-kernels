@@ -20,7 +20,13 @@ The pieces (docs/design/serving.md):
                    A prompt longer than the prefill token budget is prefilled in chunks of
                    the budget, each attending to the keys the earlier ones cached (the
                    bottom-right causal mask of attention_varlen), so a 100K-token prompt
-                   never needs 100K rows of activations at once
+                   never needs 100K rows of activations at once. Pages are taken as the
+                   tokens arrive: a request is admitted with the pages its prompt needs,
+                   grows by one page every `page` decode steps, and when the cache runs out
+                   the youngest running sequence is preempted (its pages freed, its prompt
+                   and the tokens it has so far put back at the head of the queue, to be
+                   prefilled again), as vLLM does, so the cache holds as many requests as
+                   their current lengths allow instead of as many as their worst case would
 
 A sequence keeps its batch slot from admission to the end, so the decode step's inputs
 (token ids, positions, cache slots, lengths, block table rows) live in per-slot device
@@ -447,13 +453,14 @@ class TorchModel:
 @dataclass
 class Sequence:
     sid: int
-    prompt: torch.Tensor  # [P] int64 on the device
+    prompt: torch.Tensor  # [P] int64 on the device; after a preemption, plus its tokens so far
     max_new: int
     pages: list[int] = field(default_factory=list)
     slot: int = -1
     length: int = 0  # tokens in the cache
     generated: int = 0
     stopped: int = 0  # with stop ids: how many tokens it had when one of them came out
+    resumed_at: int = 0  # `generated` when it was last admitted: the tokens not in `prompt`
 
 
 @dataclass
@@ -468,6 +475,8 @@ class Stats:
     stopped: int = 0  # sequences finished by a stop token before max_new
     generated: int = 0  # every generated token, the prefill's first one included
     finished: int = 0
+    preempted: int = 0  # sequences taken out of the batch for lack of pages
+    recomputed_tokens: int = 0  # prompt tokens prefilled again after a preemption
 
 
 class Engine:
@@ -478,13 +487,17 @@ class Engine:
     running sequences' decode rows ride in the prefill forward instead, so a step that admits
     is one forward, not two. With `graphs` (SparkModel only) each decode bucket up to
     GRAPH_MAX is captured into a CUDA graph at construction. With `compact` a decode step
-    first moves sequences out of high slots so it runs the smallest bucket that fits."""
+    first moves sequences out of high slots so it runs the smallest bucket that fits. With
+    `preempt` (the default) a request holds the pages of the tokens it has and takes one more
+    every `page` steps; a decode step that finds no free page preempts the youngest running
+    sequence, which is prefilled again later with its tokens so far. Without it the pages of
+    the prompt and every requested token are reserved at admission and never run out."""
 
     def __init__(self, model, n_layers: int, max_batch: int = 64, max_seq: int = 4096,
                  num_pages: int | None = None, page: int = PAGE, cache_bytes: int | None = None,
                  prefill_tokens: int = 8192, graphs: bool = True, log_tokens: bool = False,
                  compact: bool = True, mixed: bool | None = None,
-                 stop_ids: list[int] | None = None, device="cuda"):
+                 stop_ids: list[int] | None = None, preempt: bool = True, device="cuda"):
         if max_batch > BUCKETS[-1]:
             raise ValueError(f"max_batch is at most {BUCKETS[-1]}")
         # a decode step runs a whole bucket, so the per-slot buffers are bucket sized
@@ -504,6 +517,10 @@ class Engine:
         self.max_pages = cdiv(max_seq, page)
         self.prefill_tokens = prefill_tokens
         self.compact = compact
+        self.preempt = preempt
+        # pages kept free at admission so the running sequences can grow a little before
+        # anything has to be preempted (vLLM's watermark, 1% of the cache)
+        self.watermark = max(1, num_pages // 100) if preempt else 0
         # stop tokens: each forward's new tokens are copied to pinned host memory behind an
         # event, and read once the event has passed, so the loop never waits for the GPU
         self.stop_ids = set(stop_ids or ())
@@ -521,6 +538,11 @@ class Engine:
         self.slots = torch.full((max_batch,), self.cache.scratch * page, **i32)
         self.seq_lens = torch.zeros(max_batch, **i32)
         self.block_table = torch.zeros(max_batch, self.max_pages, **i32)
+        # every token each slot has generated since its sequence was admitted, written by the
+        # decode step itself (inside the graph) at column gen_n: what a preempted sequence is
+        # prefilled again from, so a preemption never waits for the GPU
+        self.gen = torch.zeros(max_batch, max_seq, device=device, dtype=torch.long)
+        self.gen_n = torch.zeros(max_batch, device=device, dtype=torch.long)
         # pinned staging for the per-step inputs: a ring, so the host can queue a few steps
         # ahead of the GPU without rewriting a buffer whose copy has not run yet
         self.host = [torch.zeros(3, max_batch, dtype=torch.int32).pin_memory()
@@ -547,6 +569,13 @@ class Engine:
     def _decode_once(self, bp: int, max_len: int = 0) -> None:
         logits = self.model.decode(self._decode_batch(bp, max_len), self.cache)
         self.ids[:bp].copy_(torch.argmax(logits, dim=-1))
+        self._record(self.ids[:bp], self.gen_n[:bp], slice(0, bp))
+
+    def _record(self, toks: torch.Tensor, col: torch.Tensor, rows) -> None:
+        """gen[rows, col] = toks, then col += 1 (saturating, so an empty slot's counter never
+        leaves the buffer); device tensors only, so the graphs capture it."""
+        self.gen[rows].scatter_(1, col[:, None], toks[:, None])
+        col.add_(1).clamp_(max=self.max_seq - 1)
 
     def _capture_all(self) -> None:
         """One graph per bucket up to GRAPH_MAX, captured with every slot empty (length 0,
@@ -575,6 +604,7 @@ class Engine:
             self.graphs[bp] = g
         torch.cuda.synchronize()
         self.ids.zero_()
+        self.gen_n.zero_()
 
     # ---- requests ------------------------------------------------------------------------
 
@@ -583,20 +613,28 @@ class Engine:
             raise ValueError(f"prompt + max_new = {prompt.numel() + max_new} > max_seq")
         if max_new < 1:
             raise ValueError("max_new must be >= 1")
+        need = cdiv(prompt.numel() + max_new, self.page)
+        if need > self.cache.num_pages - 1 - self.watermark:  # it would wait (or thrash) forever
+            raise ValueError(f"prompt + max_new needs {need} pages, the cache has "
+                             f"{self.cache.num_pages - 1 - self.watermark} to give")
         seq = Sequence(self._next_sid, prompt.to(self.device, torch.long).flatten(), max_new)
         self._next_sid += 1
         self.waiting.append(seq)
         return seq
 
     def _admit(self, budget: int | None = None) -> list[Sequence]:
+        """Admits queued requests into free slots while pages last: the pages of the prompt
+        plus one token with `preempt` (the rest come as the tokens do), of the prompt plus
+        every requested token without it."""
         free_slots = [i for i, s in enumerate(self.running) if s is None]
         out = []
         budget = self.prefill_tokens if budget is None else budget
         while self.waiting and free_slots:
             seq = self.waiting[0]
             n = seq.prompt.numel()
-            need = cdiv(n + seq.max_new, self.page)
-            if (out and n > budget) or need > len(self.cache.free):
+            remaining = seq.max_new - seq.generated
+            need = cdiv(n + (1 if self.preempt else remaining), self.page)
+            if (out and n > budget) or need > len(self.cache.free) - self.watermark:
                 break
             self.waiting.popleft()
             seq.pages = self.cache.alloc(need)
@@ -607,7 +645,56 @@ class Engine:
             self.block_table[seq.slot].copy_(row, non_blocking=True)
             out.append(seq)
             budget -= n
+        if out:
+            self.gen_n[torch.tensor([s.slot for s in out], device=self.device)] = 0
         return out
+
+    def _preempt(self, seq: Sequence) -> None:
+        """Takes `seq` out of the batch: its pages go back, its prompt grows by the tokens it
+        generated since it was admitted (the slot's gen buffer, read on the device), and it
+        goes to the head of the queue to be prefilled again from the start."""
+        n = seq.generated - seq.resumed_at
+        if n:
+            seq.prompt = torch.cat([seq.prompt, self.gen[seq.slot, :n]])
+            seq.resumed_at = seq.generated
+        self.cache.release(seq.pages)
+        seq.pages = []
+        self.running[seq.slot] = None
+        seq.slot = -1
+        self.waiting.appendleft(seq)
+        self.stats.preempted += 1
+        self.stats.recomputed_tokens += seq.prompt.numel()
+
+    def _grow(self, seqs: list[Sequence]) -> list[Sequence]:
+        """Gives every sequence in `seqs` the page its next token (position `length`) needs,
+        oldest first; when none is free the youngest running sequence is preempted until one
+        is. Returns the sequences of `seqs` still running. New pages land in the block table
+        with one indexed copy."""
+        if not self.preempt:
+            return seqs
+        slots, cols, pages = [], [], []
+        for seq in sorted(seqs, key=lambda s: s.sid):
+            if seq.slot < 0:
+                continue  # preempted while an older one grew
+            idx = seq.length // self.page
+            if idx < len(seq.pages):
+                continue
+            while not self.cache.free:
+                victim = max((s for s in self.running if s is not None), key=lambda s: s.sid)
+                self._preempt(victim)
+                if victim is seq:
+                    break
+            if seq.slot < 0:
+                continue
+            seq.pages.extend(self.cache.alloc(1))
+            slots.append(seq.slot)
+            cols.append(idx)
+            pages.append(seq.pages[-1])
+        if slots:
+            t = torch.tensor([slots, cols, pages], dtype=torch.int32).pin_memory().to(
+                self.device, non_blocking=True)
+            self.block_table[t[0].long(), t[1].long()] = t[2]
+        return [s for s in seqs if s.slot >= 0]
 
     def _prefill_batch(self, seqs: list, dec: list[Sequence] = ()) -> Batch:
         """The packed prefill inputs of admitted sequences: their prompts back to back, each
@@ -680,12 +767,15 @@ class Engine:
                 continue
             both = [parts[i][0] for i in fin] + rows_dec
             new = torch.argmax(logits[torch.tensor(rows, device=self.device)], dim=-1)
-            self.ids[torch.tensor([s.slot for s in both], device=self.device)] = new
+            slots = torch.tensor([s.slot for s in both], device=self.device)
+            self.ids[slots] = new
+            self.gen[slots, self.gen_n[slots]] = new
+            self.gen_n[slots] += 1
             if self.log is not None:
                 self.log.append(([s.sid for s in both], new))
             for s in both[:len(fin)]:
                 s.length = s.prompt.numel()
-                s.generated = 1
+                s.generated += 1  # from 0, or from where a preemption left it
             for s in rows_dec:
                 s.length += 1
                 s.generated += 1
@@ -723,6 +813,12 @@ class Engine:
     def _retire(self) -> None:
         if self.stop_ids:
             self._check_stops()
+        for s in list(self.waiting):  # a preempted sequence whose stop came out before
+            if s.stopped and s.resumed_at:
+                self.waiting.remove(s)
+                self.stats.finished += 1
+                if s.stopped < s.max_new:
+                    self.stats.stopped += 1
         for i, s in enumerate(self.running):
             if s is not None and (s.generated >= s.max_new or s.stopped):
                 if s.stopped and s.stopped < s.max_new:
@@ -751,6 +847,8 @@ class Engine:
         s_idx, d_idx = idx[:len(src)], idx[len(src):]
         self.ids[d_idx] = self.ids[s_idx]
         self.block_table[d_idx] = self.block_table[s_idx]
+        self.gen[d_idx] = self.gen[s_idx]
+        self.gen_n[d_idx] = self.gen_n[s_idx]
         for a, b in zip(src, dst, strict=True):
             seq = self.running[a]
             seq.slot = b
@@ -760,6 +858,7 @@ class Engine:
     def _decode(self) -> None:
         if self.compact:
             self._compact()
+        self._grow([s for s in self.running if s is not None])
         live = [i for i, s in enumerate(self.running) if s is not None]
         if not live:
             return
@@ -814,7 +913,9 @@ class Engine:
         the running sequences' decode rows inside the prefill forward and has no decode step;
         otherwise the prefill is followed by a decode step over every running sequence."""
         self._retire()
-        running = [s for s in self.running if s is not None]
+        # the running sequences take the pages their next token needs before anything is
+        # admitted, so a preemption never hits a prompt that has not been prefilled yet
+        running = self._grow([s for s in self.running if s is not None])
         admitted = self._admit()
         if admitted and self.mixed:
             self._prefill(admitted, running)
