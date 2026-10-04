@@ -532,13 +532,18 @@ inline CUtensorMap make_tensor_map_2d_u8(const void* base, uint64_t rows, uint64
 
 // 3-D map for a [d2][d1][d0] tensor (d0 contiguous) with a box of box1 x box0 in the two
 // inner dimensions and 1 in the outer one, so a box never crosses from one d2 slice into the
-// next and rows past d1 are zero-filled.
+// next and rows past d1 are zero-filled. `d1_cap` is the number of d1 rows each d2 slice is
+// allocated (its outer stride in rows): d1 for a packed tensor, more for the leading rows of
+// a K/V cache with spare capacity; the rows past d1 are out of range for the copy engine
+// either way. 0 means d1.
 inline CUtensorMap make_tensor_map_3d(CUtensorMapDataType type, size_t elem_bytes, const void* base,
                                       uint64_t d0, uint64_t d1, uint64_t d2, uint32_t box0,
-                                      uint32_t box1, CUtensorMapSwizzle swizzle) {
+                                      uint32_t box1, CUtensorMapSwizzle swizzle,
+                                      uint64_t d1_cap = 0) {
     CUtensorMap map;
+    if (d1_cap == 0) d1_cap = d1;
     const cuuint64_t dims[3] = {d0, d1, d2};
-    const cuuint64_t strides[2] = {d0 * elem_bytes, d1 * d0 * elem_bytes};
+    const cuuint64_t strides[2] = {d0 * elem_bytes, d1_cap * d0 * elem_bytes};
     const cuuint32_t box[3] = {box0, box1, 1};
     const cuuint32_t elem_strides[3] = {1, 1, 1};
     const CUresult r =
@@ -552,10 +557,10 @@ inline CUtensorMap make_tensor_map_3d(CUtensorMapDataType type, size_t elem_byte
     return map;
 }
 inline CUtensorMap make_tensor_map_3d_bf16(const void* base, uint64_t d0, uint64_t d1, uint64_t d2,
-                                           uint32_t box0, uint32_t box1,
-                                           CUtensorMapSwizzle swizzle) {
+                                           uint32_t box0, uint32_t box1, CUtensorMapSwizzle swizzle,
+                                           uint64_t d1_cap = 0) {
     return make_tensor_map_3d(CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, sizeof(__nv_bfloat16), base, d0, d1,
-                              d2, box0, box1, swizzle);
+                              d2, box0, box1, swizzle, d1_cap);
 }
 // Same for 8-bit elements (the fp8 attention kernel moves e4m3 as raw bytes).
 inline CUtensorMap make_tensor_map_3d_u8(const void* base, uint64_t d0, uint64_t d1, uint64_t d2,
