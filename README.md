@@ -560,10 +560,11 @@ back-to-back rate of the decode kernel; the whole layer moves its 436 MB at 96% 
 step. The graph buys 1 us per layer: the ten launches are queued back to back by a host that
 issues a step in 52 us while the GPU runs it in 298, so there is no launch gap left for a
 graph to close. Prefill is 88% GEMM at 246 to 254 TFLOPS. Torch eager is 12 to 17% behind on
-every row and compiled torch 2 to 8%. The reading of it, and the honest caveats (no head
-stride in the attention kernels, so a cache with spare capacity is copied before the kernel
-reads it: 19 us at 4K tokens, 0.68 ms at 128K), are in
-[docs/design/layer.md](docs/design/layer.md).
+every row and compiled torch 2 to 8%. The reading of it, and the honest caveats, are in
+[docs/design/layer.md](docs/design/layer.md). One of them is gone: the attention kernels
+take the K/V head stride now, so a cache with spare capacity is read where it is instead
+of being copied out before every step (19 us at 4K tokens, 0.68 ms at 128K, measured
+before the stride).
 
 ## serving a batch
 
@@ -851,8 +852,7 @@ Things I'd still like to do: a 128-key tile for attention, which would halve how
 two warps of a scheduler land in their softmaxes together (the 3% of tensor pipe still idle);
 the MX GEMM's last 10%, which is the scale operand's layout (cuBLASLt takes its scales in a
 tiled layout that one TMA box serves; a row-major one costs the consumer warps eight shuffles
-per stage); a K/V head stride in the attention kernels so a growing cache is read where it is;
-and a GB10 run when the Spark arrives. Both
+per stage); and a GB10 run when the Spark arrives. Both
 cards are consumer Blackwell, so `mma.sync`, `cp.async` and TMA are there and `tcgen05` isn't.
 
 ```

@@ -44,17 +44,17 @@ What is fused where:
   kernel wanted contiguous inputs, and `gu[:, :14336]` is not one, so `swiglu` grew a
   strided entry (`swiglu_strided_*`, the same 16-byte vector kernel with a row stride) that
   the binding takes for 2-D inputs whose rows are contiguous but not adjacent.
-- Not fused: the q/k/v column split (a view, free), the attention output's transpose back
+- Not fused: the q/k/v column split (a view, free) and the attention output's transpose back
   to [tokens, 4096] (a torch copy, 25 us at 4096 tokens, nothing at decode where [B, 32, 1,
-  128] already is [B, 32, 128]), and the attention over a cache that is not full (below).
+  128] already is [B, 32, 128]).
 
 The K/V cache is [B, 8, capacity, 128] per layer, the layout the attention kernel reads. The
-kernel takes a contiguous [B, H_kv, S_kv, D] tensor and has no head stride, so the filled
-part of a cache with spare capacity is a strided slice, and the layer copies it out
-contiguous before the kernel runs (`KVCache.kv()` says when). A cache whose capacity equals
-its length after the append is read in place. The decode rows below are the in-place case
-(the step fills the last slot of a cache of capacity L); the copied case is measured next
-to it as the cost of not having a strided kernel.
+kernels take the K/V head stride as a parameter (`kv_cap`, the rows each head is
+allocated: a head offset in the pointer variants and the decode kernel, the outer stride of
+the K/V tensor maps in the TMA variants), so the filled part of a cache with spare capacity
+is read where it is; `KVCache.kv()` returns the views. Before that the layer copied the
+filled part out contiguous before every step whose cache was not full, and the table under
+"The cache-append cost" is that copy's price.
 
 ## The RoPE + append kernel
 
@@ -219,8 +219,9 @@ tokens/s, and 16 GB of K/V cache is being read per step next to the 14 GB of wei
 sequences at 4K cost 0.37 ms per layer, 25% more than one, for eight times the tokens: 678
 tokens/s. Torch eager is 15 to 18% behind at every shape and compiled torch 2 to 10%.
 
-**The cache-append cost.** The same step against a cache with 256 spare slots, where the
-filled part is copied out contiguous before the attention kernel reads it:
+**The cache-append cost.** Measured before the kernels took a K/V stride: the same step
+against a cache with 256 spare slots, where the filled part was copied out contiguous
+before the attention kernel read it:
 
 | shape | in place | copied | the copy |
 |---|---|---|---|
@@ -229,13 +230,12 @@ filled part is copied out contiguous before the attention kernel reads it:
 | B=1, L=131072 | 0.604 ms | 1.287 | +683 us (512 MB) |
 | B=8, L=4096 | 0.370 ms | 0.516 | +146 us (128 MB) |
 
-That is the cache read and written once more per step, at 1,500 GB/s, and at 128K tokens it
-doubles the step. A decode loop grows its cache by one token a step, so without a fix every
-step but the one that fills the buffer pays this. The fix is a K/V head stride in the
-attention kernels (head `h` of batch `b` at `(b H_kv + h) x capacity x D` instead of
-`x S_kv x D`), which is a pointer computation in each variant and the outer stride of
-variant 4's tensor maps; it is not done here because the attention source is being changed
-elsewhere at the same time.
+That was the cache read and written once more per step, at 1,500 GB/s, and at 128K tokens it
+doubled the step. A decode loop grows its cache by one token a step, so every step but the
+one that filled the buffer paid it. The attention kernels now take the K/V head stride
+(head `h` of batch `b` at `(b H_kv + h) x capacity x D`), a pointer computation in each
+variant and the outer stride of the TMA variants' tensor maps, and `bench_layer.py`'s
+spare-capacity column (`spark_copy_ms`, the name kept) times the same step read in place.
 
 ## Caveats
 
@@ -245,8 +245,6 @@ decode kernel reads a cache in place at any length, the attention output is toke
 transpose copy is gone, and the positions, slots and lengths are device buffers, so one captured
 graph serves every step. This layer is kept as it is for the one-layer measurements.
 
-- No strided K/V in attention, so a growing cache pays the copy above; the headline decode
-  rows are the in-place case.
 - The attention output's transpose is a torch copy (25 to 80 us at prefill, none at decode).
 - The layer takes `pos` and the cache length from the host: a captured graph is for one
   cache length and one write position.

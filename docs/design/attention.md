@@ -1090,6 +1090,16 @@ variant 4 (most on the batch of four and on `D = 64`, whose tiles are shortest a
 prologue share was therefore largest), and the GQA prefill row matches its MHA twin, as it
 should (same math, a stride on the K/V pointer).
 
+## The K/V head stride
+
+`attention_bf16` takes `kv_cap`, the rows each K/V head is allocated, and reads the first
+`S_kv` of them: head `bkv` starts at `bkv * kv_cap * D`. The pointer variants and the
+flash-decoding kernel put it in the head offset; variants 4 and 5 put it in the outer
+stride of their K/V tensor maps, where the box past `S_kv` stays out of range and
+zero-filled as before. The binding reads it off the strides of `cache[:, :, :length]`, so
+a layer's cache with room to grow is read where it is, and `bench_attention --kvcap=N`
+times the strided read against the packed one (four such rows are in the default sweep).
+
 ## What remains
 
 - **The last 3%.** The tensor pipe is 96 to 97.5% active in variant 5; the block prologue
