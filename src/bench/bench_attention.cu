@@ -4,6 +4,8 @@
 //   ./bench_attention --b=1 --h=32 --s=4096 --d=128 --causal=1 --variant=2 --iters=20
 //   ./bench_attention --sq=1 --skv=4096 ...             # a decode step (S_q != S_kv)
 //   ./bench_attention --hq=32 --hkv=8 --sq=1 --skv=131072   # grouped-query attention
+//   ./bench_attention --sq=1 --skv=4096 --kvcap=4352       # K/V as the first 4096 rows of
+//                                                          # heads allocated 4352 (a cache)
 //
 // Correctness: a CPU double-precision reference on every output row for the small shapes,
 // and on 64 sampled (b, h, row) triples for the large ones (the full reference at S = 4096
@@ -34,6 +36,7 @@ namespace {
 struct Shape {
     int B, Hq, Hkv, Sq, Skv, D;
     int causal;
+    int kvcap = 0;  // rows each K/V head is allocated (0: Skv, packed); the kernel's kv_cap
 };
 
 // "b1_h32_s4096_d128_causal", or "b1_h32_sq1_skv4096_d128" when S_q != S_kv, and
@@ -51,6 +54,7 @@ std::string shape_str(const Shape& s) {
         r += "_sq" + std::to_string(s.Sq) + "_skv" + std::to_string(s.Skv);
     r += "_d" + std::to_string(s.D);
     if (s.causal) r += "_causal";
+    if (s.kvcap) r += "_cap" + std::to_string(s.kvcap);
     return r;
 }
 
@@ -105,6 +109,10 @@ bool run_one(cudaStream_t stream, const Shape& s, int variant, int iters) {
     const size_t BH = static_cast<size_t>(s.B) * s.Hq;
     const size_t BHkv = static_cast<size_t>(s.B) * s.Hkv;
     const size_t nQ = BH * s.Sq * s.D, nK = BHkv * s.Skv * s.D;
+    // With --kvcap the device K and V hold `cap` rows per head and the kernel reads the
+    // first Skv of each; the host copies stay packed (the reference does not care).
+    const int cap = s.kvcap > 0 ? s.kvcap : s.Skv;
+    const size_t nKd = BHkv * cap * s.D;
 
     // Q and K wider than V so the scores have a spread of a few units after the 1/sqrt(D)
     // scale: a near-uniform softmax would not exercise the running max and the rescale.
@@ -130,7 +138,7 @@ bool run_one(cudaStream_t stream, const Shape& s, int variant, int iters) {
     // timing loop rotates through enough copies of K and V to exceed L2 (256 MB+), as
     // bench_hgemm does with the weights of a decode GEMM. A 128K-token cache is past L2 on
     // its own (512 MB at 8 heads, 2 GB at 32) and gets one copy.
-    const size_t kv_bytes = nK * sizeof(__nv_bfloat16);
+    const size_t kv_bytes = nKd * sizeof(__nv_bfloat16);
     const int copies = s.Sq <= 64 ? static_cast<int>((size_t{256} << 20) / (2 * kv_bytes)) + 1 : 1;
 
     __nv_bfloat16 *dQ = nullptr, *dK = nullptr, *dV = nullptr, *dO = nullptr;
@@ -139,16 +147,24 @@ bool run_one(cudaStream_t stream, const Shape& s, int variant, int iters) {
     SPARK_CUDA_CHECK(cudaMalloc(&dV, copies * kv_bytes));
     SPARK_CUDA_CHECK(cudaMalloc(&dO, nQ * sizeof(__nv_bfloat16)));
     SPARK_CUDA_CHECK(cudaMemcpy(dQ, bq.data(), nQ * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
-    SPARK_CUDA_CHECK(cudaMemcpy(dK, bk.data(), kv_bytes, cudaMemcpyHostToDevice));
-    SPARK_CUDA_CHECK(cudaMemcpy(dV, bv.data(), kv_bytes, cudaMemcpyHostToDevice));
+    // the rows past Skv of every head hold garbage the kernel must not read
+    SPARK_CUDA_CHECK(cudaMemset(dK, 0xff, kv_bytes));
+    SPARK_CUDA_CHECK(cudaMemset(dV, 0xff, kv_bytes));
+    for (size_t h = 0; h < BHkv; ++h) {
+        const size_t rows = static_cast<size_t>(s.Skv) * s.D;
+        SPARK_CUDA_CHECK(cudaMemcpy(dK + h * cap * s.D, bk.data() + h * rows,
+                                    rows * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+        SPARK_CUDA_CHECK(cudaMemcpy(dV + h * cap * s.D, bv.data() + h * rows,
+                                    rows * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+    }
     for (int c = 1; c < copies; ++c) {
-        SPARK_CUDA_CHECK(cudaMemcpy(dK + c * nK, dK, kv_bytes, cudaMemcpyDeviceToDevice));
-        SPARK_CUDA_CHECK(cudaMemcpy(dV + c * nK, dV, kv_bytes, cudaMemcpyDeviceToDevice));
+        SPARK_CUDA_CHECK(cudaMemcpy(dK + c * nKd, dK, kv_bytes, cudaMemcpyDeviceToDevice));
+        SPARK_CUDA_CHECK(cudaMemcpy(dV + c * nKd, dV, kv_bytes, cudaMemcpyDeviceToDevice));
     }
     SPARK_CUDA_CHECK(cudaMemset(dO, 0, nQ * sizeof(__nv_bfloat16)));
 
     spark::attention_bf16(dQ, dK, dV, dO, s.B, s.Hq, s.Hkv, s.Sq, s.Skv, s.D, s.causal != 0,
-                          variant, stream);
+                          variant, stream, nullptr, s.kvcap);
     SPARK_CUDA_CHECK(cudaStreamSynchronize(stream));
     const auto got = to_host_f32(dO, nQ);
 
@@ -194,9 +210,9 @@ bool run_one(cudaStream_t stream, const Shape& s, int variant, int iters) {
     int turn = 0;
     const auto t = spark::bench::time_kernel(
         [&] {
-            const size_t off = static_cast<size_t>(turn++ % copies) * nK;
+            const size_t off = static_cast<size_t>(turn++ % copies) * nKd;
             spark::attention_bf16(dQ, dK + off, dV + off, dO, s.B, s.Hq, s.Hkv, s.Sq, s.Skv, s.D,
-                                  s.causal != 0, variant, stream);
+                                  s.causal != 0, variant, stream, nullptr, s.kvcap);
         },
         stream, 5, iters);
 
@@ -239,13 +255,15 @@ int run(int argc, char** argv) {
 
     std::vector<Shape> shapes;
     if (args.has("b") || args.has("h") || args.has("hq") || args.has("hkv") || args.has("s") ||
-        args.has("sq") || args.has("skv") || args.has("d") || args.has("causal")) {
+        args.has("sq") || args.has("skv") || args.has("d") || args.has("causal") ||
+        args.has("kvcap")) {
         // --h sets both head counts; --hq / --hkv set them apart (GQA).
         const int s = args.geti("s", 4096);
         const int h = args.geti("h", 32);
         const int hq = args.geti("hq", h);
         shapes.push_back({args.geti("b", 1), hq, args.geti("hkv", hq), args.geti("sq", s),
-                          args.geti("skv", s), args.geti("d", 128), args.geti("causal", 0)});
+                          args.geti("skv", s), args.geti("d", 128), args.geti("causal", 0),
+                          args.geti("kvcap", 0)});
     } else {
         // Small shapes, checked on every row: both head sizes, both masks, a sequence that is
         // not a multiple of the 128 x 64 tile, and a GQA group of 4. Then Llama-7B-sized
@@ -253,15 +271,19 @@ int run(int argc, char** argv) {
         // sequences, a D = 64 head, and a decode step (one query against a 4096-token cache).
         // Then the GQA shapes: Llama-3-8B heads (32 query, 8 K/V) in prefill and decode, the
         // 128K-token decode caches for both head layouts, and a batch of eight decode steps.
-        shapes = {{1, 4, 4, 512, 512, 128, 0},     {1, 4, 4, 512, 512, 128, 1},
-                  {1, 4, 4, 512, 512, 64, 0},      {1, 4, 4, 512, 512, 64, 1},
-                  {1, 4, 4, 200, 200, 128, 0},     {1, 4, 4, 200, 200, 128, 1},
-                  {1, 8, 2, 512, 512, 128, 1},     {1, 32, 32, 4096, 4096, 128, 0},
-                  {1, 32, 32, 4096, 4096, 128, 1}, {1, 32, 32, 8192, 8192, 128, 1},
-                  {4, 32, 32, 2048, 2048, 128, 1}, {1, 32, 32, 4096, 4096, 64, 1},
-                  {1, 32, 32, 1, 4096, 128, 0},    {1, 32, 8, 4096, 4096, 128, 1},
-                  {1, 32, 8, 1, 4096, 128, 0},     {1, 32, 32, 1, 131072, 128, 0},
-                  {1, 32, 8, 1, 131072, 128, 0},   {8, 32, 8, 1, 4096, 128, 0}};
+        // Last, caches with spare capacity (K/V heads 256 rows apart from where they end),
+        // read in place through the capacity stride: the layer's growing cache.
+        shapes = {{1, 4, 4, 512, 512, 128, 0, 0},     {1, 4, 4, 512, 512, 128, 1, 0},
+                  {1, 4, 4, 512, 512, 64, 0, 0},      {1, 4, 4, 512, 512, 64, 1, 0},
+                  {1, 4, 4, 200, 200, 128, 0, 0},     {1, 4, 4, 200, 200, 128, 1, 0},
+                  {1, 8, 2, 512, 512, 128, 1, 0},     {1, 32, 32, 4096, 4096, 128, 0, 0},
+                  {1, 32, 32, 4096, 4096, 128, 1, 0}, {1, 32, 32, 8192, 8192, 128, 1, 0},
+                  {4, 32, 32, 2048, 2048, 128, 1, 0}, {1, 32, 32, 4096, 4096, 64, 1, 0},
+                  {1, 32, 32, 1, 4096, 128, 0, 0},    {1, 32, 8, 4096, 4096, 128, 1, 0},
+                  {1, 32, 8, 1, 4096, 128, 0, 0},     {1, 32, 32, 1, 131072, 128, 0, 0},
+                  {1, 32, 8, 1, 131072, 128, 0, 0},   {8, 32, 8, 1, 4096, 128, 0, 0},
+                  {1, 32, 8, 1, 4096, 128, 0, 4352},  {1, 32, 8, 1, 131072, 128, 0, 131328},
+                  {8, 32, 8, 1, 4096, 128, 0, 4352},  {1, 32, 8, 4096, 4096, 128, 1, 4352}};
     }
     const int iters = args.geti("iters", 50);
     std::vector<int> variants;
