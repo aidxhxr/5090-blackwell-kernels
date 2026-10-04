@@ -471,8 +471,8 @@ std::tuple<Tensor, Tensor> fp8_quantize(const Tensor& x, const std::string& mode
         scale = at::empty({rows, K / 32}, x.options().dtype(at::kByte));
     }
     spark::fp8_quantize(bf16_ptr(x), static_cast<unsigned char*>(q.data_ptr()), scale.data_ptr(),
-                        work.defined() ? static_cast<unsigned*>(work.data_ptr()) : nullptr, rows,
-                        K, m, current_stream(x));
+                        work.defined() ? static_cast<unsigned*>(work.data_ptr()) : nullptr, rows, K,
+                        m, current_stream(x));
     return {q, scale};
 }
 
@@ -601,13 +601,41 @@ Tensor w4gemm(const Tensor& a, const Tensor& packed, const Tensor& scales,
     return c;
 }
 
+// The rows each K/V head is allocated when k and v are the leading S_kv rows of every head of
+// a [B, H_kv, cap, D] cache (`cache[:, :, :length]`, the filled part of a cache with spare
+// capacity), which the forward reads in place; 0 for packed k and v. Anything else is not a
+// layout the kernels take.
+int64_t kv_capacity(const Tensor& k, const Tensor& v) {
+    if (k.is_contiguous() && v.is_contiguous()) return 0;
+    TORCH_CHECK(k.strides() == v.strides(), "k and v must have the same strides, got ", k.strides(),
+                " and ", v.strides());
+    const int64_t D = k.size(3), S = k.size(2);
+    const auto st = k.strides();
+    TORCH_CHECK(
+        st[3] == 1 && st[2] == D && st[1] >= S * D && st[1] % D == 0 && st[0] == k.size(1) * st[1],
+        "k and v must be contiguous, or the first S_kv rows of every head of a "
+        "[B, H_kv, capacity, D] cache (k[:, :, :S_kv]); got shape ",
+        k.sizes(), " with strides ", k.strides());
+    return st[1] / D;
+}
+
 // The checks every attention entry point shares: q = [B, H_q, S_q, D] and k, v =
-// [B, H_kv, S_kv, D] contiguous bf16 CUDA tensors, H_q a multiple of H_kv (grouped-query
-// attention: query head h reads k/v head h / (H_q / H_kv)), D in {64, 128}, 16-byte aligned.
-void check_attention_inputs(const Tensor& q, const Tensor& k, const Tensor& v) {
+// [B, H_kv, S_kv, D] bf16 CUDA tensors, H_q a multiple of H_kv (grouped-query attention:
+// query head h reads k/v head h / (H_q / H_kv)), D in {64, 128}, 16-byte aligned. q is
+// contiguous; k and v are contiguous or, when `cache_kv`, the leading rows of a cache
+// (kv_capacity above).
+void check_attention_inputs(const Tensor& q, const Tensor& k, const Tensor& v,
+                            bool cache_kv = false) {
     check_cuda_contig(q, "q");
-    check_cuda_contig(k, "k");
-    check_cuda_contig(v, "v");
+    if (cache_kv) {
+        for (const auto& [t, name] : {std::pair{&k, "k"}, std::pair{&v, "v"}}) {
+            TORCH_CHECK(t->is_cuda(), name, " must be a CUDA tensor");
+            TORCH_CHECK(t->numel() > 0, name, " must be non-empty");
+        }
+    } else {
+        check_cuda_contig(k, "k");
+        check_cuda_contig(v, "v");
+    }
     TORCH_CHECK(q.scalar_type() == at::kBFloat16 && k.scalar_type() == at::kBFloat16 &&
                     v.scalar_type() == at::kBFloat16,
                 "attention expects bfloat16 q, k, v");
@@ -625,6 +653,12 @@ void check_attention_inputs(const Tensor& q, const Tensor& k, const Tensor& v) {
         "attention dims too large for int32");
     TORCH_CHECK(aligned16(q) && aligned16(k) && aligned16(v),
                 "attention needs 16-byte aligned q, k, v storage");
+    if (cache_kv) {
+        const int64_t cap = kv_capacity(k, v);
+        TORCH_CHECK(
+            cap <= INT32_MAX && cap * k.size(3) * k.size(1) * k.size(0) < (int64_t{1} << 40),
+            "attention: the K/V cache is too large");
+    }
 }
 
 // The forward rung for `variant` (-1: the top rung that accepts the shape).
@@ -638,7 +672,8 @@ int attention_variant(const Tensor& q, const Tensor& k, int variant) {
 }
 
 // O = softmax(q k^T / sqrt(D)) v; every variant takes any S_q, S_kv >= 1. With `lse` the
-// kernel also writes the natural-log log-sum-exp of every row of scaled scores.
+// kernel also writes the natural-log log-sum-exp of every row of scaled scores. k and v may
+// be the filled part of a cache with spare capacity (kv_capacity), read where it is.
 void run_attention(const Tensor& q, const Tensor& k, const Tensor& v, Tensor& out, bool causal,
                    int variant, float* lse) {
     const c10::cuda::CUDAGuard guard(q.device());
@@ -646,11 +681,12 @@ void run_attention(const Tensor& q, const Tensor& k, const Tensor& v, Tensor& ou
                           static_cast<int>(q.size(0)), static_cast<int>(q.size(1)),
                           static_cast<int>(k.size(1)), static_cast<int>(q.size(2)),
                           static_cast<int>(k.size(2)), static_cast<int>(q.size(3)), causal,
-                          attention_variant(q, k, variant), current_stream(q), lse);
+                          attention_variant(q, k, variant), current_stream(q), lse,
+                          static_cast<int>(kv_capacity(k, v)));
 }
 
 Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, bool causal, int variant) {
-    check_attention_inputs(q, k, v);
+    check_attention_inputs(q, k, v, /*cache_kv=*/true);
     Tensor out = at::empty_like(q);
     run_attention(q, k, v, out, causal, variant, nullptr);
     return out;
@@ -659,7 +695,7 @@ Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, bool causal,
 // The forward for training: (O, lse) with lse fp32 [B, H_q, S_q], what attention_bwd takes.
 std::tuple<Tensor, Tensor> attention_fwd(const Tensor& q, const Tensor& k, const Tensor& v,
                                          bool causal, int variant) {
-    check_attention_inputs(q, k, v);
+    check_attention_inputs(q, k, v, /*cache_kv=*/true);
     Tensor out = at::empty_like(q);
     Tensor lse = at::empty({q.size(0), q.size(1), q.size(2)}, q.options().dtype(at::kFloat));
     run_attention(q, k, v, out, causal, variant, lse.data_ptr<float>());
