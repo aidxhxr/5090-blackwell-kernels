@@ -12,10 +12,11 @@ Run on the GPU box after the extension is built:
 
 A prefill row is one layer over B sequences of S tokens from an empty cache. A decode row is
 one layer over B tokens against a cache holding L - 1 tokens, appended in place (the cache's
-capacity is L, so the attention kernel reads it where it is; `spark_copy_ms` is the same
-step against a cache with spare capacity, where the filled part is copied out contiguous
-first). With the int4 path on (the default; --no-int4 skips it), every decode row also
-times the same step with the four projections as W4A16 GEMMs (SparkLayer(int4=True):
+capacity is L; `spark_copy_ms` is the same step against a cache with 256 spare slots per
+sequence, which the attention kernels also read in place, so the two should agree: the
+column keeps its name from when that case copied the filled part out first). With the int4
+path on (the default; --no-int4 skips it), every decode row also times the same step with
+the four projections as W4A16 GEMMs (SparkLayer(int4=True):
 `spark_int4_ms` eager, `spark_int4_graph_ms` from a CUDA graph) and prints its per-stage
 breakdown. One layer's int4 weights (107 MiB) would mostly stay in the 96 MB L2 from one
 step to the next, which a 32-layer model never sees, so the int4 steps rotate over
@@ -372,8 +373,9 @@ def bench_decode(sk, L, weights, rope, b: int, n: int, args, ours4=()) -> dict:
         print(f"  compiled decode b{b} L{n} in {time.perf_counter() - t0:.0f} s", file=sys.stderr)
         compiled_ms = time_ms(compiled_step, args.warmup, args.iters)
 
-    # the same step against a cache with spare capacity: the filled part is copied out
-    # contiguous before the attention kernel reads it (KVCache.kv), an O(L) cost per step
+    # the same step against a cache with 256 spare slots: the attention kernels read the
+    # filled rows of every head where they are (the K/V capacity is their head stride), so
+    # this should cost what the packed cache costs; it used to be an O(L) copy per step
     copy_ms = 0.0
     if args.copy:
         del graph
@@ -399,7 +401,7 @@ def bench_decode(sk, L, weights, rope, b: int, n: int, args, ours4=()) -> dict:
            "breakdown_us": {s: breakdown[s]["us"] for s in STAGES + ["other"] if s in breakdown}}
     print(f"decode  b{b} L{n:6d}: ours {ours_ms:8.3f} ms  graph {graph_ms:8.3f} ms"
           f"{'' if graph_ok else ' (REPLAY MISMATCH)'}  torch {torch_ms:8.3f} ms  compiled "
-          f"{compiled_ms:8.3f} ms  copy {copy_ms:8.3f} ms  ({tokens_per_s(b, graph_ms):,.0f} "
+          f"{compiled_ms:8.3f} ms  spare {copy_ms:8.3f} ms  ({tokens_per_s(b, graph_ms):,.0f} "
           f"tok/s over {N_LAYERS} layers from the graph)", file=sys.stderr)
     print_breakdown(row["shape"], breakdown, ours_ms)
     if ours4:
@@ -420,7 +422,7 @@ def main() -> int:
     ap.add_argument("--no-compile", dest="compile", action="store_false",
                     help="skip the torch.compile columns (compiling takes minutes)")
     ap.add_argument("--no-copy", dest="copy", action="store_false",
-                    help="skip the spare-capacity (copied cache) decode timing")
+                    help="skip the spare-capacity (strided cache) decode timing")
     ap.add_argument("--no-int4", dest="int4", action="store_false",
                     help="skip the int4 (W4A16 projections) decode timings")
     ap.add_argument("--shapes",
