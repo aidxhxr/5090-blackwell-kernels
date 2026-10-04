@@ -27,10 +27,10 @@ of a column; `LayerWeights.w4_dequantized` gives the bf16 weights they stand for
 what the int4 layer is checked against). A decode step then streams 4x fewer weight bytes.
 
 `KVCache` holds K and V as [B, 8, capacity, 128] tensors, the layout the attention kernel
-reads. The kernel takes a contiguous [B, H_kv, S_kv, D] tensor and has no head stride, so a
-step whose cache is not full attends over a contiguous copy of the filled part (an O(L)
-copy, `KVCache.kv()` says when it happens); a cache with `capacity == length` after the
-append is read in place. RoPE, the q head transpose and the cache append are one kernel
+reads. The kernel takes the filled rows of every head where they are (a K/V head is
+`capacity` rows apart from the next, and the kernels take that stride), so a step attends
+over `KVCache.kv()`'s views and a cache with room to grow costs nothing per step. RoPE,
+the q head transpose and the cache append are one kernel
 (`rope_append_`, src/kernels/rope.cu); the q/k/v column split is a view of the GEMM output
 and the attention output's head transpose is a torch copy (docs/design/layer.md).
 """
@@ -150,16 +150,11 @@ class KVCache:
         self.k[:, :, pos0:pos0 + s] = k.transpose(1, 2)
         self.v[:, :, pos0:pos0 + s] = v.transpose(1, 2)
 
-    def kv(self) -> tuple[torch.Tensor, torch.Tensor, bool]:
-        """(k, v, copied) over the filled positions, contiguous as the attention kernel needs
-        them. The slice is a view when the cache is full (or has one head in all); otherwise
-        it is a contiguous copy of the filled part, `copied` says so, and that copy is the
-        cache-append cost of not having a strided kernel."""
-        k = self.k[:, :, :self.length]
-        v = self.v[:, :, :self.length]
-        if k.is_contiguous():
-            return k, v, False
-        return k.contiguous(), v.contiguous(), True
+    def kv(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """(k, v) over the filled positions: views into the cache, which the attention
+        kernels read in place (a K/V head is `capacity` rows apart from the next, and they
+        take that stride), so a cache with room to grow costs nothing per step."""
+        return self.k[:, :, :self.length], self.v[:, :, :self.length]
 
 
 def llama3_inv_freq(inv_freq: torch.Tensor, scaling: dict) -> torch.Tensor:
@@ -277,7 +272,7 @@ class SparkLayer:
             self.rope.tables(pos0, s)  # the range check
             q = sk.rope_append_(qkv.view(b, s, QKV_WIDTH), self.rope.cos, self.rope.sin,
                                 cache.k, cache.v, pos0, N_HEADS, N_KV_HEADS)
-            kc, vc, _ = cache.kv()
+            kc, vc = cache.kv()
         with _stage("attention"):
             o = sk.attention(q, kc, vc, causal=causal)  # [B, 32, S, 128]
         with _stage("o_transpose"):
@@ -331,7 +326,7 @@ class TorchLayer:
         cos, sin = self.rope.tables(cache.length, s)
         q = apply_rope(q, cos, sin).transpose(1, 2)
         cache.append(apply_rope(k, cos, sin), v)
-        kc, vc, _ = cache.kv()
+        kc, vc = cache.kv()
         o = F.scaled_dot_product_attention(q, kc, vc, is_causal=causal, enable_gqa=True)
         o = o.transpose(1, 2).reshape(b * s, Q_WIDTH)
         x = x + (o @ w.w_o).view(b, s, HIDDEN)
