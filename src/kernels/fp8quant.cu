@@ -94,8 +94,8 @@ __global__ void __launch_bounds__(kThreads)
 }
 
 __global__ void __launch_bounds__(kThreads)
-    quantize_row_kernel(const __nv_bfloat16* __restrict__ x, unsigned char* __restrict__ q,
-                        int K, float* __restrict__ scales) {
+    quantize_row_kernel(const __nv_bfloat16* __restrict__ x, unsigned char* __restrict__ q, int K,
+                        float* __restrict__ scales) {
     __shared__ float smem[32];
     const size_t base = static_cast<size_t>(blockIdx.x) * K;
     const int chunks = K / 8;
@@ -145,20 +145,21 @@ void absmax_bits(const __nv_bfloat16* x, long long n, unsigned* work, cudaStream
     SPARK_REQUIRE(n > 0 && n % 8 == 0 && is_aligned16(x),
                   "absmax_bits: n must be a positive multiple of 8 and x 16-byte aligned");
     const long long chunks = n / 8;
-    const int grid = static_cast<int>(std::min<long long>(cdiv64(chunks, kThreads),
-                                                          4LL * num_sms()));
+    const int grid =
+        static_cast<int>(std::min<long long>(cdiv64(chunks, kThreads), 4LL * num_sms()));
     amax_kernel<<<grid, kThreads, 0, stream>>>(x, chunks, work);
     SPARK_CHECK_LAUNCH();
 }
 
-void fp8_quantize(const __nv_bfloat16* x, unsigned char* q, void* scale, unsigned* work,
-                  int rows, int K, int mode, cudaStream_t stream) {
+void fp8_quantize(const __nv_bfloat16* x, unsigned char* q, void* scale, unsigned* work, int rows,
+                  int K, int mode, cudaStream_t stream) {
     SPARK_REQUIRE(x != nullptr && q != nullptr && scale != nullptr, "fp8_quantize: null pointer");
     SPARK_REQUIRE(rows > 0 && K > 0, "fp8_quantize: rows and K must be positive");
     SPARK_REQUIRE(K % (mode == FP8Q_MX ? 32 : 8) == 0,
                   "fp8_quantize: K must be a multiple of 8 (32 for mx)");
     SPARK_REQUIRE(is_aligned16(x), "fp8_quantize: x must be 16-byte aligned");
-    SPARK_REQUIRE(reinterpret_cast<uintptr_t>(q) % 8 == 0, "fp8_quantize: q must be 8-byte aligned");
+    SPARK_REQUIRE(reinterpret_cast<uintptr_t>(q) % 8 == 0,
+                  "fp8_quantize: q must be 8-byte aligned");
     const long long n = static_cast<long long>(rows) * K;
     if (mode == FP8Q_TENSOR) {
         SPARK_REQUIRE(work != nullptr, "fp8_quantize: the tensor mode needs a zeroed work cell");

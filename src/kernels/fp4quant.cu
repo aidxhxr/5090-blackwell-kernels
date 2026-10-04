@@ -166,8 +166,8 @@ void fp4_quantize(const __nv_bfloat16* x, unsigned char* q, unsigned char* sf, i
                   "fp4_quantize: a dynamic scale needs NVFP4 and a scale_out");
     if (work != nullptr) absmax_bits(x, static_cast<long long>(rows) * K, work, stream);
     if (format == FP4_NVFP4)
-        quantize_nvfp4_kernel<<<grid, kThreads, 0, stream>>>(x, q, sf, rows, padded, K, scale,
-                                                             work, scale_out);
+        quantize_nvfp4_kernel<<<grid, kThreads, 0, stream>>>(x, q, sf, rows, padded, K, scale, work,
+                                                             scale_out);
     else
         quantize_mxfp4_kernel<<<grid, kThreads, 0, stream>>>(x, q, sf, rows, padded, K);
     SPARK_CHECK_LAUNCH();
