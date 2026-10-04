@@ -7,6 +7,10 @@
 // block; under grouped-query attention (H_kv < H_q) the H_q / H_kv heads of a group read the
 // same K/V head, which is a stride on the K/V base pointer and nothing else in these kernels
 // (the decode kernel in attention_decode.cu groups them into one tile so K/V are read once).
+// That stride is kv_cap * D rows: kv_cap is the rows each K/V head is allocated, S_kv for a
+// packed tensor and the capacity of a K/V cache whose first S_kv rows are the keys, so a
+// cache with room to grow is read where it is (the TMA variants put it in the outer stride of
+// their K/V tensor maps; rows past S_kv stay out of range and zero-filled).
 // The causal mask hides key j from query i when j > i (the top-left alignment torch's
 // is_causal uses). Every variant runs the online softmax: a running
 // row max m and row sum l, with the O accumulator rescaled by exp(m_old - m_new) whenever a
@@ -113,7 +117,8 @@ template <int D>
 __global__ void __launch_bounds__(THREADS)
     attention_v0_kernel(const bf16* __restrict__ Q, const bf16* __restrict__ K,
                         const bf16* __restrict__ V, bf16* __restrict__ O, float* __restrict__ lse,
-                        int H_q, int H_kv, int S_q, int S_kv, float scale_log2, int causal) {
+                        int H_q, int H_kv, int S_q, int S_kv, int kv_cap, float scale_log2,
+                        int causal) {
     constexpr int VEC = D / 32;
     const int lane = threadIdx.x & 31;
     const int row = blockIdx.x * (THREADS / 32) + (threadIdx.x >> 5);
@@ -121,8 +126,8 @@ __global__ void __launch_bounds__(THREADS)
     const int bkv = kv_index(bh, H_q, H_kv);
     if (row >= S_q) return;
     const bf16* q = Q + (static_cast<size_t>(bh) * S_q + row) * D + lane * VEC;
-    const bf16* k = K + static_cast<size_t>(bkv) * S_kv * D + lane * VEC;
-    const bf16* v = V + static_cast<size_t>(bkv) * S_kv * D + lane * VEC;
+    const bf16* k = K + static_cast<size_t>(bkv) * kv_cap * D + lane * VEC;
+    const bf16* v = V + static_cast<size_t>(bkv) * kv_cap * D + lane * VEC;
 
     float qr[VEC];
     load_vec<VEC>(q, qr);
@@ -192,7 +197,8 @@ template <int D>
 __global__ void __launch_bounds__(THREADS, 1)
     attention_v1_kernel(const bf16* __restrict__ Q, const bf16* __restrict__ K,
                         const bf16* __restrict__ V, bf16* __restrict__ O, float* __restrict__ lse,
-                        int H_q, int H_kv, int S_q, int S_kv, float scale_log2, int causal) {
+                        int H_q, int H_kv, int S_q, int S_kv, int kv_cap, float scale_log2,
+                        int causal) {
     constexpr int CH = D / 8;                    // 16-byte chunks per bf16 row
     constexpr int DD = D / 32;                   // float4 chunks of O per lane
     constexpr int Q_ITERS = BM * CH / THREADS;   // 8 (D = 128), 4 (D = 64)
@@ -213,8 +219,8 @@ __global__ void __launch_bounds__(THREADS, 1)
     const int q0 = q_tile * BM;
     const int bkv = kv_index(bh, H_q, H_kv);
     const bf16* Qg = Q + static_cast<size_t>(bh) * S_q * D;
-    const bf16* Kg = K + static_cast<size_t>(bkv) * S_kv * D;
-    const bf16* Vg = V + static_cast<size_t>(bkv) * S_kv * D;
+    const bf16* Kg = K + static_cast<size_t>(bkv) * kv_cap * D;
+    const bf16* Vg = V + static_cast<size_t>(bkv) * kv_cap * D;
     bf16* Og = O + static_cast<size_t>(bh) * S_q * D;
 
     // Q tile, rows past S_q zeroed.
@@ -440,6 +446,7 @@ constexpr int BN = 64;
 struct Sched {
     int bh_count;   // B * H_q
     int H_q, H_kv;  // tile bh reads K/V head kv_index(bh, H_q, H_kv)
+    int kv_cap;     // rows per K/V head in memory (>= S_kv): head bkv starts at bkv * kv_cap * D
     int q_tiles;    // ceil(S_q / BM)
     int dp_tiles;
     int split;
@@ -499,8 +506,8 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
     const int q0 = q_tile * BM;
     const int bkv = kv_index(bh, sched.H_q, sched.H_kv);
     const bf16* Qg = Q + static_cast<size_t>(bh) * S_q * D;
-    const bf16* Kg = K + static_cast<size_t>(bkv) * S_kv * D;
-    const bf16* Vg = V + static_cast<size_t>(bkv) * S_kv * D;
+    const bf16* Kg = K + static_cast<size_t>(bkv) * sched.kv_cap * D;
+    const bf16* Vg = V + static_cast<size_t>(bkv) * sched.kv_cap * D;
     bf16* Og = O + static_cast<size_t>(bh) * S_q * D;
 
     // Q tile through stage 0 into A fragments: qf[kk] covers d = 16kk .. 16kk+15.
@@ -820,13 +827,14 @@ void launch_combine(bf16* O, int S_q, bool causal, const Sched& s, cudaStream_t 
 // `split_tail`: variant 3. Variant 2 runs every tile whole on the 8-warp tile.
 template <int D, int WARPS>
 void launch(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv, int S_q,
-            int S_kv, float scale_log2, bool causal, bool split_tail, float* lse,
+            int S_kv, int kv_cap, float scale_log2, bool causal, bool split_tail, float* lse,
             cudaStream_t stream) {
     constexpr int bytes = smem_bytes<D, STAGES>();
     const int resident = resident_blocks<D, WARPS>();
 
     Sched s = whole_tiles<WARPS>(B, H_q, H_kv, S_q);
     s.lse = lse;
+    s.kv_cap = kv_cap;
     if (split_tail) split_tail_tiles<D, WARPS>(s, resident, S_kv, causal);
     const int grid = grid_blocks(s);
     attention_v2_kernel<D, WARPS, STAGES>
@@ -1220,23 +1228,25 @@ int resident_blocks() {
 
 template <int D, int MODE, int PAIR, int OPT>
 void launch_mode(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv,
-                 int S_q, int S_kv, float scale_log2, bool causal, float* lse,
+                 int S_q, int S_kv, int kv_cap, float scale_log2, bool causal, float* lse,
                  cudaStream_t stream) {
     constexpr int bytes = smem_bytes<D, STAGES>();
     const int resident = resident_blocks<D, MODE, PAIR, OPT>();
     // [B*H][S][D] maps with boxes of 64 columns (one 128-byte swizzle span): 128 rows for Q,
-    // 64 for K and V. Rows past S_q / S_kv are zero-filled by the copy engine.
+    // 64 for K and V. Rows past S_q / S_kv are zero-filled by the copy engine; a K/V head
+    // is kv_cap rows apart from the next (the cache's capacity, S_kv when packed).
     const uint64_t BHq = static_cast<uint64_t>(B) * H_q;
     const uint64_t BHkv = static_cast<uint64_t>(B) * H_kv;  // K/V heads, fewer under GQA
     const CUtensorMap tmQ =
         make_tensor_map_3d_bf16(Q, D, S_q, BHq, BOX_COLS, BM, CU_TENSOR_MAP_SWIZZLE_128B);
     const CUtensorMap tmK =
-        make_tensor_map_3d_bf16(K, D, S_kv, BHkv, BOX_COLS, BN, CU_TENSOR_MAP_SWIZZLE_128B);
+        make_tensor_map_3d_bf16(K, D, S_kv, BHkv, BOX_COLS, BN, CU_TENSOR_MAP_SWIZZLE_128B, kv_cap);
     const CUtensorMap tmV =
-        make_tensor_map_3d_bf16(V, D, S_kv, BHkv, BOX_COLS, BN, CU_TENSOR_MAP_SWIZZLE_128B);
+        make_tensor_map_3d_bf16(V, D, S_kv, BHkv, BOX_COLS, BN, CU_TENSOR_MAP_SWIZZLE_128B, kv_cap);
 
     Sched s = v2::whole_tiles<WARPS>(B, H_q, H_kv, S_q);
     s.lse = lse;
+    s.kv_cap = kv_cap;
     v2::split_tail_tiles<D, WARPS>(s, resident, S_kv, causal);
     attention_v4_kernel<D, STAGES, MODE, PAIR, OPT><<<v2::grid_blocks(s), THREADS, bytes, stream>>>(
         tmQ, tmK, tmV, O, S_q, S_kv, scale_log2, causal ? 1 : 0, s);
@@ -1245,7 +1255,7 @@ void launch_mode(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, in
 
 template <int D>
 void launch(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv, int S_q,
-            int S_kv, float scale_log2, bool causal, float* lse, cudaStream_t stream) {
+            int S_kv, int kv_cap, float scale_log2, bool causal, float* lse, cudaStream_t stream) {
 #ifdef SPARK_ATTN_V4_EXPERIMENTS
     // SPARK_ATTN_V4_MODE = MODE + 10 * PAIR + 100 * OPT (see the kernel).
     static int mode = -1;
@@ -1255,38 +1265,39 @@ void launch(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q
     }
     switch (mode) {
         case 1:
-            launch_mode<D, 1, 0, 0>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, lse,
-                                    stream);
+            launch_mode<D, 1, 0, 0>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal,
+                                    lse, stream);
             return;
         case 11:
-            launch_mode<D, 1, 1, 0>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, lse,
-                                    stream);
+            launch_mode<D, 1, 1, 0>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal,
+                                    lse, stream);
             return;
         case 2:
-            launch_mode<D, 2, 0, 0>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, lse,
-                                    stream);
+            launch_mode<D, 2, 0, 0>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal,
+                                    lse, stream);
             return;
         case 12:
-            launch_mode<D, 2, 1, 0>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, lse,
-                                    stream);
+            launch_mode<D, 2, 1, 0>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal,
+                                    lse, stream);
             return;
         case 100:
-            launch_mode<D, 0, 0, 1>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, lse,
-                                    stream);
+            launch_mode<D, 0, 0, 1>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal,
+                                    lse, stream);
             return;
         case 200:
-            launch_mode<D, 0, 0, 2>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, lse,
-                                    stream);
+            launch_mode<D, 0, 0, 2>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal,
+                                    lse, stream);
             return;
         case 300:
-            launch_mode<D, 0, 0, 3>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, lse,
-                                    stream);
+            launch_mode<D, 0, 0, 3>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal,
+                                    lse, stream);
             return;
         default:
             break;
     }
 #endif
-    launch_mode<D, 0, 0, 0>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, lse, stream);
+    launch_mode<D, 0, 0, 0>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal, lse,
+                            stream);
 }
 
 }  // namespace v4
@@ -1777,8 +1788,8 @@ int resident_blocks() {
 // balance.
 template <int D, bool PWARP>
 void launch_cfg(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv,
-                int S_q, int S_kv, float scale_log2, bool causal, int split_mode, float* lse,
-                cudaStream_t stream) {
+                int S_q, int S_kv, int kv_cap, float scale_log2, bool causal, int split_mode,
+                float* lse, cudaStream_t stream) {
     constexpr int bytes = smem_bytes<D>();
     constexpr int threads = CONSUMERS + (PWARP ? 32 : 0);
     const int resident = resident_blocks<D, PWARP>();
@@ -1787,12 +1798,13 @@ void launch_cfg(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int
     const CUtensorMap tmQ =
         make_tensor_map_3d_bf16(Q, D, S_q, BHq, BOX_COLS, BM, CU_TENSOR_MAP_SWIZZLE_128B);
     const CUtensorMap tmK =
-        make_tensor_map_3d_bf16(K, D, S_kv, BHkv, BOX_COLS, BN, CU_TENSOR_MAP_SWIZZLE_128B);
+        make_tensor_map_3d_bf16(K, D, S_kv, BHkv, BOX_COLS, BN, CU_TENSOR_MAP_SWIZZLE_128B, kv_cap);
     const CUtensorMap tmV =
-        make_tensor_map_3d_bf16(V, D, S_kv, BHkv, BOX_COLS, BN, CU_TENSOR_MAP_SWIZZLE_128B);
+        make_tensor_map_3d_bf16(V, D, S_kv, BHkv, BOX_COLS, BN, CU_TENSOR_MAP_SWIZZLE_128B, kv_cap);
 
     Sched s = v2::whole_tiles<CONSUMER_WARPS>(B, H_q, H_kv, S_q);
     s.lse = lse;
+    s.kv_cap = kv_cap;
     const bool split_tail = split_mode < 0 ? !causal || s.dp_tiles < resident : split_mode != 0;
     if (split_tail) v2::split_tail_tiles<D, CONSUMER_WARPS>(s, resident, S_kv, causal);
     const int n_items = v2::grid_blocks(s);
@@ -1805,20 +1817,21 @@ void launch_cfg(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int
 
 template <int D>
 void launch(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv, int S_q,
-            int S_kv, float scale_log2, bool causal, float* lse, cudaStream_t stream) {
+            int S_kv, int kv_cap, float scale_log2, bool causal, float* lse, cudaStream_t stream) {
     if (env().pwarp)
-        launch_cfg<D, true>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, env().split,
-                            lse, stream);
+        launch_cfg<D, true>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal,
+                            env().split, lse, stream);
     else
-        launch_cfg<D, false>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, env().split,
-                             lse, stream);
+        launch_cfg<D, false>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal,
+                             env().split, lse, stream);
 }
 
 }  // namespace v5
 
 template <int D>
 void launch_v1(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv,
-               int S_q, int S_kv, float scale_log2, bool causal, float* lse, cudaStream_t stream) {
+               int S_q, int S_kv, int kv_cap, float scale_log2, bool causal, float* lse,
+               cudaStream_t stream) {
     constexpr int bytes = v1::smem_bytes<D>();
     static bool opted_in = false;
     if (!opted_in) {
@@ -1828,15 +1841,16 @@ void launch_v1(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int 
     }
     const dim3 grid(B * H_q, cdiv(S_q, v1::BM));
     v1::attention_v1_kernel<D><<<grid, v1::THREADS, bytes, stream>>>(
-        Q, K, V, O, lse, H_q, H_kv, S_q, S_kv, scale_log2, causal ? 1 : 0);
+        Q, K, V, O, lse, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal ? 1 : 0);
 }
 
 template <int D>
 void launch_v0(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv,
-               int S_q, int S_kv, float scale_log2, bool causal, float* lse, cudaStream_t stream) {
+               int S_q, int S_kv, int kv_cap, float scale_log2, bool causal, float* lse,
+               cudaStream_t stream) {
     const dim3 grid(cdiv(S_q, v0::THREADS / 32), B * H_q);
-    v0::attention_v0_kernel<D><<<grid, v0::THREADS, 0, stream>>>(Q, K, V, O, lse, H_q, H_kv, S_q,
-                                                                 S_kv, scale_log2, causal ? 1 : 0);
+    v0::attention_v0_kernel<D><<<grid, v0::THREADS, 0, stream>>>(
+        Q, K, V, O, lse, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal ? 1 : 0);
 }
 
 // SPARK_ATTENTION_DECODE=0 keeps decode shapes on the 64-row tile of variant 3 (the path
@@ -1855,14 +1869,16 @@ bool use_decode_kernel() {
 // flash-decoding kernel has no log-sum-exp output, so a call that asks for one takes the tiles.
 template <int D>
 void launch_v3(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv,
-               int S_q, int S_kv, float scale_log2, bool causal, float* lse, cudaStream_t stream) {
+               int S_q, int S_kv, int kv_cap, float scale_log2, bool causal, float* lse,
+               cudaStream_t stream) {
     if (lse == nullptr && use_decode_kernel() && attn::decode_fits(H_q, H_kv, S_q)) {
-        attn::decode_launch(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, D, scale_log2, causal, 0, stream);
+        attn::decode_launch(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, D, scale_log2, causal, 0,
+                            stream);
     } else if (S_q <= 64) {
-        v2::launch<D, 4>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, true, lse,
+        v2::launch<D, 4>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal, true, lse,
                          stream);
     } else {
-        v2::launch<D, 8>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, true, lse,
+        v2::launch<D, 8>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal, true, lse,
                          stream);
     }
 }
@@ -1881,7 +1897,7 @@ bool attention_supports(int S_q, int S_kv, int D, int variant) {
 
 void attention_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_bfloat16* V,
                     __nv_bfloat16* O, int B, int H_q, int H_kv, int S_q, int S_kv, int D,
-                    bool causal, int variant, cudaStream_t stream, float* lse) {
+                    bool causal, int variant, cudaStream_t stream, float* lse, int kv_cap) {
     SPARK_REQUIRE(Q != nullptr && K != nullptr && V != nullptr && O != nullptr,
                   "attention: null pointer");
     SPARK_REQUIRE(B > 0 && H_q > 0 && H_kv > 0 && S_q > 0 && S_kv > 0,
@@ -1891,7 +1907,9 @@ void attention_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_b
     SPARK_REQUIRE(variant >= 0 && variant < attention_num_variants(), "attention: unknown variant");
     SPARK_REQUIRE(is_aligned16(Q) && is_aligned16(K) && is_aligned16(V) && is_aligned16(O),
                   "attention: Q, K, V, O must be 16-byte aligned");
-    SPARK_REQUIRE(static_cast<int64_t>(B) * H_q * std::max(S_q, S_kv) * D < (int64_t{1} << 40),
+    if (kv_cap <= 0) kv_cap = S_kv;
+    SPARK_REQUIRE(kv_cap >= S_kv, "attention: kv_cap must be at least S_kv");
+    SPARK_REQUIRE(static_cast<int64_t>(B) * H_q * std::max(S_q, kv_cap) * D < (int64_t{1} << 40),
                   "attention: tensor too large");
 
     const float scale_log2 = kLog2e / std::sqrt(static_cast<float>(D));
@@ -1899,36 +1917,39 @@ void attention_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_b
         constexpr int DD = decltype(d)::value;
         switch (variant) {
             case 0:
-                launch_v0<DD>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, lse, stream);
+                launch_v0<DD>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal, lse,
+                              stream);
                 break;
             case 1:
-                launch_v1<DD>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, lse, stream);
+                launch_v1<DD>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal, lse,
+                              stream);
                 break;
             case 2:
-                v2::launch<DD, 8>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, false,
-                                  lse, stream);
+                v2::launch<DD, 8>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal,
+                                  false, lse, stream);
                 break;
             case 3:
-                launch_v3<DD>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, lse, stream);
+                launch_v3<DD>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal, lse,
+                              stream);
                 break;
             case 4:
                 // Short queries take variant 3's paths (the flash-decoding kernel or the 64-row
                 // tile); the TMA kernel takes every 128-row tile.
                 if (S_q <= 64)
-                    launch_v3<DD>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, lse,
-                                  stream);
+                    launch_v3<DD>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal,
+                                  lse, stream);
                 else
-                    v4::launch<DD>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, lse,
-                                   stream);
+                    v4::launch<DD>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal,
+                                   lse, stream);
                 break;
             case 5:
                 // Variant 4's routing for short queries; the persistent kernel for the rest.
                 if (S_q <= 64)
-                    launch_v3<DD>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, lse,
-                                  stream);
+                    launch_v3<DD>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal,
+                                  lse, stream);
                 else
-                    v5::launch<DD>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, lse,
-                                   stream);
+                    v5::launch<DD>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal,
+                                   lse, stream);
                 break;
             default:
                 break;

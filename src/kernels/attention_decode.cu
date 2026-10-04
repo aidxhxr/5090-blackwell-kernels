@@ -63,6 +63,7 @@ struct Params {
     const bf16* V;
     bf16* O;
     int H_q, H_kv, S_q, S_kv;
+    int kv_cap;  // rows each K/V head is allocated: head bkv starts at bkv * kv_cap * D
     int rows;    // (H_q / H_kv) * S_q: the live rows of the tile
     int kv_end;  // keys any row can see: S_kv, or S_q under the (top-left) causal mask
     int split;   // blocks per (b, kv head); block = bkv * split + slice
@@ -104,8 +105,8 @@ __global__ void __launch_bounds__(THREADS, 1) attention_decode_kernel(Params p) 
         (static_cast<size_t>(b) * p.H_q + static_cast<size_t>(kv) * group) * p.S_q * D;
     const bf16* Qg = p.Q + q_off;
     bf16* Og = p.O + q_off;
-    const bf16* Kg = p.K + static_cast<size_t>(bkv) * p.S_kv * D;
-    const bf16* Vg = p.V + static_cast<size_t>(bkv) * p.S_kv * D;
+    const bf16* Kg = p.K + static_cast<size_t>(bkv) * p.kv_cap * D;
+    const bf16* Vg = p.V + static_cast<size_t>(bkv) * p.kv_cap * D;
 
     // Slabs [sb, se) of this warp: the block's share of the (b, kv head)'s slabs, then this
     // warp's share of the block's. Contiguous ranges, so each warp streams whole rows of K/V.
@@ -462,7 +463,7 @@ int env_split() {
 
 template <int D>
 void launch(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv, int S_q,
-            int S_kv, float scale_log2, bool causal, int split, cudaStream_t stream) {
+            int S_kv, int kv_cap, float scale_log2, bool causal, int split, cudaStream_t stream) {
     constexpr int bytes = smem_bytes<D>();
     const int resident = resident_blocks<D>();
     Params p;
@@ -474,6 +475,7 @@ void launch(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q
     p.H_kv = H_kv;
     p.S_q = S_q;
     p.S_kv = S_kv;
+    p.kv_cap = kv_cap;
     p.rows = (H_q / H_kv) * S_q;
     p.kv_end = causal ? std::min(S_kv, S_q) : S_kv;
     p.causal = causal ? 1 : 0;
@@ -508,13 +510,14 @@ bool decode_fits(int H_q, int H_kv, int S_q) {
 }
 
 void decode_launch(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv,
-                   int S_q, int S_kv, int D, float scale_log2, bool causal, int split,
+                   int S_q, int S_kv, int kv_cap, int D, float scale_log2, bool causal, int split,
                    cudaStream_t stream) {
     SPARK_REQUIRE(decode_fits(H_q, H_kv, S_q), "attention decode: query rows exceed the tile");
+    SPARK_REQUIRE(kv_cap >= S_kv, "attention decode: kv_cap must be at least S_kv");
     if (D == 64)
-        launch<64>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, split, stream);
+        launch<64>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal, split, stream);
     else
-        launch<128>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, scale_log2, causal, split, stream);
+        launch<128>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal, split, stream);
 }
 
 }  // namespace spark::attn

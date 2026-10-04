@@ -272,8 +272,8 @@ enum Fp8QuantMode { FP8Q_TENSOR = 0, FP8Q_ROW = 1, FP8Q_MX = 2 };
 // atomicMax of max|x| over x [n] bf16 (n % 8 == 0, 16-byte aligned) into *work as float bits
 // (non-negative floats order like their bits); *work must hold zero or a smaller amax.
 void absmax_bits(const __nv_bfloat16* x, long long n, unsigned* work, cudaStream_t stream);
-void fp8_quantize(const __nv_bfloat16* x, unsigned char* q, void* scale, unsigned* work,
-                  int rows, int K, int mode, cudaStream_t stream);
+void fp8_quantize(const __nv_bfloat16* x, unsigned char* q, void* scale, unsigned* work, int rows,
+                  int K, int mode, cudaStream_t stream);
 
 // ---- W4A16 GEMM (int4 weights, bf16 activations) ------------------------------------------
 // C[M,N] = A[M,K] * dequant(W)[K,N] for bf16 A and C, int4 weights with one bf16 scale (and,
@@ -382,9 +382,13 @@ void rope_append_paged_bf16(const __nv_bfloat16* qkv, const float* cos, const fl
 // pass recomputes P from (torch calls it logsumexp). Every variant writes it; a decode shape
 // that would run the flash-decoding kernel runs variant 3's 64-row tile instead, since that
 // kernel does not produce it. With lse null nothing changes.
+// `kv_cap`, when not 0, is the number of key rows each K/V head is allocated: K and V are the
+// first S_kv rows of every head of a [B, H_kv, kv_cap, D] tensor (a K/V cache with spare
+// capacity, read in place instead of copied out), kv_cap >= S_kv. 0 means S_kv, packed.
 void attention_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_bfloat16* V,
                     __nv_bfloat16* O, int B, int H_q, int H_kv, int S_q, int S_kv, int D,
-                    bool causal, int variant, cudaStream_t stream, float* lse = nullptr);
+                    bool causal, int variant, cudaStream_t stream, float* lse = nullptr,
+                    int kv_cap = 0);
 int attention_num_variants();
 bool attention_supports(int S_q, int S_kv, int D, int variant);
 

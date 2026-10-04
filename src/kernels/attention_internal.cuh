@@ -42,10 +42,11 @@ __host__ __device__ __forceinline__ int kv_index(int bh, int H_q, int H_kv) {
 // The flash-decoding kernel (attention_decode.cu). Takes every (b, kv head) whose query rows,
 // (H_q / H_kv) * S_q of them, fit one 16-row tile; the launcher in attention.cu checks that
 // with decode_fits() before calling. `split` > 0 forces the number of key slices per (b, kv
-// head); 0 picks it from the SM count. D in {64, 128}.
+// head); 0 picks it from the SM count. D in {64, 128}. `kv_cap` is the rows each K/V head is
+// allocated (attention_bf16's: S_kv when packed).
 bool decode_fits(int H_q, int H_kv, int S_q);
 void decode_launch(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv,
-                   int S_q, int S_kv, int D, float scale_log2, bool causal, int split,
+                   int S_q, int S_kv, int kv_cap, int D, float scale_log2, bool causal, int split,
                    cudaStream_t stream);
 
 }  // namespace spark::attn
