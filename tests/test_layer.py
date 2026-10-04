@@ -80,8 +80,9 @@ def test_prefill_matches_torch(sk, weights, rope, b, s, delta):
 @pytest.mark.parametrize("b,n", DECODE, ids=[f"b{b}_L{n}" for b, n in DECODE])
 def test_decode_matches_torch(sk, weights, rope, b, n, full):
     # a cache holding n - 1 random tokens; the step appends the n-th and attends over n.
-    # With capacity n the kernel reads the cache in place; with more capacity it reads a
-    # contiguous copy of the filled part (KVCache.kv), which must give the same numbers.
+    # With capacity n the cache is packed; with more capacity the filled rows of every head
+    # are a strided slice of it, which the kernels read in place (KVCache.kv), and both
+    # must give the same numbers.
     torch.manual_seed(b * 1000 + n)
     cap = n if full else n + 37
     caches = [L.KVCache(b, cap, dtype=dt) for dt in (torch.bfloat16, torch.bfloat16, torch.float32)]
@@ -97,8 +98,9 @@ def test_decode_matches_torch(sk, weights, rope, b, n, full):
     (xo, do), (xt, dt), (xf, df) = _run("decode", ours, theirs, truth, x, d, caches)
     _check(xo, do, xt, dt, xf, df)
     assert caches[0].length == n
-    _, _, copied = caches[0].kv()
-    assert copied == (not full)
+    kc, vc = caches[0].kv()  # views into the cache, never a copy
+    assert kc.data_ptr() == caches[0].k.data_ptr() and vc.data_ptr() == caches[0].v.data_ptr()
+    assert kc.shape[2] == n and kc.is_contiguous() == full
     torch.testing.assert_close(caches[0].k[:, :, n - 1].float(), caches[1].k[:, :, n - 1].float(),
                                atol=2e-2, rtol=2e-2)
 
