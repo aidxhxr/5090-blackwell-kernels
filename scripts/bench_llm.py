@@ -175,7 +175,8 @@ class Spark:
         first, last = {}, {}
         for ev, f, d in marks:
             t = start.elapsed_time(ev) / 1e3
-            first.update((sid, t) for sid in f)
+            for sid in f:
+                first.setdefault(sid, t)  # a preempted request is prefilled again later
             last.update((sid, t) for sid in d)
         return [(first[s.sid], last[s.sid]) for s in seqs]
 
@@ -370,6 +371,9 @@ def run(args) -> int:
             row.update(latency_summary(lat, outs))
         if hasattr(be, "preemptions"):
             row["preemptions"] = be.preemptions
+        if hasattr(be, "eng"):
+            row["preemptions"] = be.eng.stats.preempted
+            row["recomputed_tokens"] = be.eng.stats.recomputed_tokens
         print(json.dumps(row), file=sys.stderr, flush=True)
         rows.append(row)
     if "parity" in only:
