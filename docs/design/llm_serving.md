@@ -213,6 +213,87 @@ Four commits, each with a test in `tests/test_engine.py`:
   the mixed workload, with out-of-memory retries at its default memory share; a lower share
   (0.6) did not change the result (127 s).
 
+## Prefix caching (not measured yet)
+
+Written with the box down. The code and its tests are in, the GPU tests have not run, and
+nothing in this section is a measurement.
+
+Requests often start with the same tokens: a chat system prompt, few-shot examples, one
+document asked several questions. Without a prefix cache the engine prefills that prefix
+once per request. With `Engine(prefix_cache=True)`, the default for `SparkModel`, a request
+takes the cache pages of the prefix an earlier request already wrote and prefills only the
+rest. The design is vLLM's automatic prefix caching, on our 16-token pages:
+
+- **Only full pages are shared.** Page i of a prompt is named by sha256 over the name of
+  page i - 1 and the page's 16 token ids, so a name stands for the whole prompt up to the
+  end of that page, not for 16 tokens alone. `PageTable` (`python/spark_kernels/pages.py`,
+  plain Python) maps names to page ids and keeps a hold count per page.
+- **Admission.** The prompt's names are computed at submit, from the host copy of its ids.
+  Admission walks them, takes the pages of the longest named prefix (one hold each), and
+  allocates the rest. It stops at the last full page before the prompt's last token, so at
+  least one token is computed and its logits exist; a prompt of exactly k pages that is all
+  cached still prefills its last page. The prefill then starts after the matched tokens: a
+  chunk after a cached context, the path chunked prefill already uses (`attention_varlen`
+  with the bottom-right causal mask). Matched tokens do not count against the prefill
+  budget. A matched page nobody held was counted as available, so the page check subtracts
+  it once it is taken.
+- **Registration.** After each prefill forward is queued, the full pages it wrote that hold
+  submitted prompt tokens get their names. Queued is enough: anything that reads them later
+  is a later launch on the same stream.
+- **Generated tokens are not registered.** vLLM registers them. Here their ids live on the
+  device (the decode loop never copies a token to the host), and hashing them would make the
+  host wait for the GPU every 16 steps. What it costs: a preempted sequence finds its own
+  prompt pages again on resume (unless they were evicted) but recomputes what it generated,
+  and a multi-turn chat reuses the earlier turns' prompt pages but not the pages of the
+  answers.
+- **Release and eviction.** When a sequence finishes or is preempted each of its pages loses
+  a hold. A page nobody holds goes back to the free list, or, if it has a name, to an LRU set
+  of evictable pages that stay findable. `alloc` takes free pages first, then the least
+  recently released cached ones, and drops their names. A sequence's pages are released last
+  to first, so its deeper pages are evicted before its first ones: page i can only be
+  reached through pages 0 to i - 1.
+- **Nothing writes a shared page.** Only full pages get names, and a sequence writes only
+  past the pages it matched, so no forward writes a named page or a page held twice. The
+  engine asserts this for every prefill piece and decode row (`PageTable.writable`).
+- **Preemption and reservation.** A preempted sequence drops one hold per page, so a shared
+  page stays with its other holders. With `preempt=False` the matched pages count toward the
+  reservation of prompt plus requested tokens.
+- **What it does not do.** Two requests with the same prefix admitted in the same step both
+  prefill it, since the names appear only after the forward; the second one's copies are
+  never named and go back to the free list. Holding the second request back one step would
+  save that work; it is not done. `prompt_logits` neither reuses nor registers pages (it
+  wants every position's logits). `TorchModel` cannot start a prefill after a cached
+  context, so it gets no prefix cache.
+
+**What it should buy.** Time to first token on shared-prefix workloads, and the GPU time of
+the prefill it skips. `bench_llm.py` has a `shared` workload for it: 8 wikitext passages of
+1,536 tokens, 8 questions each, the question after the passage, 64 requests in a seeded
+random order. Each passage's requests share about 1,550 tokens; the rest is the question
+and the end of the chat template, plus up to 15 tokens before the next page boundary. If
+every passage's later requests come after its first one's forward, the prefill drops from
+about 64 x 1,580 = 101K tokens to about 8 x 1,580 + 56 x 50 = 15K. At the 8,000-token
+prefill rate in the first table (14.5K tokens/s) that is about 7 s of prefill against 1 s.
+The same-step case above makes the real saving smaller. On the `continuous` workload the
+shared part is the chat header and the one-line instruction, about 15 tokens, under one
+page, so I expect no hits there.
+
+The comparison against vLLM in the tables above ran with prefix caching off on both sides,
+and `bench_llm.py` keeps it off by default so those rows stay comparable. `--prefix-cache`
+turns it on for both, and each backend's cache is reset before every timed call, so the
+warm-up never counts as a hit. Our `continuous` and `shared` rows report the prompt tokens
+looked up and the hit rate (`Stats.prefix_queries`, `Stats.prefix_hit_tokens`).
+
+Host costs I have not measured: hashing at submit (one sha256 per 16 tokens, about 6,000
+for a 100K-token prompt) and a hold-count check per decode row per step.
+
+Tests: `tests/test_pages.py` runs the bookkeeping on the CPU (the hash chain, holds, the
+LRU order, eviction dropping names, and a random workload against a small table with the
+invariants checked after every operation). `tests/test_engine.py` runs requests built from
+a few long shared prefixes, in waves, with and without the cache, and checks the same tokens
+for every request, a smaller prefill by exactly the hit tokens, every page back on the free
+list or the evictable set, eviction under a small cache, preemption with chunked prefill,
+mixed steps and stop ids, and the reservation mode.
+
 ## Surprises
 
 - The graph bug. Nothing in the kernels or the engine looked wrong on its own: a per-process
@@ -330,6 +411,11 @@ On the box, from the repository root (one model on the GPU at a time):
     python scripts/bench_llm.py run hf_static ~/models/llama3-8b-instruct --only static --batches 32 --out hf_static.jsonl
     python scripts/bench_llm.py run hf_cb ~/models/llama3-8b-instruct --only continuous --out hf_cb.jsonl
     python scripts/bench_llm.py report spark.jsonl vllm.jsonl hf.jsonl hf_static.jsonl hf_cb.jsonl
+
+With prefix caching (the `shared` workload needs a workload file written after it was added):
+
+    python scripts/bench_llm.py run spark ~/models/llama3-8b-instruct --only shared,continuous --prefix-cache --out spark_pc.jsonl
+    ~/vllm-env/bin/python scripts/bench_llm.py run vllm ~/models/llama3-8b-instruct --only shared,continuous --prefix-cache --out vllm_pc.jsonl
 
 `hf_static` compiles a step per batch shape and keeps it, so each batch size gets its own
 process.

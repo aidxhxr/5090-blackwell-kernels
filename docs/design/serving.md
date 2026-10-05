@@ -266,7 +266,10 @@ eight mixed prompts and 1.85x on the sixteen short ones.
   are taken as the tokens arrive (the prompt's at admission, one more every 16 decode steps);
   a step that finds none free preempts the youngest running sequence, whose prompt and tokens
   so far go back to the head of the queue. `preempt=False` reserves the prompt plus the
-  requested tokens at admission instead, so nothing ever runs out.
+  requested tokens at admission instead, so nothing ever runs out. With prefix caching (on by
+  default for `SparkModel`) a prompt that starts with the full pages of an earlier prompt
+  takes those pages and prefills only the rest; finished sequences leave such pages cached
+  until an allocation needs them (llm_serving.md, not measured yet).
 - A sequence keeps its slot from admission to the end, so the decode inputs are per-slot device
   buffers: token id, position, cache slot, length, block table row. A step uses the first `Bp`
   slots, `Bp` the next power of two over the highest occupied slot; empty slots have length 0

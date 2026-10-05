@@ -1176,6 +1176,11 @@ class Engine:
             rows[i].append(lg)
         return [torch.cat(r) for r in rows]
 
+    def reset_prefix_cache(self) -> None:
+        """Drops every cached prefix page no running sequence holds, so the next requests
+        find a cold cache (what a benchmark that warms up on the same prompts needs)."""
+        self.cache.table.reset()
+
     def outputs(self) -> dict[int, list[int]]:
         """Generated tokens per sequence id, in order (needs log_tokens=True); a sequence
         that stopped ends with its stop token."""

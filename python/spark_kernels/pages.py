@@ -118,6 +118,14 @@ class PageTable:
         self.page_hash[page] = h
         return True
 
+    def reset(self) -> None:
+        """Forgets every cached page nobody holds (they go back to the free list), so the
+        next requests start from a cold cache; held pages keep their names."""
+        for p in self.evictable:
+            del self.cached[self.page_hash.pop(p)]
+            self.free.append(p)
+        self.evictable.clear()
+
     def writable(self, page: int) -> bool:
         """A forward may write `page` only when one sequence holds it and it is not a
         registered (full, shared or shareable) page."""

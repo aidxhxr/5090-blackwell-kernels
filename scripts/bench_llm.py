@@ -22,9 +22,18 @@ Workloads (`workload` writes them once, so every backend reads the same token id
     parity     six chat prompts, 128 tokens each, the tokens kept for a divergence check
     summarize  the first --summarize continuous requests one at a time (B = 1), 256 out:
                where prompt lookup has text to copy from (not in the default --only)
+    shared     8 wikitext passages of 1536 tokens with 8 questions each, the question after
+               the passage, so the 8 requests of a passage share about 1550 prompt tokens;
+               64 chat requests in a seeded random order, all submitted at once (the
+               workload prefix caching is for)
 
 `spark_spec` is the engine with speculative=--spec: its rows add the draft tokens proposed
 and accepted and the decode tokens per forward of the measured run.
+
+`--prefix-cache` turns on prefix caching in our engine and in vLLM (both off by default, so
+the published comparison is without it). Each backend's cache is reset before every timed
+call, so a warm-up on the same prompts never counts as a hit; our continuous and shared rows
+report the prompt tokens looked up and the ones found cached.
 
 How a row is timed, the same on every backend: a warm-up of the same shape with 4 output
 tokens (the full output length for hf_static, whose compiled step is specialized to the cache
@@ -68,6 +77,16 @@ PARITY_PROMPTS = [
     "Translate 'the weather is nice today' into French and German.",
     "Why does ice float on water?",
 ]
+SHARED_QUESTIONS = [
+    "What is the main subject of this passage?",
+    "Which people or places does it name?",
+    "Which dates or years appear in it?",
+    "Summarize it in one sentence.",
+    "What happens first, according to the passage?",
+    "Does it mention a number, and what does the number count?",
+    "Write a title for it.",
+    "What is its tone?",
+]
 
 
 # ---- workloads ---------------------------------------------------------------------------
@@ -109,6 +128,14 @@ def make_workload(model: str, requests: int, seed: int) -> dict:
         cont.append({"prompt": ids, "out": log_uniform(rng, 16, 768)})
     w["continuous"] = cont
     w["parity"] = {"out": 128, "prompts": [chat_ids(tok, p) for p in PARITY_PROMPTS]}
+    shared = []
+    for d in range(8):
+        text = tok.decode(window(1536))
+        for q in SHARED_QUESTIONS:
+            ids = chat_ids(tok, f"Read this passage.\n\n{text}\n\nQuestion: {q}")
+            shared.append({"prompt": ids, "out": log_uniform(rng, 16, 256), "doc": d})
+    rng.shuffle(shared)
+    w["shared"] = shared
     return w
 
 
@@ -119,7 +146,7 @@ class Spark:
     static = False
 
     def __init__(self, model: str, max_batch: int, cache_gb: float, prefill_tokens: int,
-                 spec: int = 0):
+                 spec: int = 0, prefix_cache: bool = False):
         import torch
 
         from spark_kernels import engine as E
@@ -132,10 +159,12 @@ class Spark:
         self.eng = E.Engine(E.SparkModel(w, cfg.rope(MAX_SEQ)), cfg.n_layers,
                             max_batch=max_batch, max_seq=MAX_SEQ,
                             cache_bytes=int(cache_gb * (1 << 30)),
-                            prefill_tokens=prefill_tokens, graphs=True, speculative=spec)
+                            prefill_tokens=prefill_tokens, graphs=True, speculative=spec,
+                            prefix_cache=prefix_cache)
         self.config = {"max_batch": self.eng.max_batch, "cache_gb": cache_gb,
                        "cache_tokens": self.eng.cache.num_pages * self.eng.page,
-                       "prefill_tokens": prefill_tokens, "graphs": True}
+                       "prefill_tokens": prefill_tokens, "graphs": True,
+                       "prefix_caching": prefix_cache}
         if spec:
             self.name = "spark_spec"
             self.config["speculative"] = spec
@@ -159,6 +188,7 @@ class Spark:
 
     def generate(self, prompts, outs, keep=False):
         torch, eng = self.torch, self.eng
+        eng.reset_prefix_cache()  # what an earlier call left cached is not this call's hit
         eng.log = [] if keep else None
         before = copy.copy(eng.stats)
         seqs = [eng.submit(torch.tensor(p), o) for p, o in zip(prompts, outs, strict=True)]
@@ -175,6 +205,7 @@ class Spark:
         got their first or last token in it, so each request's time to first and last token
         comes out without a synchronize in the loop."""
         torch, eng = self.torch, self.eng
+        eng.reset_prefix_cache()
         marks = []
         orig_p, orig_d = eng._prefill, eng._decode
 
@@ -223,22 +254,25 @@ class VLLM:
     name = "vllm"
     static = False
 
-    def __init__(self, model: str, max_batch: int, mem: float):
+    def __init__(self, model: str, max_batch: int, mem: float, prefix_cache: bool = False):
         import vllm
         from vllm import LLM, SamplingParams
         from vllm.inputs import TokensPrompt
 
         self.SP, self.TP = SamplingParams, TokensPrompt
         self.llm = LLM(model=model, dtype="bfloat16", max_model_len=MAX_SEQ,
-                       gpu_memory_utilization=mem, enable_prefix_caching=False, seed=0,
+                       gpu_memory_utilization=mem, enable_prefix_caching=prefix_cache, seed=0,
                        max_num_seqs=max_batch, disable_log_stats=False)
         sc = self.llm.llm_engine.vllm_config.scheduler_config
         self.config = {"version": vllm.__version__, "max_num_seqs": sc.max_num_seqs,
                        "max_num_batched_tokens": sc.max_num_batched_tokens,
                        "chunked_prefill": sc.enable_chunked_prefill,
-                       "gpu_memory_utilization": mem, "prefix_caching": False}
+                       "gpu_memory_utilization": mem, "prefix_caching": prefix_cache}
+        self.prefix_cache = prefix_cache
 
     def generate(self, prompts, outs, keep=False):
+        if self.prefix_cache:
+            self.llm.reset_prefix_cache()
         sps = [self.SP(temperature=0.0, max_tokens=o, ignore_eos=True, detokenize=False)
                for o in outs]
         res = self.llm.generate([self.TP(prompt_token_ids=p) for p in prompts], sps,
@@ -248,6 +282,8 @@ class VLLM:
     def generate_latency(self, prompts, outs):
         """Time to first and last token per request from vLLM's own request stats: the
         frontend's first-token latency, plus the engine core's first to last token span."""
+        if self.prefix_cache:
+            self.llm.reset_prefix_cache()
         sps = [self.SP(temperature=0.0, max_tokens=o, ignore_eos=True, detokenize=False)
                for o in outs]
         res = self.llm.generate([self.TP(prompt_token_ids=p) for p in prompts], sps,
@@ -371,9 +407,10 @@ def run(args) -> int:
     w = json.loads(Path(args.workload).read_text())
     if args.backend in ("spark", "spark_spec"):
         spec = args.spec if args.backend == "spark_spec" else 0
-        be = Spark(args.model, args.max_batch, args.cache_gb, args.prefill_tokens, spec)
+        be = Spark(args.model, args.max_batch, args.cache_gb, args.prefill_tokens, spec,
+                   args.prefix_cache)
     elif args.backend == "vllm":
-        be = VLLM(args.model, args.max_batch, args.vllm_mem)
+        be = VLLM(args.model, args.max_batch, args.vllm_mem, args.prefix_cache)
     elif args.backend in ("hf", "hf_static"):
         be = HF(args.model, static=args.backend == "hf_static")
     elif args.backend == "hf_cb":
@@ -395,18 +432,21 @@ def run(args) -> int:
     if "summarize" in only:
         for r in w["continuous"][:args.summarize]:
             rows.append(batch_row(be, "summarize", [r["prompt"]], 256))
-    if "continuous" in only:
-        c = w["continuous"][:args.requests]
+    for kind in ("continuous", "shared"):
+        if kind not in only or kind not in w:  # an older workload file has no shared set
+            continue
+        c = w[kind][:args.requests]
         prompts, outs = [r["prompt"] for r in c], [r["out"] for r in c]
         be.generate(prompts[:16], [4] * 16)  # warm-up
+        st0 = dict(vars(be.eng.stats)) if hasattr(be, "eng") else None
         lat = None
         if hasattr(be, "generate_latency"):
             t0 = time.perf_counter()
             lat = be.generate_latency(prompts, outs)
             dt = time.perf_counter() - t0
         else:
-            dt = timed(lambda: be.generate(prompts, outs))
-        row = {"backend": be.name, "kind": "continuous", "requests": len(c),
+            dt = timed(lambda p=prompts, o=outs: be.generate(p, o))
+        row = {"backend": be.name, "kind": kind, "requests": len(c),
                "prompt_tokens": sum(map(len, prompts)), "generated": sum(outs), "total_s": dt,
                "out_tok_s": sum(outs) / dt,
                "total_tok_s": (sum(outs) + sum(map(len, prompts))) / dt}
@@ -414,9 +454,14 @@ def run(args) -> int:
             row.update(latency_summary(lat, outs))
         if hasattr(be, "preemptions"):
             row["preemptions"] = be.preemptions
-        if hasattr(be, "eng"):
-            row["preemptions"] = be.eng.stats.preempted
-            row["recomputed_tokens"] = be.eng.stats.recomputed_tokens
+        if st0 is not None:  # this run's counts, the warm-up's taken out
+            st = vars(be.eng.stats)
+            row["preemptions"] = st["preempted"] - st0["preempted"]
+            row["recomputed_tokens"] = st["recomputed_tokens"] - st0["recomputed_tokens"]
+            q = st["prefix_queries"] - st0["prefix_queries"]
+            hit = st["prefix_hit_tokens"] - st0["prefix_hit_tokens"]
+            row.update(prefix_queries=q, prefix_hit_tokens=hit,
+                       prefix_hit_rate=hit / q if q else 0.0)
             row.update(be.spec)
         print(json.dumps(row), file=sys.stderr, flush=True)
         rows.append(row)
@@ -476,11 +521,16 @@ def report(args) -> int:
                     cells[-1] += (f", {100 * r['spec_accept_rate']:.0f}% of drafts kept, "
                                   f"{r['decode_tokens_per_forward']:.2f} tok/forward")
         print(f"| {kind} B={b} {p}/{o} | " + " | ".join(cells) + " |")
-    for be in backends:
-        r = by.get((be, "continuous", None, None))
-        if r:
-            print(f"continuous {be}: {r['requests']} requests in {r['total_s']:.2f} s, "
-                  f"{r['out_tok_s']:,.0f} generated tok/s")
+    for kind in ("continuous", "shared"):
+        for be in backends:
+            r = by.get((be, kind, None, None))
+            if not r:
+                continue
+            hit = (f", prefix hit rate {100 * r['prefix_hit_rate']:.1f}%"
+                   if r.get("prefix_queries") else "")
+            ttft = f", TTFT p50 {r['ttft_ms_p50']:,.0f} ms" if "ttft_ms_p50" in r else ""
+            print(f"{kind} {be}: {r['requests']} requests in {r['total_s']:.2f} s, "
+                  f"{r['out_tok_s']:,.0f} generated tok/s{ttft}{hit}")
     par = {r["backend"]: r["tokens"] for r in rows if r["kind"] == "parity"}
     for r in rows:
         if r["kind"] == "parity" and "spec_proposed" in r:
@@ -522,7 +572,7 @@ def main() -> int:
     a.add_argument("model")
     a.add_argument("--workload", default=str(WORKLOAD))
     a.add_argument("--out", required=True)
-    a.add_argument("--only", default="static,decode,prefill,continuous,parity")
+    a.add_argument("--only", default="static,decode,prefill,continuous,parity,shared")
     a.add_argument("--batches", default=",".join(map(str, STATIC_B)))
     a.add_argument("--requests", type=int, default=256)
     a.add_argument("--max-batch", type=int, default=256, help="slots (ours), max_num_seqs")
@@ -531,6 +581,8 @@ def main() -> int:
     a.add_argument("--vllm-mem", type=float, default=0.85)
     a.add_argument("--spec", type=int, default=4, help="spark_spec: draft tokens per step")
     a.add_argument("--summarize", type=int, default=4, help="requests in the summarize rows")
+    a.add_argument("--prefix-cache", action="store_true",
+                   help="prefix caching on (ours and vLLM's), reset before every timed call")
     a = sub.add_parser("report")
     a.add_argument("rows", nargs="+")
     a.add_argument("--profile", nargs="*", help="profile_llm.py output to keep alongside")

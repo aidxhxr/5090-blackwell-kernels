@@ -118,6 +118,20 @@ def test_alloc_evicts_lru_and_drops_hash():
     t.check()
 
 
+def test_reset_frees_unheld_cached_pages():
+    t = P.PageTable(4)
+    hs = P.page_hashes(list(range(32)), PAGE)
+    a = t.alloc(2)
+    for p, h in zip(a, hs, strict=True):
+        t.register(p, h)
+    t.release(a[1:])  # page a[1] cached and unheld, a[0] still held
+    t.reset()
+    assert t.lookup(hs) == [a[0]] and not t.evictable and a[1] in t.free
+    t.release(a[:1])
+    t.check()
+    assert list(t.evictable) == [a[0]]
+
+
 def test_register_needs_a_holder():
     t = P.PageTable(2)
     with pytest.raises(AssertionError):
