@@ -5,7 +5,8 @@ package's kernels; and the same model in plain PyTorch for comparison.
 The pieces (docs/design/serving.md):
 
     PagedKVCache   K and V of every layer as [n_layers, num_pages, 8, page, 128] bf16, a free
-                   list of page ids, one reserved scratch page that padding tokens write into
+                   list of page ids, one reserved scratch page that padding tokens write into;
+                   kv_format="fp8" stores them as e4m3 with a fixed scale per (layer, kv head)
     SparkModel     prefill(batch, cache) and decode(batch, cache) -> logits, on rmsnorm,
                    hgemm (with the residual add and the SwiGLU fused into its epilogue),
                    rope_append_paged_, attention_varlen and paged_decode
@@ -130,19 +131,51 @@ class ModelWeights:
                 self.lm_head.numel() * 2 + self.final_norm.numel() * 2)
 
 
+KV_FORMATS = ("bf16", "fp8")
+
+
 class PagedKVCache:
     """K and V of every layer in pages of `page` tokens: k[l] and v[l] are the
     [num_pages, 8, page, 128] caches the kernels take. The last page is scratch: padding
     tokens of a captured decode step write there and nothing reads it. `table` (pages.py)
     keeps the other pages: the free list, a hold count per page, and the full prompt pages
-    registered for prefix caching."""
+    registered for prefix caching.
 
-    def __init__(self, n_layers: int, num_pages: int, page: int = PAGE, device="cuda"):
+    kv_format="fp8" stores K and V as float8_e4m3fn, half the bytes per token, element x of kv
+    head h of layer l as e4m3(x / scale[l, h]). The scales are fixed for the life of the cache,
+    since a page written at one step is read with the same scale at every later one: k_scale
+    and v_scale [n_layers, 8] float32, 1.0 unless given (an uncalibrated default: e4m3's
+    normal range 2^-6 to 448 holds Llama-class K and V as they are, with 3 mantissa bits of
+    relative precision; vLLM also uses 1.0 when a checkpoint carries no scales). A calibrated
+    scale is amax / 448 per head, measured on representative prompts; scales(l) is what the
+    paged ops take."""
+
+    def __init__(self, n_layers: int, num_pages: int, page: int = PAGE, device="cuda",
+                 kv_format: str = "bf16", k_scale: torch.Tensor | None = None,
+                 v_scale: torch.Tensor | None = None):
         if num_pages < 2:
             raise ValueError("need at least two pages (one is scratch)")
+        if kv_format not in KV_FORMATS:
+            raise ValueError(f"kv_format must be one of {KV_FORMATS}, got {kv_format!r}")
         shape = (n_layers, num_pages, N_KV_HEADS, page, HEAD_DIM)
-        self.k = torch.zeros(shape, device=device, dtype=torch.bfloat16)
-        self.v = torch.zeros(shape, device=device, dtype=torch.bfloat16)
+        self.kv_format = kv_format
+        self.k_scale = self.v_scale = None
+        if kv_format == "fp8":
+            # zero bytes are +0.0 in e4m3; allocated as uint8, which every torch build can fill
+            self.k = torch.zeros(shape, device=device, dtype=torch.uint8).view(
+                torch.float8_e4m3fn)
+            self.v = torch.zeros(shape, device=device, dtype=torch.uint8).view(
+                torch.float8_e4m3fn)
+            ones = torch.ones(n_layers, N_KV_HEADS, device=device, dtype=torch.float32)
+            self.k_scale = ones.clone() if k_scale is None else k_scale.to(
+                device, torch.float32).reshape(n_layers, N_KV_HEADS).contiguous()
+            self.v_scale = ones.clone() if v_scale is None else v_scale.to(
+                device, torch.float32).reshape(n_layers, N_KV_HEADS).contiguous()
+        else:
+            if k_scale is not None or v_scale is not None:
+                raise ValueError("k_scale and v_scale are for kv_format='fp8'")
+            self.k = torch.zeros(shape, device=device, dtype=torch.bfloat16)
+            self.v = torch.zeros(shape, device=device, dtype=torch.bfloat16)
         self.page = page
         self.scratch = num_pages - 1
         self.table = PageTable(num_pages - 1)
@@ -157,8 +190,15 @@ class PagedKVCache:
         return self.table.available()
 
     @staticmethod
-    def page_bytes(n_layers: int, page: int = PAGE) -> int:
-        return 2 * n_layers * N_KV_HEADS * page * HEAD_DIM * 2
+    def page_bytes(n_layers: int, page: int = PAGE, kv_format: str = "bf16") -> int:
+        return 2 * n_layers * N_KV_HEADS * page * HEAD_DIM * (1 if kv_format == "fp8" else 2)
+
+    def scales(self, layer: int) -> dict[str, torch.Tensor]:
+        """The keyword arguments the paged ops take for this layer's cache: its k_scale and
+        v_scale rows with fp8, nothing with bf16."""
+        if self.k_scale is None:
+            return {}
+        return {"k_scale": self.k_scale[layer], "v_scale": self.v_scale[layer]}
 
     @property
     def num_pages(self) -> int:
@@ -194,6 +234,16 @@ def _rope_tokens(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch
     xf = x.float()
     rot = torch.cat([-xf[..., HEAD_DIM // 2:], xf[..., :HEAD_DIM // 2]], dim=-1)
     return (xf * cos[:, None] + rot * sin[:, None]).to(x.dtype)
+
+
+def _gather_fp8(c: torch.Tensor, scale: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    """TorchModel's decode gather on an fp8 cache c [P, H_kv, page, D]: the pages of each row
+    of table [B, npg] as [H_kv, B, npg * page, D] bf16, every value times its head's scale.
+    The gather runs on the bytes (a uint8 view), the conversion after it."""
+    x8 = c.view(torch.uint8).transpose(0, 1)[:, table]  # [H_kv, B, npg, page, D]
+    x = x8.view(torch.float8_e4m3fn).float() * scale.view(-1, 1, 1, 1, 1)
+    h, b, npg, page, d = x.shape
+    return x.to(torch.bfloat16).view(h, b, npg * page, d)
 
 
 class SparkModel:
@@ -283,15 +333,16 @@ class SparkModel:
         return ModelWeights(embed=self.w.embed, layers=layers, final_norm=self.w.final_norm,
                             lm_head=head)
 
-    def _attention(self, qkv, x, b: Batch, kc, vc, decode: bool):
+    def _attention(self, qkv, x, b: Batch, cache: PagedKVCache, layer: int, decode: bool):
+        kc, vc, sc = cache.k[layer], cache.v[layer], cache.scales(layer)
         q = sk.rope_append_paged_(qkv, self.rope.cos, self.rope.sin, b.positions, b.slots,
-                                  kc, vc, N_HEADS, N_KV_HEADS)
+                                  kc, vc, N_HEADS, N_KV_HEADS, **sc)
         if decode:
-            o = sk.paged_decode(q, kc, vc, b.block_table, b.seq_lens)
+            o = sk.paged_decode(q, kc, vc, b.block_table, b.seq_lens, **sc)
         elif b.n_dec:
-            o = self._mixed_attention(q, kc, vc, b)
+            o = self._mixed_attention(q, kc, vc, b, sc)
         else:
-            o = sk.attention_varlen(q, kc, vc, b.cu_seqlens, b.seq_lens, b.block_table)
+            o = sk.attention_varlen(q, kc, vc, b.cu_seqlens, b.seq_lens, b.block_table, **sc)
         return o.view(x.shape[0], Q_WIDTH)
 
     def _layers(self, x: torch.Tensor, b: Batch, cache: PagedKVCache, decode: bool):
@@ -299,10 +350,9 @@ class SparkModel:
             return self._layers_quant(x, b, cache, decode)
         v = -1 if decode else self.prefill_variant
         for layer, w in enumerate(self.w.layers):
-            kc, vc = cache.k[layer], cache.v[layer]
             h = sk.rmsnorm(x, w.attn_norm, EPS)
             qkv = sk.hgemm(h, w.w_qkv, v)
-            o = self._attention(qkv, x, b, kc, vc, decode)
+            o = self._attention(qkv, x, b, cache, layer, decode)
             sk.hgemm(o, w.w_o, v, residual=x, out=x)
             h2 = sk.rmsnorm(x, w.mlp_norm, EPS)
             a = sk.hgemm_swiglu(h2, w.w_gate_up, v)
@@ -312,7 +362,7 @@ class SparkModel:
         return x
 
     @staticmethod
-    def _mixed_attention(q, kc, vc, b: Batch) -> torch.Tensor:
+    def _mixed_attention(q, kc, vc, b: Batch, sc: dict) -> torch.Tensor:
         """A mixed step's attention: the prompts' rows through attention_varlen and the
         decode rows (one per sequence, at the end) through paged_decode. attention_varlen
         would give each decode row a whole 128-row query tile, 128x the work it needs."""
@@ -320,19 +370,18 @@ class SparkModel:
         tp = q.shape[0] - b.n_dec
         o = torch.empty_like(q)
         o[:tp] = sk.attention_varlen(q[:tp], kc, vc, b.cu_seqlens[:nb + 1], b.seq_lens[:nb],
-                                     b.block_table[:nb])
-        o[tp:] = sk.paged_decode(q[tp:], kc, vc, b.block_table[nb:], b.seq_lens[nb:])
+                                     b.block_table[:nb], **sc)
+        o[tp:] = sk.paged_decode(q[tp:], kc, vc, b.block_table[nb:], b.seq_lens[nb:], **sc)
         return o
 
     def _layers_quant(self, x: torch.Tensor, b: Batch, cache: PagedKVCache, decode: bool):
         delta = None  # the previous layer's down output, not yet added to x
         for layer, (w, lin) in enumerate(zip(self.w.layers, self.lin, strict=True)):
-            kc, vc = cache.k[layer], cache.v[layer]
             if delta is None:
                 h = sk.rmsnorm(x, w.attn_norm, EPS)
             else:
                 h = sk.add_rmsnorm_(delta, x, w.attn_norm, EPS)  # x += delta, then the norm
-            o = self._attention(lin["qkv"](h), x, b, kc, vc, decode)
+            o = self._attention(lin["qkv"](h), x, b, cache, layer, decode)
             h2 = sk.add_rmsnorm_(lin["o"](o), x, w.mlp_norm, EPS)
             gu = lin["gate_up"](h2)
             delta = lin["down"](sk.swiglu(gu[:, :INTERMEDIATE], gu[:, INTERMEDIATE:]))
@@ -386,7 +435,13 @@ class TorchModel:
     residual, norm, MLP, residual) of a decode step's layer
     under torch.compile (max-autotune-no-cudagraphs, static shapes: one compilation per batch
     bucket); the attention and the cache writes stay eager, since the gathered length changes
-    every step, and prefill stays eager, since its token count changes every batch."""
+    every step, and prefill stays eager, since its token count changes every batch.
+
+    On an fp8 cache (kv_format="fp8") it is the reference the kernels are checked against: k
+    and v are rounded to e4m3 with the cache's scales (`quantize_kv_cache`, the rounding of
+    rope_append_paged_ up to k being rounded to bf16 first here), stored, and the attention,
+    at prefill too, runs on the dequantized values in bf16, so both models see the same
+    rounding of the cache."""
 
     def __init__(self, weights: ModelWeights, rope: RoPE, compile: bool = False):
         self.w = weights
@@ -430,15 +485,29 @@ class TorchModel:
             mask = keep[:, None, None, :]
             table = b.block_table[:, :npg].long()
         pre, post = (self.pre_d, self.post_d) if decode else (self._pre, self._post)
+        fp8 = cache.kv_format == "fp8"
         for layer, w in enumerate(self.w.layers):
             kc, vc = cache.k[layer], cache.v[layer]
             q, k, v = pre(x, w.attn_norm, w.w_qkv, cos, sin)
-            kc[pg, :, row] = k
-            vc[pg, :, row] = v
+            if fp8:
+                # bytes in and out through uint8 views: indexed writes and gathers on a float8
+                # tensor are not implemented by every torch build
+                ks, vs = cache.k_scale[layer], cache.v_scale[layer]
+                k8, v8 = sk.quantize_kv_cache(k, ks), sk.quantize_kv_cache(v, vs)
+                kc.view(torch.uint8)[pg, :, row] = k8.view(torch.uint8)
+                vc.view(torch.uint8)[pg, :, row] = v8.view(torch.uint8)
+                k = sk.dequantize_kv_cache(k8, ks, k.dtype)
+                v = sk.dequantize_kv_cache(v8, vs, v.dtype)
+            else:
+                kc[pg, :, row] = k
+                vc[pg, :, row] = v
             if decode:
                 # [H_kv, B, npg, page, D] in one gather, viewed as [B, H_kv, S, D] (strided)
-                kk = kc.transpose(0, 1)[:, table].view(N_KV_HEADS, B, npg * page, HEAD_DIM)
-                vv = vc.transpose(0, 1)[:, table].view(N_KV_HEADS, B, npg * page, HEAD_DIM)
+                if fp8:
+                    kk, vv = _gather_fp8(kc, ks, table), _gather_fp8(vc, vs, table)
+                else:
+                    kk = kc.transpose(0, 1)[:, table].view(N_KV_HEADS, B, npg * page, HEAD_DIM)
+                    vv = vc.transpose(0, 1)[:, table].view(N_KV_HEADS, B, npg * page, HEAD_DIM)
                 qg = q.view(B, N_KV_HEADS, N_HEADS // N_KV_HEADS, HEAD_DIM)
                 o = F.scaled_dot_product_attention(qg, kk.transpose(0, 1), vv.transpose(0, 1),
                                                    attn_mask=mask)
@@ -571,7 +640,11 @@ class Engine:
     reads them back once per step (a synchronize). Admitted prompts are prefilled in their
     own forward (no mixed step). Speculation verifies greedily, so a sampled request is
     refused in this mode. Needs a model whose prefill takes a chunk after a cached context
-    (SparkModel)."""
+    (SparkModel).
+
+    `kv_format="fp8"` keeps the cache in e4m3 (PagedKVCache), twice the tokens for the same
+    `cache_bytes`; `kv_scales` = (k_scale, v_scale), [n_layers, 8] each, replaces the default
+    scales of 1."""
 
     def __init__(self, model, n_layers: int, max_batch: int = 64, max_seq: int = 4096,
                  num_pages: int | None = None, page: int = PAGE, cache_bytes: int | None = None,
@@ -579,7 +652,8 @@ class Engine:
                  compact: bool = True, mixed: bool | None = None,
                  stop_ids: list[int] | None = None, preempt: bool = True,
                  speculative: int = 0, prefix_cache: bool | None = None,
-                 device="cuda"):
+                 device="cuda", kv_format: str = "bf16",
+                 kv_scales: tuple[torch.Tensor, torch.Tensor] | None = None):
         if max_batch > BUCKETS[-1]:
             raise ValueError(f"max_batch is at most {BUCKETS[-1]}")
         # a decode step runs a whole bucket, so the per-slot buffers are bucket sized
@@ -587,7 +661,7 @@ class Engine:
         if num_pages is None:
             if cache_bytes is None:
                 raise ValueError("give num_pages or cache_bytes")
-            num_pages = cache_bytes // PagedKVCache.page_bytes(n_layers, page)
+            num_pages = cache_bytes // PagedKVCache.page_bytes(n_layers, page, kv_format)
         rope_len = model.rope.cos.shape[0]
         if rope_len < max_seq:  # the rope kernel reads the table at any position it is given
             raise ValueError(f"the RoPE tables cover {rope_len} positions, max_seq is {max_seq}")
@@ -598,7 +672,8 @@ class Engine:
                              "cached context (SparkModel)")
         self.spec = speculative
         self.model = model
-        self.cache = PagedKVCache(n_layers, num_pages, page, device)
+        k_scale, v_scale = kv_scales if kv_scales is not None else (None, None)
+        self.cache = PagedKVCache(n_layers, num_pages, page, device, kv_format, k_scale, v_scale)
         self.page = page
         self.max_batch = max_batch
         self.max_seq = max_seq
