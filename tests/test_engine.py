@@ -352,3 +352,95 @@ def test_reserve_mode_never_preempts(sk, weights):
     assert st.decode_rows == st.decode_tokens  # two at a time in the 2-bucket
     with pytest.raises(ValueError):
         eng.submit(torch.randint(0, VOCAB, (400,)), 120)  # 33 pages: never fits beside scratch
+
+
+def _serve(weights, rope, prompts, news, oracle=None, **kw):
+    """Runs the requests through an engine (graphs on, every page checked back at the end);
+    with `oracle` (sid -> the plain run's tokens) the speculative engine's drafts are the
+    true next tokens with some of them changed, in place of prompt lookup."""
+    eng = E.Engine(E.SparkModel(weights, rope), N_LAYERS, graphs=True, log_tokens=True, **kw)
+    if oracle is not None:
+        def draft(seq, k):
+            g = seq.generated  # the tokens so far are oracle[sid][:g]
+            if k < 1 or g % 5 == 0:
+                return []  # some steps have sequences without a draft (paged_decode rows)
+            d = list(oracle[seq.sid][g:g + k])
+            if g % 3 == 1:  # a wrong token somewhere: partial and zero acceptance
+                i = g % len(d)
+                d[i] = (d[i] + 1) % VOCAB
+            return d
+
+        eng._draft = draft
+    for p, m in zip(prompts, news, strict=True):
+        eng.submit(p, m)
+    st = eng.run()
+    assert len(eng.cache.free) == eng.cache.num_pages - 1
+    return eng.outputs(), st
+
+
+def test_speculative_same_tokens(sk, weights):
+    """Prompt-lookup speculation gives the plain engine's tokens. The prompts repeat a random
+    segment so the drafter finds matches; whether the model agrees with them does not matter
+    to the check (random weights rarely copy), only that every kept token is greedy's."""
+    rope = L.RoPE(1024)
+    g = torch.Generator().manual_seed(31)
+    prompts = []
+    for n in (12, 40, 7, 90, 25, 3):
+        seg = torch.randint(0, VOCAB, (n,), generator=g)
+        prompts.append(torch.cat([seg, seg, seg[:n // 2]]))
+    news = [int(x) for x in torch.randint(5, 60, (len(prompts),), generator=g)]
+    kw = dict(max_batch=4, max_seq=512, num_pages=160, prefill_tokens=256)
+    want, plain = _serve(weights, rope, prompts, news, **kw)
+    for k in (4, 8):
+        got, st = _serve(weights, rope, prompts, news, speculative=k, **kw)
+        assert got == want
+        assert st.spec_proposed > 0 and st.spec_steps > 0
+        assert st.generated == plain.generated == sum(news)
+        assert st.forwards == st.prefill_batches + st.decode_steps + st.spec_steps
+
+
+def test_speculative_accept_and_rollback(sk, weights):
+    """Drafts that are the true next tokens, some changed: the accepted prefix, the bonus
+    token and the rollback of the rejected rows (their K/V stay past the length and get
+    overwritten) give the plain engine's tokens, in fewer forwards."""
+    rope = L.RoPE(1024)
+    g = torch.Generator().manual_seed(37)
+    lens = [int(x) for x in torch.randint(1, 200, (8,), generator=g)]
+    news = [int(x) for x in torch.randint(10, 70, (8,), generator=g)]
+    prompts = [torch.randint(0, VOCAB, (n,), generator=g) for n in lens]
+    kw = dict(max_batch=4, max_seq=512, num_pages=160, prefill_tokens=256)
+    want, plain = _serve(weights, rope, prompts, news, **kw)
+    got, st = _serve(weights, rope, prompts, news, oracle=want, speculative=6, **kw)
+    assert got == want
+    assert 0 < st.spec_accepted < st.spec_proposed
+    assert st.forwards < plain.forwards
+    assert st.generated == sum(news)
+
+
+def test_speculative_preemption_and_stop_ids(sk, weights):
+    """Speculation in a cache small enough to preempt (each step takes pages for its k + 1
+    rows first), under stop ids (a stop inside the accepted tokens cuts the rest): the plain
+    big-cache run's tokens cut at the stop."""
+    rope = L.RoPE(1024)
+    g = torch.Generator().manual_seed(41)
+    lens = [int(x) for x in torch.randint(1, 100, (12,), generator=g)]
+    news = [int(x) for x in torch.randint(30, 80, (12,), generator=g)]
+    prompts = [torch.randint(0, VOCAB, (n,), generator=g) for n in lens]
+    kw = dict(max_batch=4, max_seq=512, prefill_tokens=128)
+    full, _ = _serve(weights, rope, prompts, news, num_pages=1024, **kw)
+    counts = torch.bincount(torch.tensor([t for o in full.values() for t in o[1:]]))
+    stop = int(counts.argmax())
+    want = {sid: o[:o.index(stop) + 1] if stop in o else o for sid, o in full.items()}
+    got, st = _serve(weights, rope, prompts, news, oracle=full, num_pages=32,
+                     stop_ids=[stop], speculative=8, **kw)
+    assert got == want
+    assert st.preempted > 0 and st.finished == len(lens) and st.spec_accepted > 0
+    got, st = _serve(weights, rope, prompts, news, num_pages=32, stop_ids=[stop],
+                     speculative=4, **kw)
+    assert got == want
+
+
+def test_speculative_refuses_torch_model(sk, weights):
+    with pytest.raises(ValueError):
+        E.Engine(E.TorchModel(weights, L.RoPE(512)), N_LAYERS, max_batch=1, max_seq=256,
+                 num_pages=16, graphs=False, speculative=4)
