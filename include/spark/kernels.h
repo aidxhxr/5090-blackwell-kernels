@@ -79,6 +79,34 @@ void softmax_bf16(const __nv_bfloat16* x, __nv_bfloat16* out, int rows, int cols
                   cudaStream_t stream);
 int softmax_num_variants();
 
+// ---- Token sampling (src/kernels/sample.cu) ----------------------------------------------
+// out[b] (int64) = a token drawn from row b of logits [B, V] bf16, with per-row parameters in
+// device memory so a captured CUDA graph does not depend on them: temperature [B] f32, top_k
+// [B] int32, top_p [B] f32, seed [B] int64 and offset [B] int64 (the Philox block to draw
+// from; every call adds 1 to each row's offset). Per row, with x the logits in fp32 and m
+// their max:
+//   * temperature <= 0: greedy, the first index of the max (torch.argmax).
+//   * weights w_i = floor(exp((x_i - m) / T) * 2^40) as unsigned 64-bit integers (a token
+//     under 2^-40 of the top one's probability is never drawn); every sum is an integer sum,
+//     so the token depends on nothing but the row and its parameters.
+//   * top-k (0 < k): the tokens at or above the k-th largest value among the nonzero weights,
+//     ties at the threshold kept. 0 or k >= that count: no top-k.
+//   * top-p (p < 1) on what top-k kept (total Z): the tokens at or above the largest value v
+//     whose kept weight at or above v is >= ceil(p Z): sorted descending, a token is kept
+//     while the mass before it is < p, tied values kept or dropped together. p <= 0 keeps
+//     the top value.
+//   * the token: the smallest index whose running sum of kept weights exceeds
+//     floor(u * Z_f / 2^64), u the first 64 bits of Philox4_32_10(seed) at block offset.
+// variant 0: one thread per row, a bisection over the 16-bit value key per threshold
+// variant 1: one 1024-thread block per row: the max from one read of the row, each threshold
+//            by a two-pass radix select over 256-bin count and weight histograms (the row
+//            re-read from L2), the token by a scan of per-thread sums. No sort. Both variants
+//            give the same token for the same inputs. V <= 2^23
+void sample_bf16(const __nv_bfloat16* logits, int B, int V, const float* temperature,
+                 const int* top_k, const float* top_p, const int64_t* seed, int64_t* offset,
+                 int64_t* out, int variant, cudaStream_t stream);
+int sample_num_variants();
+
 // ---- SGEMM (fp32) -------------------------------------------------------------------------
 // C = A * B, fp32 in/out, fp32 accumulate. Any M, N, K >= 1 (bounds-checked).
 // variant 0: naive, one thread per output element
