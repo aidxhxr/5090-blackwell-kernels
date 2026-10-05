@@ -223,6 +223,102 @@ Four commits, each with a test in `tests/test_engine.py`:
 - Mixing decode into prefill helps less than I expected, for the reason in the table above:
   the prefill GEMM is compute bound, so the decode rows are not free there.
 
+## Speculative decoding by prompt lookup (not measured yet)
+
+Nothing in this section has run on the GPU yet. The code and its tests are in, the numbers
+below are arithmetic from the measurements above, and the table they lead to is still empty.
+
+**Why.** At B = 1 a decode step is the 15.01 GB weight read at the copy roof, 9.82 ms, and
+the GEMMs at M <= 64 are bandwidth bound: the weight-streaming kernel costs 0.08 ms more at
+M = 8 than at M = 1 (the profile above). A forward over 5 or 9 rows of one sequence costs
+about what a forward over 1 row costs. If some of those rows are guesses of the next tokens
+and the model agrees with them, one weight read yields several tokens.
+
+**Drafting** (`spark_kernels/spec.py`). No draft model: the last 3 tokens of the context
+(prompt and tokens so far) are looked up earlier in the same context, then the last 2, then
+the last 1, and the up to k tokens that followed the most recent match are the draft. This is
+prompt lookup decoding. It pays off when the output copies from the input: a summary quoting
+its passage, an answer citing a document, an edit of code given in the prompt. On a chat reply
+with nothing to copy the drafts mostly miss. The drafter keeps an index from every n-gram to
+the last place it ends, so a draft is three dictionary lookups and a new token adds three
+entries, whatever the context length.
+
+**Verification** (`Engine(speculative=k)`). Each running sequence contributes the rows
+[next token, d1, .., dk] at positions length .. length + k, as a chunk after its cached
+context: the prefill path, `attention_varlen` with its bottom-right causal mask, every row's
+logits. Row i's argmax is the greedy token after row i. `spec.accept` keeps d1 .. da while
+each equals the argmax of the row before it, then adds the argmax of row a (the bonus token):
+between 1 and k + 1 tokens per sequence per forward, and they are the tokens greedy decoding
+would give one at a time, because each kept row saw exactly the keys a plain step would have.
+A sequence with no draft is a one-row chunk; those rows go last and through `paged_decode`, as
+the decode rows of a mixed step do. A step in which no sequence has a draft runs the ordinary
+graphed decode step. A draft is cut so it never takes a sequence past its max_new.
+
+**Rollback.** The forward writes the K/V of all k + 1 rows into the cache. The sequence's
+length then grows by a + 1 only, so the rejected rows sit past the length, where no kernel
+reads them (both attention kernels stop at `seq_lens`), and the next step writes its own rows
+over them. Nothing is copied or cleared.
+
+**Pages.** Before the forward each sequence takes the pages its k + 1 rows need (`_grow` with
+a row count per sequence; it may preempt the youngest sequence as a plain step would). Pages
+that end up past the new length are kept for the next step rather than freed: with k < 16 that
+is at most one page per sequence more than plain decoding holds, and it goes back at retire or
+preemption with the rest. The cost is that a draft can preempt a sequence a plain step would
+have left alone, one page earlier.
+
+**The host copy.** The engine keeps generated tokens on the device (the `ids` buffer and the
+`gen` record the graph writes) and never waits for the GPU. Drafting needs the tokens of the
+previous step on the host, so speculative mode reads every forward's argmax back (one
+`.tolist()`, a synchronize) and writes the kept tokens, the next input and the record columns
+back with two small copies. The transfer is tens of microseconds. The larger cost is that the
+GPU idles while the host drafts, builds the next batch and launches its first kernels, which I
+estimate at 0.1 to 0.3 ms against a 10 ms step (1 to 3%, not measured). With the tokens on the
+host, stop ids are checked exactly in this mode: a stop inside a run of kept drafts cuts the
+rest.
+
+**Expected gain.** If a verify forward yields A tokens on average and costs (1 + c) of a plain
+step, single-stream throughput goes from 100 tok/s to about 100 A / (1 + c). At B = 1 with k = 4
+to 8, c is the extra rows in the GEMMs (about 1%), the lm_head over k + 1 rows, the 128-row
+query tile `attention_varlen` spends on a chunk of 5 to 9 rows (small next to the weight read
+at a few thousand keys of context), the forward not being graphed (0.07 ms, serving.md) and the
+host gap above: c of 3 to 5% is my guess. A = 2 on summarization prompts would be about 1.9x;
+A = 1.1 on open chat would be close to a wash. These are the numbers to fill in.
+
+**Costs and limits.**
+
+- Batch size. At B = 8 with k = 7 the GEMM M is 64, the last size the weight-streaming kernel
+  takes; above it the Stream-K schedule runs and every rejected row costs real flops. On a full
+  continuous batch speculation should cost throughput. There is no policy yet that turns it off
+  per step by batch size or acceptance rate.
+- An admitting step prefills the new prompts in their own forward and then runs the verify
+  forward (no mixed step in this mode), two weight reads where the plain engine does one.
+- The verify forward is not captured into a CUDA graph; its shape changes every step.
+- Greedy only. Sampling would need the rejection rule of speculative sampling.
+- Same tokens up to near ties. The verify forward computes a row through `attention_varlen`
+  and GEMMs of a different M than the plain decode step, and the engine is not batch invariant
+  (llm_parity.md), so at a near tie in bf16 a token can flip, the same kind of split the mixed
+  step can make.
+
+**Tests.** `tests/test_spec.py` runs on the CPU: the indexed drafter against a plain scan on
+growing random contexts, the acceptance rule, the stop cut, and whole speculative decodes on a
+fake model whose cache keeps rejected rows past the length, against plain greedy.
+`tests/test_engine.py` (GPU, two random layers, 1,024-token vocabulary) compares the engine
+with and without speculation token for token: on prompts that repeat a segment, with drafts
+that are the true next tokens with some changed (so partial, full and zero acceptance and the
+rollback all happen whatever the random model does), and in a cache small enough to preempt,
+under stop ids.
+
+**To measure** (`scripts/bench_llm.py`, the `spark_spec` backend):
+
+    python scripts/bench_llm.py run spark MODEL --only decode,parity,summarize --out spark.jsonl
+    python scripts/bench_llm.py run spark_spec MODEL --spec 4 --only decode,parity,summarize --out spec.jsonl
+    python scripts/bench_llm.py report spark.jsonl spec.jsonl
+
+The decode row is a wikitext window continued for 1,024 tokens (little to copy), the summarize
+rows are the first chat requests of the continuous workload ("Summarize this passage") at
+B = 1, and report prints the first differing token of each parity prompt between the two.
+`python scripts/generate.py MODEL --spec 4 "..."` prints the share of drafts kept.
+
 ## Reproducing
 
 On the box, from the repository root (one model on the GPU at a time):
