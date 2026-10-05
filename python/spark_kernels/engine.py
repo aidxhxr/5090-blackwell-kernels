@@ -67,6 +67,7 @@ from .layer import (
     LayerWeights,
     RoPE,
 )
+from .pages import PageTable
 from .spec import NgramDrafter, accept, cut_at_stop
 
 N_LAYERS = 32
@@ -122,7 +123,9 @@ class ModelWeights:
 class PagedKVCache:
     """K and V of every layer in pages of `page` tokens: k[l] and v[l] are the
     [num_pages, 8, page, 128] caches the kernels take. The last page is scratch: padding
-    tokens of a captured decode step write there and nothing reads it."""
+    tokens of a captured decode step write there and nothing reads it. `table` (pages.py)
+    keeps the other pages: the free list, a hold count per page, and the full prompt pages
+    registered for prefix caching."""
 
     def __init__(self, n_layers: int, num_pages: int, page: int = PAGE, device="cuda"):
         if num_pages < 2:
@@ -132,7 +135,16 @@ class PagedKVCache:
         self.v = torch.zeros(shape, device=device, dtype=torch.bfloat16)
         self.page = page
         self.scratch = num_pages - 1
-        self.free = list(range(num_pages - 2, -1, -1))
+        self.table = PageTable(num_pages - 1)
+
+    @property
+    def free(self) -> list[int]:
+        """Pages nobody holds and no prefix hash names."""
+        return self.table.free
+
+    def available(self) -> int:
+        """Pages an alloc can give: the free ones and the cached prefix pages nobody holds."""
+        return self.table.available()
 
     @staticmethod
     def page_bytes(n_layers: int, page: int = PAGE) -> int:
@@ -143,12 +155,10 @@ class PagedKVCache:
         return self.k.shape[1]
 
     def alloc(self, n: int) -> list[int]:
-        if n > len(self.free):
-            raise RuntimeError(f"out of cache pages: need {n}, {len(self.free)} free")
-        return [self.free.pop() for _ in range(n)]
+        return self.table.alloc(n)
 
     def release(self, pages: list[int]) -> None:
-        self.free.extend(reversed(pages))
+        self.table.release(pages)
 
 
 @dataclass
@@ -666,7 +676,7 @@ class Engine:
             n = seq.prompt.numel()
             remaining = seq.max_new - seq.generated
             need = cdiv(n + (1 if self.preempt else remaining), self.page)
-            if (out and n > budget) or need > len(self.cache.free) - self.watermark:
+            if (out and n > budget) or need > self.cache.available() - self.watermark:
                 break
             self.waiting.popleft()
             seq.pages = self.cache.alloc(need)
@@ -709,7 +719,7 @@ class Engine:
         for seq in sorted(seqs, key=lambda s: s.sid):
             need = cdiv(seq.length + (rows or {}).get(seq.sid, 1), self.page)
             while seq.slot >= 0 and len(seq.pages) < need:  # slot < 0: preempted
-                while not self.cache.free:
+                while not self.cache.available():
                     victim = max((s for s in self.running if s is not None),
                                  key=lambda s: s.sid)
                     self._preempt(victim)
