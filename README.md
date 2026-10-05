@@ -605,6 +605,13 @@ batching, 256 requests through 64 slots, the engine generates 1,862 tokens/s aga
 compiled torch on the same schedule, 2.3x. Details and what is not done yet (preemption,
 a TMA prefill) are in [docs/design/serving.md](docs/design/serving.md).
 
+The cache can also be e4m3 (`Engine(kv_format="fp8")`): K and V at one byte with a scale per
+kv head, converted to bf16 exactly inside the decode and prefill kernels. At 128K tokens the
+K/V read is more than half a decode step, so halving it should make that step about 1.36x
+faster, and the same bytes hold twice the tokens. That figure is arithmetic: the kernels and
+their tests (against a reference on the same e4m3 bytes) are written but have not run on the
+card yet (the fp8 section of serving.md).
+
 ## real models
 
 Everything above ran on random weights. So I loaded real checkpoints into the engine

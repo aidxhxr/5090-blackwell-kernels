@@ -14,6 +14,9 @@ turn the kernels into something that serves a batch the way vLLM does:
 4. an engine that runs all 32 layers of Llama-3-8B with batched prefill, continuous batching
    and CUDA-graph decode (`python/spark_kernels/engine.py`), and `scripts/bench_serve.py`.
 
+A fifth, "An fp8 K/V cache", adds an e4m3 form of the cache to all three kernels; it is not
+measured yet.
+
 Benches: `bench_paged` (both attention ladders, CPU double-precision reference, the contiguous
 kernel as `ref_ms`), `bench_rope` (a `rope_paged` row per shape), `scripts/bench_paged_torch.py`
 (the kernels against PyTorch), `scripts/bench_serve.py` (the whole model against the same model
@@ -332,6 +335,116 @@ could keep a kernel workspace that a prefill had freed), slot compaction, prefil
 rows in one forward, stop ids, and the engine against vLLM and transformers on the real
 checkpoint.
 
+## An fp8 K/V cache
+
+**Not measured yet.** Everything in this section was written and reviewed on a machine
+without a GPU or nvcc: the kernels are checked by a syntax pass and an index-level emulation
+of the fragment layouts, not by a run. The numbers below are arithmetic from the measured bf16
+rows, and `bench_paged` and the tests are the first things to run on the card.
+
+**Why.** A decode step streams the weights once and every sequence's K and V once. At long
+context the second term wins: one sequence at 128K tokens is 131,072 x 128 KB = 17.2 GB of
+K/V per step against 15.0 GB of weights, so attention is more than half the step. Storing K
+and V as e4m3 halves that term and doubles the tokens a cache of a given size holds (a 16-token
+page is 32 KB per layer instead of 64 KB).
+
+**The format.** `[num_pages, H_kv, page, D]` as before, one byte per element, and one fp32
+scale per (layer, kv head) for K and one for V: element `x` of kv head `h` is stored as
+`e4m3(x / scale[h])`, rounded to nearest even and saturated at +-448
+(`cvt.rn.satfinite.e4m3x2.f32`, sm_89+). The scale is a per-head constant, not per page or per
+token, for two reasons. A page is written at one step and read at every later one, so a scale
+that moved would need to be stored next to the page and read with it; and a per-head constant
+folds into the arithmetic the kernels already do (below), so the read path costs nothing for
+it. The default is 1.0, the uncalibrated choice: e4m3's normal range runs from 2^-6 to 448
+with 3 mantissa bits, which holds Llama-class K and V without a scale (vLLM also falls back to
+1.0 when a checkpoint has no scales). A calibrated scale is amax / 448 per head over
+representative prompts; `Engine(kv_format="fp8", kv_scales=(k, v))` takes them, `[n_layers, 8]`
+each.
+
+**The append.** `rope_append_paged_fp8` is the bf16 kernel with the k rotation kept in fp32
+and rounded once, to e4m3, instead of to bf16 first; v is divided by its scale and rounded.
+A thread stores 8 bytes where the bf16 kernel stores 16.
+
+**Decode.** e4m3 is a subset of bf16 (8 exponent bits hold e4m3's 4, 7 mantissa bits hold its
+3, and e4m3's subnormals are bf16 normals), so the kernel converts the bytes to bf16 exactly
+(`cvt.rn.f16x2.e4m3x2`, then f16 to f32 to bf16) and keeps the bf16 `mma.sync`. No rounding
+is added beyond the cache's own. The scales cost two multiplies per segment: the K scale goes
+into the softmax scale (`s = q . (k_scale k8) = k_scale (q . k8)`), the V scale into the
+output normalization (`O = v_scale sum p v8 / l`), and also into the unnormalized pieces a
+warp writes for the combine kernel, so the combine and the length-aware split are unchanged.
+
+Two choices in the slab path:
+
+- *Twice the stages, not twice the keys per slab.* An e4m3 slab is 4 KB of K+V at `D = 128`
+  instead of 8 KB. The kernel waits on memory and nothing else (5% issue active in the bf16
+  profile), so what keeps DRAM busy is bytes in flight per SM, and with the same 3 stages they
+  would halve, from 16 KB to 8 KB per warp. Doubling the slab to 32 keys would restore them but
+  changes the unit of the split, the page minimum (16) and the one k16 step of P V. Doubling
+  the stages to 6 keeps all three and fits the same 96 KB: 5 slabs, 20 KB, in flight per warp.
+  This is the first parameter to sweep on the card (5 stages is the bf16 byte count).
+- *Registers, not ldmatrix.* `ldmatrix` moves 16-bit elements, so it cannot build bf16
+  fragments from bytes. Converting the slab into a bf16 copy in shared memory first would cost
+  an 8 KB buffer per warp (4 stages at most in 96 KB) and a write and read of it. Instead each
+  lane reads its fragment bytes directly, and two permutations make those reads contiguous.
+  For `Q K^T` the head dimension is permuted the same way in Q and K, which the dot product
+  does not see: lane quad `c` owns bytes `[c D/4, (c+1) D/4)` of a key row and k16 step `kk`
+  takes bytes `4 kk .. 4 kk + 3` of them, two 16-byte loads per row. For `P V` the B fragment
+  pairs two keys of one column; the output columns are permuted instead (column `n` of n8 tile
+  `dj` is `d = n * D/8 + dj`), so a lane reads 16 contiguous bytes of each of its four key rows
+  and pairs bytes across rows with `__byte_perm`, and writes its outputs as two runs of 16
+  consecutive columns. Both reads are conflict-free at `D = 128` with the chunk XOR swizzle;
+  at `D = 64` the V reads are 2-way.
+
+The conversion adds about 300 instructions per slab per lane (64 `e4m3x2` pairs at about four
+instructions each, plus the permutes). At the copy roof a warp has about 1.9 us per 4 KB slab,
+over 4,000 cycles, so the kernel should stay memory bound.
+
+**Varlen prefill.** Here 8 warps share each 64-key tile, and converting in registers would do
+it 8 times. The kernel instead lands the e4m3 tile in its own 16 KB stage (3 stages, 48 KB),
+converts it once per block into a 32 KB bf16 tile with the bf16 kernel's layout, and runs the
+unchanged bf16 compute on it: one extra barrier per tile, 80 KB of shared memory. Prefill is
+compute bound, so this is a cost, not a gain: each thread converts 64 bytes per tile, about
+150 instructions per warp next to the 128 `mma` it issues on that tile. My guess is a 10 to 15%
+slower long-prompt attention; the bytes saved matter only at decode. Mixed steps and chunked
+prefill read the same cache through the same two kernels.
+
+**Expected effect** (arithmetic: bytes over the 1,550 GB/s the bf16 steps run at, weights
+15.0 GB, K/V 128 KB per token across 32 layers in bf16, 64 KB in e4m3):
+
+| decode, one sequence | K/V bf16 | K/V e4m3 | step bf16 | step e4m3 | speedup |
+|---|---|---|---|---|---|
+| 8K | 1.07 GB | 0.54 GB | 10.4 ms | 10.0 ms | 1.03x |
+| 32K | 4.29 GB | 2.15 GB | 12.5 ms | 11.1 ms | 1.13x |
+| 100K | 13.1 GB | 6.6 GB | 18.1 ms | 13.9 ms | 1.30x |
+| 128K | 17.2 GB | 8.6 GB | 20.8 ms | 15.2 ms | 1.36x |
+
+The bf16 column matches what was measured where there is a measurement (32K: 12.5 ms against
+79.9 tok/s = 12.5 ms in the README; 100K: 18.1 against 17.7 ms). At batch 64 on the serving mix
+(5.63 GB of K/V in a 20.6 GB step) the same arithmetic gives 14.3 to about 12.3 ms, 1.16x. On the
+kernel alone, `bench_paged`'s 1 x 32768 row moves 134 MB in 92 us at bf16; at the same rate the
+e4m3 row would be about 46 us plus the combine's 3 to 6 us. The other gain is capacity: the
+same bytes hold twice the tokens, so the 100K-token run's 12 GiB cache would fit in 6.
+
+**Accuracy.** e4m3 keeps 3 mantissa bits, a relative step of 1/8 and an rms rounding error
+around 2.5% per element. On random data the attention output moves 3.7% from the bf16 cache
+it was rounded from (`test_paged_fp8_close_to_bf16`). What that does to perplexity and to
+long-context retrieval on the real checkpoints is not measured; `eval_ppl.py` and
+`needle.py` on `Engine(kv_format="fp8")` are the checks (neither script has the flag yet).
+
+**Checks.** `tests/test_paged.py` runs every decode and varlen case of the bf16 tests again on
+an e4m3 cache with distinct per-head scales, against SDPA in fp32 on the same bytes
+dequantized in torch (`dequantize_kv_cache`), so the bf16 tolerance applies; plus a 128K-key
+decode that must repeat bit for bit, the append (v byte-exact against `quantize_kv_cache`, k
+within one e4m3 step) and the input checks. `tests/test_engine.py` runs SparkModel against
+TorchModel on fp8 caches with non-unit scales (TorchModel rounds with `quantize_kv_cache` and
+attends to the dequantized values, at prefill too), and graphed, eager and preempting engine
+runs against each other. `bench_paged --kv=bf16,fp8` prints an fp8 row next to every bf16 row,
+validated against the CPU reference on the e4m3 values, with the bf16 time as its `ref_ms`.
+
+What to look at first on the card: the decode kernel's registers and spills for the fp8
+instantiation (`o` is 64 floats, plus 32 for Q, 8 for a K row and 16 for the V rows), whether
+6 stages still give one block per SM, and the `D = 64` V reads.
+
 ## Correctness
 
 - `tests/test_paged.py`: `paged_decode` (both variants) against SDPA in fp32 per sequence on the
@@ -347,6 +460,7 @@ checkpoint.
   of four prompts, then three teacher-forced decode steps, logits within 2% relative error),
   and graph against eager decode token for token under continuous batching, with every page
   back on the free list at the end.
+- The fp8 cache's checks are listed in its section above.
 - `bench_paged` validates every variant against a CPU double-precision reference: every row of
   up to eight sequences per decode batch and 256 sampled rows per prefill batch.
 

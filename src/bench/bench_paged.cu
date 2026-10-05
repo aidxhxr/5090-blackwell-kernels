@@ -4,7 +4,8 @@
 //   ./bench_paged                                  # default sweep, every variant
 //   ./bench_paged --op=decode --lens=32768,500x50  # one decode batch: 1 x 32768 + 50 x 500
 //   ./bench_paged --op=prefill --lens=2048x4 --variant=1 --iters=20
-//   flags: --hq=32 --hkv=8 --d=128 --page=16
+//   ./bench_paged --op=decode --kv=fp8              # only the e4m3 cache rows
+//   flags: --hq=32 --hkv=8 --d=128 --page=16 --kv=bf16,fp8
 //
 // The cache is a pool of pages handed out in a shuffled order, so no sequence's pages are
 // adjacent. Correctness: a CPU double-precision reference on every row of up to eight
@@ -19,9 +20,16 @@
 // ref_ms is the dense attention ladder's top rung run once per sequence (one launch each,
 // what a server without a varlen kernel does, short of padding).
 //
+// fp8 rows (dtype "fp8"): the same pool rounded to e4m3 with a scale per kv head, through
+// paged_decode_fp8 / attention_varlen_fp8, checked against the CPU reference on the e4m3
+// values times their scales (so the tolerance is the bf16 rows'). Decode GB/s counts the e4m3
+// bytes, half the bf16 rows'. ref_ms of an fp8 row is the bf16 cache's time for the same
+// variant and batch, so ref_ms / median_ms is the speedup the format buys.
+//
 // stdout: one JSON object per row; stderr: the human table.
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 
 #include <algorithm>
 #include <cmath>
@@ -42,6 +50,7 @@ namespace {
 
 struct Cfg {
     int Hq = 32, Hkv = 8, D = 128, page = 16;
+    bool bf16 = true, fp8 = true;  // which cache formats get rows (--kv)
 };
 
 // "32768,500x50" -> {32768, 500, 500, ... (50 times)}
@@ -136,23 +145,87 @@ struct Paged {
         cudaFree(dv);
         cudaFree(dbt);
         cudaFree(dlens);
+        cudaFree(dk8);
+        cudaFree(dv8);
+        cudaFree(dks);
+        cudaFree(dvs);
     }
     // Host offset of key j of sequence b, kv head h.
     size_t at(const Cfg& c, int b, int h, int j) const {
         const int page = bt[static_cast<size_t>(b) * max_pages + j / c.page];
         return ((static_cast<size_t>(page) * c.Hkv + h) * c.page + j % c.page) * c.D;
     }
+
+    // The e4m3 form of the pool, made on first use: element x of kv head h is
+    // e4m3(x / scale[h]), scale[h] = (1 + h / 4) / 448 for K and 0.75 times that for V, so the
+    // values (in [-1, 1)) reach most of e4m3's range, subnormals included. lut decodes a byte.
+    std::vector<unsigned char> hk8, hv8;
+    std::vector<float> ks, vs;
+    float lut[256] = {};
+    unsigned char *dk8 = nullptr, *dv8 = nullptr;
+    float *dks = nullptr, *dvs = nullptr;
+    int copies8 = 1;
+    void make_fp8(const Cfg& c) {
+        if (dk8) return;
+        for (int i = 0; i < 256; ++i) {
+            __nv_fp8_e4m3 e;
+            e.__x = static_cast<__nv_fp8_storage_t>(i);
+            lut[i] = static_cast<float>(e);
+        }
+        ks.resize(c.Hkv);
+        vs.resize(c.Hkv);
+        for (int h = 0; h < c.Hkv; ++h) {
+            ks[h] = (1.f + h / 4.f) / 448.f;
+            vs[h] = 0.75f * ks[h];
+        }
+        hk8.resize(pool_elems);
+        hv8.resize(pool_elems);
+        for (size_t i = 0; i < pool_elems; ++i) {
+            const int h = static_cast<int>(i / (static_cast<size_t>(c.page) * c.D) % c.Hkv);
+            hk8[i] = __nv_fp8_e4m3(hk[i] / ks[h]).__x;
+            hv8[i] = __nv_fp8_e4m3(hv[i] / vs[h]).__x;
+        }
+        copies8 = static_cast<int>((size_t{256} << 20) / (2 * pool_elems)) + 1;
+        SPARK_CUDA_CHECK(cudaMalloc(&dk8, copies8 * pool_elems));
+        SPARK_CUDA_CHECK(cudaMalloc(&dv8, copies8 * pool_elems));
+        for (int k = 0; k < copies8; ++k) {
+            SPARK_CUDA_CHECK(
+                cudaMemcpy(dk8 + k * pool_elems, hk8.data(), pool_elems, cudaMemcpyHostToDevice));
+            SPARK_CUDA_CHECK(
+                cudaMemcpy(dv8 + k * pool_elems, hv8.data(), pool_elems, cudaMemcpyHostToDevice));
+        }
+        SPARK_CUDA_CHECK(cudaMalloc(&dks, c.Hkv * sizeof(float)));
+        SPARK_CUDA_CHECK(cudaMalloc(&dvs, c.Hkv * sizeof(float)));
+        SPARK_CUDA_CHECK(cudaMemcpy(dks, ks.data(), c.Hkv * sizeof(float), cudaMemcpyHostToDevice));
+        SPARK_CUDA_CHECK(cudaMemcpy(dvs, vs.data(), c.Hkv * sizeof(float), cudaMemcpyHostToDevice));
+    }
+    const __nv_fp8_e4m3* k8(size_t off = 0) const {
+        return reinterpret_cast<const __nv_fp8_e4m3*>(dk8 + off);
+    }
+    const __nv_fp8_e4m3* v8(size_t off = 0) const {
+        return reinterpret_cast<const __nv_fp8_e4m3*>(dv8 + off);
+    }
+    // Element i of kv head h as the kernels read it: the bf16 value, or the e4m3 value times
+    // the head's scale.
+    double kval(bool fp8, size_t i, int h) const {
+        return fp8 ? static_cast<double>(lut[hk8[i]]) * ks[h] : hk[i];
+    }
+    double vval(bool fp8, size_t i, int h) const {
+        return fp8 ? static_cast<double>(lut[hv8[i]]) * vs[h] : hv[i];
+    }
 };
 
-// One query row q (D floats) against keys [0, n) of sequence b, kv head h, in double.
-std::vector<double> ref_row(const Cfg& c, const Paged& pc, const float* q, int b, int h, int n) {
+// One query row q (D floats) against keys [0, n) of sequence b, kv head h, in double, on the
+// bf16 pool or (fp8) the e4m3 one.
+std::vector<double> ref_row(const Cfg& c, const Paged& pc, const float* q, int b, int h, int n,
+                            bool fp8 = false) {
     std::vector<double> s(n), o(c.D, 0.0);
     const double scale = 1.0 / std::sqrt(static_cast<double>(c.D));
     double mx = -1e300;
     for (int j = 0; j < n; ++j) {
-        const float* k = pc.hk.data() + pc.at(c, b, h, j);
+        const size_t k = pc.at(c, b, h, j);
         double d = 0;
-        for (int e = 0; e < c.D; ++e) d += static_cast<double>(q[e]) * k[e];
+        for (int e = 0; e < c.D; ++e) d += static_cast<double>(q[e]) * pc.kval(fp8, k + e, h);
         s[j] = d * scale;
         mx = std::max(mx, s[j]);
     }
@@ -160,8 +233,8 @@ std::vector<double> ref_row(const Cfg& c, const Paged& pc, const float* q, int b
     for (int j = 0; j < n; ++j) {
         const double p = std::exp(s[j] - mx);
         l += p;
-        const float* v = pc.hv.data() + pc.at(c, b, h, j);
-        for (int e = 0; e < c.D; ++e) o[e] += p * v[e];
+        const size_t v = pc.at(c, b, h, j);
+        for (int e = 0; e < c.D; ++e) o[e] += p * pc.vval(fp8, v + e, h);
     }
     for (auto& x : o) x /= l;
     return o;
@@ -233,67 +306,89 @@ bool run_decode(const Cfg& c, const std::vector<int>& lens, const std::vector<in
     for (int i = 0; i < 7 && i < B; ++i) check.push_back(i * B / 7 % B);
     std::sort(check.begin(), check.end());
     check.erase(std::unique(check.begin(), check.end()), check.end());
-    std::vector<std::vector<double>> ref;
     const int group = c.Hq / c.Hkv;
-    for (int b : check)
-        for (int h = 0; h < c.Hq; ++h)
-            ref.push_back(
-                lens[b] > 0 ? ref_row(c, pc, hq.data() + (static_cast<size_t>(b) * c.Hq + h) * c.D,
-                                      b, h / group, lens[b])
-                            : std::vector<double>(c.D, 0.0));
+    auto refs = [&](bool fp8) {
+        std::vector<std::vector<double>> ref;
+        for (int b : check)
+            for (int h = 0; h < c.Hq; ++h)
+                ref.push_back(lens[b] > 0
+                                  ? ref_row(c, pc,
+                                            hq.data() + (static_cast<size_t>(b) * c.Hq + h) * c.D,
+                                            b, h / group, lens[b], fp8)
+                                  : std::vector<double>(c.D, 0.0));
+        return ref;
+    };
 
     const bool equal = std::all_of(lens.begin(), lens.end(), [&](int l) { return l == lens[0]; });
-    const double ref_ms = equal ? contiguous_ms(c, pc, lens, dq, iters, stream) : 0.0;
-    const double gb = kv_bytes(c, lens) / 1e9;
+    const double contig_ms = equal && c.bf16 ? contiguous_ms(c, pc, lens, dq, iters, stream) : 0.0;
     const std::string shape = "paged_" + lens_name(lens) + "_hq" + std::to_string(c.Hq) + "_hkv" +
                               std::to_string(c.Hkv) + "_d" + std::to_string(c.D) + "_p" +
                               std::to_string(c.page);
     bool all_ok = true;
-    for (int v : variants) {
-        spark::paged_decode_bf16(dq, pc.dk, pc.dv, pc.dbt, pc.dlens, dout, B, c.Hq, c.Hkv, c.D,
-                                 c.page, pc.max_pages, v, stream);
-        SPARK_CUDA_CHECK(cudaStreamSynchronize(stream));
-        const std::vector<float> got = fetch(dout, nq);
-        double max_abs = 0, max_ref = 0;
-        size_t r = 0;
-        for (int b : check)
-            for (int h = 0; h < c.Hq; ++h, ++r)
-                for (int e = 0; e < c.D; ++e) {
-                    const double x = got[(static_cast<size_t>(b) * c.Hq + h) * c.D + e];
-                    max_abs = std::max(max_abs, std::fabs(x - ref[r][e]));
-                    max_ref = std::max(max_ref, std::fabs(ref[r][e]));
-                }
-        const double tol = 2e-2 * max_ref + 1e-3;
-        const bool ok = max_abs <= tol && std::isfinite(max_abs);
-        int turn = 0;
-        const Timing t = time_kernel(
-            [&] {
-                const size_t off = static_cast<size_t>(turn++ % pc.copies) * pc.pool_elems;
+    std::vector<double> bf16_ms(variants.size(), 0.0);  // the fp8 rows' ref_ms
+    for (const bool fp8 : {false, true}) {
+        if (fp8 ? !c.fp8 : !c.bf16) continue;
+        if (fp8) pc.make_fp8(c);
+        const std::vector<std::vector<double>> ref = refs(fp8);
+        const double gb = kv_bytes(c, lens) / (fp8 ? 2 : 1) / 1e9;
+        // Variant v on copy `turn` of the pool (the timing loop rotates them).
+        auto run = [&](int v, int turn) {
+            if (fp8) {
+                const size_t off = static_cast<size_t>(turn % pc.copies8) * pc.pool_elems;
+                spark::paged_decode_fp8(dq, pc.k8(off), pc.v8(off), pc.dks, pc.dvs, pc.dbt,
+                                        pc.dlens, dout, B, c.Hq, c.Hkv, c.D, c.page, pc.max_pages,
+                                        v, stream);
+            } else {
+                const size_t off = static_cast<size_t>(turn % pc.copies) * pc.pool_elems;
                 spark::paged_decode_bf16(dq, pc.dk + off, pc.dv + off, pc.dbt, pc.dlens, dout, B,
                                          c.Hq, c.Hkv, c.D, c.page, pc.max_pages, v, stream);
-            },
-            stream, 10, v == 0 ? std::min(iters, 10) : iters);
-        Row row;
-        row.kernel = "paged_decode";
-        row.dtype = "bf16";
-        row.variant = v;
-        row.shape = shape;
-        row.median_ms = t.median_ms;
-        row.min_ms = t.min_ms;
-        row.gbps = gb / (t.median_ms * 1e-3);
-        row.ref_ms = ref_ms;
-        row.max_abs_err = max_abs;
-        row.max_rel_err = max_ref > 0 ? max_abs / max_ref : 0;
-        row.ok = ok;
-        print_row(row);
-        if (!ok) std::fprintf(stderr, "  FAIL: max_abs %.3e > tol %.3e\n", max_abs, tol);
-        all_ok = all_ok && ok;
+            }
+        };
+        for (size_t vi = 0; vi < variants.size(); ++vi) {
+            const int v = variants[vi];
+            run(v, 0);
+            SPARK_CUDA_CHECK(cudaStreamSynchronize(stream));
+            const std::vector<float> got = fetch(dout, nq);
+            double max_abs = 0, max_ref = 0;
+            size_t r = 0;
+            for (int b : check)
+                for (int h = 0; h < c.Hq; ++h, ++r)
+                    for (int e = 0; e < c.D; ++e) {
+                        const double x = got[(static_cast<size_t>(b) * c.Hq + h) * c.D + e];
+                        max_abs = std::max(max_abs, std::fabs(x - ref[r][e]));
+                        max_ref = std::max(max_ref, std::fabs(ref[r][e]));
+                    }
+            const double tol = 2e-2 * max_ref + 1e-3;
+            const bool ok = max_abs <= tol && std::isfinite(max_abs);
+            int turn = 0;
+            const Timing t = time_kernel([&] { run(v, turn++); }, stream, 10,
+                                         v == 0 ? std::min(iters, 10) : iters);
+            Row row;
+            row.kernel = "paged_decode";
+            row.dtype = fp8 ? "fp8" : "bf16";
+            row.variant = v;
+            row.shape = shape;
+            row.median_ms = t.median_ms;
+            row.min_ms = t.min_ms;
+            row.gbps = gb / (t.median_ms * 1e-3);
+            row.ref_ms = fp8 ? bf16_ms[vi] : contig_ms;
+            row.max_abs_err = max_abs;
+            row.max_rel_err = max_ref > 0 ? max_abs / max_ref : 0;
+            row.ok = ok;
+            print_row(row);
+            if (!ok) std::fprintf(stderr, "  FAIL: max_abs %.3e > tol %.3e\n", max_abs, tol);
+            if (!fp8) bf16_ms[vi] = t.median_ms;
+            if (fp8 && bf16_ms[vi] > 0)
+                std::fprintf(stderr, "    e4m3 cache, variant %d: %.2fx the bf16 cache's speed\n",
+                             v, bf16_ms[vi] / t.median_ms);
+            all_ok = all_ok && ok;
+        }
     }
-    if (ref_ms > 0)
+    if (contig_ms > 0)
         std::fprintf(
             stderr,
             "    contiguous flash-decoding (attention v3) on the same keys: %.4f ms, %.0f GB/s\n",
-            ref_ms, gb / (ref_ms * 1e-3));
+            contig_ms, kv_bytes(c, lens) / 1e9 / (contig_ms * 1e-3));
     SPARK_CUDA_CHECK(cudaFree(dq));
     SPARK_CUDA_CHECK(cudaFree(dout));
     return all_ok;
@@ -328,12 +423,16 @@ bool run_prefill(const Cfg& c, const std::vector<int>& lens, const std::vector<i
     for (int i = 0; i < 255; ++i)
         rows.push_back({static_cast<int>(rng() % T), static_cast<int>(rng() % c.Hq)});
     const int group = c.Hq / c.Hkv;
-    std::vector<std::vector<double>> ref;
-    for (auto [t, h] : rows) {
-        const int b = static_cast<int>(std::upper_bound(cu.begin(), cu.end(), t) - cu.begin()) - 1;
-        ref.push_back(ref_row(c, pc, hq.data() + (static_cast<size_t>(t) * c.Hq + h) * c.D, b,
-                              h / group, t - cu[b] + 1));
-    }
+    auto refs = [&](bool fp8) {
+        std::vector<std::vector<double>> ref;
+        for (auto [t, h] : rows) {
+            const int b =
+                static_cast<int>(std::upper_bound(cu.begin(), cu.end(), t) - cu.begin()) - 1;
+            ref.push_back(ref_row(c, pc, hq.data() + (static_cast<size_t>(t) * c.Hq + h) * c.D, b,
+                                  h / group, t - cu[b] + 1, fp8));
+        }
+        return ref;
+    };
 
     // Reference timing: the dense ladder's top rung once per sequence on contiguous copies.
     std::vector<__nv_bfloat16*> ck(B), cv(B), cq(B), co(B);
@@ -379,43 +478,55 @@ bool run_prefill(const Cfg& c, const std::vector<int>& lens, const std::vector<i
                               std::to_string(c.Hkv) + "_d" + std::to_string(c.D) + "_p" +
                               std::to_string(c.page) + "_causal";
     bool all_ok = true;
-    for (int v : variants) {
-        spark::attention_varlen_bf16(dq, pc.dk, pc.dv, dcu, pc.dlens, pc.dbt, dout, B, T, c.Hq,
-                                     c.Hkv, c.D, c.page, pc.max_pages, true, v, stream);
-        SPARK_CUDA_CHECK(cudaStreamSynchronize(stream));
-        const std::vector<float> got = fetch(dout, nq);
-        double max_abs = 0, max_ref = 0;
-        for (size_t r = 0; r < rows.size(); ++r)
-            for (int e = 0; e < c.D; ++e) {
-                const double x =
-                    got[(static_cast<size_t>(rows[r].first) * c.Hq + rows[r].second) * c.D + e];
-                max_abs = std::max(max_abs, std::fabs(x - ref[r][e]));
-                max_ref = std::max(max_ref, std::fabs(ref[r][e]));
-            }
-        const double tol = 2e-2 * max_ref + 1e-3;
-        const bool ok = max_abs <= tol && std::isfinite(max_abs);
-        const Timing t = time_kernel(
-            [&] {
+    std::vector<double> bf16_ms(variants.size(), 0.0);  // the fp8 rows' ref_ms
+    for (const bool fp8 : {false, true}) {
+        if (fp8 ? !c.fp8 : !c.bf16) continue;
+        if (fp8) pc.make_fp8(c);
+        const std::vector<std::vector<double>> ref = refs(fp8);
+        auto run = [&](int v) {
+            if (fp8)
+                spark::attention_varlen_fp8(dq, pc.k8(), pc.v8(), pc.dks, pc.dvs, dcu, pc.dlens,
+                                            pc.dbt, dout, B, T, c.Hq, c.Hkv, c.D, c.page,
+                                            pc.max_pages, true, v, stream);
+            else
                 spark::attention_varlen_bf16(dq, pc.dk, pc.dv, dcu, pc.dlens, pc.dbt, dout, B, T,
                                              c.Hq, c.Hkv, c.D, c.page, pc.max_pages, true, v,
                                              stream);
-            },
-            stream, 5, v == 0 ? std::min(iters, 5) : iters);
-        Row row;
-        row.kernel = "attention_varlen";
-        row.dtype = "bf16";
-        row.variant = v;
-        row.shape = shape;
-        row.median_ms = t.median_ms;
-        row.min_ms = t.min_ms;
-        row.tflops = flop / (t.median_ms * 1e-3) / 1e12;
-        row.ref_ms = tr.median_ms;
-        row.max_abs_err = max_abs;
-        row.max_rel_err = max_ref > 0 ? max_abs / max_ref : 0;
-        row.ok = ok;
-        print_row(row);
-        if (!ok) std::fprintf(stderr, "  FAIL: max_abs %.3e > tol %.3e\n", max_abs, tol);
-        all_ok = all_ok && ok;
+        };
+        for (size_t vi = 0; vi < variants.size(); ++vi) {
+            const int v = variants[vi];
+            run(v);
+            SPARK_CUDA_CHECK(cudaStreamSynchronize(stream));
+            const std::vector<float> got = fetch(dout, nq);
+            double max_abs = 0, max_ref = 0;
+            for (size_t r = 0; r < rows.size(); ++r)
+                for (int e = 0; e < c.D; ++e) {
+                    const double x =
+                        got[(static_cast<size_t>(rows[r].first) * c.Hq + rows[r].second) * c.D + e];
+                    max_abs = std::max(max_abs, std::fabs(x - ref[r][e]));
+                    max_ref = std::max(max_ref, std::fabs(ref[r][e]));
+                }
+            const double tol = 2e-2 * max_ref + 1e-3;
+            const bool ok = max_abs <= tol && std::isfinite(max_abs);
+            const Timing t =
+                time_kernel([&] { run(v); }, stream, 5, v == 0 ? std::min(iters, 5) : iters);
+            Row row;
+            row.kernel = "attention_varlen";
+            row.dtype = fp8 ? "fp8" : "bf16";
+            row.variant = v;
+            row.shape = shape;
+            row.median_ms = t.median_ms;
+            row.min_ms = t.min_ms;
+            row.tflops = flop / (t.median_ms * 1e-3) / 1e12;
+            row.ref_ms = fp8 ? bf16_ms[vi] : tr.median_ms;
+            row.max_abs_err = max_abs;
+            row.max_rel_err = max_ref > 0 ? max_abs / max_ref : 0;
+            row.ok = ok;
+            print_row(row);
+            if (!ok) std::fprintf(stderr, "  FAIL: max_abs %.3e > tol %.3e\n", max_abs, tol);
+            if (!fp8) bf16_ms[vi] = t.median_ms;
+            all_ok = all_ok && ok;
+        }
     }
     std::fprintf(stderr, "    dense attention v%d once per sequence: %.4f ms, %.1f TFLOPS\n", top,
                  tr.median_ms, flop / (tr.median_ms * 1e-3) / 1e12);
@@ -448,6 +559,10 @@ int main(int argc, char** argv) {
         c.Hkv = args.geti("hkv", 8);
         c.D = args.geti("d", 128);
         c.page = args.geti("page", 16);
+        const std::string kv = args.get("kv", "bf16,fp8");
+        c.bf16 = kv.find("bf16") != std::string::npos;
+        c.fp8 = kv.find("fp8") != std::string::npos;
+        if (!c.bf16 && !c.fp8) throw std::invalid_argument("--kv takes bf16, fp8 or both");
         const std::string op = args.get("op", "all");
         std::vector<int> variants;
         if (args.has("variant")) {
