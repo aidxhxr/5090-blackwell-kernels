@@ -5,6 +5,7 @@ prefilled together and decoded greedily, and the replies are printed with the de
 
     python scripts/generate.py ~/models/llama3-8b-instruct "why is the sky blue?" "hi"
     python scripts/generate.py MODEL --new 256 --torch     # the same on engine.TorchModel
+    python scripts/generate.py MODEL --spec 4 "summarize: ..."  # prompt-lookup speculation
 
 A request stops at a stop token (the tokenizer's eos, the generation config's eos ids and
 Llama 3's <|eot_id|> when the vocabulary has it), or after --new tokens.
@@ -34,7 +35,11 @@ def main() -> None:
     ap.add_argument("--new", type=int, default=128)
     ap.add_argument("--torch", action="store_true", help="run engine.TorchModel instead")
     ap.add_argument("--raw", action="store_true", help="no chat template")
+    ap.add_argument("--spec", type=int, default=0,
+                    help="prompt-lookup speculative decoding with up to this many draft tokens")
     args = ap.parse_args()
+    if args.spec and args.torch:
+        ap.error("--spec needs the engine's own model (no --torch)")
 
     from transformers import AutoTokenizer
 
@@ -54,7 +59,7 @@ def main() -> None:
         stop.add(tok.convert_tokens_to_ids("<|eot_id|>"))
     eng = E.Engine(model, cfg.n_layers, max_batch=max(1, len(args.prompts)), max_seq=8192,
                    cache_bytes=4 << 30, graphs=not args.torch, log_tokens=True,
-                   stop_ids=sorted(stop))
+                   stop_ids=sorted(stop), speculative=args.spec)
     ids = []
     for p in args.prompts:
         if args.raw:
@@ -75,6 +80,13 @@ def main() -> None:
     n = sum(map(len, outs.values()))
     print(f"\n{n} tokens in {dt:.2f} s, {n / dt:.1f} tok/s ({len(args.prompts)} requests, "
           f"{stats.stopped} stopped before --new)")
+    if args.spec:
+        steps = stats.decode_steps + stats.spec_steps
+        print(f"speculative, up to {args.spec} drafts: {stats.spec_accepted} of "
+              f"{stats.spec_proposed} draft tokens accepted "
+              f"({100 * stats.spec_accepted / max(1, stats.spec_proposed):.0f}%), "
+              f"{stats.decode_tokens / max(1, steps):.2f} tokens per decode forward "
+              f"({stats.spec_steps} verify forwards, {stats.decode_steps} plain decode steps)")
 
 
 if __name__ == "__main__":

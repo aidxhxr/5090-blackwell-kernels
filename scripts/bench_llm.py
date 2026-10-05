@@ -6,6 +6,8 @@ venv) and appends JSON rows; `report` merges them into one table and one JSON fi
 
     python scripts/bench_llm.py workload MODEL                  # results/llm_workload.json
     python scripts/bench_llm.py run spark MODEL --out rows.jsonl
+    python scripts/bench_llm.py run spark_spec MODEL --spec 4 --only decode,parity,summarize \
+        --out rows.jsonl                                        # prompt-lookup speculation
     ~/vllm-env/bin/python scripts/bench_llm.py run vllm MODEL --out rows.jsonl
     python scripts/bench_llm.py run hf MODEL --out rows.jsonl   # hf_static, hf_cb as well
     python scripts/bench_llm.py report rows.jsonl               # results/llm_serve.json
@@ -18,6 +20,11 @@ Workloads (`workload` writes them once, so every backend reads the same token id
     continuous 256 chat requests ("summarize this passage" over a wikitext excerpt), prompt
                and output lengths drawn log-uniformly (seeded), all submitted at once
     parity     six chat prompts, 128 tokens each, the tokens kept for a divergence check
+    summarize  the first --summarize continuous requests one at a time (B = 1), 256 out:
+               where prompt lookup has text to copy from (not in the default --only)
+
+`spark_spec` is the engine with speculative=--spec: its rows add the draft tokens proposed
+and accepted and the decode tokens per forward of the measured run.
 
 How a row is timed, the same on every backend: a warm-up of the same shape with 4 output
 tokens (the full output length for hf_static, whose compiled step is specialized to the cache
@@ -31,6 +38,7 @@ is off) counts.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import random
@@ -110,7 +118,8 @@ class Spark:
     name = "spark"
     static = False
 
-    def __init__(self, model: str, max_batch: int, cache_gb: float, prefill_tokens: int):
+    def __init__(self, model: str, max_batch: int, cache_gb: float, prefill_tokens: int,
+                 spec: int = 0):
         import torch
 
         from spark_kernels import engine as E
@@ -123,18 +132,38 @@ class Spark:
         self.eng = E.Engine(E.SparkModel(w, cfg.rope(MAX_SEQ)), cfg.n_layers,
                             max_batch=max_batch, max_seq=MAX_SEQ,
                             cache_bytes=int(cache_gb * (1 << 30)),
-                            prefill_tokens=prefill_tokens, graphs=True)
+                            prefill_tokens=prefill_tokens, graphs=True, speculative=spec)
         self.config = {"max_batch": self.eng.max_batch, "cache_gb": cache_gb,
                        "cache_tokens": self.eng.cache.num_pages * self.eng.page,
                        "prefill_tokens": prefill_tokens, "graphs": True}
+        if spec:
+            self.name = "spark_spec"
+            self.config["speculative"] = spec
+        self.spec = {}  # the draft counters of the last run (spark_spec)
         print(f"spark: {torch.cuda.memory_allocated() / 2**30:.2f} GiB allocated after the "
               f"graphs, {torch.cuda.mem_get_info()[0] / 2**30:.2f} GiB free", file=sys.stderr)
+
+    def _spec_since(self, before) -> None:
+        """The draft counters of the run since `before` (a copy of the engine's stats)."""
+        st = self.eng.stats
+        if not self.eng.spec:
+            return
+        prop = st.spec_proposed - before.spec_proposed
+        acc = st.spec_accepted - before.spec_accepted
+        fw = (st.spec_steps + st.decode_steps) - (before.spec_steps + before.decode_steps)
+        dec = st.decode_tokens - before.decode_tokens
+        self.spec = {"spec_proposed": prop, "spec_accepted": acc,
+                     "spec_accept_rate": acc / prop if prop else 0.0,
+                     "spec_verify_forwards": st.spec_steps - before.spec_steps,
+                     "decode_tokens_per_forward": dec / fw if fw else 0.0}
 
     def generate(self, prompts, outs, keep=False):
         torch, eng = self.torch, self.eng
         eng.log = [] if keep else None
+        before = copy.copy(eng.stats)
         seqs = [eng.submit(torch.tensor(p), o) for p, o in zip(prompts, outs, strict=True)]
         eng.run()
+        self._spec_since(before)
         if not keep:
             return None
         got = eng.outputs()
@@ -164,14 +193,23 @@ class Spark:
             orig_d()
             mark([], live)
 
-        eng._prefill, eng._decode = prefill, decode
+        orig_s = eng._spec_step
+
+        def spec_step():  # a verify forward (its plain decode fallback marks itself)
+            live = [s for s in eng.running if s is not None]
+            orig_s()
+            mark([], live)
+
+        eng._prefill, eng._decode, eng._spec_step = prefill, decode, spec_step
         start = torch.cuda.Event(enable_timing=True)
         start.record()
+        before = copy.copy(eng.stats)
         try:
             seqs = [eng.submit(torch.tensor(p), o) for p, o in zip(prompts, outs, strict=True)]
             eng.run()
         finally:
-            eng._prefill, eng._decode = orig_p, orig_d
+            eng._prefill, eng._decode, eng._spec_step = orig_p, orig_d, orig_s
+        self._spec_since(before)
         first, last = {}, {}
         for ev, f, d in marks:
             t = start.elapsed_time(ev) / 1e3
@@ -324,14 +362,16 @@ def batch_row(be, kind: str, prompts, out: int, warm: bool = True) -> dict:
         if b == 1:
             row["step_gb_s"] = STEP_BYTES / itl / 1e9
             row["pct_copy_roof"] = 100 * row["step_gb_s"] / COPY_ROOF_GBS
+        row.update(getattr(be, "spec", {}))  # the full-length run's draft counters
     print(json.dumps(row), file=sys.stderr, flush=True)
     return row
 
 
 def run(args) -> int:
     w = json.loads(Path(args.workload).read_text())
-    if args.backend == "spark":
-        be = Spark(args.model, args.max_batch, args.cache_gb, args.prefill_tokens)
+    if args.backend in ("spark", "spark_spec"):
+        spec = args.spec if args.backend == "spark_spec" else 0
+        be = Spark(args.model, args.max_batch, args.cache_gb, args.prefill_tokens, spec)
     elif args.backend == "vllm":
         be = VLLM(args.model, args.max_batch, args.vllm_mem)
     elif args.backend in ("hf", "hf_static"):
@@ -352,6 +392,9 @@ def run(args) -> int:
     if "prefill" in only:
         for p in w["prefill"]:
             rows.append(batch_row(be, "prefill", p["prompts"], 1))
+    if "summarize" in only:
+        for r in w["continuous"][:args.summarize]:
+            rows.append(batch_row(be, "summarize", [r["prompt"]], 256))
     if "continuous" in only:
         c = w["continuous"][:args.requests]
         prompts, outs = [r["prompt"] for r in c], [r["out"] for r in c]
@@ -374,12 +417,14 @@ def run(args) -> int:
         if hasattr(be, "eng"):
             row["preemptions"] = be.eng.stats.preempted
             row["recomputed_tokens"] = be.eng.stats.recomputed_tokens
+            row.update(be.spec)
         print(json.dumps(row), file=sys.stderr, flush=True)
         rows.append(row)
     if "parity" in only:
         p = w["parity"]
         toks = be.generate(p["prompts"], [p["out"]] * len(p["prompts"]), keep=True)
-        rows.append({"backend": be.name, "kind": "parity", "tokens": toks})
+        rows.append({"backend": be.name, "kind": "parity", "tokens": toks,
+                     **getattr(be, "spec", {})})
     for r in rows:
         r["config"] = be.config
     with open(args.out, "a") as f:
@@ -411,9 +456,10 @@ def report(args) -> int:
     by = {(r["backend"], r["kind"], r.get("batch"), r.get("prompt")): r for r in rows}
     print("| workload | " + " | ".join(backends) + " |")
     print("|---|" + "---|" * len(backends))
+    kinds = ["decode", "summarize", "static", "prefill"]
     keys = sorted({(r["kind"], r.get("batch"), r.get("prompt"), r.get("out")) for r in rows
-                   if r["kind"] in ("static", "decode", "prefill")},
-                  key=lambda k: (["decode", "static", "prefill"].index(k[0]), k[1], k[2]))
+                   if r["kind"] in kinds},
+                  key=lambda k: (kinds.index(k[0]), k[1], k[2]))
     for kind, b, p, o in keys:
         cells = []
         for be in backends:
@@ -426,6 +472,9 @@ def report(args) -> int:
                 cells.append(f"{fmt(r, 'out_tok_s', '{:,.0f}')} tok/s, "
                              f"ITL {fmt(r, 'itl_ms', '{:.2f}')} ms, "
                              f"TTFT {fmt(r, 'ttft_ms', '{:,.0f}')} ms")
+                if "spec_proposed" in r:
+                    cells[-1] += (f", {100 * r['spec_accept_rate']:.0f}% of drafts kept, "
+                                  f"{r['decode_tokens_per_forward']:.2f} tok/forward")
         print(f"| {kind} B={b} {p}/{o} | " + " | ".join(cells) + " |")
     for be in backends:
         r = by.get((be, "continuous", None, None))
@@ -433,6 +482,15 @@ def report(args) -> int:
             print(f"continuous {be}: {r['requests']} requests in {r['total_s']:.2f} s, "
                   f"{r['out_tok_s']:,.0f} generated tok/s")
     par = {r["backend"]: r["tokens"] for r in rows if r["kind"] == "parity"}
+    for r in rows:
+        if r["kind"] == "parity" and "spec_proposed" in r:
+            print(f"parity {r['backend']}: {100 * r['spec_accept_rate']:.0f}% of drafts kept, "
+                  f"{r['decode_tokens_per_forward']:.2f} decode tokens per forward")
+    if "spark" in par and "spark_spec" in par:
+        div = [first_divergence(a, b) for a, b in zip(par["spark_spec"], par["spark"],
+                                                       strict=True)]
+        out["parity"]["spark_spec_vs_spark"] = div
+        print(f"parity spark_spec vs spark, first differing token per prompt: {div}")
     if "vllm" in par:
         for be, toks in par.items():
             if be == "vllm":
@@ -459,7 +517,8 @@ def main() -> int:
     a.add_argument("--seed", type=int, default=0)
     a.add_argument("--out", default=str(WORKLOAD))
     a = sub.add_parser("run")
-    a.add_argument("backend", choices=["spark", "vllm", "hf", "hf_static", "hf_cb"])
+    a.add_argument("backend", choices=["spark", "spark_spec", "vllm", "hf", "hf_static",
+                                       "hf_cb"])
     a.add_argument("model")
     a.add_argument("--workload", default=str(WORKLOAD))
     a.add_argument("--out", required=True)
@@ -470,6 +529,8 @@ def main() -> int:
     a.add_argument("--cache-gb", type=float, default=8.5, help="our K/V cache")
     a.add_argument("--prefill-tokens", type=int, default=8192, help="our prefill budget")
     a.add_argument("--vllm-mem", type=float, default=0.85)
+    a.add_argument("--spec", type=int, default=4, help="spark_spec: draft tokens per step")
+    a.add_argument("--summarize", type=int, default=4, help="requests in the summarize rows")
     a = sub.add_parser("report")
     a.add_argument("rows", nargs="+")
     a.add_argument("--profile", nargs="*", help="profile_llm.py output to keep alongside")
