@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """Chat with a real checkpoint on the engine (Llama-3-8B, Llama-3.1-8B, Mistral-7B-v0.3 or
 anything else of their shape): the prompts go through the tokenizer's chat template, are
-prefilled together and decoded greedily, and the replies are printed with the decode rate.
+prefilled together and decoded (greedily unless --temperature > 0), and the replies are
+printed with the decode rate.
 
     python scripts/generate.py ~/models/llama3-8b-instruct "why is the sky blue?" "hi"
     python scripts/generate.py MODEL --new 256 --torch     # the same on engine.TorchModel
     python scripts/generate.py MODEL --spec 4 "summarize: ..."  # prompt-lookup speculation
+    python scripts/generate.py MODEL --temperature 0.7 --top-p 0.9 --seed 1   # sampled
+
+With --temperature > 0 each prompt is sampled on the device (sk.sample: temperature, then
+top-k, then top-p) from its own random stream, seed --seed + its position on the command
+line, so the same command prints the same replies.
 
 A request stops at a stop token (the tokenizer's eos, the generation config's eos ids and
 Llama 3's <|eot_id|> when the vocabulary has it), or after --new tokens.
@@ -37,9 +43,15 @@ def main() -> None:
     ap.add_argument("--raw", action="store_true", help="no chat template")
     ap.add_argument("--spec", type=int, default=0,
                     help="prompt-lookup speculative decoding with up to this many draft tokens")
+    ap.add_argument("--temperature", type=float, default=0.0, help="0: greedy")
+    ap.add_argument("--top-k", type=int, default=0, help="0: no limit")
+    ap.add_argument("--top-p", type=float, default=1.0, help="1: no limit")
+    ap.add_argument("--seed", type=int, default=0, help="prompt i samples with seed + i")
     args = ap.parse_args()
     if args.spec and args.torch:
         ap.error("--spec needs the engine's own model (no --torch)")
+    if args.spec and args.temperature > 0:
+        ap.error("--spec verifies greedily; it does not combine with --temperature")
 
     from transformers import AutoTokenizer
 
@@ -61,7 +73,7 @@ def main() -> None:
                    cache_bytes=4 << 30, graphs=not args.torch, log_tokens=True,
                    stop_ids=sorted(stop), speculative=args.spec)
     ids = []
-    for p in args.prompts:
+    for i, p in enumerate(args.prompts):
         if args.raw:
             x = tok(p, return_tensors="pt").input_ids[0]
         else:
@@ -69,7 +81,8 @@ def main() -> None:
                                         add_generation_prompt=True, return_tensors="pt")
             x = x["input_ids"][0] if hasattr(x, "keys") else x[0]
         ids.append(x)
-        eng.submit(x, args.new)
+        eng.submit(x, args.new, E.SamplingParams(temperature=args.temperature, top_k=args.top_k,
+                                                 top_p=args.top_p, seed=args.seed + i))
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     stats = eng.run()

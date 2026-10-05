@@ -92,6 +92,7 @@ docs:
 - [rmsnorm / add_rmsnorm](design/rmsnorm.md)
 - [swiglu](design/swiglu.md)
 - [softmax](design/softmax.md)
+- [sampling: temperature, top-k and top-p on the device](design/sample.md) (not measured yet)
 - [sgemm](design/sgemm.md)
 - [hgemm](design/hgemm.md)
 - [fp8gemm](design/fp8gemm.md)
