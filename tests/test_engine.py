@@ -24,6 +24,14 @@ def _rel(a, b):
     return ((a.float() - b.float()).norm() / b.float().norm()).item()
 
 
+def _all_back(eng):
+    """Nobody holds a page: each is on the free list or a cached prefix page waiting to be
+    evicted (prefix caching keeps those named instead of freeing them)."""
+    t = eng.cache.table
+    t.check()
+    assert not any(t.refs) and eng.cache.available() == eng.cache.num_pages - 1
+
+
 def test_spark_model_matches_torch_model(sk, weights):
     rope = L.RoPE(1024)
     g = torch.Generator().manual_seed(0)
@@ -75,7 +83,7 @@ def test_graph_decode_matches_eager(sk, weights):
             eng.submit(torch.randint(0, VOCAB, (n,), generator=g), m)
         stats = eng.run()
         assert stats.finished == len(lens) and stats.generated == sum(news)
-        assert len(eng.cache.free) == eng.cache.num_pages - 1  # every page came back
+        _all_back(eng)  # every page came back
         outs.append(eng.outputs())
     assert outs[0] == outs[1]
     assert [len(outs[1][i]) for i in range(len(lens))] == news
@@ -170,7 +178,7 @@ def test_compact_keeps_tokens_and_shrinks_steps(sk, weights):
             eng.submit(p, m)
         stats.append(eng.run())
         outs.append(eng.outputs())
-        assert len(eng.cache.free) == eng.cache.num_pages - 1
+        _all_back(eng)
     assert outs[0] == outs[1]
     assert stats[1].moved > 0
     assert stats[1].decode_rows < stats[0].decode_rows
@@ -195,7 +203,7 @@ def test_mixed_step_same_tokens(sk, weights):
             eng.submit(p, m)
         stats.append(eng.run())
         outs.append(eng.outputs())
-        assert len(eng.cache.free) == eng.cache.num_pages - 1
+        _all_back(eng)
     assert outs[0] == outs[1]
     assert [len(outs[1][i]) for i in range(len(lens))] == news
     assert stats[1].mixed_rows > 0 and stats[0].mixed_rows == 0
@@ -220,7 +228,7 @@ def test_stop_ids(sk, weights):
         for p, m in zip(prompts, news, strict=True):
             eng.submit(p, m)
         st = eng.run()
-        assert len(eng.cache.free) == eng.cache.num_pages - 1
+        _all_back(eng)
         return eng.outputs(), st
 
     full, _ = run(None)
@@ -247,7 +255,7 @@ def test_chunked_prefill_matches_whole(sk, weights):
         chunks = list(eng.prompt_logits_chunks(prompts))
         assert all(lg.shape[0] <= budget for _, _, lg in chunks)
         out.append(eng.prompt_logits(prompts))
-        assert len(eng.cache.free) == eng.cache.num_pages - 1
+        _all_back(eng)
     assert len(chunks) > len(prompts)
     for a, b in zip(*out, strict=True):
         assert a.shape == b.shape and _rel(b, a) < 2e-2
@@ -271,7 +279,7 @@ def test_chunked_prefill_with_mixed_steps(sk, weights):
             eng.submit(p, m)
         stats.append(eng.run())
         outs.append(eng.outputs())
-        assert len(eng.cache.free) == eng.cache.num_pages - 1
+        _all_back(eng)
     assert outs[0] == outs[1]
     assert stats[1].mixed_rows > 0 and stats[1].prefill_batches > stats[0].prefill_batches
 
@@ -301,7 +309,7 @@ def test_preemption_keeps_tokens_in_a_small_cache(sk, weights):
             eng.submit(p, m)
         stats.append(eng.run())
         outs.append(eng.outputs())
-        assert len(eng.cache.free) == eng.cache.num_pages - 1
+        _all_back(eng)
     assert outs[0] == outs[1]
     assert [len(outs[1][i]) for i in range(len(lens))] == news
     assert stats[0].preempted == 0 and stats[1].preempted > 0
@@ -326,7 +334,7 @@ def test_preemption_with_stop_ids_and_mixed_steps(sk, weights):
         for p, m in zip(prompts, news, strict=True):
             eng.submit(p, m)
         st = eng.run()
-        assert len(eng.cache.free) == eng.cache.num_pages - 1
+        _all_back(eng)
         return eng.outputs(), st
 
     full, _ = run(1024, None)
@@ -374,7 +382,7 @@ def _serve(weights, rope, prompts, news, oracle=None, **kw):
     for p, m in zip(prompts, news, strict=True):
         eng.submit(p, m)
     st = eng.run()
-    assert len(eng.cache.free) == eng.cache.num_pages - 1
+    assert _all_back(eng)
     return eng.outputs(), st
 
 
@@ -444,3 +452,148 @@ def test_speculative_refuses_torch_model(sk, weights):
     with pytest.raises(ValueError):
         E.Engine(E.TorchModel(weights, L.RoPE(512)), N_LAYERS, max_batch=1, max_seq=256,
                  num_pages=16, graphs=False, speculative=4)
+def _shared_prefix_workload(seed, n, prefix_lens, suffix_max, new_lo, new_hi):
+    """n prompts, each one of a few common prefixes (a system prompt, a document) plus a
+    suffix of its own, some of them the bare prefix; and their output lengths."""
+    g = torch.Generator().manual_seed(seed)
+    prefixes = [torch.randint(0, VOCAB, (k,), generator=g) for k in prefix_lens]
+    prompts, news = [], []
+    for i in range(n):
+        k = int(torch.randint(0, suffix_max, (1,), generator=g)) if i % 5 else 0
+        prompts.append(torch.cat([prefixes[i % len(prefixes)],
+                                  torch.randint(0, VOCAB, (k,), generator=g)]))
+        news.append(int(torch.randint(new_lo, new_hi, (1,), generator=g)))
+    return prompts, news
+
+
+def _run_waves(eng, prompts, news, waves, steps=4):
+    """Submits the requests in waves with a few steps between them (so later waves find the
+    pages earlier ones registered), runs to the end, and returns the tokens in submit order."""
+    sids, i = [], 0
+    for w in waves:
+        for p, m in zip(prompts[i:i + w], news[i:i + w], strict=True):
+            sids.append(eng.submit(p, m).sid)
+        i += w
+        for _ in range(steps):
+            eng.step()
+    st = eng.run()
+    out = eng.outputs()
+    return [out[s] for s in sids], st
+
+
+def test_prefix_cache_same_tokens(sk, weights):
+    """Requests sharing long prefixes, some submitted at once and some in later waves: with
+    the prefix cache the later ones take the earlier ones' pages and prefill only their own
+    tokens, and every request gets the tokens it gets without the cache. Pages that nobody
+    holds at the end are free or cached, never lost."""
+    rope = L.RoPE(1024)
+    prompts, news = _shared_prefix_workload(31, 24, (200, 77, 333), 60, 1, 20)
+    outs, stats = [], []
+    for prefix in (False, True):
+        eng = E.Engine(E.SparkModel(weights, rope), N_LAYERS, max_batch=8, max_seq=512,
+                       num_pages=512, graphs=True, log_tokens=True, prefill_tokens=512,
+                       prefix_cache=prefix)
+        o, st = _run_waves(eng, prompts, news, (6, 8, 10))
+        outs.append(o)
+        stats.append(st)
+        _all_back(eng)
+        if prefix:
+            assert len(eng.cache.table.evictable) > 0  # the prefixes stay cached
+    assert outs[0] == outs[1]
+    assert [len(o) for o in outs[1]] == news
+    assert stats[0].prefix_hit_tokens == stats[0].prefix_queries == 0
+    assert stats[1].prefix_hit_tokens > 0
+    assert stats[1].prefix_queries == stats[0].prefill_tokens
+    assert stats[1].prefill_tokens == stats[0].prefill_tokens - stats[1].prefix_hit_tokens
+
+
+def test_prefix_cache_whole_prompt_hit_computes_last_token(sk, weights):
+    """A prompt of whole pages that is all cached still prefills its last page (a page
+    holding the last token is never shared), so the first token comes from its own logits;
+    the second identical request matches all but that page."""
+    rope = L.RoPE(512)
+    p = torch.randint(0, VOCAB, (64,))
+    outs = []
+    for prefix in (False, True):
+        eng = E.Engine(E.SparkModel(weights, rope), N_LAYERS, max_batch=2, max_seq=256,
+                       num_pages=64, graphs=False, log_tokens=True, prefix_cache=prefix)
+        o, st = _run_waves(eng, [p, p, p[:50]], [6, 6, 6], (1, 1, 1))
+        outs.append(o)
+        _all_back(eng)
+    assert outs[0] == outs[1] and outs[1][0] == outs[1][1]
+    assert st.prefix_hit_tokens == 48 + 48  # three of four pages twice
+    assert st.prefill_tokens == 64 + 16 + 2
+
+
+def test_prefix_cache_evicts_in_a_small_cache(sk, weights):
+    """A cache too small to keep every prefix: cached pages nobody holds are taken back
+    (least recently released first) when an allocation needs them, a later request for an
+    evicted prefix prefills it again, and the tokens are the big cache's."""
+    rope = L.RoPE(1024)
+    prompts, news = _shared_prefix_workload(37, 30, (180, 150, 220, 120, 200), 40, 2, 12)
+    want, _ = _run_waves(
+        E.Engine(E.SparkModel(weights, rope), N_LAYERS, max_batch=4, max_seq=512,
+                 num_pages=1024, graphs=True, log_tokens=True, prefix_cache=False),
+        prompts, news, (5, 5, 5, 5, 5, 5))
+    eng = E.Engine(E.SparkModel(weights, rope), N_LAYERS, max_batch=4, max_seq=512,
+                   num_pages=72, graphs=True, log_tokens=True, prefix_cache=True)
+    got, st = _run_waves(eng, prompts, news, (5, 5, 5, 5, 5, 5))
+    assert got == want
+    assert eng.cache.table.evicted > 0 and st.prefix_hit_tokens > 0
+    _all_back(eng)
+
+
+def test_prefix_cache_with_preemption_chunks_and_stops(sk, weights):
+    """Prefix caching under a cache small enough to preempt, a 96-token prefill budget (so
+    prompts after a hit are still chunked) with mixed steps, and stop ids: the outputs are
+    the big cache's without prefix caching, cut at the stop token. A preempted sequence
+    finds its own prompt pages again unless they were evicted."""
+    rope = L.RoPE(1024)
+    prompts, news = _shared_prefix_workload(41, 16, (150, 90), 50, 30, 90)
+
+    def run(pages, prefix, stop_ids):
+        eng = E.Engine(E.SparkModel(weights, rope), N_LAYERS, max_batch=8, max_seq=512,
+                       num_pages=pages, graphs=True, log_tokens=True, prefill_tokens=96,
+                       stop_ids=stop_ids, prefix_cache=prefix)
+        o, st = _run_waves(eng, prompts, news, (8, 4, 4))
+        _all_back(eng)
+        return o, st
+
+    full, _ = run(1024, False, None)
+    counts = torch.bincount(torch.tensor([t for o in full for t in o[1:]]))
+    stop = int(counts.argmax())
+    want = [o[:o.index(stop) + 1] if stop in o else o for o in full]
+    got, st = run(48, True, [stop])
+    assert got == want
+    assert st.preempted > 0 and st.prefix_hit_tokens > 0 and st.finished == len(prompts)
+    plain, st = run(48, True, None)
+    assert plain == full and st.preempted > 0
+
+
+def test_prefix_cache_reserve_mode(sk, weights):
+    """preempt=False with prefix caching: matched pages count toward the reservation, a
+    request waits for pages instead of preempting, and the tokens do not change."""
+    rope = L.RoPE(1024)
+    prompts, news = _shared_prefix_workload(43, 12, (160,), 40, 40, 100)
+    outs = []
+    for prefix in (False, True):
+        eng = E.Engine(E.SparkModel(weights, rope), N_LAYERS, max_batch=8, max_seq=512,
+                       num_pages=48, graphs=False, log_tokens=True, preempt=False,
+                       prefix_cache=prefix)
+        o, st = _run_waves(eng, prompts, news, (4, 4, 4))
+        outs.append(o)
+        assert st.preempted == 0
+        _all_back(eng)
+    assert outs[0] == outs[1] and st.prefix_hit_tokens > 0
+
+
+def test_prefix_cache_needs_a_context_prefill(sk, weights):
+    """TorchModel's prefill cannot start after a cached context: it gets no prefix cache by
+    default and refuses one asked for."""
+    rope = L.RoPE(512)
+    eng = E.Engine(E.TorchModel(weights, rope), N_LAYERS, max_batch=1, max_seq=256,
+                   num_pages=32, graphs=False)
+    assert not eng.prefix_cache
+    with pytest.raises(ValueError):
+        E.Engine(E.TorchModel(weights, rope), N_LAYERS, max_batch=1, max_seq=256,
+                 num_pages=32, graphs=False, prefix_cache=True)
