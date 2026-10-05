@@ -21,7 +21,7 @@ from . import _C
 
 KERNELS = ("bandwidth", "rmsnorm", "swiglu", "softmax", "sgemm", "hgemm", "fp8gemm", "fp4gemm",
            "w4gemm", "attention", "attention_bwd", "paged_decode", "attention_varlen",
-           "attention_fp8")
+           "attention_fp8", "sample")
 
 
 def num_variants(name: str) -> int:
@@ -72,6 +72,44 @@ def swiglu(gate: torch.Tensor, up: torch.Tensor, variant: int = -1) -> torch.Ten
 def softmax(x: torch.Tensor, variant: int = -1) -> torch.Tensor:
     """Softmax over the last dim with fp32 max/sum (online softmax for variants >= 1)."""
     return _C.softmax(x, variant)
+
+
+def sample(
+    logits: torch.Tensor,
+    temperature: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    seed: torch.Tensor,
+    offset: torch.Tensor,
+    variant: int = -1,
+) -> torch.Tensor:
+    """One token per row of `logits` [B, V] bfloat16, returned as int64 [B]. The parameters
+    are [B] device tensors, so a CUDA graph that captures the call replays with whatever they
+    hold: temperature and top_p float32, top_k int32, seed and offset int64. Every call adds
+    one to each row's offset in place, so replays draw fresh numbers; the engine sets a
+    request's offset to the index of the token it is about to generate.
+
+    Per row, with x the logits in fp32 and m their max:
+
+    * temperature <= 0 is greedy: the first index of the max, as torch.argmax.
+    * The weights are w_i = floor(exp((x_i - m) / T) * 2^40) as 64-bit integers; a token
+      under 2^-40 of the top token's probability has weight 0 and is never drawn. All sums
+      are integer sums, so the token depends on the row and its parameters only, not on the
+      batch around it or the order of the kernel's reductions.
+    * top_k > 0: keep the tokens whose value is at least the k-th largest among the nonzero
+      weights; tokens tied with the k-th are all kept. 0 (or k at least that count) disables.
+    * top_p < 1, applied after top-k to what it kept (total weight Z): keep the tokens whose
+      value is at least the largest v such that the kept weight at or above v is at least
+      ceil(top_p Z). That is the usual rule (sorted descending, a token is kept while the
+      probability before it is < top_p), with tied values kept or dropped together. top_p <= 0
+      keeps the top value only.
+    * The token is the inverse CDF in index order at floor(u Z_f / 2^64), Z_f the kept total
+      and u the first 64 bits of Philox4_32_10 block `offset` of stream `seed`.
+
+    Variant 0 is one thread per row (the reference); variant 1, the default, one block per row
+    with a radix select instead of a sort. Both give the same token for the same inputs.
+    """
+    return _C.sample(logits, temperature, top_k, top_p, seed, offset, variant)
 
 
 def sgemm(a: torch.Tensor, b: torch.Tensor, variant: int = -1) -> torch.Tensor:

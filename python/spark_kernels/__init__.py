@@ -9,6 +9,9 @@ Ops (all run on the current CUDA stream, all accept float32 or bfloat16 unless n
     add_rmsnorm_(x, resid, w, eps=1e-6)      resid += x; return rmsnorm(resid)  (bf16, in place)
     swiglu(gate, up, variant=-1)             silu(gate) * up
     softmax(x, variant=-1)                   softmax over the last dim, fp32 math
+    sample(logits, temperature, top_k, top_p, seed, offset, variant=-1)
+                                             one token per row of bf16 logits (temperature,
+                                             top-k, top-p, Philox), parameters on the device
     sgemm(a, b, variant=-1)                  fp32 GEMM (a @ b)
     hgemm(a, b, variant=-1, bias=, act=, residual=, out=)
                                              bf16 tensor-core GEMM (a @ b), fp32 accumulate,
@@ -77,6 +80,7 @@ from .ops import (
     rmsnorm,
     rope_append_,
     rope_append_paged_,
+    sample,
     sgemm,
     softmax,
     swiglu,
@@ -111,6 +115,7 @@ __all__ = [
     "rmsnorm",
     "rope_append_",
     "rope_append_paged_",
+    "sample",
     "sgemm",
     "softmax",
     "swiglu",

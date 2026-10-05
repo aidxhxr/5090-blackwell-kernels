@@ -192,6 +192,40 @@ Tensor softmax(const Tensor& x, int variant) {
     return out;
 }
 
+// The per-row parameters of sample: [B] on the device of logits, the given dtype.
+void check_row_param(const Tensor& t, const char* name, at::ScalarType dtype, int64_t B,
+                     const Tensor& logits) {
+    check_cuda_contig(t, name);
+    TORCH_CHECK(t.scalar_type() == dtype, name, " must be ", dtype, ", got ", t.scalar_type());
+    TORCH_CHECK(t.dim() == 1 && t.size(0) == B, name, " must be [B] = [", B, "]");
+    TORCH_CHECK(t.device() == logits.device(), name, " must be on the device of logits");
+}
+
+// One token per row of logits [B, V] bf16 (spark::sample_bf16 states the rule): per-row
+// temperature, top_p (float32), top_k (int32), seed and offset (int64), all [B] on the device;
+// each row's offset is advanced by one in place.
+Tensor sample(const Tensor& logits, const Tensor& temperature, const Tensor& top_k,
+              const Tensor& top_p, const Tensor& seed, Tensor offset, int variant) {
+    check_cuda_contig(logits, "logits");
+    TORCH_CHECK(logits.scalar_type() == at::kBFloat16 && logits.dim() == 2,
+                "sample expects logits as [B, V] bfloat16");
+    const int64_t B = logits.size(0), V = logits.size(1);
+    TORCH_CHECK(B <= INT32_MAX && V <= (int64_t{1} << 23), "sample: B or V too large");
+    check_row_param(temperature, "temperature", at::kFloat, B, logits);
+    check_row_param(top_k, "top_k", at::kInt, B, logits);
+    check_row_param(top_p, "top_p", at::kFloat, B, logits);
+    check_row_param(seed, "seed", at::kLong, B, logits);
+    check_row_param(offset, "offset", at::kLong, B, logits);
+    const c10::cuda::CUDAGuard guard(logits.device());
+    Tensor out = at::empty({B}, logits.options().dtype(at::kLong));
+    const int v = resolve_variant(variant, spark::sample_num_variants());
+    spark::sample_bf16(
+        bf16_ptr(logits), static_cast<int>(B), static_cast<int>(V), temperature.data_ptr<float>(),
+        top_k.data_ptr<int>(), top_p.data_ptr<float>(), seed.data_ptr<int64_t>(),
+        offset.data_ptr<int64_t>(), out.data_ptr<int64_t>(), v, current_stream(logits));
+    return out;
+}
+
 struct GemmShape {
     int M, N, K;
 };
@@ -959,6 +993,7 @@ int num_variants(const std::string& name) {
     if (name == "rmsnorm") return spark::rmsnorm_num_variants();
     if (name == "swiglu") return spark::swiglu_num_variants();
     if (name == "softmax") return spark::softmax_num_variants();
+    if (name == "sample") return spark::sample_num_variants();
     if (name == "sgemm") return spark::sgemm_num_variants();
     if (name == "hgemm") return spark::hgemm_num_variants();
     if (name == "fp8gemm") return spark::fp8gemm_num_variants();
@@ -987,6 +1022,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("gate"), py::arg("up"), py::arg("variant") = -1);
     m.def("softmax", &softmax, "softmax over the last dim (fp32 math)", py::arg("x"),
           py::arg("variant") = -1);
+    m.def("sample", &sample,
+          "one token per row of [B, V] bf16 logits with per-row temperature, top_k, top_p, seed "
+          "and offset device tensors (offset advanced in place); int64 [B]",
+          py::arg("logits"), py::arg("temperature"), py::arg("top_k"), py::arg("top_p"),
+          py::arg("seed"), py::arg("offset"), py::arg("variant") = -1);
     m.def("sgemm", &sgemm, "fp32 GEMM: a @ b (variants 6 and 7: tensor cores in TF32 / 3xTF32)",
           py::arg("a"), py::arg("b"), py::arg("variant") = -1);
     m.def("hgemm", &hgemm,
