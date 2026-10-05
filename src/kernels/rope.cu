@@ -20,6 +20,8 @@
 // rope_append_paged_bf16 is the same work for packed tokens and a paged cache
 // (docs/design/serving.md): token t rotates at positions[t], its k and v go to slot slots[t]
 // of [num_pages, H_kv, page, D] caches, and q comes out token-major as [T, H_q, D].
+// rope_append_paged_fp8 writes the caches as e4m3, x / scale[kv head] rounded once from fp32
+// (cvt.rn.satfinite, sm_89+), 8 bytes per thread where the bf16 form stores 16.
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -171,6 +173,112 @@ __global__ void rope_append_paged_kernel(PagedParams p) {
     *reinterpret_cast<bf16x8*>(dst + half) = o2;
 }
 
+// rotate8 with fp32 results, for the e4m3 cache: k is rounded once, to e4m3, not to bf16
+// first. Kept apart so the bf16 kernels compile exactly as before.
+__device__ __forceinline__ void rotate8_f32(const __nv_bfloat16* src, int half, const float* cs,
+                                            const float* sn, float (&o1)[8], float (&o2)[8]) {
+    const bf16x8 x1 = *reinterpret_cast<const bf16x8*>(src);
+    const bf16x8 x2 = *reinterpret_cast<const bf16x8*>(src + half);
+    const float4 c0 = ld_f4(cs), c1 = ld_f4(cs + 4);
+    const float4 s0 = ld_f4(sn), s1 = ld_f4(sn + 4);
+    const float cv[8] = {c0.x, c0.y, c0.z, c0.w, c1.x, c1.y, c1.z, c1.w};
+    const float sv[8] = {s0.x, s0.y, s0.z, s0.w, s1.x, s1.y, s1.z, s1.w};
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const float2 a = __bfloat1622float2(x1.h[k]);
+        const float2 bb = __bfloat1622float2(x2.h[k]);
+        o1[2 * k] = a.x * cv[2 * k] - bb.x * sv[2 * k];
+        o1[2 * k + 1] = a.y * cv[2 * k + 1] - bb.y * sv[2 * k + 1];
+        o2[2 * k] = bb.x * cv[2 * k] + a.x * sv[2 * k];
+        o2[2 * k + 1] = bb.y * cv[2 * k + 1] + a.y * sv[2 * k + 1];
+    }
+}
+
+// Four floats to four e4m3 bytes, x0 in the low byte (round to nearest even, saturating at
+// +-448). cvt...e4m3x2 puts its first source in the upper byte; attention_fp8.cu's helper.
+__device__ __forceinline__ unsigned pack_e4m3x4(float x0, float x1, float x2, float x3) {
+    unsigned short lo, hi;
+    unsigned r;
+    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(lo) : "f"(x1), "f"(x0));
+    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(hi) : "f"(x3), "f"(x2));
+    asm("mov.b32 %0, {%1, %2};" : "=r"(r) : "h"(lo), "h"(hi));
+    return r;
+}
+
+// Eight floats divided by s, as 8 e4m3 bytes. A true division, so the bytes are what
+// (x / s).to(torch.float8_e4m3fn) gives after a clamp to +-448.
+__device__ __forceinline__ uint2 e4m3x8(const float (&f)[8], float s) {
+    return make_uint2(pack_e4m3x4(f[0] / s, f[1] / s, f[2] / s, f[3] / s),
+                      pack_e4m3x4(f[4] / s, f[5] / s, f[6] / s, f[7] / s));
+}
+
+struct PagedFp8Params {
+    const __nv_bfloat16* qkv;
+    const float* cos;
+    const float* sin;
+    const int* pos;
+    const int* slots;
+    __nv_bfloat16* q;
+    unsigned char* k_cache;
+    unsigned char* v_cache;
+    const float* k_scale;
+    const float* v_scale;
+    int H_q, H_kv, D, shift;
+    int64_t width, rope_items, per_tok, total;
+};
+
+// rope_append_paged_kernel with e4m3 caches: same items, a cache row is D bytes, and slot
+// offsets in elements are offsets in bytes.
+__global__ void rope_append_paged_fp8_kernel(PagedFp8Params p) {
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= p.total) return;
+    const int64_t tok = i / p.per_tok;
+    const int64_t j = i - tok * p.per_tok;
+    const int slot = p.slots[tok];
+    const __nv_bfloat16* row = p.qkv + tok * p.width;
+
+    if (j >= p.rope_items) {
+        if (slot < 0) return;
+        const int64_t jv = j - p.rope_items;
+        const int per_row = p.D / 8;
+        const int vh = static_cast<int>(jv / per_row);
+        const int c = static_cast<int>(jv - static_cast<int64_t>(vh) * per_row) * 8;
+        const bf16x8 v = *reinterpret_cast<const bf16x8*>(row + (p.H_q + p.H_kv + vh) * p.D + c);
+        float f[8];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const float2 t = __bfloat1622float2(v.h[k]);
+            f[2 * k] = t.x;
+            f[2 * k + 1] = t.y;
+        }
+        *reinterpret_cast<uint2*>(p.v_cache + slot_offset(slot, p.H_kv, vh, p.shift, p.D) + c) =
+            e4m3x8(f, p.v_scale[vh]);
+        return;
+    }
+
+    const int per_row = p.D / 16;
+    const int h = static_cast<int>(j / per_row);
+    const int c = static_cast<int>(j - static_cast<int64_t>(h) * per_row) * 8;
+    if (h >= p.H_q && slot < 0) return;
+    const int half = p.D / 2;
+    const int64_t pos = p.pos[tok];
+    if (h < p.H_q) {
+        bf16x8 o1, o2;
+        rotate8(row + h * p.D + c, half, p.cos + pos * p.D + c, p.sin + pos * p.D + c, o1, o2);
+        __nv_bfloat16* dst = p.q + (tok * p.H_q + h) * p.D + c;
+        *reinterpret_cast<bf16x8*>(dst) = o1;
+        *reinterpret_cast<bf16x8*>(dst + half) = o2;
+        return;
+    }
+    float o1[8], o2[8];
+    rotate8_f32(row + h * p.D + c, half, p.cos + pos * p.D + c, p.sin + pos * p.D + c, o1, o2);
+    const int kh = h - p.H_q;
+    const float s = p.k_scale[kh];
+    unsigned char* dst = p.k_cache + slot_offset(slot, p.H_kv, kh, p.shift, p.D) + c;
+    *reinterpret_cast<uint2*>(dst) = e4m3x8(o1, s);
+    *reinterpret_cast<uint2*>(dst + half) = e4m3x8(o2, s);
+}
+
 }  // namespace
 
 void rope_append_bf16(const __nv_bfloat16* qkv, const float* cos, const float* sin,
@@ -244,6 +352,48 @@ void rope_append_paged_bf16(const __nv_bfloat16* qkv, const float* cos, const fl
     const int64_t blocks = cdiv64(p.total, kBlock);
     SPARK_REQUIRE(blocks < (int64_t{1} << 31), "rope_append_paged: too many tokens");
     rope_append_paged_kernel<<<static_cast<unsigned>(blocks), kBlock, 0, stream>>>(p);
+    SPARK_CHECK_LAUNCH();
+}
+
+void rope_append_paged_fp8(const __nv_bfloat16* qkv, const float* cos, const float* sin,
+                           const int* positions, const int* slots, __nv_bfloat16* q,
+                           __nv_fp8_e4m3* k_cache, __nv_fp8_e4m3* v_cache, const float* k_scale,
+                           const float* v_scale, int T, int H_q, int H_kv, int D, int page,
+                           cudaStream_t stream) {
+    SPARK_REQUIRE(qkv != nullptr && cos != nullptr && sin != nullptr && positions != nullptr &&
+                      slots != nullptr && q != nullptr && k_cache != nullptr &&
+                      v_cache != nullptr && k_scale != nullptr && v_scale != nullptr,
+                  "rope_append_paged_fp8: null pointer");
+    SPARK_REQUIRE(T >= 1 && H_q >= 1 && H_kv >= 1 && D >= 16 && D % 16 == 0,
+                  "rope_append_paged_fp8: need T, H_q, H_kv >= 1 and D a multiple of 16");
+    int shift = 0;
+    while ((1 << shift) < page) ++shift;
+    SPARK_REQUIRE(page >= 1 && (1 << shift) == page, "rope_append_paged_fp8: page a power of two");
+    SPARK_REQUIRE(is_aligned16(qkv) && is_aligned16(cos) && is_aligned16(sin) && is_aligned16(q) &&
+                      is_aligned16(k_cache) && is_aligned16(v_cache),
+                  "rope_append_paged_fp8: needs 16-byte aligned pointers");
+    PagedFp8Params p;
+    p.qkv = qkv;
+    p.cos = cos;
+    p.sin = sin;
+    p.pos = positions;
+    p.slots = slots;
+    p.q = q;
+    p.k_cache = reinterpret_cast<unsigned char*>(k_cache);
+    p.v_cache = reinterpret_cast<unsigned char*>(v_cache);
+    p.k_scale = k_scale;
+    p.v_scale = v_scale;
+    p.H_q = H_q;
+    p.H_kv = H_kv;
+    p.D = D;
+    p.shift = shift;
+    p.width = static_cast<int64_t>(H_q + 2 * H_kv) * D;
+    p.rope_items = static_cast<int64_t>(H_q + H_kv) * (D / 16);
+    p.per_tok = p.rope_items + static_cast<int64_t>(H_kv) * (D / 8);
+    p.total = static_cast<int64_t>(T) * p.per_tok;
+    const int64_t blocks = cdiv64(p.total, kBlock);
+    SPARK_REQUIRE(blocks < (int64_t{1} << 31), "rope_append_paged_fp8: too many tokens");
+    rope_append_paged_fp8_kernel<<<static_cast<unsigned>(blocks), kBlock, 0, stream>>>(p);
     SPARK_CHECK_LAUNCH();
 }
 

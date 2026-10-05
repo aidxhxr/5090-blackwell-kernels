@@ -31,6 +31,17 @@
 //                sequence with q_len new tokens and seq_len keys sees keys
 //                j <= seq_len - q_len + i, which is the plain causal mask for a fresh prompt
 //                and the right one for a chunk appended to an existing context.
+//
+// Both ops also read an e4m3 cache (paged_decode_fp8, attention_varlen_fp8): the same
+// [num_pages, H_kv, page, D] layout at one byte per element, with a per-kv-head scale for K
+// and one for V. e4m3 is a subset of bf16, so the kernels convert the bytes to bf16 exactly
+// and keep the bf16 mma; the K scale goes into the softmax scale and the V scale into the
+// output normalization. Decode variant 1 reads e4m3 slabs from shared memory into registers in
+// the fragment layouts (no ldmatrix, no bf16 copy of the slab) and keeps twice the slabs in
+// flight; varlen variant 1 converts each 64-key tile to bf16 in shared memory once for its 8
+// warps and runs the bf16 tile code unchanged. docs/design/serving.md, "An fp8 K/V cache".
+#include <cuda_fp8.h>
+
 #include <algorithm>
 #include <cstdlib>
 
@@ -46,6 +57,7 @@ using attn::ex2;
 using attn::kLog2e;
 using attn::pack_bf16x2;
 using attn::swz;
+using u8 = unsigned char;
 
 // The per-block prefix sums below park one int per sequence in shared memory, next to the
 // 96 KB of the decode pipeline, under the 99 KB a block can have on sm_120.
@@ -109,13 +121,45 @@ __device__ __forceinline__ size_t cache_row(int page_id, int H_kv, int kvh, int 
     return ((static_cast<size_t>(page_id) * H_kv + kvh) << shift) + (j & ((1 << shift) - 1));
 }
 
+// ---- e4m3 helpers --------------------------------------------------------------------------
+
+// The two e4m3 bytes in the low 16 bits of x (the first in the low byte) as a bf16x2 word,
+// the first in the low half. cvt.rn.f16x2.e4m3x2 (sm_89+) then f16 -> f32 -> bf16; every
+// step is exact, since e4m3 values (2^-9 to 448, 3 mantissa bits) are f16 and bf16 values.
+__device__ __forceinline__ unsigned e4m3x2_to_bf16x2(unsigned x) {
+    const __half2_raw h =
+        __nv_cvt_fp8x2_to_halfraw2(static_cast<__nv_fp8x2_storage_t>(x & 0xFFFFu), __NV_E4M3);
+    const float2 f = __half22float2(__half2(h));
+    return pack_bf16x2(f.x, f.y);
+}
+
+// One cache element as a float (the naive rungs).
+__device__ __forceinline__ float kv_float(const bf16* p) {
+    return __bfloat162float(*p);
+}
+__device__ __forceinline__ float kv_float(const u8* p) {
+    return __half2float(__half(__nv_cvt_fp8_to_halfraw(*p, __NV_E4M3)));
+}
+
+// Physical 16-byte chunk of logical (row, chunk) in an e4m3 tile of D-byte rows. D = 128:
+// swz's XOR over 8 chunks, which keeps both fragment reads of the decode kernel and the
+// conversion reads of the varlen kernel conflict-free. D = 64 (4 chunks a row, two rows per
+// 128 bytes): XOR with row / 2, which leaves the decode kernel's 8-byte V reads 2-way
+// conflicted instead of 4-way.
+template <int D>
+__device__ __forceinline__ int swz8(int row, int chunk) {
+    static_assert(D == 64 || D == 128, "D = 64 or 128");
+    return D == 128 ? chunk ^ (row & 7) : chunk ^ ((row >> 1) & 3);
+}
+
 // ---- the naive rungs (variant 0 of both ops) ---------------------------------------------
 
 // One warp computes one query row against keys [0, nkeys) of sequence b, kv head kvh. Lane l
 // owns columns l*VEC .. l*VEC+VEC-1; the score of a key is a shuffle reduction.
-template <int D>
-__device__ void naive_row(const bf16* q, const bf16* K, const bf16* V, const int* bt, int H_kv,
-                          int kvh, int shift, int nkeys, float scale_log2, bf16* out) {
+// `KV` is bf16 or u8 (e4m3); scale_log2 carries the K scale and out_mul the V scale (1 for bf16).
+template <int D, typename KV>
+__device__ void naive_row(const bf16* q, const KV* K, const KV* V, const int* bt, int H_kv, int kvh,
+                          int shift, int nkeys, float scale_log2, float out_mul, bf16* out) {
     constexpr int VEC = D / 32;
     const int lane = threadIdx.x & 31;
     float qf[VEC], acc[VEC];
@@ -127,60 +171,71 @@ __device__ void naive_row(const bf16* q, const bf16* K, const bf16* V, const int
     float m = -INFINITY, l = 0.f;
     for (int j = 0; j < nkeys; ++j) {
         const size_t row = cache_row(__ldg(bt + (j >> shift)), H_kv, kvh, shift, j) * D;
-        const bf16* kr = K + row + lane * VEC;
+        const KV* kr = K + row + lane * VEC;
         float s = 0.f;
 #pragma unroll
-        for (int e = 0; e < VEC; ++e) s = fmaf(qf[e], __bfloat162float(kr[e]), s);
+        for (int e = 0; e < VEC; ++e) s = fmaf(qf[e], kv_float(kr + e), s);
         s = warp_reduce_sum(s) * scale_log2;
         const float m_new = fmaxf(m, s);
         const float alpha = ex2(m - m_new);
         const float pj = ex2(s - m_new);
         l = fmaf(l, alpha, pj);
-        const bf16* vr = V + row + lane * VEC;
+        const KV* vr = V + row + lane * VEC;
 #pragma unroll
-        for (int e = 0; e < VEC; ++e) acc[e] = fmaf(acc[e], alpha, pj * __bfloat162float(vr[e]));
+        for (int e = 0; e < VEC; ++e) acc[e] = fmaf(acc[e], alpha, pj * kv_float(vr + e));
         m = m_new;
     }
-    const float inv = nkeys > 0 ? 1.f / l : 0.f;
+    const float inv = nkeys > 0 ? out_mul / l : 0.f;
 #pragma unroll
     for (int e = 0; e < VEC; ++e) out[lane * VEC + e] = __float2bfloat16(acc[e] * inv);
 }
 
+// K and V are the caches as bf16 or e4m3 bytes (the kernel's KV); the scales only for e4m3.
 struct NaiveDecodeParams {
     const bf16* Q;
-    const bf16* K;
-    const bf16* V;
+    const void* K;
+    const void* V;
     bf16* O;
     const int* bt;
     const int* lens;
     int B, H_q, H_kv, max_pages, shift;
     float scale_log2;
+    const float* k_scale;
+    const float* v_scale;
 };
 
-template <int D>
+template <int D, typename KV>
 __global__ void __launch_bounds__(128) paged_decode_naive_kernel(NaiveDecodeParams p) {
     const int row = blockIdx.x * 4 + (threadIdx.x >> 5);  // (b, h)
     if (row >= p.B * p.H_q) return;
     const int b = row / p.H_q, h = row - b * p.H_q;
     const int kvh = h / (p.H_q / p.H_kv);
-    naive_row<D>(p.Q + static_cast<size_t>(row) * D, p.K, p.V,
-                 p.bt + static_cast<size_t>(b) * p.max_pages, p.H_kv, kvh, p.shift,
-                 max(0, p.lens[b]), p.scale_log2, p.O + static_cast<size_t>(row) * D);
+    float sl2 = p.scale_log2, om = 1.f;
+    if constexpr (sizeof(KV) == 1) {
+        sl2 *= p.k_scale[kvh];
+        om = p.v_scale[kvh];
+    }
+    naive_row<D, KV>(p.Q + static_cast<size_t>(row) * D, static_cast<const KV*>(p.K),
+                     static_cast<const KV*>(p.V), p.bt + static_cast<size_t>(b) * p.max_pages,
+                     p.H_kv, kvh, p.shift, max(0, p.lens[b]), sl2, om,
+                     p.O + static_cast<size_t>(row) * D);
 }
 
 struct NaiveVarlenParams {
     const bf16* Q;
-    const bf16* K;
-    const bf16* V;
+    const void* K;
+    const void* V;
     bf16* O;
     const int* cu_q;
     const int* lens;
     const int* bt;
     int B, T, H_q, H_kv, max_pages, shift, causal;
     float scale_log2;
+    const float* k_scale;
+    const float* v_scale;
 };
 
-template <int D>
+template <int D, typename KV>
 __global__ void __launch_bounds__(128) varlen_naive_kernel(NaiveVarlenParams p) {
     const int row = blockIdx.x * 4 + (threadIdx.x >> 5);  // (token, h)
     if (row >= p.T * p.H_q) return;
@@ -196,9 +251,15 @@ __global__ void __launch_bounds__(128) varlen_naive_kernel(NaiveVarlenParams p) 
     const int b = lo;
     const int q_len = p.cu_q[b + 1] - p.cu_q[b], kv_len = p.lens[b];
     const int nkeys = p.causal ? kv_len - q_len + (t - p.cu_q[b]) + 1 : kv_len;
-    naive_row<D>(p.Q + static_cast<size_t>(row) * D, p.K, p.V,
-                 p.bt + static_cast<size_t>(b) * p.max_pages, p.H_kv, h / (p.H_q / p.H_kv), p.shift,
-                 nkeys, p.scale_log2, p.O + static_cast<size_t>(row) * D);
+    const int kvh = h / (p.H_q / p.H_kv);
+    float sl2 = p.scale_log2, om = 1.f;
+    if constexpr (sizeof(KV) == 1) {
+        sl2 *= p.k_scale[kvh];
+        om = p.v_scale[kvh];
+    }
+    naive_row<D, KV>(p.Q + static_cast<size_t>(row) * D, static_cast<const KV*>(p.K),
+                     static_cast<const KV*>(p.V), p.bt + static_cast<size_t>(b) * p.max_pages,
+                     p.H_kv, kvh, p.shift, nkeys, sl2, om, p.O + static_cast<size_t>(row) * D);
 }
 
 // ---- paged flash-decoding (decode variant 1) ---------------------------------------------
@@ -210,15 +271,70 @@ constexpr int THREADS = WARPS * 32;
 constexpr int ROWS = 16;  // one m16 tile of query rows: the group's heads
 constexpr int SLAB = 16;  // keys per pipeline stage, and the smallest page
 constexpr int STAGES = 3;
+// An e4m3 stage is half the bytes, so twice the stages fit the same 96 KB: 5 slabs, 20 KB, in
+// flight per warp against bf16's 2 slabs, 16 KB. Bytes in flight are what keep DRAM busy
+// (the kernel waits on memory and nothing else), so the stages double rather than the slab:
+// the slab stays the 16-key unit of the split, the page minimum and the one k16 step of P V.
+constexpr int STAGES_FP8 = 6;
 
-// A stage is a K slab then a V slab, 8 KB at D = 128.
+template <bool FP8>
+constexpr int stages() {
+    return FP8 ? STAGES_FP8 : STAGES;
+}
+// A stage is a K slab then a V slab, 8 KB at D = 128 (4 KB in e4m3).
 template <int D>
 constexpr int stage_elems() {
     return 2 * SLAB * D;
 }
-template <int D>
+template <int D, bool FP8>
+constexpr int stage_bytes() {
+    return stage_elems<D>() * (FP8 ? 1 : 2);
+}
+template <int D, bool FP8>
 constexpr int smem_bytes() {
-    return WARPS * STAGES * stage_elems<D>() * 2;  // 96 KB at D = 128
+    return WARPS * stages<FP8>() * stage_bytes<D, FP8>();  // 96 KB at D = 128, either format
+}
+
+// DT consecutive output columns of accumulator element e, times mul, as bf16 (16-byte stores)
+// or fp32 (float4 stores): the e4m3 path's O, whose columns are permuted (see the kernel).
+template <int DT>
+__device__ __forceinline__ void store_run_bf16(bf16* dst, const float (&o)[DT][4], int e,
+                                               float mul) {
+    static_assert(DT % 8 == 0, "whole 16-byte stores");
+#pragma unroll
+    for (int j = 0; j < DT; j += 8) {
+        uint4 u;
+        u.x = pack_bf16x2(o[j][e] * mul, o[j + 1][e] * mul);
+        u.y = pack_bf16x2(o[j + 2][e] * mul, o[j + 3][e] * mul);
+        u.z = pack_bf16x2(o[j + 4][e] * mul, o[j + 5][e] * mul);
+        u.w = pack_bf16x2(o[j + 6][e] * mul, o[j + 7][e] * mul);
+        *reinterpret_cast<uint4*>(dst + j) = u;
+    }
+}
+template <int DT>
+__device__ __forceinline__ void store_run_f32(float* dst, const float (&o)[DT][4], int e,
+                                              float mul) {
+#pragma unroll
+    for (int j = 0; j < DT; j += 4)
+        *reinterpret_cast<float4*>(dst + j) =
+            make_float4(o[j][e] * mul, o[j + 1][e] * mul, o[j + 2][e] * mul, o[j + 3][e] * mul);
+}
+
+// N bytes (8 or 16) from shared memory as N / 4 words.
+template <int N>
+__device__ __forceinline__ void load_words(unsigned (&w)[N / 4], const u8* src) {
+    static_assert(N == 8 || N == 16, "one 8- or 16-byte load");
+    if constexpr (N == 16) {
+        const uint4 u = *reinterpret_cast<const uint4*>(src);
+        w[0] = u.x;
+        w[1] = u.y;
+        w[2] = u.z;
+        w[3] = u.w;
+    } else {
+        const uint2 u = *reinterpret_cast<const uint2*>(src);
+        w[0] = u.x;
+        w[1] = u.y;
+    }
 }
 // One piece: ROWS unnormalized fp32 O rows, then m, then l.
 template <int D>
@@ -237,8 +353,12 @@ struct Params {
     int min_slabs;  // slabs per active warp at least: fewer warps on a short batch
     int grid;       // blocks of the decode kernel (the combine kernel needs the same partition)
     float scale_log2;
-    float* ws;  // two pieces per warp of the grid
-    int* meta;  // the slab prefix s_pre[0..B], published by block 0 for the combine kernel
+    float* ws;     // two pieces per warp of the grid
+    int* meta;     // the slab prefix s_pre[0..B], published by block 0 for the combine kernel
+    const u8* K8;  // the e4m3 caches and their [H_kv] scales (FP8 only)
+    const u8* V8;
+    const float* k_scale;
+    const float* v_scale;
 };
 
 // The flat slab list: segment (b, kvh) holds n_b = ceil(len_b / SLAB) slabs and starts at
@@ -289,15 +409,32 @@ __device__ __forceinline__ int warp_of(int x, int T, int weff) {
     return static_cast<int>((static_cast<int64_t>(x + 1) * weff + T - 1) / T) - 1;
 }
 
-template <int D>
+// FP8: the caches are e4m3 (p.K8, p.V8). A slab is read from shared memory straight into
+// the mma fragments, converted to bf16 in registers. K: for its key rows g and g + 8 a lane
+// needs, in k16 step kk, d pairs (2c, 2c + 1) and (2c + 8, 2c + 9), 2 bytes out of every 8
+// of the row. The dot product does not care which d sits at which k position as long as Q
+// and K agree, so lane quad c takes the contiguous bytes [c D/4, (c + 1) D/4) of the row and
+// step kk takes bytes 4 kk .. 4 kk + 3 of that run, (2c, 2c + 1) the low pair and (2c + 8,
+// 2c + 9) the high pair: two 16-byte loads per row (one at D = 64), and the Q fragments are
+// loaded with the same d. V: B of P V wants, for output column n = g of tile dj, keys 2c,
+// 2c + 1 (and + 8) of one d. The output columns are permuted instead: column n of tile dj is
+// d = n DT + dj (DT = D/8 tiles), so a lane reads DT contiguous bytes of each of its four key
+// rows and pairs bytes across rows with byte permutes. Accumulator element (row, 2c + i) of
+// tile dj is then d = (2c + i) DT + dj, and a lane writes two runs of DT consecutive columns.
+template <int D, bool FP8>
 __global__ void __launch_bounds__(THREADS, 1) paged_decode_kernel(Params p) {
-    constexpr int CH = D / 8;                 // 16-byte chunks per row
-    constexpr int KT = D / 16;                // k16 steps of Q K^T
-    constexpr int DT = D / 8;                 // n8 tiles of O
-    constexpr int NT = SLAB / 8;              // n8 tiles of S: 2
-    constexpr int KV_ITERS = SLAB * CH / 32;  // chunks per lane per operand per slab: 8, 4
+    constexpr int CH = D / 8;                   // 16-byte chunks per row
+    constexpr int KT = D / 16;                  // k16 steps of Q K^T
+    constexpr int DT = D / 8;                   // n8 tiles of O
+    constexpr int NT = SLAB / 8;                // n8 tiles of S: 2
+    constexpr int KV_ITERS = SLAB * CH / 32;    // chunks per lane per operand per slab: 8, 4
+    constexpr int CH8 = D / 16;                 // 16-byte chunks per e4m3 row
+    constexpr int KV_ITERS8 = SLAB * CH8 / 32;  // 4, 2
+    constexpr int ST = stages<FP8>();
+    constexpr int SB = stage_bytes<D, FP8>();
     constexpr int PF = piece_floats<D>();
     static_assert(SLAB == 16, "P V below is one k16 step");
+    static_assert(KV_ITERS8 * 32 == SLAB * CH8 && KT % 4 == 0 && DT % 4 == 0, "");
 
     extern __shared__ __align__(128) unsigned char smem_raw[];
     __shared__ int s_pre[kMaxBatch + 1];
@@ -305,6 +442,7 @@ __global__ void __launch_bounds__(THREADS, 1) paged_decode_kernel(Params p) {
     const int tid = threadIdx.x;
     const int lane = tid & 31, warp = tid >> 5;
     const int g = lane >> 2, c2 = (lane & 3) * 2;
+    [[maybe_unused]] const int t4 = lane & 3;
     const int B = p.B, H_kv = p.H_kv;
 
     block_prefix(B, [&](int b) { return cdiv(max(0, p.lens[b]), SLAB); }, s_pre, s_scan);
@@ -318,10 +456,11 @@ __global__ void __launch_bounds__(THREADS, 1) paged_decode_kernel(Params p) {
     if (w >= weff) return;  // no block-wide barrier from here on
     const int a = range_start(w, T, weff), e = range_start(w + 1, T, weff);
 
-    bf16* wsm = reinterpret_cast<bf16*>(smem_raw) + warp * STAGES * stage_elems<D>();
+    // This warp's stages, as bytes (the bf16 path indexes them in elements).
+    u8* wsm = smem_raw + warp * ST * SB;
 
-    // Loads run STAGES - 1 slabs ahead of the compute. `lpage` is the page of the next slab
-    // to load, fetched one load early so the address is ready when the load issues.
+    // Loads run ST - 1 slabs ahead of the compute. `lpage` is the page of the next slab to
+    // load, fetched one load early so the address is ready when the load issues.
     Cursor L = locate(s_pre, B, H_kv, a);
     int nl = a;
     auto page_of = [&](const Cursor& c) {
@@ -329,25 +468,39 @@ __global__ void __launch_bounds__(THREADS, 1) paged_decode_kernel(Params p) {
     };
     int lpage = page_of(L);
     auto load = [&](int stage) {
-        bf16* ks = wsm + stage * stage_elems<D>();
-        bf16* vs = ks + SLAB * D;
         const int len = __ldg(p.lens + L.b);
         const int key0 = L.j * SLAB;
         const size_t base = cache_row(lpage, H_kv, L.kvh, p.shift, key0);
+        if constexpr (FP8) {
+            u8* ks = wsm + stage * SB;
+            u8* vs = ks + SLAB * D;
 #pragma unroll
-        for (int i = 0; i < KV_ITERS; ++i) {
-            const int c = lane + i * 32;
-            const int row = c / CH, ch = c % CH;
-            const bool ok = key0 + row < len;
-            const size_t off = (base + (ok ? row : 0)) * D + ch * 8;
-            cp_async_16_zfill(ks + row * D + swz(row, ch) * 8, p.K + off, ok);
-            cp_async_16_zfill(vs + row * D + swz(row, ch) * 8, p.V + off, ok);
+            for (int i = 0; i < KV_ITERS8; ++i) {
+                const int c = lane + i * 32;
+                const int row = c / CH8, ch = c % CH8;
+                const bool ok = key0 + row < len;
+                const size_t off = (base + (ok ? row : 0)) * D + ch * 16;
+                cp_async_16_zfill(ks + row * D + swz8<D>(row, ch) * 16, p.K8 + off, ok);
+                cp_async_16_zfill(vs + row * D + swz8<D>(row, ch) * 16, p.V8 + off, ok);
+            }
+        } else {
+            bf16* ks = reinterpret_cast<bf16*>(wsm) + stage * stage_elems<D>();
+            bf16* vs = ks + SLAB * D;
+#pragma unroll
+            for (int i = 0; i < KV_ITERS; ++i) {
+                const int c = lane + i * 32;
+                const int row = c / CH, ch = c % CH;
+                const bool ok = key0 + row < len;
+                const size_t off = (base + (ok ? row : 0)) * D + ch * 8;
+                cp_async_16_zfill(ks + row * D + swz(row, ch) * 8, p.K + off, ok);
+                cp_async_16_zfill(vs + row * D + swz(row, ch) * 8, p.V + off, ok);
+            }
         }
         advance(L, s_pre, B, H_kv);
         if (++nl < e) lpage = page_of(L);
     };
 #pragma unroll
-    for (int s = 0; s < STAGES - 1; ++s) {
+    for (int s = 0; s < ST - 1; ++s) {
         if (nl < e) load(s);
         cp_async_commit();
     }
@@ -358,31 +511,47 @@ __global__ void __launch_bounds__(THREADS, 1) paged_decode_kernel(Params p) {
     unsigned qf[KT][4];
     float o[DT][4];
     float m[2], l[2];
+    float sl2 = p.scale_log2;           // the softmax scale (log2 units), times K's scale in FP8
+    [[maybe_unused]] float vmul = 1.f;  // V's scale (FP8)
 
     for (int x = a, it = 0; x < e; ++x, ++it) {
-        cp_async_wait<STAGES - 2>();  // slab x has landed for this lane
-        __syncwarp();                 // ... for every lane; and stage (it-1)%STAGES is free
-        if (nl < e) load((it + STAGES - 1) % STAGES);
+        cp_async_wait<ST - 2>();  // slab x has landed for this lane
+        __syncwarp();             // ... for every lane; and stage (it-1)%ST is free
+        if (nl < e) load((it + ST - 1) % ST);
         cp_async_commit();
-        const bf16* ks = wsm + (it % STAGES) * stage_elems<D>();
-        const bf16* vs = ks + SLAB * D;
+        const u8* stg = wsm + (it % ST) * SB;
 
         if (x == a || C.j == 0) {  // a new segment: its Q fragments, a fresh softmax state
             // The A fragments straight from global memory (rows g and g + 8, k pairs c2 and
             // 8 + c2 of each k16 step), rows past the group zero. The rows were written by the
-            // RoPE kernel just before, so this is an L2 round trip, taken while the next two
+            // RoPE kernel just before, so this is an L2 round trip, taken while the next
             // slabs are already in flight.
             const unsigned* qg = reinterpret_cast<const unsigned*>(
                 p.Q +
                 (static_cast<size_t>(C.b) * p.H_q + static_cast<size_t>(C.kvh) * p.group) * D);
             const bool r0 = g < p.group, r1 = g + 8 < p.group;
+            if constexpr (FP8) {
+                // The permuted d of the K fragments: step kk of quad c holds d = c D/4 + 4 kk
+                // + {0, 1} in its low pair and + {2, 3} in its high pair (word c D/8 + 2 kk).
 #pragma unroll
-            for (int kk = 0; kk < KT; ++kk) {
-                const int k0 = (kk * 16 + c2) / 2;
-                qf[kk][0] = r0 ? __ldg(qg + (g * D) / 2 + k0) : 0u;
-                qf[kk][1] = r1 ? __ldg(qg + ((g + 8) * D) / 2 + k0) : 0u;
-                qf[kk][2] = r0 ? __ldg(qg + (g * D) / 2 + k0 + 4) : 0u;
-                qf[kk][3] = r1 ? __ldg(qg + ((g + 8) * D) / 2 + k0 + 4) : 0u;
+                for (int kk = 0; kk < KT; ++kk) {
+                    const int k0 = t4 * (D / 8) + 2 * kk;
+                    qf[kk][0] = r0 ? __ldg(qg + (g * D) / 2 + k0) : 0u;
+                    qf[kk][1] = r1 ? __ldg(qg + ((g + 8) * D) / 2 + k0) : 0u;
+                    qf[kk][2] = r0 ? __ldg(qg + (g * D) / 2 + k0 + 1) : 0u;
+                    qf[kk][3] = r1 ? __ldg(qg + ((g + 8) * D) / 2 + k0 + 1) : 0u;
+                }
+                sl2 = p.scale_log2 * __ldg(p.k_scale + C.kvh);
+                vmul = __ldg(p.v_scale + C.kvh);
+            } else {
+#pragma unroll
+                for (int kk = 0; kk < KT; ++kk) {
+                    const int k0 = (kk * 16 + c2) / 2;
+                    qf[kk][0] = r0 ? __ldg(qg + (g * D) / 2 + k0) : 0u;
+                    qf[kk][1] = r1 ? __ldg(qg + ((g + 8) * D) / 2 + k0) : 0u;
+                    qf[kk][2] = r0 ? __ldg(qg + (g * D) / 2 + k0 + 4) : 0u;
+                    qf[kk][3] = r1 ? __ldg(qg + ((g + 8) * D) / 2 + k0 + 4) : 0u;
+                }
             }
 #pragma unroll
             for (int dj = 0; dj < DT; ++dj)
@@ -399,15 +568,40 @@ __global__ void __launch_bounds__(THREADS, 1) paged_decode_kernel(Params p) {
         for (int nj = 0; nj < NT; ++nj)
 #pragma unroll
             for (int k = 0; k < 4; ++k) sc[nj][k] = 0.f;
+        if constexpr (FP8) {
+            // Key row nj * 8 + g, bytes [c D/4, (c + 1) D/4): KT words, word kk for step kk.
 #pragma unroll
-        for (int kk = 0; kk < KT; ++kk) {
-            const int row = lane & 15;
-            unsigned r[4];
-            ldmatrix_x4(r, ks + row * D + swz(row, 2 * kk + (lane >> 4)) * 8);
-            const unsigned b0[2] = {r[0], r[2]};
-            const unsigned b1[2] = {r[1], r[3]};
-            mma_bf16_16816(sc[0], qf[kk], b0);
-            mma_bf16_16816(sc[1], qf[kk], b1);
+            for (int nj = 0; nj < NT; ++nj) {
+                const int row = nj * 8 + g;
+                unsigned kw[KT];
+#pragma unroll
+                for (int h = 0; h < KT / 4; ++h) {
+                    const uint4 u = *reinterpret_cast<const uint4*>(
+                        stg + row * D + swz8<D>(row, t4 * (KT / 4) + h) * 16);
+                    kw[4 * h] = u.x;
+                    kw[4 * h + 1] = u.y;
+                    kw[4 * h + 2] = u.z;
+                    kw[4 * h + 3] = u.w;
+                }
+#pragma unroll
+                for (int kk = 0; kk < KT; ++kk) {
+                    const unsigned b[2] = {e4m3x2_to_bf16x2(kw[kk]),
+                                           e4m3x2_to_bf16x2(kw[kk] >> 16)};
+                    mma_bf16_16816(sc[nj], qf[kk], b);
+                }
+            }
+        } else {
+            const bf16* ks = reinterpret_cast<const bf16*>(stg);
+#pragma unroll
+            for (int kk = 0; kk < KT; ++kk) {
+                const int row = lane & 15;
+                unsigned r[4];
+                ldmatrix_x4(r, ks + row * D + swz(row, 2 * kk + (lane >> 4)) * 8);
+                const unsigned b0[2] = {r[0], r[2]};
+                const unsigned b1[2] = {r[1], r[3]};
+                mma_bf16_16816(sc[0], qf[kk], b0);
+                mma_bf16_16816(sc[1], qf[kk], b1);
+            }
         }
 
         const int len = __ldg(p.lens + C.b);
@@ -426,13 +620,13 @@ __global__ void __launch_bounds__(THREADS, 1) paged_decode_kernel(Params p) {
                 fmaxf(fmaxf(sc[0][2 * r], sc[0][2 * r + 1]), fmaxf(sc[1][2 * r], sc[1][2 * r + 1]));
             mx = fmaxf(mx, __shfl_xor_sync(kFullMask, mx, 1));
             mx = fmaxf(mx, __shfl_xor_sync(kFullMask, mx, 2));
-            const float m_new = fmaxf(m[r], mx * p.scale_log2);  // finite: slab has a key
+            const float m_new = fmaxf(m[r], mx * sl2);  // finite: slab has a key
             const float alpha = ex2(m[r] - m_new);
             float rs = 0.f;
 #pragma unroll
             for (int nj = 0; nj < NT; ++nj) {
-                const float p0 = ex2(fmaf(sc[nj][2 * r], p.scale_log2, -m_new));
-                const float p1 = ex2(fmaf(sc[nj][2 * r + 1], p.scale_log2, -m_new));
+                const float p0 = ex2(fmaf(sc[nj][2 * r], sl2, -m_new));
+                const float p1 = ex2(fmaf(sc[nj][2 * r + 1], sl2, -m_new));
                 sc[nj][2 * r] = p0;
                 sc[nj][2 * r + 1] = p1;
                 rs += p0 + p1;
@@ -452,20 +646,53 @@ __global__ void __launch_bounds__(THREADS, 1) paged_decode_kernel(Params p) {
         pa[1] = pack_bf16x2(sc[0][2], sc[0][3]);
         pa[2] = pack_bf16x2(sc[1][0], sc[1][1]);
         pa[3] = pack_bf16x2(sc[1][2], sc[1][3]);
+        if constexpr (FP8) {
+            // Key rows 2c, 2c + 1, 2c + 8, 2c + 9, bytes [g DT, (g + 1) DT): byte dj of a row
+            // is d = g DT + dj, column g of tile dj. __byte_perm pairs byte i of two rows
+            // (selector 0x5140: bytes 0 and 1, 0x7362: bytes 2 and 3) into e4m3x2 halves,
+            // the lower key in the low byte.
+            const u8* vs = stg + SLAB * D;
+            unsigned vw[4][DT / 4];
 #pragma unroll
-        for (int dj = 0; dj < DT; dj += 2) {
-            const int row = lane & 15;
-            unsigned r[4];
-            ldmatrix_x4_trans(r, vs + row * D + swz(row, dj + (lane >> 4)) * 8);
-            const unsigned b0[2] = {r[0], r[1]};
-            const unsigned b1[2] = {r[2], r[3]};
-            mma_bf16_16816(o[dj], pa, b0);
-            mma_bf16_16816(o[dj + 1], pa, b1);
+            for (int rr = 0; rr < 4; ++rr) {
+                const int row = 2 * t4 + (rr & 1) + (rr >> 1) * 8;
+                load_words<DT>(vw[rr],
+                               vs + row * D + swz8<D>(row, (g * DT) >> 4) * 16 + ((g * DT) & 15));
+            }
+#pragma unroll
+            for (int q4 = 0; q4 < DT / 4; ++q4) {
+                const unsigned lo0 = __byte_perm(vw[0][q4], vw[1][q4], 0x5140);
+                const unsigned hi0 = __byte_perm(vw[0][q4], vw[1][q4], 0x7362);
+                const unsigned lo1 = __byte_perm(vw[2][q4], vw[3][q4], 0x5140);
+                const unsigned hi1 = __byte_perm(vw[2][q4], vw[3][q4], 0x7362);
+                const unsigned b0[2] = {e4m3x2_to_bf16x2(lo0), e4m3x2_to_bf16x2(lo1)};
+                const unsigned b1[2] = {e4m3x2_to_bf16x2(lo0 >> 16), e4m3x2_to_bf16x2(lo1 >> 16)};
+                const unsigned b2[2] = {e4m3x2_to_bf16x2(hi0), e4m3x2_to_bf16x2(hi1)};
+                const unsigned b3[2] = {e4m3x2_to_bf16x2(hi0 >> 16), e4m3x2_to_bf16x2(hi1 >> 16)};
+                mma_bf16_16816(o[4 * q4], pa, b0);
+                mma_bf16_16816(o[4 * q4 + 1], pa, b1);
+                mma_bf16_16816(o[4 * q4 + 2], pa, b2);
+                mma_bf16_16816(o[4 * q4 + 3], pa, b3);
+            }
+        } else {
+            const bf16* vs = reinterpret_cast<const bf16*>(stg) + SLAB * D;
+#pragma unroll
+            for (int dj = 0; dj < DT; dj += 2) {
+                const int row = lane & 15;
+                unsigned r[4];
+                ldmatrix_x4_trans(r, vs + row * D + swz(row, dj + (lane >> 4)) * 8);
+                const unsigned b0[2] = {r[0], r[1]};
+                const unsigned b1[2] = {r[2], r[3]};
+                mma_bf16_16816(o[dj], pa, b0);
+                mma_bf16_16816(o[dj + 1], pa, b1);
+            }
         }
 
         // End of a segment or of the range: this warp's piece of segment (C.b, C.kvh) is done.
         // A whole segment is normalized and written; a piece goes to the warp's slot 0 (the
-        // first segment of its range) or 1 (the last) for the combine kernel.
+        // first segment of its range) or 1 (the last) for the combine kernel. In FP8 the
+        // columns are the permuted ones above and V's scale is applied here, also to a piece,
+        // so the combine is the same for both formats.
         if (C.j == C.n - 1 || x == e - 1) {
             const bool whole = piece_j0 == 0 && C.j == C.n - 1;
             float* part = p.ws + (static_cast<size_t>(w) * 2 + (first_seg ? 0 : 1)) * PF;
@@ -478,7 +705,21 @@ __global__ void __launch_bounds__(THREADS, 1) paged_decode_kernel(Params p) {
                 ls += __shfl_xor_sync(kFullMask, ls, 2);
                 const int row = g + 8 * r;
                 if (row >= p.group) continue;
-                if (whole) {
+                if constexpr (FP8) {
+                    const int d0 = 2 * t4 * DT, d1 = (2 * t4 + 1) * DT;
+                    if (whole) {
+                        const float mul = vmul / ls;
+                        store_run_bf16<DT>(og + row * D + d0, o, 2 * r, mul);
+                        store_run_bf16<DT>(og + row * D + d1, o, 2 * r + 1, mul);
+                    } else {
+                        store_run_f32<DT>(part + row * D + d0, o, 2 * r, vmul);
+                        store_run_f32<DT>(part + row * D + d1, o, 2 * r + 1, vmul);
+                        if ((lane & 3) == 0) {
+                            part[ROWS * D + row] = m[r];
+                            part[ROWS * D + ROWS + row] = ls;
+                        }
+                    }
+                } else if (whole) {
                     const float inv = 1.f / ls;
 #pragma unroll
                     for (int dj = 0; dj < DT; ++dj)
@@ -600,15 +841,16 @@ int* meta_buffer() {
     return meta;
 }
 
-template <int D>
+template <int D, bool FP8>
 int resident_blocks() {
     static int resident = 0;
     if (resident == 0) {
-        SPARK_CUDA_CHECK(cudaFuncSetAttribute(
-            paged_decode_kernel<D>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes<D>()));
+        SPARK_CUDA_CHECK(cudaFuncSetAttribute(paged_decode_kernel<D, FP8>,
+                                              cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                              smem_bytes<D, FP8>()));
         int per_sm = 0;
         SPARK_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &per_sm, paged_decode_kernel<D>, THREADS, smem_bytes<D>()));
+            &per_sm, paged_decode_kernel<D, FP8>, THREADS, smem_bytes<D, FP8>()));
         resident = (per_sm > 0 ? per_sm : 1) * num_sms();
     }
     return resident;
@@ -624,15 +866,15 @@ int env_int(const char* name, int def) {
     return def;
 }
 
-template <int D>
+template <int D, bool FP8>
 void launch(Params p, cudaStream_t stream) {
     static const int min_slabs = env_int("SPARK_PAGED_MIN_SLABS", 4);
     static const int grid_cap = env_int("SPARK_PAGED_GRID", 1 << 30);
-    p.grid = std::min(resident_blocks<D>(), grid_cap);
+    p.grid = std::min(resident_blocks<D, FP8>(), grid_cap);
     p.min_slabs = min_slabs;
     p.ws = workspace(static_cast<size_t>(p.grid) * WARPS * 2 * piece_floats<D>());
     p.meta = meta_buffer();
-    paged_decode_kernel<D><<<p.grid, THREADS, smem_bytes<D>(), stream>>>(p);
+    paged_decode_kernel<D, FP8><<<p.grid, THREADS, smem_bytes<D, FP8>(), stream>>>(p);
     SPARK_CHECK_LAUNCH();
     paged_combine_kernel<D><<<p.B * p.H_kv * p.group, COMBINE_THREADS, 0, stream>>>(p);
     SPARK_CHECK_LAUNCH();
@@ -654,9 +896,11 @@ template <int D>
 constexpr int stage_elems() {
     return 2 * BN * D;  // K tile then V tile
 }
-template <int D>
+// bf16: STAGES bf16 stages, 96 KB at D = 128. FP8: one bf16 tile (the Q staging, then each
+// K/V tile converted for the 8 warps), then STAGES e4m3 stages: 32 + 48 = 80 KB at D = 128.
+template <int D, bool FP8>
 constexpr int smem_bytes() {
-    return STAGES * stage_elems<D>() * 2;  // 96 KB at D = 128
+    return FP8 ? stage_elems<D>() * 2 + STAGES * stage_elems<D>() : STAGES * stage_elems<D>() * 2;
 }
 
 struct Params {
@@ -669,9 +913,48 @@ struct Params {
     const int* bt;
     int B, H_q, H_kv, group, max_pages, shift, causal;
     float scale_log2;
+    const u8* K8;  // the e4m3 caches and their [H_kv] scales (FP8 only)
+    const u8* V8;
+    const float* k_scale;
+    const float* v_scale;
 };
 
-template <int D>
+// One ROWS x D e4m3 tile (rows of D bytes, chunks at swz8) to bf16 in the bf16 tiles' layout
+// (rows of D elements, chunks at swz), by the block's THREADS_ threads. A thread converts 16
+// bytes into two 16-byte chunks; it writes the second one first when (ch / 4) is odd, so the 8
+// threads of a store phase (one row at D = 128) land in 8 different bank groups.
+template <int D, int ROWS_, int THREADS_>
+__device__ __forceinline__ void tile_e4m3_to_bf16(const u8* src, bf16* dst, int tid) {
+    constexpr int CH8 = D / 16;
+    constexpr int ITERS = ROWS_ * CH8 / THREADS_;
+    static_assert(ITERS * THREADS_ == ROWS_ * CH8, "whole chunks per thread");
+#pragma unroll
+    for (int i = 0; i < ITERS; ++i) {
+        const int c = tid + i * THREADS_;
+        const int row = c / CH8, ch = c % CH8;
+        const uint4 u = *reinterpret_cast<const uint4*>(src + row * D + swz8<D>(row, ch) * 16);
+        uint4 lo, hi;  // d 16 ch .. 16 ch + 7, then 16 ch + 8 .. 16 ch + 15
+        lo.x = e4m3x2_to_bf16x2(u.x);
+        lo.y = e4m3x2_to_bf16x2(u.x >> 16);
+        lo.z = e4m3x2_to_bf16x2(u.y);
+        lo.w = e4m3x2_to_bf16x2(u.y >> 16);
+        hi.x = e4m3x2_to_bf16x2(u.z);
+        hi.y = e4m3x2_to_bf16x2(u.z >> 16);
+        hi.z = e4m3x2_to_bf16x2(u.w);
+        hi.w = e4m3x2_to_bf16x2(u.w >> 16);
+        bf16* r = dst + row * D;
+        const int f = (ch >> 2) & 1;
+        *reinterpret_cast<uint4*>(r + swz(row, 2 * ch + f) * 8) = f ? hi : lo;
+        *reinterpret_cast<uint4*>(r + swz(row, 2 * ch + 1 - f) * 8) = f ? lo : hi;
+    }
+}
+
+// FP8: the K/V tiles arrive as e4m3 in their own stages, past one bf16 tile at the start of
+// shared memory. After a tile lands the block converts it into the bf16 tile (each element
+// once, where converting in registers would do it once per warp, 8 times) and the compute
+// below runs on it unchanged, with K's scale in the softmax scale and V's in the final
+// normalization.
+template <int D, bool FP8>
 __global__ void __launch_bounds__(THREADS, 1) varlen_kernel(Params p) {
     constexpr int CH = D / 8;
     constexpr int KT = D / 16;
@@ -680,7 +963,11 @@ __global__ void __launch_bounds__(THREADS, 1) varlen_kernel(Params p) {
     constexpr int PT = BN / 16;
     constexpr int Q_ITERS = BM * CH / THREADS;
     constexpr int KV_ITERS = BN * CH / THREADS;
+    constexpr int CH8 = D / 16;
+    constexpr int KV_ITERS8 = BN * CH8 / THREADS;  // 2, 1
+    constexpr int SB8 = stage_elems<D>();          // bytes of an e4m3 stage
     static_assert(Q_ITERS * THREADS == BM * CH && KV_ITERS * THREADS == BN * CH, "");
+    static_assert(KV_ITERS8 * THREADS == BN * CH8, "");
     static_assert(BM * D <= stage_elems<D>(), "the Q tile is staged through one K/V stage");
 
     extern __shared__ __align__(128) unsigned char smem_raw[];
@@ -732,21 +1019,40 @@ __global__ void __launch_bounds__(THREADS, 1) varlen_kernel(Params p) {
 
     const int kv_end = p.causal ? min(kv_len, ctx + q0 + BM) : kv_len;
     const int nt = cdiv(kv_end, BN);
+    // The e4m3 stages, past the bf16 tile (FP8).
+    [[maybe_unused]] u8* smem8 = smem_raw + stage_elems<D>() * 2;
 
     auto load_kv = [&](int stage, int t) {
-        bf16* ks = smem + stage * stage_elems<D>();
-        bf16* vs = ks + BN * D;
+        if constexpr (FP8) {
+            u8* ks = smem8 + stage * SB8;
+            u8* vs = ks + BN * D;
 #pragma unroll
-        for (int i = 0; i < KV_ITERS; ++i) {
-            const int c = tid + i * THREADS;
-            const int row = c / CH, ch = c % CH;
-            const int j = t * BN + row;
-            const bool ok = j < kv_len;
-            const int jj = ok ? j : 0;
-            const size_t off =
-                cache_row(__ldg(btb + (jj >> p.shift)), p.H_kv, kvh, p.shift, jj) * D + ch * 8;
-            cp_async_16_zfill(ks + row * D + swz(row, ch) * 8, p.K + off, ok);
-            cp_async_16_zfill(vs + row * D + swz(row, ch) * 8, p.V + off, ok);
+            for (int i = 0; i < KV_ITERS8; ++i) {
+                const int c = tid + i * THREADS;
+                const int row = c / CH8, ch = c % CH8;
+                const int j = t * BN + row;
+                const bool ok = j < kv_len;
+                const int jj = ok ? j : 0;
+                const size_t off =
+                    cache_row(__ldg(btb + (jj >> p.shift)), p.H_kv, kvh, p.shift, jj) * D + ch * 16;
+                cp_async_16_zfill(ks + row * D + swz8<D>(row, ch) * 16, p.K8 + off, ok);
+                cp_async_16_zfill(vs + row * D + swz8<D>(row, ch) * 16, p.V8 + off, ok);
+            }
+        } else {
+            bf16* ks = smem + stage * stage_elems<D>();
+            bf16* vs = ks + BN * D;
+#pragma unroll
+            for (int i = 0; i < KV_ITERS; ++i) {
+                const int c = tid + i * THREADS;
+                const int row = c / CH, ch = c % CH;
+                const int j = t * BN + row;
+                const bool ok = j < kv_len;
+                const int jj = ok ? j : 0;
+                const size_t off =
+                    cache_row(__ldg(btb + (jj >> p.shift)), p.H_kv, kvh, p.shift, jj) * D + ch * 8;
+                cp_async_16_zfill(ks + row * D + swz(row, ch) * 8, p.K + off, ok);
+                cp_async_16_zfill(vs + row * D + swz(row, ch) * 8, p.V + off, ok);
+            }
         }
     };
 #pragma unroll
@@ -761,16 +1067,33 @@ __global__ void __launch_bounds__(THREADS, 1) varlen_kernel(Params p) {
 #pragma unroll
         for (int e = 0; e < 4; ++e) o[dj][e] = 0.f;
     float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.f, 0.f};
+    float sl2 = p.scale_log2;           // times K's scale in FP8
+    [[maybe_unused]] float vmul = 1.f;  // V's scale (FP8)
+    if constexpr (FP8) {
+        sl2 = p.scale_log2 * __ldg(p.k_scale + kvh);
+        vmul = __ldg(p.v_scale + kvh);
+    }
 
     for (int t = 0; t < nt; ++t) {
         cp_async_wait<STAGES - 2>();
+        // Tile t has landed and every warp is done with tile t - 1: in FP8 also with the bf16
+        // tile and with the e4m3 stage the next load overwrites.
         __syncthreads();
         {
             const int n2 = t + STAGES - 1;
             if (n2 < nt) load_kv(n2 % STAGES, n2);
             cp_async_commit();
         }
-        const bf16* ks = smem + (t % STAGES) * stage_elems<D>();
+        const bf16* ks;
+        if constexpr (FP8) {
+            const u8* k8 = smem8 + (t % STAGES) * SB8;
+            tile_e4m3_to_bf16<D, BN, THREADS>(k8, smem, tid);
+            tile_e4m3_to_bf16<D, BN, THREADS>(k8 + BN * D, smem + BN * D, tid);
+            __syncthreads();
+            ks = smem;
+        } else {
+            ks = smem + (t % STAGES) * stage_elems<D>();
+        }
         const bf16* vs = ks + BN * D;
 
         float s[NT][4];
@@ -811,14 +1134,14 @@ __global__ void __launch_bounds__(THREADS, 1) varlen_kernel(Params p) {
             for (int nj = 1; nj < NT; ++nj) mx = fmaxf(mx, fmaxf(s[nj][2 * r], s[nj][2 * r + 1]));
             mx = fmaxf(mx, __shfl_xor_sync(kFullMask, mx, 1));
             mx = fmaxf(mx, __shfl_xor_sync(kFullMask, mx, 2));
-            const float m_new = fmaxf(m[r], mx * p.scale_log2);
+            const float m_new = fmaxf(m[r], mx * sl2);
             const float m_use = m_new == -INFINITY ? 0.f : m_new;
             const float alpha = ex2(m[r] - m_use);
             float rs = 0.f;
 #pragma unroll
             for (int nj = 0; nj < NT; ++nj) {
-                const float p0 = ex2(fmaf(s[nj][2 * r], p.scale_log2, -m_use));
-                const float p1 = ex2(fmaf(s[nj][2 * r + 1], p.scale_log2, -m_use));
+                const float p0 = ex2(fmaf(s[nj][2 * r], sl2, -m_use));
+                const float p1 = ex2(fmaf(s[nj][2 * r + 1], sl2, -m_use));
                 s[nj][2 * r] = p0;
                 s[nj][2 * r + 1] = p1;
                 rs += p0 + p1;
@@ -863,7 +1186,11 @@ __global__ void __launch_bounds__(THREADS, 1) varlen_kernel(Params p) {
         ls += __shfl_xor_sync(kFullMask, ls, 2);
         const int row = q0 + warp * 16 + g + 8 * r;
         if (row >= q_len) continue;
-        const float inv = 1.f / ls;
+        float inv;
+        if constexpr (FP8)
+            inv = vmul / ls;
+        else
+            inv = 1.f / ls;
         bf16* out = Og + static_cast<size_t>(row) * q_stride + c2;
 #pragma unroll
         for (int dj = 0; dj < DT; ++dj)
@@ -872,19 +1199,21 @@ __global__ void __launch_bounds__(THREADS, 1) varlen_kernel(Params p) {
     }
 }
 
-template <int D>
+template <int D, bool FP8>
 void launch(const Params& p, int T, cudaStream_t stream) {
     static bool init = false;
     if (!init) {
-        SPARK_CUDA_CHECK(cudaFuncSetAttribute(
-            varlen_kernel<D>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes<D>()));
+        SPARK_CUDA_CHECK(cudaFuncSetAttribute(varlen_kernel<D, FP8>,
+                                              cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                              smem_bytes<D, FP8>()));
         init = true;
     }
     // sum_b ceil(q_len_b / BM) <= (T + B (BM - 1)) / BM; blocks past the real count exit.
     const int64_t tiles = (static_cast<int64_t>(T) + static_cast<int64_t>(p.B) * (BM - 1)) / BM;
     const int64_t blocks = tiles * p.H_q;
     SPARK_REQUIRE(blocks < (int64_t{1} << 31), "attention_varlen: too many tiles for one launch");
-    varlen_kernel<D><<<static_cast<unsigned>(blocks), THREADS, smem_bytes<D>(), stream>>>(p);
+    varlen_kernel<D, FP8>
+        <<<static_cast<unsigned>(blocks), THREADS, smem_bytes<D, FP8>(), stream>>>(p);
     SPARK_CHECK_LAUNCH();
 }
 
@@ -910,35 +1239,47 @@ void check_paged(const void* Q, const void* K, const void* V, const void* O, con
                   n + ": needs 16-byte aligned Q, K, V, O");
 }
 
-}  // namespace
-
-void paged_decode_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* k_cache,
-                       const __nv_bfloat16* v_cache, const int* block_table, const int* seq_lens,
-                       __nv_bfloat16* O, int B, int H_q, int H_kv, int D, int page, int max_pages,
-                       int variant, cudaStream_t stream) {
-    check_paged(Q, k_cache, v_cache, O, block_table, seq_lens, B, H_q, H_kv, D, page, max_pages,
+// The entry points of both formats: K and V are the caches (bf16, or e4m3 bytes with fp8 and
+// their scales).
+void decode_impl(const bf16* Q, const void* K, const void* V, const float* k_scale,
+                 const float* v_scale, bool fp8, const int* block_table, const int* seq_lens,
+                 bf16* O, int B, int H_q, int H_kv, int D, int page, int max_pages, int variant,
+                 cudaStream_t stream) {
+    check_paged(Q, K, V, O, block_table, seq_lens, B, H_q, H_kv, D, page, max_pages,
                 "paged_decode");
+    SPARK_REQUIRE(!fp8 || (k_scale && v_scale), "paged_decode: null scale pointer");
     SPARK_REQUIRE(variant >= 0 && variant < paged_decode_num_variants(),
                   "paged_decode: variant out of range");
     const float scale_log2 = kLog2e / std::sqrt(static_cast<float>(D));
     const int shift = log2_exact(page);
     if (variant == 0) {
-        NaiveDecodeParams p{Q, k_cache, v_cache, O,         block_table, seq_lens,
-                            B, H_q,     H_kv,    max_pages, shift,       scale_log2};
+        NaiveDecodeParams p{Q,   K,    V,         O,     block_table, seq_lens, B,
+                            H_q, H_kv, max_pages, shift, scale_log2,  k_scale,  v_scale};
         const int blocks = cdiv(B * H_q, 4);
-        if (D == 64)
-            paged_decode_naive_kernel<64><<<blocks, 128, 0, stream>>>(p);
+        if (D == 64 && fp8)
+            paged_decode_naive_kernel<64, u8><<<blocks, 128, 0, stream>>>(p);
+        else if (D == 64)
+            paged_decode_naive_kernel<64, bf16><<<blocks, 128, 0, stream>>>(p);
+        else if (fp8)
+            paged_decode_naive_kernel<128, u8><<<blocks, 128, 0, stream>>>(p);
         else
-            paged_decode_naive_kernel<128><<<blocks, 128, 0, stream>>>(p);
+            paged_decode_naive_kernel<128, bf16><<<blocks, 128, 0, stream>>>(p);
         SPARK_CHECK_LAUNCH();
         return;
     }
     SPARK_REQUIRE(H_q / H_kv <= dec::ROWS,
                   "paged_decode: variant 1 needs at most 16 query heads per K/V head");
-    dec::Params p;
+    dec::Params p{};
+    if (fp8) {
+        p.K8 = static_cast<const u8*>(K);
+        p.V8 = static_cast<const u8*>(V);
+        p.k_scale = k_scale;
+        p.v_scale = v_scale;
+    } else {
+        p.K = static_cast<const bf16*>(K);
+        p.V = static_cast<const bf16*>(V);
+    }
     p.Q = Q;
-    p.K = k_cache;
-    p.V = v_cache;
     p.O = O;
     p.bt = block_table;
     p.lens = seq_lens;
@@ -949,24 +1290,24 @@ void paged_decode_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* k_cache,
     p.max_pages = max_pages;
     p.shift = shift;
     p.scale_log2 = scale_log2;
-    if (D == 64)
-        dec::launch<64>(p, stream);
+    if (D == 64 && fp8)
+        dec::launch<64, true>(p, stream);
+    else if (D == 64)
+        dec::launch<64, false>(p, stream);
+    else if (fp8)
+        dec::launch<128, true>(p, stream);
     else
-        dec::launch<128>(p, stream);
+        dec::launch<128, false>(p, stream);
 }
 
-int paged_decode_num_variants() {
-    return 2;
-}
-
-void attention_varlen_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* k_cache,
-                           const __nv_bfloat16* v_cache, const int* cu_seqlens_q,
-                           const int* seq_lens, const int* block_table, __nv_bfloat16* O, int B,
-                           int T, int H_q, int H_kv, int D, int page, int max_pages, bool causal,
-                           int variant, cudaStream_t stream) {
-    check_paged(Q, k_cache, v_cache, O, block_table, seq_lens, B, H_q, H_kv, D, page, max_pages,
+void varlen_impl(const bf16* Q, const void* K, const void* V, const float* k_scale,
+                 const float* v_scale, bool fp8, const int* cu_seqlens_q, const int* seq_lens,
+                 const int* block_table, bf16* O, int B, int T, int H_q, int H_kv, int D, int page,
+                 int max_pages, bool causal, int variant, cudaStream_t stream) {
+    check_paged(Q, K, V, O, block_table, seq_lens, B, H_q, H_kv, D, page, max_pages,
                 "attention_varlen");
     SPARK_REQUIRE(cu_seqlens_q != nullptr, "attention_varlen: null pointer");
+    SPARK_REQUIRE(!fp8 || (k_scale && v_scale), "attention_varlen: null scale pointer");
     SPARK_REQUIRE(T >= 1, "attention_varlen: need T >= 1");
     SPARK_REQUIRE(variant >= 0 && variant < attention_varlen_num_variants(),
                   "attention_varlen: variant out of range");
@@ -974,21 +1315,33 @@ void attention_varlen_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* k_cache,
     const int shift = log2_exact(page);
     if (variant == 0) {
         NaiveVarlenParams p{
-            Q, k_cache, v_cache, O,         cu_seqlens_q, seq_lens,       block_table, B,
-            T, H_q,     H_kv,    max_pages, shift,        causal ? 1 : 0, scale_log2};
+            Q,   K,    V,         O,     cu_seqlens_q,   seq_lens,   block_table, B,      T,
+            H_q, H_kv, max_pages, shift, causal ? 1 : 0, scale_log2, k_scale,     v_scale};
         const int64_t blocks = cdiv64(static_cast<int64_t>(T) * H_q, 4);
         SPARK_REQUIRE(blocks < (int64_t{1} << 31), "attention_varlen: too many rows");
-        if (D == 64)
-            varlen_naive_kernel<64><<<static_cast<unsigned>(blocks), 128, 0, stream>>>(p);
+        const unsigned nb = static_cast<unsigned>(blocks);
+        if (D == 64 && fp8)
+            varlen_naive_kernel<64, u8><<<nb, 128, 0, stream>>>(p);
+        else if (D == 64)
+            varlen_naive_kernel<64, bf16><<<nb, 128, 0, stream>>>(p);
+        else if (fp8)
+            varlen_naive_kernel<128, u8><<<nb, 128, 0, stream>>>(p);
         else
-            varlen_naive_kernel<128><<<static_cast<unsigned>(blocks), 128, 0, stream>>>(p);
+            varlen_naive_kernel<128, bf16><<<nb, 128, 0, stream>>>(p);
         SPARK_CHECK_LAUNCH();
         return;
     }
-    vl::Params p;
+    vl::Params p{};
+    if (fp8) {
+        p.K8 = static_cast<const u8*>(K);
+        p.V8 = static_cast<const u8*>(V);
+        p.k_scale = k_scale;
+        p.v_scale = v_scale;
+    } else {
+        p.K = static_cast<const bf16*>(K);
+        p.V = static_cast<const bf16*>(V);
+    }
     p.Q = Q;
-    p.K = k_cache;
-    p.V = v_cache;
     p.O = O;
     p.cu_q = cu_seqlens_q;
     p.lens = seq_lens;
@@ -1001,10 +1354,54 @@ void attention_varlen_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* k_cache,
     p.shift = shift;
     p.causal = causal ? 1 : 0;
     p.scale_log2 = scale_log2;
-    if (D == 64)
-        vl::launch<64>(p, T, stream);
+    if (D == 64 && fp8)
+        vl::launch<64, true>(p, T, stream);
+    else if (D == 64)
+        vl::launch<64, false>(p, T, stream);
+    else if (fp8)
+        vl::launch<128, true>(p, T, stream);
     else
-        vl::launch<128>(p, T, stream);
+        vl::launch<128, false>(p, T, stream);
+}
+
+}  // namespace
+
+void paged_decode_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* k_cache,
+                       const __nv_bfloat16* v_cache, const int* block_table, const int* seq_lens,
+                       __nv_bfloat16* O, int B, int H_q, int H_kv, int D, int page, int max_pages,
+                       int variant, cudaStream_t stream) {
+    decode_impl(Q, k_cache, v_cache, nullptr, nullptr, false, block_table, seq_lens, O, B, H_q,
+                H_kv, D, page, max_pages, variant, stream);
+}
+
+void paged_decode_fp8(const __nv_bfloat16* Q, const __nv_fp8_e4m3* k_cache,
+                      const __nv_fp8_e4m3* v_cache, const float* k_scale, const float* v_scale,
+                      const int* block_table, const int* seq_lens, __nv_bfloat16* O, int B, int H_q,
+                      int H_kv, int D, int page, int max_pages, int variant, cudaStream_t stream) {
+    decode_impl(Q, k_cache, v_cache, k_scale, v_scale, true, block_table, seq_lens, O, B, H_q, H_kv,
+                D, page, max_pages, variant, stream);
+}
+
+int paged_decode_num_variants() {
+    return 2;
+}
+
+void attention_varlen_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* k_cache,
+                           const __nv_bfloat16* v_cache, const int* cu_seqlens_q,
+                           const int* seq_lens, const int* block_table, __nv_bfloat16* O, int B,
+                           int T, int H_q, int H_kv, int D, int page, int max_pages, bool causal,
+                           int variant, cudaStream_t stream) {
+    varlen_impl(Q, k_cache, v_cache, nullptr, nullptr, false, cu_seqlens_q, seq_lens, block_table,
+                O, B, T, H_q, H_kv, D, page, max_pages, causal, variant, stream);
+}
+
+void attention_varlen_fp8(const __nv_bfloat16* Q, const __nv_fp8_e4m3* k_cache,
+                          const __nv_fp8_e4m3* v_cache, const float* k_scale, const float* v_scale,
+                          const int* cu_seqlens_q, const int* seq_lens, const int* block_table,
+                          __nv_bfloat16* O, int B, int T, int H_q, int H_kv, int D, int page,
+                          int max_pages, bool causal, int variant, cudaStream_t stream) {
+    varlen_impl(Q, k_cache, v_cache, k_scale, v_scale, true, cu_seqlens_q, seq_lens, block_table, O,
+                B, T, H_q, H_kv, D, page, max_pages, causal, variant, stream);
 }
 
 int attention_varlen_num_variants() {
