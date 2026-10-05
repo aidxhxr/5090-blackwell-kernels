@@ -5,7 +5,8 @@ rotation and slot writes. Pages are handed out in a shuffled order, so a sequenc
 never adjacent; lengths cover the empty sequence, a single key, partial last pages and slabs,
 one long sequence among short ones (segments that cross warps of the length-aware split), GQA
 groups of 1, 4 and 8, both head sizes and two page sizes. The varlen cases include prompts
-appended to an existing context (the bottom-right causal mask)."""
+appended to an existing context (the bottom-right causal mask). The same cases run on an e4m3
+cache with per-head scales against SDPA on the dequantized bytes."""
 
 import pytest
 import torch
@@ -284,3 +285,167 @@ def test_paged_ops_reject_bad_input(sk):
     kc = torch.zeros(4, 8, 16, 128, device="cuda", dtype=torch.bfloat16)
     with pytest.raises(RuntimeError):
         sk.paged_decode(q, kc, kc, bt.long(), sl)
+
+
+# ---- the fp8 (e4m3) cache ------------------------------------------------------------------
+# The kernels read the e4m3 bytes and the per-head scales; the reference is SDPA in fp32 on the
+# same bytes dequantized in torch, so the only error left is the kernel's own (bf16 P, fp32
+# accumulation, the same TOL as the bf16 cache).
+
+
+def _head_scales(H_kv, base=5.0):
+    """Distinct per-head scales, kv head h mapping |x| = base * (1 + h / 4) to 448: a
+    standard normal cache lands on the whole e4m3 range, subnormals included."""
+    return torch.tensor([base * (1 + h / 4) / 448 for h in range(H_kv)], device="cuda")
+
+
+def _paged_cache_fp8(lens, H_kv, D, page, seed=0):
+    """_paged_cache's random cache rounded to e4m3 with _head_scales. Returns (k8, v8,
+    k_scale, v_scale, block_table, seq_lens, k_list, v_list) with k_list[b] the fp32 values
+    of sequence b's e4m3 keys, [H_kv, len_b, D]. The NaN past each length stays NaN."""
+    from spark_kernels.ops import dequantize_kv_cache, quantize_kv_cache
+
+    kc, vc, bt, sl, _, _ = _paged_cache(lens, H_kv, D, page, seed)
+    ks, vs = _head_scales(H_kv), _head_scales(H_kv, base=3.0)
+    k8, v8 = quantize_kv_cache(kc, ks), quantize_kv_cache(vc, vs)
+    kd, vd = dequantize_kv_cache(k8, ks), dequantize_kv_cache(v8, vs)
+    k_list, v_list = [], []
+    for b, n in enumerate(lens):
+        npg = (n + page - 1) // page
+        ids = bt[b, :npg].long()
+        k_list.append(kd[ids].permute(1, 0, 2, 3).reshape(H_kv, npg * page, D)[:, :n])
+        v_list.append(vd[ids].permute(1, 0, 2, 3).reshape(H_kv, npg * page, D)[:, :n])
+    return k8, v8, ks, vs, bt, sl, k_list, v_list
+
+
+@pytest.mark.parametrize("variant", _variants("paged_decode"))
+@pytest.mark.parametrize("case", DECODE_CASES, ids=_case_id)
+def test_paged_decode_fp8_matches_dequantized(sk, case, variant):
+    lens, hq, hkv, d, page = case
+    k8, v8, ks, vs, bt, sl, kl, vl = _paged_cache_fp8(lens, hkv, d, page)
+    torch.manual_seed(1)
+    q = torch.randn(len(lens), hq, d, device="cuda", dtype=torch.bfloat16)
+    got = sk.paged_decode(q, k8, v8, bt, sl, variant=variant, k_scale=ks, v_scale=vs)
+    assert got.shape == q.shape and got.dtype == torch.bfloat16
+    for b, n in enumerate(lens):
+        if n == 0:
+            assert torch.all(got[b] == 0)
+            continue
+        ref = _sdpa(q[b][:, None], kl[b], vl[b])[:, 0]
+        torch.testing.assert_close(got[b].float(), ref, **TOL)
+
+
+def test_paged_decode_fp8_is_deterministic_and_long(sk):
+    # 128K keys next to short ones through the split and the combine, twice, the same bits
+    lens = [131072, 5000, 17, 0]
+    k8, v8, ks, vs, bt, sl, kl, vl = _paged_cache_fp8(lens, 2, 128, 16, seed=4)
+    torch.manual_seed(5)
+    q = torch.randn(len(lens), 8, 128, device="cuda", dtype=torch.bfloat16)
+    got = sk.paged_decode(q, k8, v8, bt, sl, k_scale=ks, v_scale=vs)
+    torch.testing.assert_close(sk.paged_decode(q, k8, v8, bt, sl, k_scale=ks, v_scale=vs), got,
+                               atol=0, rtol=0)
+    for b in range(3):
+        ref = _sdpa(q[b][:, None], kl[b], vl[b])[:, 0]
+        torch.testing.assert_close(got[b].float(), ref, **TOL)
+
+
+@pytest.mark.parametrize("variant", _variants("attention_varlen"))
+@pytest.mark.parametrize("causal", [True, False], ids=["causal", "full"])
+@pytest.mark.parametrize("case", VARLEN_CASES, ids=_varlen_id)
+def test_attention_varlen_fp8_matches_dequantized(sk, case, causal, variant):
+    q_lens, ctx, hq, hkv, d, page = case
+    lens = [a + b for a, b in zip(q_lens, ctx, strict=True)]
+    k8, v8, ks, vs, bt, sl, kl, vl = _paged_cache_fp8(lens, hkv, d, page, seed=2)
+    T = sum(q_lens)
+    torch.manual_seed(3)
+    q = torch.randn(T, hq, d, device="cuda", dtype=torch.bfloat16)
+    cu = torch.tensor([0] + list(torch.tensor(q_lens).cumsum(0)), dtype=torch.int32,
+                      device="cuda")
+    got = sk.attention_varlen(q, k8, v8, cu, sl, bt, causal=causal, variant=variant,
+                              k_scale=ks, v_scale=vs)
+    t0 = 0
+    for b, (n, c) in enumerate(zip(q_lens, ctx, strict=True)):
+        if n == 0:
+            continue
+        mask = None
+        if causal:
+            i = torch.arange(n, device="cuda")[:, None]
+            mask = torch.arange(n + c, device="cuda")[None, :] <= c + i
+        ref = _sdpa(q[t0:t0 + n].transpose(0, 1), kl[b], vl[b], mask).transpose(0, 1)
+        torch.testing.assert_close(got[t0:t0 + n].float(), ref, **TOL)
+        t0 += n
+
+
+def test_paged_fp8_close_to_bf16(sk):
+    # the cache's own rounding: e4m3 attention against the bf16 cache it was rounded from
+    lens = [3000, 40, 513]
+    kc, vc, bt, sl, _, _ = _paged_cache(lens, 8, 128, 16, seed=9)
+    k8, v8, ks, vs, _, _, _, _ = _paged_cache_fp8(lens, 8, 128, 16, seed=9)
+    q = torch.randn(3, 32, 128, device="cuda", dtype=torch.bfloat16)
+    a = sk.paged_decode(q, kc, vc, bt, sl).float()
+    b = sk.paged_decode(q, k8, v8, bt, sl, k_scale=ks, v_scale=vs).float()
+    # e4m3 keeps 3 mantissa bits: about 2.5% rms per element, 3.7% on these outputs in torch
+    assert ((a - b).norm() / a.norm()).item() < 6e-2
+
+
+@pytest.mark.parametrize("page", [16, 32])
+def test_rope_append_paged_fp8(sk, page):
+    from spark_kernels.ops import dequantize_kv_cache, quantize_kv_cache
+
+    L = pytest.importorskip("spark_kernels.layer")
+    hq, hkv, d = 32, 8, 128
+    positions = [0, 1, 2, 40, 41, 7, 1000]
+    slots = [5, 6, 7, 2 * page + 3, 2 * page + 4, -1, 3 * page + page - 1]
+    T = len(positions)
+    torch.manual_seed(0)
+    qkv = torch.randn(T, (hq + 2 * hkv) * d, device="cuda", dtype=torch.bfloat16) * 4
+    rope = L.RoPE(1024)
+    ks, vs = _head_scales(hkv, base=12.0), _head_scales(hkv, base=8.0)
+    kc = torch.randint(0, 120, (4, hkv, page, d), device="cuda", dtype=torch.uint8).view(
+        torch.float8_e4m3fn)
+    vc = torch.randint(0, 120, (4, hkv, page, d), device="cuda", dtype=torch.uint8).view(
+        torch.float8_e4m3fn)
+    k_ref, v_ref = kc.view(torch.uint8).clone(), vc.view(torch.uint8).clone()
+    pos_t = torch.tensor(positions, dtype=torch.int32, device="cuda")
+    slot_t = torch.tensor(slots, dtype=torch.int32, device="cuda")
+    q = sk.rope_append_paged_(qkv, rope.cos, rope.sin, pos_t, slot_t, kc, vc, hq, hkv,
+                              k_scale=ks, v_scale=vs)
+
+    cos, sin = rope.cos[pos_t.long()], rope.sin[pos_t.long()]
+    x = qkv.view(T, hq + 2 * hkv, d).float()
+    r = torch.cat([-x[..., d // 2:], x[..., :d // 2]], dim=-1)
+    rot = x * cos[:, None] + r * sin[:, None]  # fp32, as the kernel rotates
+    k_new = quantize_kv_cache(rot[:, hq:hq + hkv], ks).view(torch.uint8)
+    v_new = quantize_kv_cache(x[:, hq + hkv:], vs).view(torch.uint8)
+    for t, s in enumerate(slots):
+        if s < 0:
+            continue
+        k_ref[s // page, :, s % page] = k_new[t]
+        v_ref[s // page, :, s % page] = v_new[t]
+    torch.testing.assert_close(q.float(), rot[:, :hq], atol=1e-2, rtol=1e-2)
+    # v is a bf16 input divided exactly: the same bytes. k's fp32 rotation may differ from
+    # torch's in the last bit (fma contraction), so a value may round to the next e4m3 step.
+    assert torch.equal(vc.view(torch.uint8), v_ref)
+    kd = dequantize_kv_cache(kc, ks)
+    kr = dequantize_kv_cache(k_ref.view(torch.float8_e4m3fn), ks)
+    torch.testing.assert_close(kd, kr, atol=float(ks.max()) * 2 ** -9, rtol=2 ** -3)
+    assert (kc.view(torch.uint8) != k_ref).float().mean().item() < 1e-3
+
+
+def test_paged_ops_reject_bad_fp8_input(sk):
+    k8 = torch.zeros(4, 8, 16, 128, device="cuda", dtype=torch.uint8).view(torch.float8_e4m3fn)
+    kb = torch.zeros(4, 8, 16, 128, device="cuda", dtype=torch.bfloat16)
+    q = torch.zeros(1, 32, 128, device="cuda", dtype=torch.bfloat16)
+    bt = torch.zeros(1, 4, dtype=torch.int32, device="cuda")
+    sl = torch.ones(1, dtype=torch.int32, device="cuda")
+    s = torch.ones(8, device="cuda")
+    with pytest.raises(RuntimeError):  # no scales
+        sk.paged_decode(q, k8, k8, bt, sl)
+    with pytest.raises(RuntimeError):  # scales with a bf16 cache
+        sk.paged_decode(q, kb, kb, bt, sl, k_scale=s, v_scale=s)
+    with pytest.raises(RuntimeError):  # one fp8 and one bf16 cache
+        sk.paged_decode(q, k8, kb, bt, sl, k_scale=s, v_scale=s)
+    with pytest.raises(RuntimeError):  # a scale per query head instead of per kv head
+        sk.paged_decode(q, k8, k8, bt, sl, k_scale=torch.ones(32, device="cuda"), v_scale=s)
+    with pytest.raises(RuntimeError):
+        sk.paged_decode(q, k8, k8, bt, sl, k_scale=s.double(), v_scale=s)

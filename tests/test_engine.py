@@ -646,3 +646,72 @@ def test_submit_refuses_bad_sampling_params(sk, weights):
                E.SamplingParams(temperature=float("nan"))):
         with pytest.raises(ValueError):
             eng.submit(torch.randint(0, VOCAB, (4,)), 2, sp)
+
+
+def test_fp8_cache_matches_torch_model(sk, weights):
+    """SparkModel on an e4m3 cache against TorchModel on its own e4m3 cache with the same
+    (non-unit, per layer and head) scales: TorchModel rounds k and v the same way and runs
+    SDPA on the dequantized values, so what is compared is the kernels, not the format. A
+    packed prefill, then teacher-forced decode steps."""
+    rope = L.RoPE(1024)
+    g = torch.Generator().manual_seed(31)
+    ks = (0.5 + torch.rand(N_LAYERS, 8, generator=g)).cuda()
+    vs = (0.5 + torch.rand(N_LAYERS, 8, generator=g)).cuda()
+    prompts = [torch.randint(0, VOCAB, (n,), generator=g) for n in (37, 200, 1, 64)]
+    engines, seqs = [], []
+    for m in (E.SparkModel(weights, rope), E.TorchModel(weights, rope)):
+        eng = E.Engine(m, N_LAYERS, max_batch=8, max_seq=512, num_pages=128, graphs=False,
+                       kv_format="fp8", kv_scales=(ks, vs))
+        assert eng.cache.k.dtype == torch.float8_e4m3fn
+        for p in prompts:
+            eng.submit(p, max_new=8)
+        engines.append(eng)
+        seqs.append(eng._admit())
+    pre = [eng.model.prefill(eng._prefill_batch(s), eng.cache)
+           for eng, s in zip(engines, seqs, strict=True)]
+    assert _rel(pre[0], pre[1]) < 2e-2
+    for ss in seqs:
+        for s in ss:
+            s.length = s.prompt.numel()
+    for step in range(3):
+        toks = torch.randint(0, VOCAB, (4,), generator=g).cuda()
+        outs = []
+        for eng, ss in zip(engines, seqs, strict=True):
+            pos = [s.length for s in ss]
+            eng.ids[:4] = toks
+            eng.positions[:4] = torch.tensor(pos, dtype=torch.int32)
+            slots = [s.pages[p // eng.page] * eng.page + p % eng.page
+                     for s, p in zip(ss, pos, strict=True)]
+            eng.slots[:4] = torch.tensor(slots, dtype=torch.int32)
+            eng.seq_lens[:4] = torch.tensor([p + 1 for p in pos], dtype=torch.int32)
+            outs.append(eng.model.decode(eng._decode_batch(4, max(pos) + 1), eng.cache))
+            for s in ss:
+                s.length += 1
+        assert _rel(outs[0], outs[1]) < 2e-2, f"step {step}: {_rel(outs[0], outs[1])}"
+
+
+def test_fp8_cache_engine_graphs_mixed_preemption(sk, weights):
+    """The e4m3 cache through the whole scheduler: graphed decode against eager, mixed steps
+    and preemption in a small cache, the same tokens each way and every page back. And the
+    cache has twice the pages of a bf16 one for the same bytes."""
+    rope = L.RoPE(1024)
+    g = torch.Generator().manual_seed(37)
+    lens = [int(x) for x in torch.randint(1, 120, (12,), generator=g)]
+    news = [int(x) for x in torch.randint(10, 60, (12,), generator=g)]
+    prompts = [torch.randint(0, VOCAB, (n,), generator=g) for n in lens]
+    outs, stats = [], []
+    for graphs, pages in ((False, 1024), (True, 1024), (True, 32)):
+        eng = E.Engine(E.SparkModel(weights, rope), N_LAYERS, max_batch=8, max_seq=512,
+                       num_pages=pages, graphs=graphs, log_tokens=True, prefill_tokens=128,
+                       kv_format="fp8")
+        for p, m in zip(prompts, news, strict=True):
+            eng.submit(p, m)
+        stats.append(eng.run())
+        outs.append(eng.outputs())
+        assert _all_back(eng)
+    assert outs[0] == outs[1] == outs[2]
+    assert [len(outs[0][i]) for i in range(len(lens))] == news
+    assert stats[2].preempted > 0
+    nb = 1 << 26
+    assert (nb // E.PagedKVCache.page_bytes(N_LAYERS, 16, "fp8") ==
+            2 * (nb // E.PagedKVCache.page_bytes(N_LAYERS, 16)))
