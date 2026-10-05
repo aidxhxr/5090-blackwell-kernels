@@ -875,12 +875,17 @@ void check_int32(const Tensor& t, const char* name) {
     TORCH_CHECK(t.scalar_type() == at::kInt, name, " must be int32");
 }
 
-// The caches [num_pages, H_kv, page, D] bf16, the same shape, page a power of two.
-void check_cache(const Tensor& k_cache, const Tensor& v_cache) {
+// The caches [num_pages, H_kv, page, D], both bf16 or both float8_e4m3fn, the same shape,
+// page a power of two. Returns true for e4m3, whose per-head scales (k_scale, v_scale:
+// float32 [H_kv], the layer's) must then be given; a bf16 cache takes none.
+bool check_cache(const Tensor& k_cache, const Tensor& v_cache, const std::optional<Tensor>& k_scale,
+                 const std::optional<Tensor>& v_scale) {
     check_cuda_contig(k_cache, "k_cache");
     check_cuda_contig(v_cache, "v_cache");
-    TORCH_CHECK(k_cache.scalar_type() == at::kBFloat16 && v_cache.scalar_type() == at::kBFloat16,
-                "k_cache and v_cache must be bfloat16");
+    const bool fp8 = k_cache.scalar_type() == at::kFloat8_e4m3fn;
+    TORCH_CHECK((fp8 || k_cache.scalar_type() == at::kBFloat16) &&
+                    v_cache.scalar_type() == k_cache.scalar_type(),
+                "k_cache and v_cache must both be bfloat16 or both float8_e4m3fn");
     TORCH_CHECK(k_cache.dim() == 4 && k_cache.sizes() == v_cache.sizes(),
                 "k_cache and v_cache must be [num_pages, H_kv, page, D] with the same shape");
     const int64_t page = k_cache.size(2);
@@ -889,19 +894,41 @@ void check_cache(const Tensor& k_cache, const Tensor& v_cache) {
                 "power of two, got ",
                 page);
     TORCH_CHECK(aligned16(k_cache) && aligned16(v_cache), "the caches need 16-byte alignment");
+    if (!fp8) {
+        TORCH_CHECK(!k_scale.has_value() && !v_scale.has_value(),
+                    "k_scale and v_scale are for float8_e4m3fn caches only");
+        return false;
+    }
+    TORCH_CHECK(k_scale.has_value() && v_scale.has_value(),
+                "float8_e4m3fn caches need k_scale and v_scale");
+    for (const Tensor* t : {&*k_scale, &*v_scale}) {
+        check_cuda_contig(*t, "k_scale and v_scale");
+        TORCH_CHECK(t->scalar_type() == at::kFloat && t->numel() == k_cache.size(1),
+                    "k_scale and v_scale must be float32 with one element per kv head (",
+                    k_cache.size(1), ")");
+        TORCH_CHECK(t->device() == k_cache.device(), "the scales must be on the caches' device");
+    }
+    return true;
+}
+
+const __nv_fp8_e4m3* fp8_ptr(const Tensor& t) {
+    return reinterpret_cast<const __nv_fp8_e4m3*>(t.data_ptr());
 }
 
 // q = rope(qkv[:, :H_q D]) as [T, H_q, D]; token t's rope(k) and v go to slot slots[t] of the
 // paged caches (skipped when slots[t] < 0), rotated at position positions[t].
+// With float8_e4m3fn caches k and v are stored as e4m3(x / scale) of their kv head.
 Tensor rope_append_paged_(const Tensor& qkv, const Tensor& cos, const Tensor& sin,
                           const Tensor& positions, const Tensor& slots, Tensor k_cache,
-                          Tensor v_cache, int64_t H_q, int64_t H_kv) {
+                          Tensor v_cache, int64_t H_q, int64_t H_kv,
+                          const std::optional<Tensor>& k_scale,
+                          const std::optional<Tensor>& v_scale) {
     check_cuda_contig(qkv, "qkv");
     check_cuda_contig(cos, "cos");
     check_cuda_contig(sin, "sin");
     check_int32(positions, "positions");
     check_int32(slots, "slots");
-    check_cache(k_cache, v_cache);
+    const bool fp8 = check_cache(k_cache, v_cache, k_scale, v_scale);
     TORCH_CHECK(qkv.scalar_type() == at::kBFloat16, "rope_append_paged_ expects bfloat16 qkv");
     TORCH_CHECK(cos.scalar_type() == at::kFloat && sin.scalar_type() == at::kFloat,
                 "rope_append_paged_ expects float32 cos and sin tables");
@@ -920,6 +947,17 @@ Tensor rope_append_paged_(const Tensor& qkv, const Tensor& cos, const Tensor& si
     TORCH_CHECK(T * (H_q + 2 * H_kv) * D < (int64_t{1} << 40), "rope_append_paged_ too large");
     const c10::cuda::CUDAGuard guard(qkv.device());
     Tensor q = at::empty({T, H_q, D}, qkv.options());
+    if (fp8) {
+        spark::rope_append_paged_fp8(
+            bf16_ptr(qkv), cos.data_ptr<float>(), sin.data_ptr<float>(), positions.data_ptr<int>(),
+            slots.data_ptr<int>(), bf16_ptr_mut(q),
+            reinterpret_cast<__nv_fp8_e4m3*>(k_cache.data_ptr()),
+            reinterpret_cast<__nv_fp8_e4m3*>(v_cache.data_ptr()), k_scale->data_ptr<float>(),
+            v_scale->data_ptr<float>(), static_cast<int>(T), static_cast<int>(H_q),
+            static_cast<int>(H_kv), static_cast<int>(D), static_cast<int>(k_cache.size(2)),
+            current_stream(qkv));
+        return q;
+    }
     spark::rope_append_paged_bf16(
         bf16_ptr(qkv), cos.data_ptr<float>(), sin.data_ptr<float>(), positions.data_ptr<int>(),
         slots.data_ptr<int>(), bf16_ptr_mut(q), bf16_ptr_mut(k_cache), bf16_ptr_mut(v_cache),
@@ -929,11 +967,12 @@ Tensor rope_append_paged_(const Tensor& qkv, const Tensor& cos, const Tensor& si
 }
 
 // o [B, H_q, D] = attention of each sequence's one query token over its seq_lens[b] keys in
-// the paged cache.
+// the paged cache (bf16, or float8_e4m3fn with its scales).
 Tensor paged_decode(const Tensor& q, const Tensor& k_cache, const Tensor& v_cache,
-                    const Tensor& block_table, const Tensor& seq_lens, int variant) {
+                    const Tensor& block_table, const Tensor& seq_lens, int variant,
+                    const std::optional<Tensor>& k_scale, const std::optional<Tensor>& v_scale) {
     check_cuda_contig(q, "q");
-    check_cache(k_cache, v_cache);
+    const bool fp8 = check_cache(k_cache, v_cache, k_scale, v_scale);
     check_int32(block_table, "block_table");
     check_int32(seq_lens, "seq_lens");
     TORCH_CHECK(q.scalar_type() == at::kBFloat16 && q.dim() == 3,
@@ -948,6 +987,15 @@ Tensor paged_decode(const Tensor& q, const Tensor& k_cache, const Tensor& v_cach
     const c10::cuda::CUDAGuard guard(q.device());
     Tensor out = at::empty_like(q);
     const int var = resolve_variant(variant, spark::paged_decode_num_variants());
+    if (fp8) {
+        spark::paged_decode_fp8(
+            bf16_ptr(q), fp8_ptr(k_cache), fp8_ptr(v_cache), k_scale->data_ptr<float>(),
+            v_scale->data_ptr<float>(), block_table.data_ptr<int>(), seq_lens.data_ptr<int>(),
+            bf16_ptr_mut(out), static_cast<int>(B), static_cast<int>(H_q), static_cast<int>(H_kv),
+            static_cast<int>(D), static_cast<int>(k_cache.size(2)),
+            static_cast<int>(block_table.size(1)), var, current_stream(q));
+        return out;
+    }
     spark::paged_decode_bf16(
         bf16_ptr(q), bf16_ptr(k_cache), bf16_ptr(v_cache), block_table.data_ptr<int>(),
         seq_lens.data_ptr<int>(), bf16_ptr_mut(out), static_cast<int>(B), static_cast<int>(H_q),
@@ -960,9 +1008,11 @@ Tensor paged_decode(const Tensor& q, const Tensor& k_cache, const Tensor& v_cach
 // cu_seqlens_q[b] .. cu_seqlens_q[b+1]-1) over their sequences' keys in the paged cache.
 Tensor attention_varlen(const Tensor& q, const Tensor& k_cache, const Tensor& v_cache,
                         const Tensor& cu_seqlens_q, const Tensor& seq_lens,
-                        const Tensor& block_table, bool causal, int variant) {
+                        const Tensor& block_table, bool causal, int variant,
+                        const std::optional<Tensor>& k_scale,
+                        const std::optional<Tensor>& v_scale) {
     check_cuda_contig(q, "q");
-    check_cache(k_cache, v_cache);
+    const bool fp8 = check_cache(k_cache, v_cache, k_scale, v_scale);
     check_int32(cu_seqlens_q, "cu_seqlens_q");
     check_int32(seq_lens, "seq_lens");
     check_int32(block_table, "block_table");
@@ -980,6 +1030,16 @@ Tensor attention_varlen(const Tensor& q, const Tensor& k_cache, const Tensor& v_
     const c10::cuda::CUDAGuard guard(q.device());
     Tensor out = at::empty_like(q);
     const int var = resolve_variant(variant, spark::attention_varlen_num_variants());
+    if (fp8) {
+        spark::attention_varlen_fp8(
+            bf16_ptr(q), fp8_ptr(k_cache), fp8_ptr(v_cache), k_scale->data_ptr<float>(),
+            v_scale->data_ptr<float>(), cu_seqlens_q.data_ptr<int>(), seq_lens.data_ptr<int>(),
+            block_table.data_ptr<int>(), bf16_ptr_mut(out), static_cast<int>(B),
+            static_cast<int>(T), static_cast<int>(H_q), static_cast<int>(H_kv), static_cast<int>(D),
+            static_cast<int>(k_cache.size(2)), static_cast<int>(block_table.size(1)), causal, var,
+            current_stream(q));
+        return out;
+    }
     spark::attention_varlen_bf16(
         bf16_ptr(q), bf16_ptr(k_cache), bf16_ptr(v_cache), cu_seqlens_q.data_ptr<int>(),
         seq_lens.data_ptr<int>(), block_table.data_ptr<int>(), bf16_ptr_mut(out),
@@ -1091,20 +1151,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("pos0"), py::arg("H_q"), py::arg("H_kv"));
     m.def("rope_append_paged_", &rope_append_paged_,
           "RoPE on the q and k columns of packed tokens, k and v written to their slots of the "
-          "paged caches; returns q as [T, H_q, D]",
+          "paged caches (bf16, or float8_e4m3fn divided by k_scale / v_scale [H_kv]); returns q "
+          "as [T, H_q, D]",
           py::arg("qkv"), py::arg("cos"), py::arg("sin"), py::arg("positions"), py::arg("slots"),
-          py::arg("k_cache"), py::arg("v_cache"), py::arg("H_q"), py::arg("H_kv"));
+          py::arg("k_cache"), py::arg("v_cache"), py::arg("H_q"), py::arg("H_kv"),
+          py::arg("k_scale") = py::none(), py::arg("v_scale") = py::none());
     m.def("paged_decode", &paged_decode,
           "one query token per sequence against a paged K/V cache: q [B, H_q, D], block_table "
-          "[B, max_pages], seq_lens [B]",
+          "[B, max_pages], seq_lens [B]; float8_e4m3fn caches take k_scale and v_scale [H_kv]",
           py::arg("q"), py::arg("k_cache"), py::arg("v_cache"), py::arg("block_table"),
-          py::arg("seq_lens"), py::arg("variant") = -1);
+          py::arg("seq_lens"), py::arg("variant") = -1, py::arg("k_scale") = py::none(),
+          py::arg("v_scale") = py::none());
     m.def("attention_varlen", &attention_varlen,
           "packed prompts (q [T, H_q, D], cu_seqlens_q [B + 1]) against a paged K/V cache, "
-          "causal mask aligned bottom-right",
+          "causal mask aligned bottom-right; float8_e4m3fn caches take k_scale and v_scale",
           py::arg("q"), py::arg("k_cache"), py::arg("v_cache"), py::arg("cu_seqlens_q"),
           py::arg("seq_lens"), py::arg("block_table"), py::arg("causal") = true,
-          py::arg("variant") = -1);
+          py::arg("variant") = -1, py::arg("k_scale") = py::none(),
+          py::arg("v_scale") = py::none());
     m.def("num_variants", &num_variants, "number of implementation variants for a kernel",
           py::arg("name"));
 }

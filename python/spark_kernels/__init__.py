@@ -44,6 +44,10 @@ Ops (all run on the current CUDA stream, all accept float32 or bfloat16 unless n
                                              a decode step of a batch of any lengths
     attention_varlen(q, k_cache, v_cache, cu_seqlens_q, seq_lens, block_table, causal=True)
                                              packed prompts of any lengths, no padding
+                                             (the three paged ops also take float8_e4m3fn
+                                             caches with k_scale=, v_scale= per kv head;
+                                             quantize_kv_cache is the same rounding in
+                                             torch, dequantize_kv_cache its values)
     num_variants(name)                       how many implementations exist for `name`
 
 `variant` selects a rung on the optimization ladder described in docs/DESIGN.md; -1 picks
@@ -67,6 +71,7 @@ from .ops import (
     attention_fwd,
     attention_varlen,
     attention_with_grad,
+    dequantize_kv_cache,
     fp4_quantize,
     fp4gemm,
     fp8_quantize,
@@ -77,6 +82,7 @@ from .ops import (
     num_variants,
     paged_decode,
     quantize_fp8,
+    quantize_kv_cache,
     rmsnorm,
     rope_append_,
     rope_append_paged_,
@@ -99,6 +105,7 @@ __all__ = [
     "attention_fwd",
     "attention_varlen",
     "attention_with_grad",
+    "dequantize_kv_cache",
     "engine",
     "fp4_quantize",
     "fp8_quantize",
@@ -111,6 +118,7 @@ __all__ = [
     "num_variants",
     "paged_decode",
     "quantize_fp8",
+    "quantize_kv_cache",
     "reference",
     "rmsnorm",
     "rope_append_",

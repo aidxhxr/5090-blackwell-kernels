@@ -395,6 +395,8 @@ def rope_append_paged_(
     v_cache: torch.Tensor,
     H_q: int,
     H_kv: int,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """RoPE plus the K/V append for packed tokens into a paged cache, one launch.
 
@@ -403,8 +405,14 @@ def rope_append_paged_(
     page_id * page + row) of k_cache and v_cache, [num_pages, H_kv, page, D] bf16 with page a
     power of two; a negative slot skips the write (a padding token). Returns the rotated q as
     [T, H_q, D], the layout `attention_varlen` and `paged_decode` take.
+
+    With float8_e4m3fn caches, k_scale and v_scale (float32 [H_kv], one per kv head of this
+    layer) are required: an element x of kv head h is stored as e4m3(x / scale[h]), rounded to
+    nearest even and saturated at +-448, k rounded once from its fp32 rotation. The attention
+    ops take the same scales (`quantize_kv_cache` is the same rounding in torch).
     """
-    return _C.rope_append_paged_(qkv, cos, sin, positions, slots, k_cache, v_cache, H_q, H_kv)
+    return _C.rope_append_paged_(qkv, cos, sin, positions, slots, k_cache, v_cache, H_q, H_kv,
+                                 k_scale, v_scale)
 
 
 def paged_decode(
@@ -414,6 +422,8 @@ def paged_decode(
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
     variant: int = -1,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """One decode step of a batch against a paged K/V cache: softmax(q k^T / sqrt(D)) v per
     sequence, fp32 math, bf16 out.
@@ -426,8 +436,14 @@ def paged_decode(
     divides the keys of the whole batch evenly over the SMs whatever the lengths; the
     lengths are read on the device, so a captured step replays correctly as they grow.
     Returns [B, H_q, D] bfloat16.
+
+    The caches may be float8_e4m3fn (`rope_append_paged_` with scales), read as
+    k_scale[h] * k_cache and v_scale[h] * v_cache with k_scale, v_scale float32 [H_kv]: half
+    the bytes of a bf16 cache, the same variants. The e4m3 values are converted to bf16
+    exactly, so the only rounding added is the cache's own.
     """
-    return _C.paged_decode(q, k_cache, v_cache, block_table, seq_lens, variant)
+    return _C.paged_decode(q, k_cache, v_cache, block_table, seq_lens, variant, k_scale,
+                           v_scale)
 
 
 def attention_varlen(
@@ -439,6 +455,8 @@ def attention_varlen(
     block_table: torch.Tensor,
     causal: bool = True,
     variant: int = -1,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Attention for a packed batch of prompts against a paged K/V cache, no padding.
 
@@ -448,10 +466,34 @@ def attention_varlen(
     them. With `causal` the mask is aligned bottom-right, so query i of sequence b sees keys
     j <= seq_lens[b] - q_len_b + i: the usual causal mask for a fresh prompt, and the right
     one for a chunk of a longer prompt. Returns [T, H_q, D] bfloat16, which is [T, H_q * D]
-    for the output projection without a transpose.
+    for the output projection without a transpose. float8_e4m3fn caches take k_scale and
+    v_scale as `paged_decode` does.
     """
     return _C.attention_varlen(q, k_cache, v_cache, cu_seqlens_q, seq_lens, block_table, causal,
-                               variant)
+                               variant, k_scale, v_scale)
+
+
+def _head_scale(scale: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """scale [H_kv] shaped to broadcast over dim 1 of x."""
+    if x.dim() not in (3, 4):
+        raise ValueError(f"expected [T, H_kv, D] or [num_pages, H_kv, page, D], got {x.shape}")
+    return scale.float().view([-1] + [1] * (x.dim() - 2))
+
+
+def quantize_kv_cache(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """x as e4m3 with one scale per kv head, the rounding `rope_append_paged_` applies to an
+    fp8 cache: (x / scale[h]) clamped to +-448, then to float8_e4m3fn (round to nearest even).
+    x is [T, H_kv, D] (tokens) or [num_pages, H_kv, page, D] (a cache), any float dtype;
+    `scale` is float32 [H_kv]."""
+    return (x.float() / _head_scale(scale, x)).clamp(-E4M3_MAX, E4M3_MAX).to(
+        torch.float8_e4m3fn)
+
+
+def dequantize_kv_cache(x8: torch.Tensor, scale: torch.Tensor,
+                        dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """The values an fp8 cache stands for: x8 (float8_e4m3fn, kv heads at dim 1 as in
+    `quantize_kv_cache`) times its kv head's scale, one float32 rounding, then `dtype`."""
+    return (x8.float() * _head_scale(scale, x8)).to(dtype)
 
 
 E4M3_MAX = 448.0
