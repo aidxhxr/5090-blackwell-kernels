@@ -42,7 +42,12 @@ CUDA graph once, with every slot empty, and replayed every step after the host r
 positions, slots and lengths of the slots in use; paged_decode reads the lengths on the device,
 so the graph does not depend on them. The next token of every slot is the argmax of its logits
 (greedy), written back into the token-id buffer by the graph itself, so a decode loop never
-copies a token to the host.
+copies a token to the host. A request submitted with SamplingParams (temperature, top-k,
+top-p, seed) is sampled instead: its parameters sit in per-slot device tensors, and while any
+running request samples, the steps run `sk.sample` over every slot (a greedy slot still gets
+its argmax) from a second set of captured graphs. Each request draws from its own Philox
+stream (its seed) at the offset of the token's index in its output, so its tokens do not
+depend on what else is in the batch, on which slot it runs in, or on being preempted.
 
 Weights: `ModelWeights.random()` draws every matrix on the GPU. w_gate_up is stored in the
 interleaved layout of `interleave_gate_up` (gate_j at column 2j, up_j at 2j + 1), the layout
@@ -468,11 +473,34 @@ class TorchModel:
         return self._logits(self._forward(x, b, cache, decode=True))
 
 
+@dataclass(frozen=True)
+class SamplingParams:
+    """How a request picks its tokens (the rule is `sk.sample`'s): temperature <= 0 is greedy;
+    otherwise softmax(logits / temperature) restricted to the top_k most likely tokens (0: no
+    limit), then to the smallest top set holding top_p of what is left (1: no limit). `seed`
+    picks the request's random stream; None draws one from torch's default generator at
+    submit. The same seed gives the same tokens whatever else the engine runs."""
+
+    temperature: float = 0.0
+    top_k: int = 0
+    top_p: float = 1.0
+    seed: int | None = None
+
+    @property
+    def greedy(self) -> bool:
+        return not self.temperature > 0
+
+
+GREEDY = SamplingParams()
+
+
 @dataclass
 class Sequence:
     sid: int
     prompt: torch.Tensor  # [P] int64 on the device; after a preemption, plus its tokens so far
     max_new: int
+    params: SamplingParams = GREEDY
+    seed: int = 0  # params.seed, or the one drawn at submit
     pages: list[int] = field(default_factory=list)
     slot: int = -1
     length: int = 0  # tokens in the cache
@@ -522,7 +550,8 @@ class Engine:
     `preempt` (the default) a request holds the pages of the tokens it has and takes one more
     every `page` steps; a decode step that finds no free page preempts the youngest running
     sequence, which is prefilled again later with its tokens so far. Without it the pages of
-    the prompt and every requested token are reserved at admission and never run out. With
+    the prompt and every requested token are reserved at admission and never run out.
+    `submit` takes a request's SamplingParams; without them it decodes greedily. With
     `prefix_cache` (the default for SparkModel, whose prefill can start after a cached
     context) an admitted prompt takes the cached full pages of its longest registered prefix
     and is prefilled from the first token after them; at least one prompt token is always
@@ -540,8 +569,9 @@ class Engine:
     forward is not graph-captured; a step where no sequence has a draft runs the ordinary
     (graphed) decode step. The drafts need each step's tokens on the host, so this mode
     reads them back once per step (a synchronize). Admitted prompts are prefilled in their
-    own forward (no mixed step). Needs a model whose prefill takes a chunk after a cached
-    context (SparkModel)."""
+    own forward (no mixed step). Speculation verifies greedily, so a sampled request is
+    refused in this mode. Needs a model whose prefill takes a chunk after a cached context
+    (SparkModel)."""
 
     def __init__(self, model, n_layers: int, max_batch: int = 64, max_seq: int = 4096,
                  num_pages: int | None = None, page: int = PAGE, cache_bytes: int | None = None,
@@ -608,6 +638,15 @@ class Engine:
         # prefilled again from, so a preemption never waits for the GPU
         self.gen = torch.zeros(max_batch, max_seq, device=device, dtype=torch.long)
         self.gen_n = torch.zeros(max_batch, device=device, dtype=torch.long)
+        # per-slot sampling parameters, read by sk.sample on the device; written at admission
+        # and moved with the slot. offsets[i] is the Philox block of the slot's next token (the
+        # token's index in its sequence's output), advanced by sk.sample itself
+        f32 = dict(device=device, dtype=torch.float32)
+        self.temperature = torch.zeros(max_batch, **f32)
+        self.top_k = torch.zeros(max_batch, **i32)
+        self.top_p = torch.ones(max_batch, **f32)
+        self.seeds = torch.zeros(max_batch, device=device, dtype=torch.long)
+        self.offsets = torch.zeros(max_batch, device=device, dtype=torch.long)
         # pinned staging for the per-step inputs: a ring, so the host can queue a few steps
         # ahead of the GPU without rewriting a buffer whose copy has not run yet
         self.host = [torch.zeros(3, max_batch, dtype=torch.int32).pin_memory()
@@ -618,7 +657,8 @@ class Engine:
         self.waiting: deque[Sequence] = deque()
         self.stats = Stats()
         self._next_sid = 0
-        self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self.graphs: dict[int, torch.cuda.CUDAGraph] = {}  # argmax steps
+        self.sample_graphs: dict[int, torch.cuda.CUDAGraph] = {}  # sk.sample steps
         # (sequence ids, device tensor of their new tokens) per forward, when log_tokens
         self.log: list[tuple[list[int], torch.Tensor]] | None = [] if log_tokens else None
         if graphs:
@@ -631,9 +671,14 @@ class Engine:
                      seq_lens=self.seq_lens[:bp], block_table=self.block_table[:bp],
                      max_len=max_len)
 
-    def _decode_once(self, bp: int, max_len: int = 0) -> None:
+    def _decode_once(self, bp: int, max_len: int = 0, sample: bool = False) -> None:
         logits = self.model.decode(self._decode_batch(bp, max_len), self.cache)
-        self.ids[:bp].copy_(torch.argmax(logits, dim=-1))
+        if sample:
+            new = sk.sample(logits, self.temperature[:bp], self.top_k[:bp], self.top_p[:bp],
+                            self.seeds[:bp], self.offsets[:bp])
+        else:
+            new = torch.argmax(logits, dim=-1)
+        self.ids[:bp].copy_(new)
         self._record(self.ids[:bp], self.gen_n[:bp], slice(0, bp))
 
     def _record(self, toks: torch.Tensor, col: torch.Tensor, rows) -> None:
@@ -651,7 +696,9 @@ class Engine:
         run the M <= 64 kernel are captured: from M = 128 hgemm runs the Stream-K schedule,
         whose workspace a later prefill can grow, which freed the buffer a captured 128 or 256
         bucket still pointed at (an illegal address on replay). Those buckets run eagerly; the
-        graph saves under 1% of a step (docs/design/serving.md)."""
+        graph saves under 1% of a step (docs/design/serving.md). Each bucket is captured twice,
+        ending in argmax and in sk.sample; a step runs the second only while some running
+        request samples, so a greedy run replays exactly the graphs it did before sampling."""
         warm = getattr(self.model, "warm_workspaces", None)
         if warm is not None:
             warm()
@@ -659,30 +706,46 @@ class Engine:
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
         for bp in (x for x in BUCKETS if x <= min(self.max_batch, GRAPH_MAX)):
-            with torch.cuda.stream(side):
-                for _ in range(2):  # grows every workspace before the capture
-                    self._decode_once(bp)
-            torch.cuda.current_stream().wait_stream(side)
-            g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g, pool=pool):
-                self._decode_once(bp)
-            self.graphs[bp] = g
+            for sample, graphs in ((False, self.graphs), (True, self.sample_graphs)):
+                with torch.cuda.stream(side):
+                    for _ in range(2):  # grows every workspace before the capture
+                        self._decode_once(bp, sample=sample)
+                torch.cuda.current_stream().wait_stream(side)
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g, pool=pool):
+                    self._decode_once(bp, sample=sample)
+                graphs[bp] = g
         torch.cuda.synchronize()
         self.ids.zero_()
         self.gen_n.zero_()
+        self.offsets.zero_()
 
     # ---- requests ------------------------------------------------------------------------
 
-    def submit(self, prompt: torch.Tensor, max_new: int) -> Sequence:
+    def submit(self, prompt: torch.Tensor, max_new: int,
+               params: SamplingParams | None = None) -> Sequence:
+        """Queues a request for max_new tokens after `prompt`, greedy unless `params` says
+        otherwise."""
+        params = GREEDY if params is None else params
         if prompt.numel() + max_new > self.max_seq:
             raise ValueError(f"prompt + max_new = {prompt.numel() + max_new} > max_seq")
         if max_new < 1:
             raise ValueError("max_new must be >= 1")
+        if math.isnan(params.temperature) or params.top_k < 0 or not 0 < params.top_p <= 1:
+            raise ValueError(f"bad sampling parameters {params}: need a temperature, "
+                             "top_k >= 0 and 0 < top_p <= 1")
+        if self.spec and not params.greedy:
+            raise ValueError("speculative decoding verifies drafts greedily; a sampled request "
+                             "needs an engine with speculative=0")
         need = cdiv(prompt.numel() + max_new, self.page)
         if need > self.cache.num_pages - 1 - self.watermark:  # it would wait (or thrash) forever
             raise ValueError(f"prompt + max_new needs {need} pages, the cache has "
                              f"{self.cache.num_pages - 1 - self.watermark} to give")
-        seq = Sequence(self._next_sid, prompt.to(self.device, torch.long).flatten(), max_new)
+        seed = params.seed
+        if seed is None:  # a greedy request leaves torch's generator alone
+            seed = 0 if params.greedy else int(torch.randint(0, 2**62, ()))
+        seq = Sequence(self._next_sid, prompt.to(self.device, torch.long).flatten(), max_new,
+                       params=params, seed=seed)
         if self.spec:
             seq.drafter = NgramDrafter(prompt.flatten().tolist())
         if self.prefix_cache:  # host ids: free for a CPU prompt, one sync for a device one
@@ -730,8 +793,22 @@ class Engine:
             out.append(seq)
             budget -= n - cached
         if out:
-            self.gen_n[torch.tensor([s.slot for s in out], device=self.device)] = 0
+            idx = torch.tensor([s.slot for s in out], device=self.device)
+            self.gen_n[idx] = 0
+            self._load_params(idx, out)
         return out
+
+    def _load_params(self, idx: torch.Tensor, seqs: list[Sequence]) -> None:
+        """The sampling parameters of `seqs` into their slots `idx`, each offset at the index
+        of the token the sequence generates next (from 0, or where a preemption left it)."""
+        dev = dict(device=self.device)
+        self.temperature[idx] = torch.tensor([s.params.temperature for s in seqs],
+                                             dtype=torch.float32, **dev)
+        self.top_k[idx] = torch.tensor([s.params.top_k for s in seqs], dtype=torch.int32, **dev)
+        self.top_p[idx] = torch.tensor([s.params.top_p for s in seqs], dtype=torch.float32,
+                                       **dev)
+        self.seeds[idx] = torch.tensor([s.seed for s in seqs], dtype=torch.long, **dev)
+        self.offsets[idx] = torch.tensor([s.generated for s in seqs], dtype=torch.long, **dev)
 
     def _preempt(self, seq: Sequence) -> None:
         """Takes `seq` out of the batch: its pages go back, its prompt grows by the tokens it
@@ -856,8 +933,15 @@ class Engine:
             if not rows:
                 continue
             both = [parts[i][0] for i in fin] + rows_dec
-            new = torch.argmax(logits[torch.tensor(rows, device=self.device)], dim=-1)
             slots = torch.tensor([s.slot for s in both], device=self.device)
+            lg = logits[torch.tensor(rows, device=self.device)]
+            if any(not s.params.greedy for s in both):
+                off = self.offsets[slots]
+                new = sk.sample(lg, self.temperature[slots], self.top_k[slots],
+                                self.top_p[slots], self.seeds[slots], off)
+                self.offsets[slots] = off
+            else:
+                new = torch.argmax(lg, dim=-1)
             self.ids[slots] = new
             self.gen[slots, self.gen_n[slots]] = new
             self.gen_n[slots] += 1
@@ -936,8 +1020,9 @@ class Engine:
         step would otherwise run a larger bucket than the number of live sequences needs.
         Sequences retire in any order, so without this a few long requests left in high
         slots keep every later step at the bucket of the highest one (a 64-row step for six
-        sequences). A move is two device copies, the slot's next token id and its block table
-        row; the other per-slot inputs are rewritten every step."""
+        sequences). A move copies the slot's device state: its next token id, block table row,
+        record of generated tokens and sampling parameters (the Philox offset with them); the
+        other per-slot inputs are rewritten every step."""
         live = [i for i, s in enumerate(self.running) if s is not None]
         if not live:
             return
@@ -953,6 +1038,8 @@ class Engine:
         self.block_table[d_idx] = self.block_table[s_idx]
         self.gen[d_idx] = self.gen[s_idx]
         self.gen_n[d_idx] = self.gen_n[s_idx]
+        for t in (self.temperature, self.top_k, self.top_p, self.seeds, self.offsets):
+            t[d_idx] = t[s_idx]
         for a, b in zip(src, dst, strict=True):
             seq = self.running[a]
             seq.slot = b
@@ -986,10 +1073,12 @@ class Engine:
         self.seq_lens[:bp].copy_(h[2, :bp], non_blocking=True)
         self.host_ev[k] = torch.cuda.Event()
         self.host_ev[k].record()
-        if bp in self.graphs:
-            self.graphs[bp].replay()
+        sample = any(not self.running[i].params.greedy for i in live)
+        graphs = self.sample_graphs if sample else self.graphs
+        if bp in graphs:
+            graphs[bp].replay()
         else:
-            self._decode_once(bp, max(lens))
+            self._decode_once(bp, max(lens), sample)
         if self.log is not None:
             self.log.append(([self.running[i].sid for i in live],
                              self.ids[torch.tensor(live, device=self.device)]))
