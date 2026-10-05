@@ -597,3 +597,52 @@ def test_prefix_cache_needs_a_context_prefill(sk, weights):
     with pytest.raises(ValueError):
         E.Engine(E.TorchModel(weights, rope), N_LAYERS, max_batch=1, max_seq=256,
                  num_pages=32, graphs=False, prefix_cache=True)
+
+
+def test_sampling_reproducible_and_independent_of_the_batch(sk, weights):
+    """Requests with their own seeds (every fourth one greedy) give the same tokens on a second
+    run, with twice the slots and no compaction (other buckets, other slots, other
+    neighbours), and from a cache small enough to preempt (a resumed request continues its
+    random stream at its own token index). The greedy ones give what an all-greedy run gives,
+    and the sampled ones do not."""
+    rope = L.RoPE(1024)
+    g = torch.Generator().manual_seed(31)
+    lens = [int(x) for x in torch.randint(1, 120, (12,), generator=g)]
+    news = [int(x) for x in torch.randint(8, 40, (12,), generator=g)]
+    prompts = [torch.randint(0, VOCAB, (n,), generator=g) for n in lens]
+    params = [E.SamplingParams() if i % 4 == 3 else
+              E.SamplingParams(temperature=0.9, top_k=50 if i % 2 else 0,
+                               top_p=0.9 if i % 3 else 1.0, seed=1000 + i)
+              for i in range(len(lens))]
+
+    def run(params, max_batch=4, num_pages=256, **kw):
+        eng = E.Engine(E.SparkModel(weights, rope), N_LAYERS, max_batch=max_batch, max_seq=512,
+                       num_pages=num_pages, graphs=True, log_tokens=True, **kw)
+        for p, m, sp in zip(prompts, news, params, strict=True):
+            eng.submit(p, m, sp)
+        st = eng.run()
+        assert _all_back(eng)
+        return eng.outputs(), st
+
+    want, _ = run(params)
+    assert [len(want[i]) for i in range(len(lens))] == news
+    assert run(params)[0] == want
+    assert run(params, max_batch=8, compact=False)[0] == want
+    small, st = run(params, num_pages=16)
+    assert st.preempted > 0 and small == want
+    greedy, _ = run([E.SamplingParams()] * len(lens))
+    for i, sp in enumerate(params):
+        if sp.greedy:
+            assert want[i] == greedy[i]
+    assert any(want[i] != greedy[i] for i, sp in enumerate(params) if not sp.greedy)
+
+
+def test_submit_refuses_bad_sampling_params(sk, weights):
+    eng = E.Engine(E.SparkModel(weights, L.RoPE(256)), N_LAYERS, max_batch=1, max_seq=256,
+                   num_pages=16, graphs=False)
+    for sp in (E.SamplingParams(temperature=1.0, top_k=-1),
+               E.SamplingParams(temperature=1.0, top_p=0.0),
+               E.SamplingParams(temperature=1.0, top_p=1.5),
+               E.SamplingParams(temperature=float("nan"))):
+        with pytest.raises(ValueError):
+            eng.submit(torch.randint(0, VOCAB, (4,)), 2, sp)
