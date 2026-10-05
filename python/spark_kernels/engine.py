@@ -28,7 +28,12 @@ The pieces (docs/design/serving.md):
                    prefilled again), as vLLM does, so the cache holds as many requests as
                    their current lengths allow instead of as many as their worst case would.
                    With `speculative=k` each step drafts up to k tokens per sequence by
-                   prompt lookup (spec.py) and verifies them in one forward
+                   prompt lookup (spec.py) and verifies them in one forward.
+                   With `prefix_cache` a full page of prompt tokens is named by the hash
+                   chain of the prompt up to its end once its K/V is written, and a later
+                   prompt that starts with the same tokens takes those pages (a hold count
+                   per page) and prefills only the rest; a page nobody holds stays cached
+                   until an allocation needs it (least recently released first)
 
 A sequence keeps its batch slot from admission to the end, so the decode step's inputs
 (token ids, positions, cache slots, lengths, block table rows) live in per-slot device
@@ -67,7 +72,7 @@ from .layer import (
     LayerWeights,
     RoPE,
 )
-from .pages import PageTable
+from .pages import PageTable, page_hashes
 from .spec import NgramDrafter, accept, cut_at_stop
 
 N_LAYERS = 32
@@ -477,6 +482,10 @@ class Sequence:
     # speculative mode: the prompt and every generated token on the host, with the n-gram
     # index the drafts come from
     drafter: NgramDrafter | None = None
+    hashes: list[bytes] = field(default_factory=list)  # hash chain of the submitted prompt's
+    # full pages (prefix caching); the tokens a preemption appends are not hashed
+    cached: int = 0  # prompt tokens whose K/V came from shared pages at the last admission
+    n_reg: int = 0  # leading pages already registered or matched
 
 
 @dataclass
@@ -497,6 +506,8 @@ class Stats:
     spec_steps: int = 0  # verify forwards (speculative mode)
     spec_proposed: int = 0  # draft tokens put in verify forwards
     spec_accepted: int = 0  # draft tokens that matched the model's greedy token
+    prefix_queries: int = 0  # prompt tokens of every admission with prefix caching on
+    prefix_hit_tokens: int = 0  # of those, the tokens whose pages were found cached
 
 
 class Engine:
@@ -511,7 +522,13 @@ class Engine:
     `preempt` (the default) a request holds the pages of the tokens it has and takes one more
     every `page` steps; a decode step that finds no free page preempts the youngest running
     sequence, which is prefilled again later with its tokens so far. Without it the pages of
-    the prompt and every requested token are reserved at admission and never run out.
+    the prompt and every requested token are reserved at admission and never run out. With
+    `prefix_cache` (the default for SparkModel, whose prefill can start after a cached
+    context) an admitted prompt takes the cached full pages of its longest registered prefix
+    and is prefilled from the first token after them; at least one prompt token is always
+    computed, so its logits exist. The prefill registers each full page of a submitted
+    prompt once the forward that writes it is queued. Pages of generated tokens are not
+    registered: their ids are on the device and hashing them would make the host wait.
 
     With `speculative=k` (0, the default, is off) a step drafts up to k tokens for every
     running sequence by prompt lookup (`spec.NgramDrafter` over its prompt and tokens so far)
@@ -531,7 +548,8 @@ class Engine:
                  prefill_tokens: int = 8192, graphs: bool = True, log_tokens: bool = False,
                  compact: bool = True, mixed: bool | None = None,
                  stop_ids: list[int] | None = None, preempt: bool = True,
-                 speculative: int = 0, device="cuda"):
+                 speculative: int = 0, prefix_cache: bool | None = None,
+                 device="cuda"):
         if max_batch > BUCKETS[-1]:
             raise ValueError(f"max_batch is at most {BUCKETS[-1]}")
         # a decode step runs a whole bucket, so the per-slot buffers are bucket sized
@@ -570,6 +588,13 @@ class Engine:
         # decode rows inside a prefill forward need the model's prefill to take a chunk after
         # a cached context (attention_varlen does; TorchModel's per-prompt SDPA does not)
         self.mixed = getattr(model, "context_prefill", False) if mixed is None else mixed
+        # a prefix hit prefills a prompt after the cached pages, which needs the same
+        if prefix_cache is None:
+            prefix_cache = getattr(model, "context_prefill", False)
+        elif prefix_cache and not getattr(model, "context_prefill", False):
+            raise ValueError("prefix_cache needs a model whose prefill continues a cached "
+                             "context")
+        self.prefix_cache = prefix_cache
         self.device = device
         i32 = dict(device=device, dtype=torch.int32)
         # per-slot decode inputs; slot i of a Bp-bucket step reads row i
@@ -660,33 +685,50 @@ class Engine:
         seq = Sequence(self._next_sid, prompt.to(self.device, torch.long).flatten(), max_new)
         if self.spec:
             seq.drafter = NgramDrafter(prompt.flatten().tolist())
+        if self.prefix_cache:  # host ids: free for a CPU prompt, one sync for a device one
+            seq.hashes = page_hashes(prompt.flatten().tolist(), self.page)
         self._next_sid += 1
         self.waiting.append(seq)
         return seq
 
-    def _admit(self, budget: int | None = None) -> list[Sequence]:
+    def _admit(self, budget: int | None = None, reuse: bool = True) -> list[Sequence]:
         """Admits queued requests into free slots while pages last: the pages of the prompt
         plus one token with `preempt` (the rest come as the tokens do), of the prompt plus
-        every requested token without it."""
+        every requested token without it. With prefix caching (and `reuse`) the leading
+        pages come from the cache when their hashes are registered, up to the last full page
+        before the prompt's last token, and only the tokens after them count against the
+        prefill budget."""
         free_slots = [i for i, s in enumerate(self.running) if s is None]
         out = []
         budget = self.prefill_tokens if budget is None else budget
+        table = self.cache.table
+        reuse = reuse and self.prefix_cache
         while self.waiting and free_slots:
             seq = self.waiting[0]
             n = seq.prompt.numel()
             remaining = seq.max_new - seq.generated
             need = cdiv(n + (1 if self.preempt else remaining), self.page)
-            if (out and n > budget) or need > self.cache.available() - self.watermark:
+            hit = table.lookup(seq.hashes, (n - 1) // self.page) if reuse else []
+            cached = len(hit) * self.page
+            # a hit page nobody holds is counted as available until it is taken
+            taken = sum(table.refs[p] == 0 for p in hit)
+            if ((out and n - cached > budget) or
+                    need - len(hit) > self.cache.available() - taken - self.watermark):
                 break
             self.waiting.popleft()
-            seq.pages = self.cache.alloc(need)
+            table.acquire(hit)  # before the alloc, which could evict them otherwise
+            seq.pages = hit + self.cache.alloc(need - len(hit))
+            seq.cached, seq.n_reg = cached, len(hit)
+            if reuse:
+                self.stats.prefix_queries += n
+                self.stats.prefix_hit_tokens += cached
             seq.slot = free_slots.pop(0)
             self.running[seq.slot] = seq
             row = torch.zeros(self.max_pages, dtype=torch.int32)
             row[:need] = torch.tensor(seq.pages, dtype=torch.int32)
             self.block_table[seq.slot].copy_(row, non_blocking=True)
             out.append(seq)
-            budget -= n
+            budget -= n - cached
         if out:
             self.gen_n[torch.tensor([s.slot for s in out], device=self.device)] = 0
         return out
@@ -746,7 +788,11 @@ class Engine:
         device in its slot's id) at its current length, a one-token chunk after its cached
         context."""
         page = self.page
-        parts = [x if isinstance(x, tuple) else (x, 0, x.prompt.numel()) for x in seqs]
+        parts = [x if isinstance(x, tuple) else (x, x.cached, x.prompt.numel()) for x in seqs]
+        if self.prefix_cache:  # shared and registered pages are never written again
+            t = self.cache.table
+            assert all(t.writable(p) for s, a, e in parts for p in s.pages[a // page:cdiv(e, page)])
+            assert all(t.writable(s.pages[s.length // page]) for s in dec)
         q_lens = [e - a for _, a, e in parts] + [1] * len(dec)
         kv_lens = [e for _, _, e in parts] + [s.length + 1 for s in dec]
         ids = [s.prompt[a:e] for s, a, e in parts]
@@ -779,7 +825,7 @@ class Engine:
         the (sequence, start, end) pieces of each forward. Prompts are packed in order and a
         prompt longer than what is left of a forward's budget is split, so a 100K-token prompt
         runs as chunks that each attend to the cache the previous ones filled."""
-        done = {s.sid: 0 for s in seqs}
+        done = {s.sid: s.cached for s in seqs}  # a prefix hit starts after its pages
         todo = list(seqs)
         while todo:
             parts, budget = [], self.prefill_tokens
@@ -803,6 +849,8 @@ class Engine:
             logits = self.model.prefill(self._prefill_batch(parts, rows_dec), self.cache)
             self.stats.prefill_batches += 1
             self.stats.forwards += 1
+            if self.prefix_cache:
+                self._register(parts)
             fin = [i for i, (s, _, e) in enumerate(parts) if e == s.prompt.numel()]
             rows = fin + list(range(len(parts), len(parts) + len(rows_dec)))
             if not rows:
@@ -828,7 +876,18 @@ class Engine:
             self.stats.decode_tokens += len(rows_dec)
             self.stats.mixed_rows += len(rows_dec)
             self.stats.generated += len(both)
-        self.stats.prefill_tokens += sum(s.prompt.numel() for s in seqs)
+        self.stats.prefill_tokens += sum(s.prompt.numel() - s.cached for s in seqs)
+
+    def _register(self, parts) -> None:
+        """Names the full pages of submitted prompt tokens that a prefill forward has just
+        written (queued: any later reader runs after it on the stream), so later prompts with
+        the same prefix find them."""
+        table = self.cache.table
+        for s, _, e in parts:
+            full = min(e // self.page, len(s.hashes))
+            for i in range(s.n_reg, full):
+                table.register(s.pages[i], s.hashes[i])
+            s.n_reg = max(s.n_reg, full)
 
     def _watch(self, seqs: list[Sequence], rows: list[int], toks: torch.Tensor) -> None:
         """Queues the copy of a forward's new tokens to the host for the stop check:
@@ -912,6 +971,7 @@ class Engine:
         for i in live:
             s = self.running[i]
             p = s.length  # the position of the token this step appends
+            assert not self.prefix_cache or self.cache.table.writable(s.pages[p // self.page])
             pos[i] = p
             slot[i] = s.pages[p // self.page] * self.page + p % self.page
             lens[i] = p + 1
@@ -1086,7 +1146,9 @@ class Engine:
         if any(s is not None for s in self.running) or self.waiting:
             raise RuntimeError("prompt_logits needs an idle engine")
         seqs = [self.submit(p, 1) for p in prompts]
-        admitted = self._admit(budget=sum(p.numel() for p in prompts))
+        # every position's logits are wanted, so nothing is taken from the prefix cache (and
+        # nothing is registered: these pages are released at the end)
+        admitted = self._admit(budget=sum(p.numel() for p in prompts), reuse=False)
         if len(admitted) != len(seqs):
             self.waiting.clear()
             for s in admitted:
