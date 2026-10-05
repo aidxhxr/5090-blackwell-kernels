@@ -26,7 +26,9 @@ The pieces (docs/design/serving.md):
                    the youngest running sequence is preempted (its pages freed, its prompt
                    and the tokens it has so far put back at the head of the queue, to be
                    prefilled again), as vLLM does, so the cache holds as many requests as
-                   their current lengths allow instead of as many as their worst case would
+                   their current lengths allow instead of as many as their worst case would.
+                   With `speculative=k` each step drafts up to k tokens per sequence by
+                   prompt lookup (spec.py) and verifies them in one forward
 
 A sequence keeps its batch slot from admission to the end, so the decode step's inputs
 (token ids, positions, cache slots, lengths, block table rows) live in per-slot device
@@ -65,6 +67,7 @@ from .layer import (
     LayerWeights,
     RoPE,
 )
+from .spec import NgramDrafter, accept, cut_at_stop
 
 N_LAYERS = 32
 VOCAB = 128256  # a multiple of 64, as hgemm needs for N
@@ -461,6 +464,9 @@ class Sequence:
     generated: int = 0
     stopped: int = 0  # with stop ids: how many tokens it had when one of them came out
     resumed_at: int = 0  # `generated` when it was last admitted: the tokens not in `prompt`
+    # speculative mode: the prompt and every generated token on the host, with the n-gram
+    # index the drafts come from
+    drafter: NgramDrafter | None = None
 
 
 @dataclass
@@ -477,6 +483,10 @@ class Stats:
     finished: int = 0
     preempted: int = 0  # sequences taken out of the batch for lack of pages
     recomputed_tokens: int = 0  # prompt tokens prefilled again after a preemption
+    forwards: int = 0  # model forwards of every kind (prefill, decode, verify)
+    spec_steps: int = 0  # verify forwards (speculative mode)
+    spec_proposed: int = 0  # draft tokens put in verify forwards
+    spec_accepted: int = 0  # draft tokens that matched the model's greedy token
 
 
 class Engine:
@@ -491,13 +501,27 @@ class Engine:
     `preempt` (the default) a request holds the pages of the tokens it has and takes one more
     every `page` steps; a decode step that finds no free page preempts the youngest running
     sequence, which is prefilled again later with its tokens so far. Without it the pages of
-    the prompt and every requested token are reserved at admission and never run out."""
+    the prompt and every requested token are reserved at admission and never run out.
+
+    With `speculative=k` (0, the default, is off) a step drafts up to k tokens for every
+    running sequence by prompt lookup (`spec.NgramDrafter` over its prompt and tokens so far)
+    and runs one forward over each sequence's [next token, d1..dk] as a chunk after its cached
+    context, the prefill path with every row's logits. The longest prefix of the draft that
+    agrees with the greedy tokens is kept, plus the token after it (`spec.accept`), so the
+    output is greedy decoding's. The length grows only by what was kept: the K/V of rejected
+    rows stay in the cache past the length and are overwritten by later steps. The verify
+    forward is not graph-captured; a step where no sequence has a draft runs the ordinary
+    (graphed) decode step. The drafts need each step's tokens on the host, so this mode
+    reads them back once per step (a synchronize). Admitted prompts are prefilled in their
+    own forward (no mixed step). Needs a model whose prefill takes a chunk after a cached
+    context (SparkModel)."""
 
     def __init__(self, model, n_layers: int, max_batch: int = 64, max_seq: int = 4096,
                  num_pages: int | None = None, page: int = PAGE, cache_bytes: int | None = None,
                  prefill_tokens: int = 8192, graphs: bool = True, log_tokens: bool = False,
                  compact: bool = True, mixed: bool | None = None,
-                 stop_ids: list[int] | None = None, preempt: bool = True, device="cuda"):
+                 stop_ids: list[int] | None = None, preempt: bool = True,
+                 speculative: int = 0, device="cuda"):
         if max_batch > BUCKETS[-1]:
             raise ValueError(f"max_batch is at most {BUCKETS[-1]}")
         # a decode step runs a whole bucket, so the per-slot buffers are bucket sized
@@ -509,6 +533,12 @@ class Engine:
         rope_len = model.rope.cos.shape[0]
         if rope_len < max_seq:  # the rope kernel reads the table at any position it is given
             raise ValueError(f"the RoPE tables cover {rope_len} positions, max_seq is {max_seq}")
+        if speculative < 0:
+            raise ValueError("speculative is a number of draft tokens, >= 0")
+        if speculative and not getattr(model, "context_prefill", False):
+            raise ValueError("speculative decoding needs a prefill that takes a chunk after a "
+                             "cached context (SparkModel)")
+        self.spec = speculative
         self.model = model
         self.cache = PagedKVCache(n_layers, num_pages, page, device)
         self.page = page
@@ -618,6 +648,8 @@ class Engine:
             raise ValueError(f"prompt + max_new needs {need} pages, the cache has "
                              f"{self.cache.num_pages - 1 - self.watermark} to give")
         seq = Sequence(self._next_sid, prompt.to(self.device, torch.long).flatten(), max_new)
+        if self.spec:
+            seq.drafter = NgramDrafter(prompt.flatten().tolist())
         self._next_sid += 1
         self.waiting.append(seq)
         return seq
@@ -665,31 +697,30 @@ class Engine:
         self.stats.preempted += 1
         self.stats.recomputed_tokens += seq.prompt.numel()
 
-    def _grow(self, seqs: list[Sequence]) -> list[Sequence]:
-        """Gives every sequence in `seqs` the page its next token (position `length`) needs,
-        oldest first; when none is free the youngest running sequence is preempted until one
-        is. Returns the sequences of `seqs` still running. New pages land in the block table
-        with one indexed copy."""
+    def _grow(self, seqs: list[Sequence], rows: dict[int, int] | None = None) -> list[Sequence]:
+        """Gives every sequence in `seqs` the pages its next tokens need (positions `length`
+        to `length + rows[sid] - 1`, one token when `rows` does not name it), oldest first;
+        when none is free the youngest running sequence is preempted until one is. Returns the
+        sequences of `seqs` still running. New pages land in the block table with one indexed
+        copy."""
         if not self.preempt:
             return seqs
         slots, cols, pages = [], [], []
         for seq in sorted(seqs, key=lambda s: s.sid):
-            if seq.slot < 0:
-                continue  # preempted while an older one grew
-            idx = seq.length // self.page
-            if idx < len(seq.pages):
-                continue
-            while not self.cache.free:
-                victim = max((s for s in self.running if s is not None), key=lambda s: s.sid)
-                self._preempt(victim)
-                if victim is seq:
+            need = cdiv(seq.length + (rows or {}).get(seq.sid, 1), self.page)
+            while seq.slot >= 0 and len(seq.pages) < need:  # slot < 0: preempted
+                while not self.cache.free:
+                    victim = max((s for s in self.running if s is not None),
+                                 key=lambda s: s.sid)
+                    self._preempt(victim)
+                    if victim is seq:
+                        break
+                if seq.slot < 0:
                     break
-            if seq.slot < 0:
-                continue
-            seq.pages.extend(self.cache.alloc(1))
-            slots.append(seq.slot)
-            cols.append(idx)
-            pages.append(seq.pages[-1])
+                seq.pages.extend(self.cache.alloc(1))
+                slots.append(seq.slot)
+                cols.append(len(seq.pages) - 1)
+                pages.append(seq.pages[-1])
         if slots:
             t = torch.tensor([slots, cols, pages], dtype=torch.int32).pin_memory().to(
                 self.device, non_blocking=True)
@@ -761,6 +792,7 @@ class Engine:
             rows_dec = list(dec) if k == 0 else []
             logits = self.model.prefill(self._prefill_batch(parts, rows_dec), self.cache)
             self.stats.prefill_batches += 1
+            self.stats.forwards += 1
             fin = [i for i, (s, _, e) in enumerate(parts) if e == s.prompt.numel()]
             rows = fin + list(range(len(parts), len(parts) + len(rows_dec)))
             if not rows:
@@ -773,6 +805,9 @@ class Engine:
             self.gen_n[slots] += 1
             if self.log is not None:
                 self.log.append(([s.sid for s in both], new))
+            if self.spec:  # the drafts of the next step need these tokens on the host
+                for s, t in zip(both, new.tolist(), strict=True):
+                    s.drafter.extend([t])
             for s in both[:len(fin)]:
                 s.length = s.prompt.numel()
                 s.generated += 1  # from 0, or from where a preemption left it
@@ -894,9 +929,109 @@ class Engine:
             s.generated += 1
         self._watch([self.running[i] for i in live], live, self.ids[:bp])
         self.stats.decode_steps += 1
+        self.stats.forwards += 1
         self.stats.decode_tokens += len(live)
         self.stats.decode_rows += bp
         self.stats.generated += len(live)
+
+    # ---- speculative decoding ------------------------------------------------------------
+
+    def _draft(self, seq: Sequence, k: int) -> list[int]:
+        """Up to k draft tokens for `seq` (a method so a test can put its own drafts in)."""
+        return seq.drafter.draft(k)
+
+    def _spec_step(self) -> None:
+        """One speculative step over every running sequence: drafts on the host, pages for
+        the 1 + k rows of each, one forward over the rows with every row's logits, then the
+        greedy argmax of every row read back to the host (the one synchronize of the step),
+        the agreeing prefix kept, and the device's token ids and token record brought up to
+        date. When no sequence has a draft the step is the ordinary graphed decode step and
+        its tokens are read back the same way."""
+        self._check_stops(wait=True)  # every forward so far was read back, so this is free
+        live = [s for s in self.running if s is not None and not s.stopped]
+        # a draft never runs past max_new: k drafts give up to k + 1 tokens
+        drafts = {s.sid: self._draft(s, min(self.spec, s.max_new - s.generated - 1))
+                  for s in live}
+        if not any(drafts.values()):
+            self._decode()
+            seqs = [s for s in self.running if s is not None]
+            if seqs:
+                idx = torch.tensor([s.slot for s in seqs], device=self.device)
+                for s, t in zip(seqs, self.ids[idx].tolist(), strict=True):
+                    s.drafter.extend([t])
+            return
+        live = self._grow(live, {s.sid: 1 + len(drafts[s.sid]) for s in live})
+        if not live:
+            return
+        # the sequences with a draft first; the rest are one-row decode rows at the end,
+        # which the mixed path sends through paged_decode instead of a 128-row query tile
+        # (when a preemption took every sequence that had one, all rows go through
+        # attention_varlen, which needs at least one sequence)
+        live.sort(key=lambda s: not drafts[s.sid])
+        rows = [[s.drafter.context[-1]] + drafts[s.sid] for s in live]
+        n_dec = sum(1 for s in live if not drafts[s.sid])
+        b = self._verify_batch(live, rows, n_dec if n_dec < len(live) else 0)
+        logits = self.model.prefill(b, self.cache, all_logits=True)
+        pred = torch.argmax(logits, dim=-1).tolist()  # waits for the forward
+        self.stats.forwards += 1
+        self.stats.spec_steps += 1
+        sids, toks, g_rows, g_cols, g_toks, last = [], [], [], [], [], []
+        t0 = 0
+        for s, r in zip(live, rows, strict=True):
+            d = r[1:]
+            new = accept(d, pred[t0:t0 + len(r)])
+            t0 += len(r)
+            self.stats.spec_proposed += len(d)
+            self.stats.spec_accepted += len(new) - 1
+            # the row of the next token and of every accepted draft is cached now; the
+            # rejected rows past it are stale and get overwritten by later steps
+            s.length += len(new)
+            if self.stop_ids:
+                new, hit = cut_at_stop(new, self.stop_ids)
+                if hit:
+                    s.stopped = s.generated + len(new)
+                    self.stop_counts[s.sid] = s.stopped
+            col = s.generated - s.resumed_at  # the slot's gen_n
+            g_rows += [s.slot] * len(new)
+            g_cols += range(col, col + len(new))
+            g_toks += new
+            last.append((s.slot, new[-1], col + len(new)))
+            s.generated += len(new)
+            s.drafter.extend(new)
+            sids += [s.sid] * len(new)
+            toks += new
+        dev = dict(device=self.device, non_blocking=True)
+        g = torch.tensor([g_rows, g_cols, g_toks], dtype=torch.long).pin_memory().to(**dev)
+        self.gen[g[0], g[1]] = g[2]
+        u = torch.tensor(last, dtype=torch.long).T.contiguous().pin_memory().to(**dev)
+        self.ids[u[0]] = u[1]
+        self.gen_n[u[0]] = u[2]
+        if self.log is not None:
+            self.log.append((sids, torch.tensor(toks)))
+        self.stats.decode_tokens += len(toks)
+        self.stats.generated += len(toks)
+
+    def _verify_batch(self, seqs: list[Sequence], rows: list[list[int]], n_dec: int) -> Batch:
+        """The verify forward's inputs: rows[j] (the next token and the drafts) of seqs[j]
+        at positions length.. as a chunk after its cached context, through the pages `_grow`
+        gave it. The last n_dec sequences have one row each."""
+        page = self.page
+        q_lens = [len(r) for r in rows]
+        kv_lens = [s.length + n for s, n in zip(seqs, q_lens, strict=True)]
+        pos, slots = [], []
+        for s, n in zip(seqs, q_lens, strict=True):
+            for p in range(s.length, s.length + n):
+                pos.append(p)
+                slots.append(s.pages[p // page] * page + p % page)
+        cu = torch.tensor([0] + q_lens, dtype=torch.int32).cumsum(0, dtype=torch.int32)
+        dev = dict(device=self.device, non_blocking=True)
+        return Batch(ids=torch.tensor([t for r in rows for t in r]).pin_memory().to(**dev),
+                     positions=torch.tensor(pos, dtype=torch.int32).to(**dev),
+                     slots=torch.tensor(slots, dtype=torch.int32).to(**dev),
+                     seq_lens=torch.tensor(kv_lens, dtype=torch.int32).to(**dev),
+                     block_table=self.block_table[torch.tensor([s.slot for s in seqs])],
+                     cu_seqlens=cu.to(**dev), q_lens=q_lens, max_len=max(kv_lens),
+                     n_dec=n_dec, chunked=True)
 
     def prefill_waiting(self) -> None:
         """Admits and prefills queued requests until the queue is empty or nothing more fits,
@@ -917,6 +1052,12 @@ class Engine:
         # admitted, so a preemption never hits a prompt that has not been prefilled yet
         running = self._grow([s for s in self.running if s is not None])
         admitted = self._admit()
+        if self.spec:
+            if admitted:
+                self._prefill(admitted)
+                self._retire()
+            self._spec_step()
+            return
         if admitted and self.mixed:
             self._prefill(admitted, running)
             self._retire()
