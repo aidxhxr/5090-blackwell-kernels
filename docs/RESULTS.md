@@ -536,6 +536,27 @@ Arithmetic intensity ≈ 61.00 FLOP/byte (w4a16, 16x28672x4096) — memory-bound
 | w4a16_asym | 16x4096x14336 | 2 | 0.0256 | 0.0250 | 1225.21 | 68.4% | 2.91× | ✅ |
 | w4a16_asym | 16x28672x4096 | 2 | 0.0412 | 0.0396 | 1516.92 | 84.6% | 3.59× | ✅ |
 
+## w1gemm
+
+Not measured yet. The kernel, its bench and its tests were written on a machine without a GPU; `bench_w1gemm` has no rows and this section is a placeholder that `make results` will replace with the bench's JSON once it has run. The shapes are DeepSeek V4.1 Flash's expert projections (gate/up 5120 to 2304, down 2304 to 5120) and a 4096² reference, at 1 and 2 bits; the MoE rows are 6 of 384 experts at 1 token. Arithmetic intensity at 1x2304x5120, w1a16: about 14 FLOP per byte at 1 bit, memory-bound; the ceiling is DRAM bandwidth. Speedup is against the bf16 `hgemm` on the dequantized weights, as for w4gemm.
+
+| dtype | shape | variant | median ms | min ms | GB/s | % of peak (1792 GB/s) | speedup vs bf16 hgemm | ok |
+|---|---|---|---|---|---|---|---|---|
+| w1a16 | 1x2304x5120 | 0, 1, 2 | unmeasured | | | | | |
+| w1a16 | 16x2304x5120 | 0, 1, 2 | unmeasured | | | | | |
+| w1a16 | 64x2304x5120 | 1, 2 | unmeasured | | | | | |
+| w1a16 | 1x5120x2304 | 0, 1, 2 | unmeasured | | | | | |
+| w1a16 | 16x5120x2304 | 0, 1, 2 | unmeasured | | | | | |
+| w1a16 | 64x5120x2304 | 1, 2 | unmeasured | | | | | |
+| w1a16 | 1x4096x4096 | 0, 1, 2 | unmeasured | | | | | |
+| w1a16 | 16x4096x4096 | 0, 1, 2 | unmeasured | | | | | |
+| w2a16 | 1x2304x5120 | 0, 1, 2 | unmeasured | | | | | |
+| w2a16 | 16x2304x5120 | 0, 1, 2 | unmeasured | | | | | |
+| w2a16 | 1x5120x2304 | 0, 1, 2 | unmeasured | | | | | |
+| w2a16 | 1x4096x4096 | 0, 1, 2 | unmeasured | | | | | |
+| w1a16_moe | 6 of 384, 1x2304x5120 | 2 | unmeasured | | | | | |
+| w1a16_moe | 6 of 384, 1x5120x2304 | 2 | unmeasured | | | | | |
+
 ## attention
 
 | dtype | shape | variant | median ms | min ms | TFLOPS | % of peak (258.69 TFLOPS) | speedup vs torch | ok |

@@ -98,6 +98,7 @@ docs:
 - [fp8gemm](design/fp8gemm.md)
 - [fp4gemm](design/fp4gemm.md) (NVFP4 and MXFP4, and the quantizer)
 - [w4gemm](design/w4gemm.md)
+- [w1gemm: 1-bit and ternary expert weights for DeepSeek V4.1 Flash, and the grouped MoE form](design/w1gemm.md) (not measured yet)
 - [attention](design/attention.md)
 - [attention backward](design/attention_bwd.md)
 - [one decoder layer](design/layer.md)
