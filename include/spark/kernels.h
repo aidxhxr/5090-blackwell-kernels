@@ -349,6 +349,43 @@ void w4gemm_bf16(const __nv_bfloat16* A, const int32_t* packed, const __nv_bfloa
 int w4gemm_num_variants();
 bool w4gemm_supports(int M, int N, int K, int variant);
 
+// ---- 1-bit / ternary weight GEMM (src/kernels/w1gemm.cu) ----------------------------------
+// C[M,N] = A[M,K] * dequant(W)[K,N] for bf16 A and C, 1-bit (sign) or 2-bit (ternary) weights
+// with one bf16 scale per group of 128 consecutive k of a column, fp32 accumulation. A decode
+// step is a weight stream: a sign bit is 16x fewer bytes than bf16 and 4x fewer than int4.
+constexpr int kW1GroupSize = 128;
+// Quantize W [K, N] bf16 (row-major, the [K, N] layout hgemm takes) per group of 128 k of
+// one column, in fp32. bits == 1: s = bf16(mean|w| over the group), code = w >= 0.
+// bits == 2 (ternary): s = bf16(mean|w|), code = 0 for w < -s/2, 1 for |w| <= s/2, 2 for w > s/2
+// (an all-zero group gets s = 0). Output packed: uint32 [N, K * bits / 32] with k ascending
+// from the lowest bits of the lowest word (bits==1: bit k%32 of word k/32; bits==2: bits
+// 2*(k%16) of word k/16), scales [K/128, N] bf16. K % 128 == 0, N % 16 == 0.
+void w1_quantize_bf16(const __nv_bfloat16* W, uint32_t* packed, __nv_bfloat16* scales, int K,
+                      int N, int bits, cudaStream_t stream);
+// C[M, N] = A[M, K] bf16 * dequant(packed, scales), fp32 accumulate, bf16 out. The
+// dequantized weight is bf16(s * (2 code - 1)) for bits == 1 and bf16(s * (code - 1)) for
+// bits == 2, so it is bit for bit what a dequantize-then-bf16-GEMM reference multiplies.
+// Requires N % 16 == 0, K % 128 == 0, any M >= 1, 16-byte aligned pointers.
+// variant 0: one thread per output element, scalar dequant
+// variant 1: one warp per 16-column strip and 8 tokens over the whole K, the packed bits
+//            straight into registers, selected into bf16x2 mma.sync A fragments
+// variant 2: M <= 16: variant 1's step with the block's warps splitting K and the next
+//            groups' weights in flight in registers, fp32 workspace fixup across the split;
+//            M > 16: block tile with warps along N and M sharing activations through shared
+//            memory
+void w1gemm_bf16(const __nv_bfloat16* A, const uint32_t* packed, const __nv_bfloat16* scales,
+                 __nv_bfloat16* C, int M, int N, int K, int bits, int variant,
+                 cudaStream_t stream);
+int w1gemm_num_variants();
+bool w1gemm_supports(int M, int N, int K, int bits, int variant);
+// Grouped form over E experts for a mixture-of-experts layer: A is [T, K], its rows sorted
+// by expert so expert e owns rows offsets[e]..offsets[e+1]-1 (offsets is int32 [E + 1] on
+// the device, offsets[E] == T, empty experts allowed); packed is E stacked [N, K*bits/32]
+// weights and scales E stacked [K/128, N]; C is [T, N]. One launch for every expert.
+void w1gemm_moe_bf16(const __nv_bfloat16* A, const uint32_t* packed,
+                     const __nv_bfloat16* scales, const int32_t* offsets, __nv_bfloat16* C,
+                     int E, int N, int K, int bits, int variant, cudaStream_t stream);
+
 // ---- RoPE + K/V cache append -------------------------------------------------------------
 // From qkv = [B, S, (H_q + 2 H_kv) * D] bf16 (a fused q|k|v projection) and rotary tables
 // cos, sin = [>= pos0 + S, D] fp32 in the rotate-half layout (column d pairs with d + D/2;
