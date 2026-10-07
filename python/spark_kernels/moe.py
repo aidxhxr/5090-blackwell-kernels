@@ -317,20 +317,20 @@ class MoEBlock1Bit:
                std: float = 0.02) -> MoEBlock1Bit:
         """A block of normal weights for benches, quantized expert by expert so the bf16
         source of one expert (3 * hidden * inter * 2 bytes) is all that is live at once."""
-        E, H, I = cfg.n_routed, cfg.hidden, cfg.inter
+        E, H, N_I = cfg.n_routed, cfg.hidden, cfg.inter
 
         def rand(*shape):
             return torch.randn(*shape, device=device, generator=generator) \
                 .mul_(std).to(torch.bfloat16)
 
-        gate_up = _cat_experts([quantize_experts(rand(1, H, 2 * I), cfg.bits)
+        gate_up = _cat_experts([quantize_experts(rand(1, H, 2 * N_I), cfg.bits)
                                 for _ in range(E)], cfg.bits)
-        down = _cat_experts([quantize_experts(rand(1, I, H), cfg.bits)
+        down = _cat_experts([quantize_experts(rand(1, N_I, H), cfg.bits)
                              for _ in range(E)], cfg.bits)
         shared_gu = shared_dn = None
         if cfg.n_shared:
-            shared_gu = quantize_weight(rand(H, 2 * I * cfg.n_shared), cfg.bits)
-            shared_dn = quantize_weight(rand(I * cfg.n_shared, H), cfg.bits)
+            shared_gu = quantize_weight(rand(H, 2 * N_I * cfg.n_shared), cfg.bits)
+            shared_dn = quantize_weight(rand(N_I * cfg.n_shared, H), cfg.bits)
         router_w = rand(H, E)
         router_b = torch.randn(E, device=device, generator=generator).mul_(0.1)
         return MoEBlock1Bit(cfg, gate_up, down, shared_gu, shared_dn, router_w, router_b)
