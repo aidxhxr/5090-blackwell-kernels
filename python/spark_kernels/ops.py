@@ -20,8 +20,8 @@ import torch
 from . import _C
 
 KERNELS = ("bandwidth", "rmsnorm", "swiglu", "softmax", "sgemm", "hgemm", "fp8gemm", "fp4gemm",
-           "w4gemm", "attention", "attention_bwd", "paged_decode", "attention_varlen",
-           "attention_fp8", "sample")
+           "w4gemm", "w1gemm", "attention", "attention_bwd", "paged_decode",
+           "attention_varlen", "attention_fp8", "sample")
 
 
 def num_variants(name: str) -> int:
@@ -344,6 +344,119 @@ def w4gemm(a: torch.Tensor, w: W4Weight | torch.Tensor, scales: torch.Tensor | N
     if scales is None:
         raise ValueError("w4gemm needs the scales of the packed weight")
     return _C.w4gemm(a, w, scales, zeros, variant)
+
+
+def w1_quantize(w: torch.Tensor, bits: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sign (bits=1) or ternary (bits=2) quantization of a [K, N] bfloat16 weight (the [K, N]
+    layout of `hgemm`, x @ w), one scale per 128 consecutive k of a column, computed in fp32.
+
+    s = bf16(mean|w| over the group). bits=1: code = w >= 0, w ~ s * (2 code - 1), so every
+    weight becomes +-s. bits=2: code = 0 for w < -s/2, 1 for |w| <= s/2, 2 for w > s/2 (the
+    rounded s), w ~ s * (code - 1), so every weight becomes -s, 0 or +s. An all-zero group
+    gets s = 0.
+
+    Returns (packed [N, K * bits / 32] int32 with k ascending from the lowest bits of the
+    lowest word of row n: bit k % 32 of word k // 32 for bits=1, bits 2 (k % 16) and up of
+    word k // 16 for bits=2; scales [K/128, N] bfloat16). Needs K a multiple of 128 and N a
+    multiple of 16. `reference.w1_quantize` is the same in plain torch, bit for bit.
+    """
+    return _C.w1_quantize(w, bits)
+
+
+class W1Weight:
+    """A sign or ternary weight ready for `w1gemm`: the packed codes, the scales and the
+    width of the codes (1 or 2 bits) of a [K, N] (in_features x out_features) matrix."""
+
+    def __init__(self, packed: torch.Tensor, scales: torch.Tensor, bits: int = 1):
+        self.packed = packed
+        self.scales = scales
+        self.bits = bits
+
+    @staticmethod
+    def quantize(w: torch.Tensor, bits: int = 1) -> W1Weight:
+        """Quantize (w1_quantize) a [K, N] bfloat16 weight."""
+        packed, scales = w1_quantize(w, bits)
+        return W1Weight(packed, scales, bits)
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        """(K, N) of the weight it replaces."""
+        return self.packed.shape[1] * 32 // self.bits, self.packed.shape[0]
+
+    def nbytes(self) -> int:
+        return sum(t.numel() * t.element_size() for t in (self.packed, self.scales))
+
+
+def w1gemm(a: torch.Tensor, w: W1Weight | torch.Tensor, scales: torch.Tensor | None = None,
+           bits: int = 1, variant: int = -1) -> torch.Tensor:
+    """W1A16 GEMM: a [M, K] bfloat16 @ sign or ternary weight [K, N] -> [M, N] bfloat16, fp32
+    accumulate.
+
+    `w` is a `W1Weight` (which carries its own `bits`), or the packed codes with `scales` and
+    `bits` passed separately. The weight each product uses is bf16(s * (2 code - 1)) for one
+    bit and bf16(s * (code - 1)) for two, what `reference.w1_dequantize` returns. Needs K a
+    multiple of 128, N a multiple of 16, any M >= 1. Variant -1 is the top rung.
+    """
+    if isinstance(w, W1Weight):
+        if scales is not None:
+            raise ValueError("pass the scales inside the W1Weight, not separately")
+        w, scales, bits = w.packed, w.scales, w.bits
+    if scales is None:
+        raise ValueError("w1gemm needs the scales of the packed weight")
+    return _C.w1gemm(a, w, scales, bits, variant)
+
+
+class W1ExpertWeights:
+    """The W1Weights of E experts stacked for `w1gemm_moe`: packed [E, N, K * bits / 32]
+    int32, scales [E, K/128, N] bfloat16, one `bits` for all of them."""
+
+    def __init__(self, packed: torch.Tensor, scales: torch.Tensor, bits: int = 1):
+        self.packed = packed
+        self.scales = scales
+        self.bits = bits
+
+    @staticmethod
+    def quantize(w: torch.Tensor, bits: int = 1) -> W1ExpertWeights:
+        """Quantize an [E, K, N] bfloat16 weight stack expert by expert (w1_quantize) and
+        stack the results."""
+        if w.dim() != 3:
+            raise ValueError(f"expected an [E, K, N] weight stack, got shape {tuple(w.shape)}")
+        pairs = [w1_quantize(w[e], bits) for e in range(w.shape[0])]
+        packed = torch.stack([p for p, _ in pairs])
+        scales = torch.stack([s for _, s in pairs])
+        return W1ExpertWeights(packed, scales, bits)
+
+    @property
+    def num_experts(self) -> int:
+        return self.packed.shape[0]
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        """(E, K, N) of the weight stack it replaces."""
+        return (self.packed.shape[0], self.packed.shape[2] * 32 // self.bits,
+                self.packed.shape[1])
+
+    def expert(self, e: int) -> W1Weight:
+        """Expert e's weight on its own, for `w1gemm`."""
+        return W1Weight(self.packed[e], self.scales[e], self.bits)
+
+    def nbytes(self) -> int:
+        return sum(t.numel() * t.element_size() for t in (self.packed, self.scales))
+
+
+def w1gemm_moe(a: torch.Tensor, w: W1ExpertWeights, offsets: torch.Tensor,
+               variant: int = -1) -> torch.Tensor:
+    """`w1gemm` grouped over the E experts of `w`: a [T, K] bfloat16 with its rows sorted by
+    expert, expert e owning rows offsets[e]..offsets[e+1]-1 -> [T, N] bfloat16, row t the
+    product of a[t] with its expert's weight.
+
+    `offsets` is int32 [E + 1] on a's device with offsets[E] == T; an expert with no rows
+    (offsets[e] == offsets[e+1]) is skipped. One launch for every expert, the same numbers as
+    calling `w1gemm` on each expert's rows with `w.expert(e)`.
+    """
+    if not isinstance(w, W1ExpertWeights):
+        raise TypeError("w1gemm_moe takes a W1ExpertWeights (W1ExpertWeights.quantize)")
+    return _C.w1gemm_moe(a, w.packed, w.scales, offsets, w.bits, variant)
 
 
 def rope_append_(

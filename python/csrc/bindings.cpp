@@ -635,6 +635,113 @@ Tensor w4gemm(const Tensor& a, const Tensor& packed, const Tensor& scales,
     return c;
 }
 
+// ---- W1A16 (sign and ternary weights) -------------------------------------------------------
+
+void check_w1_bits(int bits, const char* op) {
+    TORCH_CHECK(bits == 1 || bits == 2, op, " takes bits 1 (sign) or 2 (ternary), got ", bits);
+}
+
+// w [K, N] bf16 -> (packed [N, K * bits / 32] int32, scales [K/128, N] bf16): one scale per
+// 128 k of a column, s = bf16(mean|w|); bits == 1 codes w >= 0, bits == 2 codes w against
+// +-s/2. k ascends from the lowest bits of the lowest word of its row (kernels.h).
+std::tuple<Tensor, Tensor> w1_quantize(const Tensor& w, int bits) {
+    check_cuda_contig(w, "w");
+    check_w1_bits(bits, "w1_quantize");
+    TORCH_CHECK(w.scalar_type() == at::kBFloat16, "w1_quantize expects a bfloat16 weight");
+    TORCH_CHECK(w.dim() == 2, "w1_quantize expects a 2-D [K, N] weight");
+    const int64_t K = w.size(0), N = w.size(1);
+    TORCH_CHECK(K % spark::kW1GroupSize == 0 && N % 16 == 0 && K <= INT32_MAX && N <= INT32_MAX,
+                "w1_quantize needs K a multiple of 128 and N a multiple of 16, got ", K, "x", N);
+    const c10::cuda::CUDAGuard guard(w.device());
+    Tensor packed = at::empty({N, K * bits / 32}, w.options().dtype(at::kInt));
+    Tensor sc = at::empty({K / spark::kW1GroupSize, N}, w.options());
+    spark::w1_quantize_bf16(bf16_ptr(w), reinterpret_cast<uint32_t*>(packed.data_ptr<int32_t>()),
+                            bf16_ptr_mut(sc), static_cast<int>(K), static_cast<int>(N), bits,
+                            current_stream(w));
+    return {packed, sc};
+}
+
+// The checks w1gemm and w1gemm_moe share on one expert's (packed [N, K * bits / 32], scales
+// [K/128, N]) pair, given the trailing two dims of each; returns N.
+int64_t check_w1_weight(const Tensor& a, const Tensor& packed, const Tensor& scales, int bits,
+                        int64_t K, const char* op) {
+    check_cuda_contig(packed, "packed");
+    check_cuda_contig(scales, "scales");
+    TORCH_CHECK(packed.scalar_type() == at::kInt, op, " expects packed as the int32 tensor "
+                "from w1_quantize, got ", packed.scalar_type());
+    const int64_t N = packed.size(-2);
+    TORCH_CHECK(packed.size(-1) == K * bits / 32, "packed is ", packed.sizes(),
+                ", expected a trailing [N, K * bits / 32] = [N, ", K * bits / 32, "] for K = ", K,
+                ", bits = ", bits);
+    TORCH_CHECK(K % spark::kW1GroupSize == 0, op, " needs K a multiple of 128, got ", K);
+    TORCH_CHECK(N % 16 == 0, op, " needs N a multiple of 16, got ", N);
+    TORCH_CHECK(N <= INT32_MAX && K <= INT32_MAX, op, " dims too large");
+    TORCH_CHECK(scales.scalar_type() == at::kBFloat16 &&
+                    scales.size(-2) == K / spark::kW1GroupSize && scales.size(-1) == N,
+                "scales must be bfloat16 with trailing [", K / spark::kW1GroupSize, ", ", N,
+                "], got ", scales.sizes());
+    TORCH_CHECK(packed.device() == a.device() && scales.device() == a.device(),
+                "packed and scales must be on a's device");
+    TORCH_CHECK(aligned16(a) && aligned16(packed) && aligned16(scales), op,
+                " needs 16-byte aligned a, packed and scales storage");
+    return N;
+}
+
+// a [M, K] bf16 times the sign or ternary weight (packed [N, K * bits / 32] int32, scales
+// [K/128, N] bf16 from w1_quantize) -> [M, N] bf16, fp32 accumulate.
+Tensor w1gemm(const Tensor& a, const Tensor& packed, const Tensor& scales, int bits,
+              int variant) {
+    check_cuda_contig(a, "a");
+    check_w1_bits(bits, "w1gemm");
+    TORCH_CHECK(a.scalar_type() == at::kBFloat16 && a.dim() == 2,
+                "w1gemm expects a 2-D bfloat16 a");
+    TORCH_CHECK(packed.dim() == 2 && scales.dim() == 2,
+                "w1gemm expects 2-D packed and scales (w1gemm_moe takes the stacked ones)");
+    const int64_t M = a.size(0), K = a.size(1);
+    const int64_t N = check_w1_weight(a, packed, scales, bits, K, "w1gemm");
+    TORCH_CHECK(M <= INT32_MAX, "w1gemm dims too large");
+    const c10::cuda::CUDAGuard guard(a.device());
+    Tensor c = at::empty({M, N}, a.options());
+    const int v = resolve_variant(variant, spark::w1gemm_num_variants());
+    spark::w1gemm_bf16(bf16_ptr(a), reinterpret_cast<const uint32_t*>(packed.data_ptr<int32_t>()),
+                       bf16_ptr(scales), bf16_ptr_mut(c), static_cast<int>(M),
+                       static_cast<int>(N), static_cast<int>(K), bits, v, current_stream(a));
+    return c;
+}
+
+// Grouped over E experts: a [T, K] bf16 with its rows sorted by expert, expert e owning rows
+// offsets[e]..offsets[e+1]-1 (offsets int32 [E+1] on the device, offsets[E] == T, empty
+// experts allowed); packed [E, N, K * bits / 32] int32 and scales [E, K/128, N] bf16 are the
+// per-expert w1_quantize outputs stacked -> [T, N] bf16.
+Tensor w1gemm_moe(const Tensor& a, const Tensor& packed, const Tensor& scales,
+                  const Tensor& offsets, int bits, int variant) {
+    check_cuda_contig(a, "a");
+    check_cuda_contig(offsets, "offsets");
+    check_w1_bits(bits, "w1gemm_moe");
+    TORCH_CHECK(a.scalar_type() == at::kBFloat16 && a.dim() == 2,
+                "w1gemm_moe expects a 2-D bfloat16 a [T, K]");
+    TORCH_CHECK(packed.dim() == 3 && scales.dim() == 3,
+                "w1gemm_moe expects packed [E, N, K * bits / 32] and scales [E, K/128, N]");
+    const int64_t E = packed.size(0);
+    TORCH_CHECK(scales.size(0) == E, "scales has ", scales.size(0), " experts, packed has ", E);
+    const int64_t T = a.size(0), K = a.size(1);
+    const int64_t N = check_w1_weight(a, packed, scales, bits, K, "w1gemm_moe");
+    TORCH_CHECK(offsets.scalar_type() == at::kInt && offsets.dim() == 1 && offsets.size(0) == E + 1,
+                "offsets must be int32 [E + 1] = [", E + 1, "], got ", offsets.scalar_type(), " ",
+                offsets.sizes());
+    TORCH_CHECK(offsets.device() == a.device(), "offsets must be on a's device");
+    TORCH_CHECK(T <= INT32_MAX && E <= INT32_MAX, "w1gemm_moe dims too large");
+    const c10::cuda::CUDAGuard guard(a.device());
+    Tensor c = at::empty({T, N}, a.options());
+    const int v = resolve_variant(variant, spark::w1gemm_num_variants());
+    spark::w1gemm_moe_bf16(bf16_ptr(a),
+                           reinterpret_cast<const uint32_t*>(packed.data_ptr<int32_t>()),
+                           bf16_ptr(scales), offsets.data_ptr<int32_t>(), bf16_ptr_mut(c),
+                           static_cast<int>(E), static_cast<int>(N), static_cast<int>(K), bits, v,
+                           current_stream(a));
+    return c;
+}
+
 // The rows each K/V head is allocated when k and v are the leading S_kv rows of every head of
 // a [B, H_kv, cap, D] cache (`cache[:, :, :length]`, the filled part of a cache with spare
 // capacity), which the forward reads in place; 0 for packed k and v. Anything else is not a
@@ -1062,6 +1169,7 @@ int num_variants(const std::string& name) {
     if (name == "attention_fp8") return spark::attention_fp8_num_variants();
     if (name == "attention_bwd") return spark::attention_bwd_num_variants();
     if (name == "w4gemm") return spark::w4gemm_num_variants();
+    if (name == "w1gemm") return spark::w1gemm_num_variants();
     if (name == "bandwidth") return spark::bandwidth_num_variants();
     if (name == "paged_decode") return spark::paged_decode_num_variants();
     if (name == "attention_varlen") return spark::attention_varlen_num_variants();
@@ -1124,6 +1232,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "a [M, K] bf16 @ the int4 weight (packed, scales, zeros) -> [M, N] bf16, fp32 accumulate",
           py::arg("a"), py::arg("packed"), py::arg("scales"), py::arg("zeros") = py::none(),
           py::arg("variant") = -1);
+    m.def("w1_quantize", &w1_quantize,
+          "sign (bits=1) or ternary (bits=2) quantization of a [K, N] bf16 weight, one scale "
+          "per 128 k: (packed [N, K * bits / 32] int32, scales [K/128, N] bf16)",
+          py::arg("w"), py::arg("bits") = 1);
+    m.def("w1gemm", &w1gemm,
+          "a [M, K] bf16 @ the sign or ternary weight (packed, scales) -> [M, N] bf16, fp32 "
+          "accumulate",
+          py::arg("a"), py::arg("packed"), py::arg("scales"), py::arg("bits") = 1,
+          py::arg("variant") = -1);
+    m.def("w1gemm_moe", &w1gemm_moe,
+          "w1gemm grouped over E experts: a [T, K] sorted by expert with offsets int32 [E + 1], "
+          "packed [E, N, K * bits / 32], scales [E, K/128, N] -> [T, N] bf16",
+          py::arg("a"), py::arg("packed"), py::arg("scales"), py::arg("offsets"),
+          py::arg("bits") = 1, py::arg("variant") = -1);
     m.def("attention", &attention,
           "softmax(q k^T / sqrt(D)) v over [B, H, S, D] bf16 tensors (k, v may have fewer heads)",
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("causal") = false,

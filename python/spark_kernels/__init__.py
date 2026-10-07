@@ -18,6 +18,11 @@ Ops (all run on the current CUDA stream, all accept float32 or bfloat16 unless n
                                              with a fused act(a @ b + bias) + residual epilogue
     w4gemm(a, W4Weight.quantize(w))          bf16 activations times an int4 weight (one scale
                                              per 128 k), fp32 accumulate
+    w1gemm(a, W1Weight.quantize(w, bits))    bf16 activations times a sign (bits=1) or ternary
+                                             (bits=2) weight, one scale per 128 k, fp32 accumulate
+    w1gemm_moe(a, W1ExpertWeights.quantize(w, bits), offsets)
+                                             the same over E experts' weights, a's rows sorted
+                                             by expert (offsets int32 [E + 1])
     hgemm_swiglu(a, w_gate_up, ...)          silu(a @ w_gate) * (a @ w_up) in one GEMM from the
                                              interleaved weight of interleave_gate_up(g, u)
     fp8gemm(a, b_t, scale_a, scale_b, variant=-1, sfa=None, sfb=None)
@@ -63,6 +68,8 @@ from importlib.metadata import PackageNotFoundError, version
 from . import engine, layer, reference
 from .ops import (
     AttentionFunction,
+    W1ExpertWeights,
+    W1Weight,
     W4Weight,
     add_rmsnorm_,
     attention,
@@ -90,6 +97,9 @@ from .ops import (
     sgemm,
     softmax,
     swiglu,
+    w1_quantize,
+    w1gemm,
+    w1gemm_moe,
     w4_quantize,
     w4_repack,
     w4gemm,
@@ -97,6 +107,8 @@ from .ops import (
 
 __all__ = [
     "AttentionFunction",
+    "W1ExpertWeights",
+    "W1Weight",
     "W4Weight",
     "add_rmsnorm_",
     "attention",
@@ -127,6 +139,9 @@ __all__ = [
     "sgemm",
     "softmax",
     "swiglu",
+    "w1_quantize",
+    "w1gemm",
+    "w1gemm_moe",
     "w4_quantize",
     "w4_repack",
     "w4gemm",
