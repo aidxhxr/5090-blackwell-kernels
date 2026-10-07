@@ -301,6 +301,49 @@ __global__ void __launch_bounds__(kSplitWarps * 32)
     }
 }
 
+// ---- grouped form over the experts of an MoE layer -------------------------------------
+
+// blockIdx.y is the expert; the block's four warps each own a 16-column strip of its weight
+// and walk the expert's token rows offsets[e]..offsets[e+1]-1 in chunks of 8 with variant 1's
+// step (the weights are re-read per chunk, from L2 past the first). Empty experts exit.
+template <int BITS>
+__global__ void __launch_bounds__(128)
+    w1_moe_kernel(const __nv_bfloat16* __restrict__ A, const uint32_t* __restrict__ packed,
+                  const __nv_bfloat16* __restrict__ scales, const int32_t* __restrict__ offsets,
+                  __nv_bfloat16* __restrict__ C, int N, int K) {
+    const int e = blockIdx.y;
+    const int tb = offsets[e], te = offsets[e + 1];
+    const int t = blockIdx.x * 4 + (threadIdx.x >> 5);
+    if (tb >= te || t >= N / 16) return;
+    const uint32_t* pe = packed + static_cast<size_t>(e) * N * w1::words_per_row(K, BITS);
+    const __nv_bfloat16* se = scales + static_cast<size_t>(e) * (K / kG) * N;
+    for (int m0 = tb; m0 < te; m0 += 8)
+        strip_chunk<BITS>(A, pe, se, C, m0, te, N, K, t * 16, threadIdx.x & 31);
+}
+
+// Variant 0 of the grouped form: one thread per output column, a loop over the expert's rows.
+__global__ void w1_moe_naive_kernel(const __nv_bfloat16* __restrict__ A,
+                                    const uint32_t* __restrict__ packed,
+                                    const __nv_bfloat16* __restrict__ scales,
+                                    const int32_t* __restrict__ offsets,
+                                    __nv_bfloat16* __restrict__ C, int N, int K, int bits) {
+    const int e = blockIdx.y;
+    const int tb = offsets[e], te = offsets[e + 1];
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n >= N) return;
+    const uint32_t* pe = packed + static_cast<size_t>(e) * N * w1::words_per_row(K, bits);
+    const __nv_bfloat16* se = scales + static_cast<size_t>(e) * (K / kG) * N;
+    for (int m = tb; m < te; ++m) {
+        float acc = 0.f;
+        for (int k = 0; k < K; ++k) {
+            const float s = __bfloat162float(se[static_cast<size_t>(k / kG) * N + n]);
+            const float w = dequant_scalar(w1::code_at(pe, n, k, K, bits), s, bits);
+            acc = fmaf(__bfloat162float(A[static_cast<size_t>(m) * K + k]), w, acc);
+        }
+        C[static_cast<size_t>(m) * N + n] = __float2bfloat16(acc);
+    }
+}
+
 template <int BITS>
 void launch_v1(const __nv_bfloat16* A, const uint32_t* packed, const __nv_bfloat16* scales,
                __nv_bfloat16* C, int M, int N, int K, cudaStream_t stream) {
@@ -379,6 +422,31 @@ void w1gemm_bf16(const __nv_bfloat16* A, const uint32_t* packed, const __nv_bflo
                 launch_v2<2>(A, packed, scales, C, M, N, K, stream);
             break;
     }
+}
+
+void w1gemm_moe_bf16(const __nv_bfloat16* A, const uint32_t* packed,
+                     const __nv_bfloat16* scales, const int32_t* offsets, __nv_bfloat16* C,
+                     int E, int N, int K, int bits, int variant, cudaStream_t stream) {
+    SPARK_REQUIRE(variant >= 0 && variant < w1gemm_num_variants(), "w1gemm_moe: bad variant");
+    SPARK_REQUIRE(E >= 1 && w1gemm_supports(1, N, K, bits, variant),
+                  "w1gemm_moe: needs E >= 1, bits 1 or 2, N % 16 == 0 and K % 128 == 0");
+    SPARK_REQUIRE(A && packed && scales && offsets && C, "w1gemm_moe: null pointer");
+    SPARK_REQUIRE(is_aligned16(A) && is_aligned16(packed) && is_aligned16(scales),
+                  "w1gemm_moe: A, packed and scales must be 16-byte aligned");
+    if (variant == 0) {
+        const dim3 grid(cdiv(N, 128), E);
+        w1_moe_naive_kernel<<<grid, 128, 0, stream>>>(A, packed, scales, offsets, C, N, K, bits);
+        SPARK_CHECK_LAUNCH();
+        return;
+    }
+    // Variants 1 and 2 share the warp kernel: an expert's token count is not known on the
+    // host, so the K split of variant 2 is not picked per expert.
+    const dim3 grid(cdiv(N / 16, 4), E);
+    if (bits == 1)
+        w1_moe_kernel<1><<<grid, 128, 0, stream>>>(A, packed, scales, offsets, C, N, K);
+    else
+        w1_moe_kernel<2><<<grid, 128, 0, stream>>>(A, packed, scales, offsets, C, N, K);
+    SPARK_CHECK_LAUNCH();
 }
 
 }  // namespace spark
