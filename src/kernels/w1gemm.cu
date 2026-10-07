@@ -205,11 +205,123 @@ __global__ void __launch_bounds__(128)
     strip_chunk<BITS>(A, packed, scales, C, blockIdx.y * 8, M, N, K, t * 16, threadIdx.x & 31);
 }
 
+// ---- variant 2, M <= 16: four warps split K, partial sums through shared memory ---------
+
+// Block: WK = 4 warps on one 16-column strip (blockIdx.x) and one chunk of 16 tokens
+// (blockIdx.y), over the whole K. Warp wk takes groups wk, wk + 4, ... so the block's warps
+// read consecutive bytes of the strip at any moment; the weights of the next D groups are in
+// a register ring, and no barrier is taken until the partial sums are added at the end.
+// The whole K lives in one block, so the sum is exact and reproducible: no atomics.
+constexpr int kSplitWarps = 4;
+constexpr int kSplitDepth = 2;
+
+template <int BITS>
+__global__ void __launch_bounds__(kSplitWarps * 32)
+    w1_split_kernel(const __nv_bfloat16* __restrict__ A, const uint32_t* __restrict__ packed,
+                    const __nv_bfloat16* __restrict__ scales, __nv_bfloat16* __restrict__ C,
+                    int M, int N, int K) {
+    constexpr int NT = 2, WK = kSplitWarps, D = kSplitDepth;
+    constexpr int E = NT * 4;  // accumulator elements per lane
+    __shared__ float red[WK * E * 32];
+
+    const int lane = threadIdx.x & 31, wk = threadIdx.x >> 5;
+    const int g = lane >> 2, c = lane & 3;
+    const int G = K / kG;
+    const int ng = G > wk ? (G - wk + WK - 1) / WK : 0;  // this warp's groups
+    const int n0 = blockIdx.x * 16, m0 = blockIdx.y * 16;
+    const int wpr = w1::words_per_row(K, BITS);
+    const unsigned short* sbase = reinterpret_cast<const unsigned short*>(scales) + n0 + g;
+    const uint4* abase[NT];
+    bool arow[NT];
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt) {
+        const int tw = nt * 8 + g;
+        arow[nt] = m0 + tw < M;
+        abase[nt] =
+            reinterpret_cast<const uint4*>(A + static_cast<size_t>(arow[nt] ? m0 + tw : 0) * K) +
+            c;
+    }
+
+    GroupWords<BITS> wr[D][2];
+    unsigned short sr[D][2];
+    auto load_w = [&](int slot, int grp) {
+        wr[slot][0].load(packed, n0 + g, grp, wpr);
+        wr[slot][1].load(packed, n0 + g + 8, grp, wpr);
+        const size_t srow = static_cast<size_t>(grp) * N;
+        sr[slot][0] = __ldg(sbase + srow);
+        sr[slot][1] = __ldg(sbase + srow + 8);
+    };
+
+    float acc[NT][4];
+#pragma unroll
+    for (int j = 0; j < NT; ++j)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) acc[j][e] = 0.f;
+
+#pragma unroll
+    for (int d = 0; d < D; ++d)
+        if (d < ng) load_w(d, wk + d * WK);
+
+    for (int i0 = 0; i0 < ng; i0 += D) {
+#pragma unroll
+        for (int d = 0; d < D; ++d) {
+            const int i = i0 + d;
+            if (i < ng) {
+                const int grp = wk + i * WK;
+                uint4 act[NT][4];
+#pragma unroll
+                for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+                    for (int q = 0; q < 4; ++q)
+                        act[nt][q] = arow[nt] ? __ldg(abase[nt] + grp * 16 + 4 * q)
+                                              : make_uint4(0, 0, 0, 0);
+                group_mma<BITS, NT>(acc, wr[d][0], wr[d][1], w1::splat(sr[d][0]),
+                                    w1::splat(sr[d][1]), act, c);
+                if (i + D < ng) load_w(d, wk + (i + D) * WK);
+            }
+        }
+    }
+
+    // Sum the WK warps' partials; thread i then owns elements of lane i % 32.
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+        for (int q = 0; q < 4; ++q) red[(wk * E + nt * 4 + q) * 32 + lane] = acc[nt][q];
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < E * 32; idx += WK * 32) {
+        const int e = idx / 32, ln = idx % 32;
+        float v = 0.f;
+#pragma unroll
+        for (int w = 0; w < WK; ++w) v += red[(w * E + e) * 32 + ln];
+        const int nt = e / 4, q = e % 4;
+        const int dn = (ln >> 2) + (q >> 1) * 8;
+        const int dm = nt * 8 + 2 * (ln & 3) + (q & 1);
+        const int m = m0 + dm;
+        if (m < M) C[static_cast<size_t>(m) * N + n0 + dn] = __float2bfloat16(v);
+    }
+}
+
 template <int BITS>
 void launch_v1(const __nv_bfloat16* A, const uint32_t* packed, const __nv_bfloat16* scales,
                __nv_bfloat16* C, int M, int N, int K, cudaStream_t stream) {
     const dim3 grid(cdiv(N / 16, 4), cdiv(M, 8));
     w1_reg_kernel<BITS><<<grid, 128, 0, stream>>>(A, packed, scales, C, M, N, K);
+    SPARK_CHECK_LAUNCH();
+}
+
+// M <= 16: one block of four K-splitting warps per 16-column strip and 16-token chunk.
+// M > 16: variant 1's kernel over 8-token chunks; a shared-memory block tile for the
+// prefill shapes is not written yet, and at 1 bit the weight stream is small enough that
+// the activation re-reads of variant 1 come from L2.
+template <int BITS>
+void launch_v2(const __nv_bfloat16* A, const uint32_t* packed, const __nv_bfloat16* scales,
+               __nv_bfloat16* C, int M, int N, int K, cudaStream_t stream) {
+    if (M > 16) {
+        launch_v1<BITS>(A, packed, scales, C, M, N, K, stream);
+        return;
+    }
+    const dim3 grid(N / 16, cdiv(M, 16));
+    w1_split_kernel<BITS><<<grid, kSplitWarps * 32, 0, stream>>>(A, packed, scales, C, M, N, K);
     SPARK_CHECK_LAUNCH();
 }
 
@@ -261,11 +373,10 @@ void w1gemm_bf16(const __nv_bfloat16* A, const uint32_t* packed, const __nv_bflo
                 launch_v1<2>(A, packed, scales, C, M, N, K, stream);
             break;
         default:
-            // The K-split rung is not written yet: variant 2 runs variant 1's kernel.
             if (bits == 1)
-                launch_v1<1>(A, packed, scales, C, M, N, K, stream);
+                launch_v2<1>(A, packed, scales, C, M, N, K, stream);
             else
-                launch_v1<2>(A, packed, scales, C, M, N, K, stream);
+                launch_v2<2>(A, packed, scales, C, M, N, K, stream);
             break;
     }
 }
