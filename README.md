@@ -2,8 +2,8 @@
 
 I have an RTX 5090 and a copy of cuBLAS, and I wanted to know how close I could get to it by
 hand. So I wrote the pieces of a Llama-style decoder block from scratch: RMSNorm, SwiGLU,
-softmax, an fp32 GEMM, a bf16 tensor-core GEMM, fp8 and fp4 tensor-core GEMMs, a GEMM for
-int4 weights, and fused attention with grouped-query heads, in bf16 and fp8, with its
+softmax, an fp32 GEMM, a bf16 tensor-core GEMM, fp8 and fp4 tensor-core GEMMs, GEMMs for
+int4 and for 1-bit weights, and fused attention with grouped-query heads, in bf16 and fp8, with its
 backward pass and a paged K/V cache. Each kernel is a ladder. Variant 0 is the naive
 version. Every rung after it changes one thing, gets benchmarked against cuBLAS, cuBLASLt or
 PyTorch on the same shapes in the same timing loop, and gets profiled in Nsight Compute so
@@ -383,6 +383,46 @@ tokens/s for 32 layers against 105. At 131,072 cached tokens attention is most o
 the gain drops to 1.47x. Round-to-nearest int4 has the format's error, up to half a step per
 weight; GPTQ or AWQ change the codes and scales, not the kernel. Details in
 [the design note](docs/design/w4gemm.md).
+
+## 1-bit experts for DeepSeek V4.1 Flash
+
+The int4 result says a batch-1 decode step is bytes of weights over the copy roof, and a
+mixture of experts makes it more so: a step reads only the experts the router picked. DeepSeek
+V4.1 Flash is 552B parameters in 40 layers, hidden 5120, 384 routed experts of SwiGLU
+intermediate 2304 plus one shared, 6 active per token. So `w1gemm` takes bf16 activations and
+weights at one bit (the sign) or two (ternary) with one bf16 scale per 128 k of a column, the
+BitNet b1.58 absmean recipe applied after training: `s` is the group's mean |w|, the weight is
+`-s` or `+s` (or `0` at two bits), and the kernel's dequant is an XOR of the code bit into the
+sign of a splatted scale, no multiply, exact. `w1gemm_moe` is the grouped form: tokens sorted
+by expert, int32 offsets, one launch for all 384 experts. `moe.py` has the sigmoid routing with
+the selection bias, top-6 of 384 renormalized, and `deepseek_flash.py` loads the checkpoint,
+whose routed experts ship in MXFP4.
+
+| rung | what changed |
+|---|---|
+| v0 | one thread per output, one sign-add per weight, one FMA per group |
+| v1 | one warp per 16-column strip and 8 tokens, the bits selected into bf16x2 `mma.sync` fragments, activations straight into registers |
+| v2 | warps split K for M <= 16, a register ring of the next groups' words, partial sums added in shared memory |
+
+What the format buys is a byte count, and byte counts are all these are: nothing in this
+section has run on the card. The routed experts of one layer are 13.6 billion weights.
+
+| format | bytes per weight | one layer's experts | 40 layers | 6 active experts, one layer | 6 active, 40 layers, per token | decode step on one layer |
+|---|---|---|---|---|---|---|
+| bf16 | 2 | 27.2 GB | 1,087 GB | 425 MB | 17.0 GB | unmeasured |
+| MXFP4 (the checkpoint) | 0.531 | 7.2 GB | 289 GB | 113 MB | 4.5 GB | unmeasured |
+| int4 g128 (`w4gemm`) | 0.516 | 7.0 GB | 280 GB | 109 MB | 4.4 GB | unmeasured |
+| ternary g128 (`w1gemm`, bits=2) | 0.266 | 3.6 GB | 144 GB | 56 MB | 2.3 GB | unmeasured |
+| 1 bit g128 (`w1gemm`, bits=1) | 0.141 | 1.9 GB | 76 GB | 30 MB | 1.2 GB | unmeasured |
+
+At 1 bit the model's experts are 68 GB of packed bits and 8.5 GB of scales, which is not a 32
+GB card; about 15 to 17 layers of them fit next to the rest, so the bench
+(`scripts/bench_deepseek_flash.py`, `bench_w1gemm`) runs per layer and rotates what fits past
+L2. The per-layer floor for the six experts' bytes at the copy roof is 19.5 us at 1 bit against
+277 at bf16 and 72 at int4. Quality is the other half and it is not a kernel question: sign
+weights with a mean-abs scale are lossy on a checkpoint trained in higher precision, and
+`scripts/eval_ppl.py` on the real weights is where that gets measured. Details, the floors per
+shape and what to measure first in [the design note](docs/design/w1gemm.md).
 
 ## attention
 
@@ -766,6 +806,7 @@ default stays on the CUDA cores.
 | `fp8gemm` e4m3 | naive `mma.sync.m16n8k32`, the swizzled cp.async tile with a 64x64 warp tile and decode configs, TMA; all on the block-scaled instruction, with per-tensor scales or MXFP8 block scales | cuBLASLt, `torch._scaled_mm`, `F.scaled_mm` |
 | `fp4gemm` NVFP4, MXFP4 | naive `mma.sync.m16n8k64.kind::mxf4nvf4`, the swizzled cp.async tile with the block scales staged beside it, TMA with bulk-copied scales; a bf16 -> fp4 quantizer | cuBLASLt NVFP4 (bit-identical), `F.scaled_mm` |
 | `w4gemm` W4A16 | thread per output; a warp per 16 columns with the repacked int4 fragments and the activations straight into registers; warps along K on a cp.async pipeline for M <= 8 and independent warps for M <= 16, Stream-K tiles above; round-to-nearest quantizer and the offline repack | the bf16 `hgemm` on the dequantized weights, cuBLAS |
+| `w1gemm`, `w1gemm_moe` W1A16 | thread per output; a warp per 16 columns with the sign bits XORed into bf16x2 fragments and the activations straight into registers; warps along K for M <= 16; the grouped form over experts from sorted rows and offsets; the absmean quantizer at 1 and 2 bits | the bf16 `hgemm` on the dequantized weights, cuBLAS; unmeasured |
 | `attention` bf16 | warp per row, CUDA-core flash attention, `mma.sync` flash attention, split-KV tail, TMA mbarrier pipeline, persistent tile queue with a producer warp; GQA and a flash-decoding kernel | `F.scaled_dot_product_attention` |
 | `attention_fp8` e4m3 | warp per row on dequantized inputs, variant 5's persistent TMA kernel with both products on the block-scaled fp8 `mma.sync`, P rounded to e4m3 in registers, V transposed by `ldmatrix.trans` and byte permutes | the bf16 kernel, `F.scaled_dot_product_attention` in bf16 |
 | `attention_bwd` bf16 | warp per row, FlashAttention-2's key-tile loop on `mma.sync`, V in registers with a double-buffered Q/dO tile and a simulated split, TMA and mbarriers with no block barrier; GQA, a deterministic dQ pass, an autograd Function | torch autograd through `F.scaled_dot_product_attention` (flash and cuDNN) |
@@ -828,6 +869,10 @@ a4, sfa4, sa4 = sk.fp4_quantize(a_bf16)    # NVFP4: packed e2m1, e4m3 scale per 
 c = sk.fp4gemm(a4, w4, sfa4, sfw4, sa4, sw4)  # fmt="mxfp4" for a ue8m0 scale per 32
 wq = sk.W4Weight.quantize(w_bf16)          # int4, one bf16 scale per 128 k of a column, repacked once
 c = sk.w4gemm(a_bf16, wq)                  # a @ w with 4x fewer weight bytes than hgemm streams
+w1 = sk.W1Weight.quantize(w_bf16, bits=1)  # sign weights, one bf16 mean-abs scale per 128 k; bits=2 for ternary
+c = sk.w1gemm(a_bf16, w1)                  # a @ (±s), 14x fewer weight bytes than hgemm streams
+ex = sk.W1ExpertWeights.quantize(w_experts, bits=1)       # [E, K, N], every expert in one tensor
+c = sk.w1gemm_moe(a_sorted, ex, offsets)   # rows sorted by expert, int32 offsets [E+1], one launch
 o = sk.attention(q, k, v, causal=True)     # q is [B, H, S, D] bf16; k and v may have fewer heads
 (q8, sq), (k8, sk8), (v8, sv) = (sk.quantize_fp8(x) for x in (q, k, v))   # e4m3 + descale
 o = sk.attention_fp8(q8, k8, v8, sq, sk8, sv, causal=True)   # both products on the fp8 tensor cores
@@ -852,7 +897,8 @@ numbers, the sweeps that picked the constants, and which Nsight metric moved:
   [swiglu](docs/design/swiglu.md), [softmax](docs/design/softmax.md),
   [sgemm](docs/design/sgemm.md), [hgemm](docs/design/hgemm.md),
   [fp8gemm](docs/design/fp8gemm.md), [fp4gemm](docs/design/fp4gemm.md),
-  [w4gemm](docs/design/w4gemm.md), [attention](docs/design/attention.md),
+  [w4gemm](docs/design/w4gemm.md), [w1gemm](docs/design/w1gemm.md),
+  [attention](docs/design/attention.md),
   [layer](docs/design/layer.md), [serving](docs/design/serving.md)
 
 Things I'd still like to do: a 128-key tile for attention, which would halve how often the
