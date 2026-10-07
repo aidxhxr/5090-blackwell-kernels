@@ -371,3 +371,63 @@ def w4gemm(a: torch.Tensor, q: torch.Tensor, scales: torch.Tensor,
            zeros: torch.Tensor | None = None) -> torch.Tensor:
     """a @ the dequantized weight, fp32 sum, one bf16 rounding."""
     return (a.float() @ w4_dequantize(q, scales, zeros).float()).to(torch.bfloat16)
+
+
+# ---- W1A16 (sign and ternary weights) ---------------------------------------------------------
+
+W1_GROUP = 128
+
+
+def w1_quantize(w: torch.Tensor, bits: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
+    """The quantizer of `spark_kernels.w1_quantize` in plain PyTorch, same fp32 operations:
+    (packed [N, K * bits / 32] int32, scales [K/128, N] bf16) for a [K, N] weight.
+
+    One scale per 128 consecutive k of a column, s = bf16(mean|w|). bits == 1: code = w >= 0.
+    bits == 2 (ternary): code 0 for w < -s/2, 1 for |w| <= s/2, 2 for w > s/2, with s the
+    rounded bf16 scale. Word k // (32 / bits) of row n holds k in its bits (k % (32 / bits))
+    * bits upward, lowest k lowest."""
+    if bits not in (1, 2):
+        raise ValueError(f"bits must be 1 or 2, got {bits}")
+    K, N = w.shape
+    if K % W1_GROUP != 0 or N % 16 != 0:
+        raise ValueError(f"w1_quantize needs K a multiple of 128 and N of 16, got {K}x{N}")
+    wf = w.float().reshape(K // W1_GROUP, W1_GROUP, N)
+    s = wf.abs().mean(dim=1).to(torch.bfloat16)
+    if bits == 1:
+        code = (wf >= 0).to(torch.int64)
+    else:
+        half = s.float()[:, None] * 0.5
+        code = torch.full_like(wf, 1, dtype=torch.int64)
+        code = torch.where(wf < -half, torch.zeros_like(code), code)
+        code = torch.where(wf > half, torch.full_like(code, 2), code)
+    per_word = 32 // bits
+    c = code.reshape(K, N).t().reshape(N, K // per_word, per_word)
+    shifts = torch.arange(per_word, device=w.device) * bits
+    words = (c << shifts).sum(dim=-1)
+    return _as_int32(words), s
+
+
+def w1_unpack(packed: torch.Tensor, bits: int) -> torch.Tensor:
+    """packed [N, K * bits / 32] int32 -> codes [K, N] uint8 (0..1 or 0..2)."""
+    N, words = packed.shape
+    per_word = 32 // bits
+    w = packed.to(torch.int64) & 0xFFFFFFFF
+    shifts = torch.arange(per_word, device=packed.device) * bits
+    codes = (w[:, :, None] >> shifts) & ((1 << bits) - 1)
+    return codes.reshape(N, words * per_word).t().contiguous().to(torch.uint8)
+
+
+def w1_dequantize(packed: torch.Tensor, scales: torch.Tensor, bits: int = 1) -> torch.Tensor:
+    """The [K, N] bf16 weight w1gemm multiplies: bf16(s * (2 code - 1)) for bits == 1,
+    bf16(s * (code - 1)) for bits == 2."""
+    q = w1_unpack(packed, bits).float()
+    K, N = q.shape
+    v = 2.0 * q - 1.0 if bits == 1 else q - 1.0
+    w = v.reshape(K // W1_GROUP, W1_GROUP, N) * scales.float()[:, None]
+    return w.reshape(K, N).to(torch.bfloat16)
+
+
+def w1gemm_ref(a: torch.Tensor, packed: torch.Tensor, scales: torch.Tensor, bits: int = 1
+               ) -> torch.Tensor:
+    """a @ the dequantized weight, fp32 sum, one bf16 rounding."""
+    return (a.float() @ w1_dequantize(packed, scales, bits).float()).to(torch.bfloat16)
