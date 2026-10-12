@@ -109,3 +109,4 @@ docs:
 - [the Grace side: the 1-bit GEMV, routing, sampling and a bandwidth probe on the GB10's Arm cores, and whether sharing the 273 GB/s gains anything](design/grace.md) (not measured yet)
 - [unified memory: a kernel reading cudaMalloc, managed, host-mapped and plain system memory, advice, and the CPU-GPU flag round trip](design/unified.md) (not measured yet)
 - [DeepSeek V4.1 Flash on the GB10's 128 GB: the footprint, the step budget and the fused 1-bit expert kernel w1moe_decode](design/moe_spark.md) (not measured yet)
+- [decode grids on the GB10: bytes in flight, split-K from the SM count, the 24 MB L2](design/decode_spark.md) (not measured yet)
