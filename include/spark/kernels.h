@@ -587,4 +587,81 @@ void attention_fp8(const __nv_fp8_e4m3* Q, const __nv_fp8_e4m3* K, const __nv_fp
 int attention_fp8_num_variants();
 bool attention_fp8_supports(int S_q, int S_kv, int D, int variant);
 
+// ---- Unified memory experiments (src/kernels/unified.cu, unified_gemv.cu) ----------------
+// On the GB10 the CPU and the GPU share one 128 GB pool and there is no PCIe copy; on the RTX
+// 5090 the same calls go over PCIe. These helpers and kernels ask what a kernel reading each
+// kind of memory gets, and what the CPU-to-GPU handoff of a few bytes costs. Unmeasured on
+// both machines (docs/design/unified.md).
+//
+// Where a buffer lives. `ptr` is what the GPU dereferences; `host_ptr` what the CPU writes
+// (nullptr for device memory, the same address otherwise under unified addressing).
+enum class UnifiedKind : int {
+    device = 0,       // cudaMalloc
+    managed = 1,      // cudaMallocManaged: migrates on demand, takes advice and prefetch
+    host_mapped = 2,  // cudaHostAlloc(cudaHostAllocMapped): pinned pages read in place
+    system = 3        // posix_memalign: pageable memory. Read as is when the device reports
+                      // pageableMemoryAccess (HMM / ATS), else pinned with cudaHostRegister
+                      // and `registered` set
+};
+constexpr int kUnifiedNumKinds = 4;
+const char* unified_kind_name(UnifiedKind kind);
+
+struct UnifiedAlloc {
+    void* ptr = nullptr;
+    void* host_ptr = nullptr;
+    size_t bytes = 0;
+    UnifiedKind kind = UnifiedKind::device;
+    int device = 0;
+    bool registered = false;
+};
+UnifiedAlloc unified_alloc(UnifiedKind kind, size_t bytes);
+void unified_free(UnifiedAlloc& a);
+
+// cudaMemAdvise / cudaMemPrefetchAsync on a managed (or, with HMM, system) range. Returns
+// false when the runtime refuses the advice for that memory (device, host_mapped, plain pages
+// without HMM), which the bench records instead of failing. `device` < 0 means the current one.
+enum class UnifiedAdvice : int {
+    none = 0,
+    preferred_gpu = 1,    // cudaMemAdviseSetPreferredLocation, the GPU
+    preferred_cpu = 2,    // cudaMemAdviseSetPreferredLocation, the CPU: pages stay on the host
+    accessed_by_gpu = 3,  // cudaMemAdviseSetAccessedBy: a mapping for the GPU, no migration
+    read_mostly = 4,      // cudaMemAdviseSetReadMostly: read-duplicated on both sides
+    prefetch_gpu = 5,     // cudaMemPrefetchAsync to the GPU, on `stream`
+    prefetch_cpu = 6      // cudaMemPrefetchAsync to the CPU, on `stream`
+};
+constexpr int kUnifiedNumAdvice = 7;
+const char* unified_advice_name(UnifiedAdvice advice);
+bool unified_advise(void* ptr, size_t bytes, UnifiedAdvice advice, int device,
+                    cudaStream_t stream);
+
+// What the device says about unified memory, from cudaDeviceGetAttribute. The GB10 is expected
+// to report pageableMemoryAccess, concurrentManagedAccess and
+// directManagedMemAccessFromHost; the 5090 reports pageableMemoryAccess only with the open
+// kernel modules and HMM.
+struct UnifiedDeviceCaps {
+    int device = 0;
+    int sm_count = 0;
+    int unified_addressing = 0;
+    int integrated = 0;
+    int can_map_host_memory = 0;
+    int pageable_memory_access = 0;
+    int pageable_memory_access_uses_host_page_tables = 0;
+    int concurrent_managed_access = 0;
+    int direct_managed_mem_access_from_host = 0;
+    int host_native_atomic_supported = 0;
+    int can_use_host_pointer_for_registered_mem = 0;
+};
+UnifiedDeviceCaps unified_device_caps(int device = -1);
+
+// Streams x (n bf16, any kind of memory) into sink[unified_read_sink_floats()] fp32 partial
+// sums, one per block, overwritten each launch; the caller adds them. The grid is sized from
+// the SM count, so the sink length does not depend on n.
+// variant 0: one bf16 per thread per step, grid-stride
+// variant 1: one 16-byte load per thread per step, grid-stride (16-byte aligned x)
+// variant 2: four independent 16-byte loads in flight per thread per step
+void unified_read_bf16(const __nv_bfloat16* x, float* sink, int64_t n, int variant,
+                       cudaStream_t stream);
+int unified_read_num_variants();
+int unified_read_sink_floats();
+
 }  // namespace spark
