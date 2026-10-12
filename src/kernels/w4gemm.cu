@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "launch_config.cuh"
 #include "spark/common.cuh"
 #include "spark/kernels.h"
 #include "w4gemm_internal.cuh"
@@ -675,9 +676,26 @@ Fixup workspace(size_t floats, size_t count) {
     return {ws, counters};
 }
 
-// The small-M kernel: `split` K slices per (strip, chunk), 0 = pick one so that the grid
-// reaches kMinBlocks blocks.
-constexpr int kMinBlocks = 128;
+// The small-M kernels: `split` K slices per (strip, chunk), 0 = pick one so that the grid
+// carries the device's bytes in flight.
+//
+// That used to be the constant kMinBlocks = 128, swept on the RTX 5090 (docs/design/w4gemm.md).
+// Expressed as bytes in flight it is 1,572,864 / 128 = 12,288 B per block: three quarters of
+// the 16 KB a 4-warp block with a 4-group ring nominally holds (a ring slot is refilled only
+// after its group is consumed, so the ring is never entirely outstanding), and the one figure
+// that reproduces the sweep. launch_config divides the device's bytes in flight by it: 128
+// on 170 SMs, bit for bit the old grid; 18 on 48 SMs at the assumed 800 ns, so a 64-strip
+// Llama K/V projection that split 2 ways on the 5090 runs unsplit on the GB10 and skips the
+// atomics. The sweep that confirms or refutes the 18 is bench_decode_spark --sweep-split.
+constexpr int64_t kW4BlockInFlight = 12288;
+static_assert(launch::kRTX5090.bytes_in_flight / kW4BlockInFlight == 128,
+              "the swept 128 blocks of the 5090");
+
+// Packed weight plus scales (and zeros) in bytes, for the plan.
+int64_t weight_bytes(const Args& a) {
+    const int64_t kn = static_cast<int64_t>(a.K) * a.N;
+    return kn / 2 + (kn / kG) * (2 + (a.Z ? 1 : 0));
+}
 
 template <int MTW, int NT, int TW, int WK, int D, bool ASYM>
 int warp_slots() {
@@ -686,7 +704,7 @@ int warp_slots() {
         int per_sm = 0;
         SPARK_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
             &per_sm, w4_warp_kernel<MTW, NT, TW, WK, D, ASYM>, WK * 32, 0));
-        resident = (per_sm > 0 ? per_sm : 1) * num_sms();
+        resident = (per_sm > 0 ? per_sm : 1) * launch::device_shape().sm_count;
     }
     return resident;
 }
@@ -707,7 +725,12 @@ void launch_warp(const Args& a, int split) {
     p.N = a.N;
     p.K = a.K;
     p.chunks = chunks;
-    if (split <= 0) split = cdiv(kMinBlocks, strips * chunks);
+    // Old: if (split <= 0) split = cdiv(kMinBlocks, strips * chunks) with kMinBlocks = 128.
+    // New: the same on 170 SMs (kW4BlockInFlight), the device's number elsewhere, the forced
+    // split for the sweeps; the clamp to [1, G] is inside.
+    if (split <= 0)
+        split = launch::split_k_for(weight_bytes(a), strips * chunks, G, kW4BlockInFlight,
+                                    warp_slots<MTW, NT, TW, WK, D, ASYM>(), launch::device_shape());
     p.split = std::max(1, std::min(split, G));
     p.fix = Fixup{nullptr, nullptr};
     if (p.split > 1)
@@ -728,14 +751,15 @@ int pipe_slots() {
         int per_sm = 0;
         SPARK_CUDA_CHECK(
             cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, fn, C_::kThreads, C_::kSmem));
-        resident = (per_sm > 0 ? per_sm : 1) * num_sms();
+        resident = (per_sm > 0 ? per_sm : 1) * launch::device_shape().sm_count;
     }
     return resident;
 }
 
 // The pipelined kernel: `split` K slices per tile, or 0 for Stream-K over every resident
 // block (WK = 1 only; with warps splitting K a block runs one tile, and split 0 picks the
-// slices that bring the grid to kMinBlocks).
+// slices that carry the device's bytes in flight, the old kMinBlocks). A forced split
+// (decode_force_split_k, the sweeps) turns a Stream-K entry into a plain split too.
 template <int MTW, int NT, int TW, int WM, int WN, int WK, int STAGES, bool ASYM>
 void launch_pipe(const Args& a, int split) {
     using C_ = PipeCfg<MTW, NT, TW, WM, WN, WK, STAGES, ASYM>;
@@ -753,9 +777,14 @@ void launch_pipe(const Args& a, int split) {
     p.N = a.N;
     p.K = a.K;
     p.chunks = chunks;
+    if (split <= 0 && WK == 1) split = launch::forced_split_k();
     int grid;
     if (split > 0 || WK > 1) {
-        if (split <= 0) split = cdiv(kMinBlocks, tiles);
+        // Old: if (split <= 0) split = cdiv(kMinBlocks, tiles) with kMinBlocks = 128; same
+        // reproduction as launch_warp.
+        if (split <= 0)
+            split = launch::split_k_for(weight_bytes(a), tiles, G, kW4BlockInFlight, resident,
+                                        launch::device_shape());
         p.split = std::max(1, std::min(split, G));
         grid = tiles * p.split;
     } else {
@@ -830,20 +859,26 @@ bool env_override(int& idx, int& split) {
 }
 
 // Blocks of one launch of entry e without a forced split (Stream-K grids always fit).
+// Old: tiles * std::max(1, cdiv(kMinBlocks, tiles)); the plan gives the same on 170 SMs.
 int blocks_of(const Entry& e, const Args& a) {
     const int tiles = (a.N / e.bn) * cdiv(a.M, e.bm);
-    return tiles * std::max(1, cdiv(kMinBlocks, tiles));
+    const int G = a.K / kG;
+    return tiles * launch::split_k_for(weight_bytes(a), tiles, G, kW4BlockInFlight, e.slots(),
+                                       launch::device_shape());
 }
 
 // The block shape for a call, from the measurements of docs/design/w4gemm.md: a preferred
 // shape per token count, used when its blocks fit in one wave of resident blocks (384 blocks
-// on 340 slots would run a second wave for 44 of them), else a fallback that is faster when
-// neither fits; either must divide N, and 16-column blocks divide every legal N.
+// on 340 slots would run a second wave for 44 of them; the GB10's slots are 48 / 170 of
+// these), else a fallback that is faster when neither fits; either must divide N, and
+// 16-column blocks divide every legal N.
 int pick(const Args& a) {
     const int G = a.K / kG;
     int pref, fallback;
     // Four one-warp strips per SM already keep the weights streaming: no K split at all.
-    const bool wide = a.N / 16 >= 4 * num_sms();
+    // Old: a.N / 16 >= 4 * num_sms(); the same count, through launch_config so SPARK_FORCE_SMS
+    // moves it (N >= 10,880 on 170 SMs, N >= 3,072 on 48: every Llama projection but K/V).
+    const bool wide = a.N / 16 >= 4 * launch::device_shape().sm_count;
     if (a.M <= 1) {
         pref = wide ? 3 : 5;  // pipelined, 4 warps along K, one token row staged
         fallback = wide ? 3 : 0;

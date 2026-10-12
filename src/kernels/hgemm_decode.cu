@@ -21,6 +21,7 @@
 
 #include "hgemm_epilogue.cuh"
 #include "hgemm_internal.cuh"
+#include "launch_config.cuh"
 #include "spark/common.cuh"
 
 namespace spark::hgemm_decode {
@@ -276,7 +277,8 @@ Workspace& workspace(size_t floats, size_t strips) {
     return w;
 }
 
-// Resident CTAs per GPU for one configuration; also the > 48 KB smem opt-in.
+// Resident CTAs per GPU for one configuration; also the > 48 KB smem opt-in. The SM count
+// is launch_config's (num_sms() with the SPARK_FORCE_SMS override), 170 on the 5090.
 template <int BM, int BN, int BK, int STAGES, int WM, int WN, bool FUSED>
 int slots() {
     constexpr int bytes = smem_bytes<BM, BN, BK, STAGES>();
@@ -287,7 +289,7 @@ int slots() {
         int per_sm = 0;
         SPARK_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
             &per_sm, decode_kernel<BM, BN, BK, STAGES, WM, WN, FUSED>, WM * WN * 32, bytes));
-        resident = (per_sm > 0 ? per_sm : 1) * num_sms();
+        resident = (per_sm > 0 ? per_sm : 1) * launch::device_shape().sm_count;
     }
     return resident;
 }
@@ -295,8 +297,18 @@ int slots() {
 // Measured on the RTX 5090 (docs/design/hgemm.md, "Decode"): 64 CTAs with 3 x 8 KB of B in
 // flight each already stream B at the copy roof, and every split-K launch pays a flat 2 us
 // for the atomics, fence, counter and last-arriver chain. So K is split only when the column
-// strips alone would leave fewer than 64 CTAs.
-constexpr int kMinCtas = 64;
+// strips alone would leave fewer CTAs than the device needs for its bytes in flight.
+//
+// That used to be the constant kMinCtas = 64. The 64 is the 5090's 1.5 MB in flight divided
+// by the 24 KB a 16x64x64 CTA holds with 3 of its 4 stages loading, so launch_config gets the
+// 24 KB and asks the device for the rest: on 170 SMs cdiv(1,572,864, 24,576) = 64 and the
+// split is cdiv(64, strips) again, bit for bit; on 48 SMs at the assumed 800 ns it is
+// cdiv(218,400, 24,576) = 9 CTAs, so a 16-strip K/V projection that split 4 ways here runs
+// unsplit there and saves the fixup (bench_decode_spark --sweep-split is the check). The
+// narrower tiles (BN = 32, 2 of 3 stages) keep this same 24 KB figure as they kept the 64:
+// their CTA count was never measured on its own.
+constexpr int64_t kDecodeCtaInFlight = int64_t{3} * 64 * 64 * sizeof(__nv_bfloat16);  // 24 KB
+static_assert(kDecodeCtaInFlight == 24576, "");
 
 template <int BM, int BN, int BK, int STAGES, int WM, int WN, bool FUSED>
 void launch_cfg(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N,
@@ -312,7 +324,13 @@ void launch_cfg(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C
     p.K = K;
     p.ep = hgemm_epi::make(ep);
     const int strips = N / BN;
-    p.split = std::min(K / BK, std::max(1, cdiv(kMinCtas, strips)));
+    // Old: p.split = std::min(K / BK, std::max(1, cdiv(kMinCtas, strips))) with kMinCtas = 64.
+    // New: the same number on 170 SMs (see kDecodeCtaInFlight), the device's number elsewhere,
+    // a forced split (decode_force_split_k) for the sweeps.
+    p.split = launch::split_k_for(static_cast<int64_t>(K) * N * sizeof(__nv_bfloat16), strips,
+                                  K / BK, kDecodeCtaInFlight,
+                                  slots<BM, BN, BK, STAGES, WM, WN, FUSED>(),
+                                  launch::device_shape());
     p.ws = nullptr;
     p.counters = nullptr;
     if (p.split > 1) {
@@ -326,7 +344,9 @@ void launch_cfg(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C
 
 // Two configurations per row tile, in order of preference: the first whose strips fit in one
 // wave of resident CTAs runs (172 strips on 170 slots would be a full wave plus two stragglers
-// that take as long again), otherwise the second, which has more slots.
+// that take as long again), otherwise the second, which has more slots. The slot counts in
+// the comments below are the 5090's (170 SMs); the GB10 has 48 SMs and 48 / 96 / 144 / 192
+// slots for 1 / 2 / 3 / 4 CTAs per SM, so its crossovers sit 3.5x lower in N.
 template <int BM, int BN, int BK, int STAGES, int WM, int WN, bool FUSED>
 bool fits(int N, int K) {
     return N % BN == 0 && K % BK == 0 && N / BN <= slots<BM, BN, BK, STAGES, WM, WN, FUSED>();
@@ -336,23 +356,23 @@ template <bool FUSED>
 void launch_impl(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N,
                  int K, cudaStream_t stream, const HgemmEpilogue& ep) {
     if (M <= 16) {
-        // 16x64x64, 4 stages, 4 warps along N, 40 KB: 2 CTAs per SM, 340 slots.
+        // 16x64x64, 4 stages, 4 warps along N, 40 KB: 2 CTAs per SM, 340 slots (96 on the GB10).
         if (fits<16, 64, 64, 4, 1, 4, FUSED>(N, K))
             launch_cfg<16, 64, 64, 4, 1, 4, FUSED>(A, B, C, M, N, K, stream, ep);
-        else  // 16x32x64, 24 KB: 4 per SM, 680 slots
+        else  // 16x32x64, 24 KB: 4 per SM, 680 slots (192 on the GB10)
             launch_cfg<16, 32, 64, 4, 1, 2, FUSED>(A, B, C, M, N, K, stream, ep);
     } else if (M <= 32) {
-        // 32x32x64, 4 stages, 2x2 warps, 32 KB: 3 per SM, 510 slots.
+        // 32x32x64, 4 stages, 2x2 warps, 32 KB: 3 per SM, 510 slots (144 on the GB10).
         if (fits<32, 32, 64, 4, 2, 2, FUSED>(N, K))
             launch_cfg<32, 32, 64, 4, 2, 2, FUSED>(A, B, C, M, N, K, stream, ep);
-        else  // 32x64x64, 2x4 warps, 40 KB: 2 per SM, 340 slots, half the strips
+        else  // 32x64x64, 2x4 warps, 40 KB: 2 per SM, 340 slots (96), half the strips
             launch_cfg<32, 64, 64, 4, 2, 4, FUSED>(A, B, C, M, N, K, stream, ep);
     } else {
-        // 64x32x128, 4 stages, 4x2 warps, 96 KB: 1 per SM, 170 slots. The tensor work of a
+        // 64x32x128, 4 stages, 4x2 warps, 96 KB: 1 per SM, 170 slots (48). The tensor work of a
         // 64-row strip is what limits the CTA, so the tile is narrow and the warps many.
         if (fits<64, 32, 128, 4, 4, 2, FUSED>(N, K))
             launch_cfg<64, 32, 128, 4, 4, 2, FUSED>(A, B, C, M, N, K, stream, ep);
-        else  // 64x64x64, 3 stages, 2x4 warps, 48 KB: 2 per SM, 340 slots
+        else  // 64x64x64, 3 stages, 2x4 warps, 48 KB: 2 per SM, 340 slots (96)
             launch_cfg<64, 64, 64, 3, 2, 4, FUSED>(A, B, C, M, N, K, stream, ep);
     }
 }

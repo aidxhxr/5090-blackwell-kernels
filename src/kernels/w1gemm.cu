@@ -356,6 +356,15 @@ void launch_v1(const __nv_bfloat16* A, const uint32_t* packed, const __nv_bfloat
 // M > 16: variant 1's kernel over 8-token chunks; a shared-memory block tile for the
 // prefill shapes is not written yet, and at 1 bit the weight stream is small enough that
 // the activation re-reads of variant 1 come from L2.
+//
+// No SM count enters this grid: it is N / 16 blocks whatever the device, and K is split
+// inside the block, never across blocks. Against launch_config's bytes in flight: a block
+// keeps kSplitWarps x kSplitDepth x 2 rows x 512 B = 8 KB of weights outstanding, so the
+// DeepSeek expert's 144 strips hold 1.15 MB, short of the 5090's measured 1.5 MB (the only
+// decode kernel here that is, by Little's law, under the 5090's line; unmeasured) and five
+// times the GB10's 218 KB at the assumed 800 ns. A cross-block K split for narrow N on 48
+// SMs (N <= 768 leaves SMs empty) would need the fp32 fixup of w4gemm's warp kernel and is
+// not written; the grid is left as it is and bench_decode_spark reports its waves.
 template <int BITS>
 void launch_v2(const __nv_bfloat16* A, const uint32_t* packed, const __nv_bfloat16* scales,
                __nv_bfloat16* C, int M, int N, int K, cudaStream_t stream) {
