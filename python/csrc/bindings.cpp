@@ -1156,6 +1156,43 @@ Tensor attention_varlen(const Tensor& q, const Tensor& k_cache, const Tensor& v_
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// Launch configuration (src/kernels/launch_config.cu): what the decode kernels decided
+// ---------------------------------------------------------------------------
+int decode_device_of(const std::string& device) {
+    if (device.empty() || device == "current") return spark::DECODE_DEVICE_CURRENT;
+    if (device == "gb10") return spark::DECODE_DEVICE_GB10;
+    if (device == "rtx5090") return spark::DECODE_DEVICE_RTX5090;
+    throw std::invalid_argument("device must be '', 'gb10' or 'rtx5090', got '" + device + "'");
+}
+
+py::dict device_shape() {
+    py::dict d;
+    d["sm_count"] = spark::device_shape_sm_count();
+    d["l2_bytes"] = spark::device_shape_l2_bytes();
+    d["spec_gbps"] = spark::device_shape_spec_gbps();
+    d["bytes_in_flight"] = spark::device_shape_bytes_in_flight();
+    d["forced"] = spark::device_shape_forced();
+    return d;
+}
+
+int split_k_for(int64_t weight_bytes, int tiles, int max_split, int64_t per_cta_in_flight,
+                int slots, const std::string& device) {
+    TORCH_CHECK(tiles >= 1 && max_split >= 1 && per_cta_in_flight >= 1 && slots >= 0,
+                "split_k_for: tiles, max_split and per_cta_in_flight must be >= 1, slots >= 0");
+    return spark::decode_split_k(weight_bytes, tiles, max_split, per_cta_in_flight, slots,
+                                 decode_device_of(device));
+}
+
+int need_ctas(int64_t per_cta_in_flight, const std::string& device) {
+    TORCH_CHECK(per_cta_in_flight >= 1, "need_ctas: per_cta_in_flight must be >= 1");
+    return spark::decode_need_ctas(per_cta_in_flight, decode_device_of(device));
+}
+
+bool fits_l2(int64_t bytes, const std::string& device) {
+    return spark::decode_fits_l2(bytes, decode_device_of(device));
+}
+
 int num_variants(const std::string& name) {
     if (name == "rmsnorm") return spark::rmsnorm_num_variants();
     if (name == "swiglu") return spark::swiglu_num_variants();
@@ -1458,4 +1495,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("bits") = 1, py::arg("variant") = -1);
     m.def("w1moe_decode_num_variants", &spark::w1moe_decode_num_variants,
           "number of implementation variants of w1moe_decode");
+    m.def("device_shape", &device_shape,
+          "what the decode kernels decided about the current device: sm_count, l2_bytes, "
+          "spec_gbps, bytes_in_flight, forced (SPARK_FORCE_SMS)");
+    m.def("split_k_for", &split_k_for,
+          "the decode kernels' K split for `tiles` CTAs over a weight of weight_bytes, each "
+          "keeping per_cta_in_flight bytes outstanding, `slots` resident; device '' (current), "
+          "'gb10' or 'rtx5090' (the named shapes need no GPU)",
+          py::arg("weight_bytes"), py::arg("tiles"), py::arg("max_split"),
+          py::arg("per_cta_in_flight"), py::arg("slots"), py::arg("device") = "");
+    m.def("need_ctas", &need_ctas,
+          "CTAs the bandwidth rule asks for at per_cta_in_flight bytes each, on a device",
+          py::arg("per_cta_in_flight"), py::arg("device") = "");
+    m.def("fits_l2", &fits_l2, "whether a weight of `bytes` is L2-resident on a device",
+          py::arg("bytes"), py::arg("device") = "");
+    m.def("decode_force_split_k", &spark::decode_force_split_k,
+          "force the K split of every decode kernel that has one (0 = the rule)",
+          py::arg("split"));
 }

@@ -729,4 +729,34 @@ void w1moe_decode_bf16(const __nv_bfloat16* x, const int32_t* expert_ids,
 int w1moe_decode_num_variants();
 bool w1moe_decode_supports(int T, int topk, int K, int I, int bits, int variant);
 
+// ---- Launch configuration: what the decode kernels decided about the device --------------
+// (src/kernels/launch_config.cu; the rules live in src/kernels/launch_config.cuh.) Every
+// decode kernel (hgemm's decode path, w4gemm's small-M shapes, w1gemm) is a weight stream
+// whose grid used to be sized by the RTX 5090's constants (64 CTAs, 128 blocks, 170 SMs).
+// They now ask the device: SM count, L2 bytes, DRAM spec bandwidth from the memory clock and
+// bus width, and the bytes the device must keep in flight to stream at that bandwidth (the
+// 5090's measured 1.5 MB; bandwidth x an assumed 800 ns elsewhere, the GB10's loaded latency
+// being unmeasured). SPARK_FORCE_SMS=n (read once per process) replaces the SM count so a
+// 5090 can run the 48-SM grids for a correctness pass; device_shape_forced() says it did.
+int device_shape_sm_count();
+int64_t device_shape_l2_bytes();
+double device_shape_spec_gbps();
+int64_t device_shape_bytes_in_flight();
+bool device_shape_forced();
+// The split-K rule and the L2 question on the current device (DECODE_DEVICE_CURRENT) or on a
+// named shape without touching CUDA, for the host-side tests: `tiles` CTAs each keeping
+// per_cta_in_flight bytes outstanding over a weight of weight_bytes, `slots` CTAs resident at
+// once, a split of at most max_split -> the K slices per tile. decode_need_ctas is the CTA
+// count the bandwidth rule asks for at that in-flight depth.
+enum DecodeDevice { DECODE_DEVICE_CURRENT = 0, DECODE_DEVICE_GB10 = 1, DECODE_DEVICE_RTX5090 = 2 };
+int decode_split_k(int64_t weight_bytes, int tiles, int max_split, int64_t per_cta_in_flight,
+                   int slots, int device = DECODE_DEVICE_CURRENT);
+int decode_need_ctas(int64_t per_cta_in_flight, int device = DECODE_DEVICE_CURRENT);
+bool decode_fits_l2(int64_t bytes, int device = DECODE_DEVICE_CURRENT);
+// Force the K split of every decode kernel that has one (0 = the rule; also the initial
+// value of SPARK_DECODE_SPLIT). bench_decode_spark --sweep-split walks the legal splits with
+// it; each kernel clamps it to its own range.
+void decode_force_split_k(int split);
+int decode_forced_split_k();
+
 }  // namespace spark

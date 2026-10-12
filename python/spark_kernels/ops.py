@@ -859,3 +859,44 @@ def w1moe_decode(
     w = expert_weights.to(device=x.device, dtype=torch.bfloat16).contiguous()
     return _C.w1moe_decode(x, ids, w, experts.packed, experts.scales, down.packed, down.scales,
                            experts.bits, variant)
+# ---- launch configuration: what the decode kernels decided about the device --------------
+
+
+def device_shape() -> dict[str, int | float | bool]:
+    """The device as the decode kernels see it (src/kernels/launch_config.cuh).
+
+    Keys: ``sm_count`` (``SPARK_FORCE_SMS`` replaces it, and ``forced`` says so), ``l2_bytes``,
+    ``spec_gbps`` (DRAM spec from the memory clock and bus width: 1792 on the RTX 5090, 273 on
+    the GB10), ``bytes_in_flight`` (what the device must keep outstanding to stream at that
+    bandwidth: the 5090's measured 1.5 MB, bandwidth times an assumed 800 ns on anything else,
+    the GB10's loaded latency being unmeasured). Needs a CUDA device.
+    """
+    return dict(_C.device_shape())
+
+
+def split_k_for(weight_bytes: int, tiles: int, max_split: int, per_cta_in_flight: int,
+                slots: int, device: str = "") -> int:
+    """The decode kernels' K split: slices per tile so that ``tiles * split`` CTAs, each with
+    ``per_cta_in_flight`` bytes outstanding, carry the device's bytes in flight, then (only
+    past one wave of ``slots`` resident CTAs) a split whose last wave is full. ``device`` is
+    ``""`` for the current GPU or ``"gb10"`` / ``"rtx5090"`` for the named shapes, which need
+    no GPU. On the 5090 shape this is the old ``cdiv(64, strips)`` of hgemm_decode at 24 KB
+    per CTA and the old ``cdiv(128, tiles)`` of w4gemm at 12 KB.
+    """
+    return _C.split_k_for(weight_bytes, tiles, max_split, per_cta_in_flight, slots, device)
+
+
+def need_ctas(per_cta_in_flight: int, device: str = "") -> int:
+    """CTAs the bandwidth rule asks for when each keeps ``per_cta_in_flight`` bytes in flight."""
+    return _C.need_ctas(per_cta_in_flight, device)
+
+
+def fits_l2(bytes_: int, device: str = "") -> bool:
+    """Whether a weight of ``bytes_`` can stay L2-resident between two decode launches: at most
+    three quarters of the L2 (24 MB on the GB10, 96 on the RTX 5090)."""
+    return _C.fits_l2(bytes_, device)
+
+
+def decode_force_split_k(split: int) -> None:
+    """Force the K split of every decode kernel that has one; 0 restores the rule. For sweeps."""
+    _C.decode_force_split_k(split)
