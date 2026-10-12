@@ -22,8 +22,11 @@ The routing and the sort are plain torch and run on the CPU:
 `MoEBlock1Bit` holds the routed experts as two `W1ExpertWeights` (gate and up fused into one
 [E, hidden, 2 inter], down [E, inter, hidden]), the shared expert as two `W1Weight`, the
 router in bf16 with an fp32 bias, and runs a forward of two `w1gemm_moe` launches and two
-`w1gemm` launches around the swiglu. `forward_reference` is the same block in plain torch on
-the dequantized experts, one expert at a time, for the tests.
+`w1gemm` launches around the swiglu. `decode` is the same block for up to `DECODE_MAX_TOKENS`
+tokens through the fused `w1moe_decode` kernel (one launch for the routed experts, the
+intermediate kept on chip) plus the shared expert; past that it is `forward`.
+`forward_reference` is the same block in plain torch on the dequantized experts, one expert
+at a time, for the tests.
 
 The quantizer contract of `W1Weight.quantize` is restated here in `_quantize_experts_ref` so
 the block and the tests build the same bytes without the extension: at 1 bit a column's 128
@@ -41,6 +44,7 @@ import torch.nn.functional as F
 
 GROUP = 128  # k per scale, the w1gemm group
 FORMATS = ("w1", "bf16", "int4", "mxfp4")
+DECODE_MAX_TOKENS = 8  # the batch w1moe_decode takes; larger batches go the sorted way
 
 
 @dataclass(frozen=True)
@@ -335,6 +339,45 @@ class MoEBlock1Bit:
         router_b = torch.randn(E, device=device, generator=generator).mul_(0.1)
         return MoEBlock1Bit(cfg, gate_up, down, shared_gu, shared_dn, router_w, router_b)
 
+    @staticmethod
+    def random_bits(cfg: MoEConfig, device="cuda", generator: torch.Generator | None = None,
+                    scale: float = 0.016) -> MoEBlock1Bit:
+        """A block of random packed codes and scales near `scale` (the mean |w| of N(0, 0.02)
+        weights), built straight in the packed format: no bf16 source, so a whole layer takes
+        the time of writing its 1.9 GB and 40 layers can be built on a 128 GB machine. The
+        shared expert and the router are random too. For footprint and step benches, where
+        the kernel does not care where the bits came from."""
+        E, H, N_I, bits = cfg.n_routed, cfg.hidden, cfg.inter, cfg.bits
+        per_word = 32 // bits
+
+        def words(*shape):
+            w = torch.randint(0, 2**32, shape, device=device, generator=generator,
+                              dtype=torch.int64)
+            if bits == 2:  # codes 0, 1, 2 only: clear a code's high bit where its low bit is set
+                lo = w & 0x55555555
+                w = w & ~(lo << 1)
+            return _to_int32(w)
+
+        def scales(*shape):
+            return (torch.rand(*shape, device=device, generator=generator) * scale +
+                    0.5 * scale).to(torch.bfloat16)
+
+        def expert_stack(K, N):
+            return _wrap_experts(words(E, N, K // per_word), scales(E, K // GROUP, N), bits)
+
+        def one(K, N):
+            return _wrap_weight(words(N, K // per_word), scales(K // GROUP, N), bits)
+
+        gate_up = expert_stack(H, 2 * N_I)
+        down = expert_stack(N_I, H)
+        shared_gu = shared_dn = None
+        if cfg.n_shared:
+            shared_gu = one(H, 2 * N_I * cfg.n_shared)
+            shared_dn = one(N_I * cfg.n_shared, H)
+        router_w = (torch.randn(H, E, device=device, generator=generator) * 0.02).to(torch.bfloat16)
+        router_b = torch.randn(E, device=device, generator=generator).mul_(0.1)
+        return MoEBlock1Bit(cfg, gate_up, down, shared_gu, shared_dn, router_w, router_b)
+
     def nbytes(self) -> int:
         """Bytes of the routed experts (packed + scales)."""
         return self.gate_up.nbytes() + self.down.nbytes()
@@ -370,6 +413,26 @@ class MoEBlock1Bit:
             out += sk.w1gemm(sh, self.shared_down).float()
         return out.to(torch.bfloat16)
 
+    def decode(self, x: torch.Tensor, variant: int = -1) -> torch.Tensor:
+        """[T, hidden] bf16 -> [T, hidden] bf16 for a decode batch: T <= DECODE_MAX_TOKENS
+        rows go through `w1moe_decode` (the routed experts in one launch, the SwiGLU
+        intermediate on chip, the routing weights folded in) plus the shared expert on
+        `w1gemm`; a larger batch is `forward`. The routing is the same `route` as forward's.
+        `variant` picks the kernel's rung (-1 the top one)."""
+        from spark_kernels import ops as sk
+
+        T = x.shape[0]
+        if T > DECODE_MAX_TOKENS or not hasattr(sk, "w1moe_decode"):
+            return self.forward(x)
+        ids, gate_w = self.routing(x)
+        out = sk.w1moe_decode(x, ids, gate_w, self.gate_up, self.down, variant).float()
+        if self.shared_gate_up is not None:
+            sgu = sk.w1gemm(x, self.shared_gate_up)
+            n = sgu.shape[1] // 2
+            sh = sk.swiglu(sgu[:, :n].contiguous(), sgu[:, n:].contiguous())
+            out += sk.w1gemm(sh, self.shared_down).float()
+        return out.to(torch.bfloat16)
+
     def forward_reference(self, x: torch.Tensor) -> torch.Tensor:
         """The same block in plain torch on the dequantized weights, one expert at a time:
         fp32 math with a bf16 rounding where the kernels round (each GEMM's output, the
@@ -394,10 +457,9 @@ class MoEBlock1Bit:
         return out.to(torch.bfloat16)
 
 
-def _cat_experts(parts: list, bits: int):
-    """Per-expert quantized weights ([1, ...] each) as one stacked W1ExpertWeights / _Packed."""
-    packed = torch.cat([p.packed for p in parts])
-    scales = torch.cat([p.scales for p in parts])
+def _wrap_experts(packed: torch.Tensor, scales: torch.Tensor, bits: int):
+    """Stacked packed codes and scales as a W1ExpertWeights, or a _Packed without the
+    extension."""
     sk = _ops()
     if sk is not None and hasattr(sk, "W1ExpertWeights"):
         try:
@@ -405,3 +467,20 @@ def _cat_experts(parts: list, bits: int):
         except TypeError:
             pass
     return _Packed(packed, scales, bits)
+
+
+def _wrap_weight(packed: torch.Tensor, scales: torch.Tensor, bits: int):
+    """One weight's packed codes and scales as a W1Weight, or a _Packed without the extension."""
+    sk = _ops()
+    if sk is not None and hasattr(sk, "W1Weight"):
+        try:
+            return sk.W1Weight(packed, scales, bits)
+        except TypeError:
+            pass
+    return _Packed(packed, scales, bits)
+
+
+def _cat_experts(parts: list, bits: int):
+    """Per-expert quantized weights ([1, ...] each) as one stacked W1ExpertWeights / _Packed."""
+    return _wrap_experts(torch.cat([p.packed for p in parts]),
+                         torch.cat([p.scales for p in parts]), bits)

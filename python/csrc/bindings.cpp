@@ -1176,6 +1176,68 @@ int num_variants(const std::string& name) {
     throw std::invalid_argument("unknown kernel: " + name);
 }
 
+// The fused decode-step over the routed experts (w1moe_decode_bf16): x [T, K] bf16,
+// expert_ids int32 [T, topk], expert_weights bf16 [T, topk], the gate|up experts (packed
+// [E, 2I, K * bits / 32], scales [E, K/128, 2I]) and the down experts (packed [E, K, I * bits / 32],
+// scales [E, I/128, K]) -> y [T, K] bf16. T <= 8.
+Tensor w1moe_decode(const Tensor& x, const Tensor& expert_ids, const Tensor& expert_weights,
+                    const Tensor& packed_gu, const Tensor& scales_gu, const Tensor& packed_dn,
+                    const Tensor& scales_dn, int bits, int variant) {
+    check_cuda_contig(x, "x");
+    check_cuda_contig(expert_ids, "expert_ids");
+    check_cuda_contig(expert_weights, "expert_weights");
+    check_w1_bits(bits, "w1moe_decode");
+    TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.dim() == 2,
+                "w1moe_decode expects a 2-D bfloat16 x [T, K]");
+    TORCH_CHECK(packed_gu.dim() == 3 && scales_gu.dim() == 3 && packed_dn.dim() == 3 &&
+                    scales_dn.dim() == 3,
+                "w1moe_decode expects stacked expert weights [E, N, K * bits / 32] / [E, K/128, N]");
+    const int64_t T = x.size(0), K = x.size(1);
+    const int64_t E = packed_gu.size(0);
+    TORCH_CHECK(scales_gu.size(0) == E && packed_dn.size(0) == E && scales_dn.size(0) == E,
+                "w1moe_decode: the four expert tensors must hold the same number of experts");
+    const int64_t N_gu = check_w1_weight(x, packed_gu, scales_gu, bits, K, "w1moe_decode");
+    TORCH_CHECK(N_gu % 2 == 0, "w1moe_decode: the gate|up weight needs an even column count");
+    const int64_t I = N_gu / 2;
+    TORCH_CHECK(packed_dn.scalar_type() == at::kInt && packed_dn.size(1) == K &&
+                    packed_dn.size(2) == I * bits / 32,
+                "w1moe_decode: down packed must be int32 [E, K, I * bits / 32] = [", E, ", ", K, ", ",
+                I * bits / 32, "], got ", packed_dn.sizes());
+    TORCH_CHECK(scales_dn.scalar_type() == at::kBFloat16 &&
+                    scales_dn.size(1) == I / spark::kW1GroupSize && scales_dn.size(2) == K,
+                "w1moe_decode: down scales must be bfloat16 [E, I/128, K], got ", scales_dn.sizes());
+    check_cuda_contig(packed_dn, "packed_down");
+    check_cuda_contig(scales_dn, "scales_down");
+    TORCH_CHECK(expert_ids.scalar_type() == at::kInt && expert_ids.dim() == 2 &&
+                    expert_ids.size(0) == T,
+                "w1moe_decode: expert_ids must be int32 [T, topk], got ", expert_ids.scalar_type(),
+                " ", expert_ids.sizes());
+    const int64_t topk = expert_ids.size(1);
+    TORCH_CHECK(expert_weights.scalar_type() == at::kBFloat16 &&
+                    expert_weights.sizes() == expert_ids.sizes(),
+                "w1moe_decode: expert_weights must be bfloat16 [T, topk]");
+    TORCH_CHECK(T >= 1 && T <= 8 && T * topk <= 64, "w1moe_decode takes 1 <= T <= 8 tokens and "
+                "T * topk <= 64, got T = ", T, ", topk = ", topk);
+    TORCH_CHECK(K % 256 == 0 && K <= 16384 && I % spark::kW1GroupSize == 0,
+                "w1moe_decode needs K % 256 == 0, K <= 16384 and I % 128 == 0, got K = ", K,
+                ", I = ", I);
+    TORCH_CHECK(expert_ids.device() == x.device() && expert_weights.device() == x.device() &&
+                    packed_dn.device() == x.device() && scales_dn.device() == x.device(),
+                "w1moe_decode: every tensor must be on x's device");
+    TORCH_CHECK(aligned16(packed_dn), "w1moe_decode needs 16-byte aligned down packed storage");
+    const c10::cuda::CUDAGuard guard(x.device());
+    Tensor y = at::empty({T, K}, x.options());
+    const int v = resolve_variant(variant, spark::w1moe_decode_num_variants());
+    spark::w1moe_decode_bf16(bf16_ptr(x), expert_ids.data_ptr<int32_t>(), bf16_ptr(expert_weights),
+                             reinterpret_cast<const uint32_t*>(packed_gu.data_ptr<int32_t>()),
+                             bf16_ptr(scales_gu),
+                             reinterpret_cast<const uint32_t*>(packed_dn.data_ptr<int32_t>()),
+                             bf16_ptr(scales_dn), bf16_ptr_mut(y), static_cast<int>(T),
+                             static_cast<int>(topk), static_cast<int>(E), static_cast<int>(K),
+                             static_cast<int>(I), bits, v, current_stream(x));
+    return y;
+}
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -1387,4 +1449,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             throw std::invalid_argument("unknown unified kernel: " + name);
         },
         "number of variants of unified_read or unified_gemv", py::arg("name"));
+    m.def("w1moe_decode", &w1moe_decode,
+          "the decode step over the routed 1-bit / ternary experts: x [T, K] bf16 (T <= 8), "
+          "expert_ids int32 [T, topk], expert_weights bf16 [T, topk], the stacked gate|up and "
+          "down experts (packed, scales) -> y [T, K] bf16, the SwiGLU intermediate kept on chip",
+          py::arg("x"), py::arg("expert_ids"), py::arg("expert_weights"), py::arg("packed_gate_up"),
+          py::arg("scales_gate_up"), py::arg("packed_down"), py::arg("scales_down"),
+          py::arg("bits") = 1, py::arg("variant") = -1);
+    m.def("w1moe_decode_num_variants", &spark::w1moe_decode_num_variants,
+          "number of implementation variants of w1moe_decode");
 }

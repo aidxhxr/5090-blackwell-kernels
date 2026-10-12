@@ -822,3 +822,40 @@ def unified_gemv(a: torch.Tensor, w: torch.Tensor, variant: int = -1) -> torch.T
     sized from the SM count; -1 is the top rung.
     """
     return _C.unified_gemv(a, w, variant)
+def w1moe_decode_num_variants() -> int:
+    """Number of implementation variants of `w1moe_decode` (docs/design/moe_spark.md)."""
+    return _C.w1moe_decode_num_variants()
+
+
+def w1moe_decode(
+    x: torch.Tensor,
+    expert_ids: torch.Tensor,
+    expert_weights: torch.Tensor,
+    experts: W1ExpertWeights,
+    down: W1ExpertWeights,
+    variant: int = -1,
+) -> torch.Tensor:
+    """The routed-expert half of an MoE decode step in one launch, for up to 8 tokens.
+
+    x is [T, K] bfloat16 (T <= 8), expert_ids int32 [T, topk] the experts each token goes to,
+    expert_weights [T, topk] their routing weights (converted to bfloat16 here), `experts` the
+    gate|up weights of all E experts as a `W1ExpertWeights` over [E, K, 2I] (gate columns then
+    up columns, the layout `MoEBlock1Bit` holds) and `down` the down weights over [E, I, K].
+    Returns [T, K] bfloat16: for every token the sum over its experts of
+    weight * (silu(x @ gate) * (x @ up)) @ down, fp32 accumulation, with the gate, up and
+    SwiGLU values rounded to bfloat16 where the sorted `w1gemm_moe` path rounds them. The
+    shared expert is not included.
+
+    Variant 0 runs three plain passes with the intermediate in global memory; variants 1 and
+    2 keep it in shared memory, one persistent block per (expert, 128 intermediate columns),
+    and add into y with fp32 atomics, so the last bits can differ between runs. Needs
+    K % 256 == 0, K <= 16384, I % 128 == 0 and T * topk <= 64.
+    """
+    if not isinstance(experts, W1ExpertWeights) or not isinstance(down, W1ExpertWeights):
+        raise TypeError("w1moe_decode takes two W1ExpertWeights (gate|up and down)")
+    if experts.bits != down.bits:
+        raise ValueError(f"gate|up is {experts.bits}-bit and down {down.bits}-bit")
+    ids = expert_ids.to(device=x.device, dtype=torch.int32).contiguous()
+    w = expert_weights.to(device=x.device, dtype=torch.bfloat16).contiguous()
+    return _C.w1moe_decode(x, ids, w, experts.packed, experts.scales, down.packed, down.scales,
+                           experts.bits, variant)
