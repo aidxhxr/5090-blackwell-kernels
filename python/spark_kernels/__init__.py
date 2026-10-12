@@ -151,3 +151,14 @@ try:
     __version__ = version("5090-blackwell-kernels")  # the one copy lives in pyproject.toml
 except PackageNotFoundError:  # imported from a checkout that was never pip-installed
     __version__ = "0.0.0+unknown"
+
+# Unified memory experiments (docs/design/unified.md): a tensor read by the GPU wherever it
+# lives, and the device's view of unified memory.
+from .ops import (  # noqa: E402
+    unified_device_caps,
+    unified_gemv,
+    unified_num_variants,
+    unified_read_sum,
+)
+
+__all__ += ["unified_device_caps", "unified_gemv", "unified_num_variants", "unified_read_sum"]

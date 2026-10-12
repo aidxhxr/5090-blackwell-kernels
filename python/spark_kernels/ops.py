@@ -773,3 +773,52 @@ def cpu_bandwidth_probe(bytes: int, threads: int, iters: int = 5) -> float:
     `threads` threads: the median over `iters` sweeps of the slowest thread's wall time. On
     the GB10 this is the share of the 273 GB/s the Arm side gets on its own."""
     return _C.cpu_bandwidth_probe(bytes, threads, iters)
+# ---- unified memory experiments (docs/design/unified.md) -----------------------------------
+# The GB10 shares one pool of memory between its CPU and GPU; these ops let a kernel read a
+# tensor wherever it lives so the bench and the tests can ask what that costs. Unmeasured.
+
+UNIFIED_KERNELS = ("unified_read", "unified_gemv")
+
+
+def unified_num_variants(name: str) -> int:
+    """Number of variants of `unified_read` or `unified_gemv` (their ladders are separate from
+    `num_variants`'s list; see docs/design/unified.md)."""
+    if name not in UNIFIED_KERNELS:
+        raise ValueError(f"unknown unified kernel {name!r}; expected one of {UNIFIED_KERNELS}")
+    return _C.unified_num_variants(name)
+
+
+def unified_device_caps() -> dict[str, bool | int]:
+    """What the current CUDA device reports about unified memory, from cudaDeviceGetAttribute.
+
+    Keys: `device`, `sm_count`, and the booleans `unified_addressing`, `integrated`,
+    `can_map_host_memory`, `pageable_memory_access` (the GPU can read plain malloc / torch CPU
+    memory in place: HMM or ATS), `pageable_memory_access_uses_host_page_tables`,
+    `concurrent_managed_access`, `direct_managed_mem_access_from_host`,
+    `host_native_atomic_supported`, `can_use_host_pointer_for_registered_mem`.
+    """
+    return _C.unified_device_caps()
+
+
+def unified_read_sum(x: torch.Tensor, variant: int = -1) -> torch.Tensor:
+    """Stream a bfloat16 tensor through the GPU and return its sum as a float64 0-d tensor.
+
+    `x` may be a CUDA tensor, a pinned CPU tensor (`pin_memory=True`: cudaHostAlloc memory,
+    which the GPU reads in place), or a plain CPU tensor when `unified_device_caps()` reports
+    `pageable_memory_access`. The kernel writes one fp32 partial per block, summed here in
+    fp64. Variants: 0 one element per thread, 1 one 16-byte load per thread, 2 four 16-byte
+    loads in flight per thread; -1 is the top rung.
+    """
+    return _C.unified_read_sum(x, variant).double().sum()
+
+
+def unified_gemv(a: torch.Tensor, w: torch.Tensor, variant: int = -1) -> torch.Tensor:
+    """Decode GEMV y = w @ a for a [K] or [1, K] bfloat16 CUDA tensor and w [N, K] bfloat16
+    (K contiguous, a Linear's stored layout) that may live in CUDA, pinned CPU, or (with
+    `pageable_memory_access`) plain CPU memory; fp32 accumulation, [N] or [1, N] bfloat16.
+
+    Needs K a multiple of 8 and 16-byte aligned storage. Variants: 0 one warp per row, 1 one
+    warp per 4 rows with the next step's loads in flight, 2 variant 1 on a persistent grid
+    sized from the SM count; -1 is the top rung.
+    """
+    return _C.unified_gemv(a, w, variant)

@@ -664,4 +664,42 @@ void unified_read_bf16(const __nv_bfloat16* x, float* sink, int64_t n, int varia
 int unified_read_num_variants();
 int unified_read_sink_floats();
 
+// Decode GEMV: y[N] = W[N, K] . A[K], bf16 in and out, fp32 accumulation. A and y are device
+// memory; W is [N, K] row-major (K contiguous, a Linear's stored layout) in any UnifiedKind.
+// K % 8 == 0, 16-byte aligned A and W, any N (src/kernels/unified_gemv.cu).
+// variant 0: one warp per row, one 16-byte load per lane per step
+// variant 1: one warp per 4 rows, the next step's four loads in flight during the multiplies
+// variant 2: variant 1's body on a persistent grid of SM count x resident blocks per SM
+//            (cudaOccupancyMaxActiveBlocksPerMultiprocessor), warps striding over row groups
+void unified_gemv_bf16(const __nv_bfloat16* A, const __nv_bfloat16* W, __nv_bfloat16* y, int N,
+                       int K, int variant, cudaStream_t stream);
+int unified_gemv_num_variants();
+
+// The CPU-GPU signal pair, for measuring the handoff of a few bytes without a copy.
+// Requirements, all of them:
+//   * `flag`, `req`, `ack` and `out_iters` live in memory both sides can access while the
+//     kernel runs: host_mapped, system, or managed on a device with concurrentManagedAccess.
+//     Device memory is not readable by the host, and managed memory without concurrent
+//     access faults on a host touch during a kernel.
+//   * The GPU side reads and writes with cuda::atomic_ref<int, cuda::thread_scope_system>
+//     (acquire loads, release stores), which bypasses L1 and orders the write of a payload
+//     before the flag. The host side must do the same: __atomic_store_n(p, v,
+//     __ATOMIC_RELEASE) after writing the payload, __atomic_load_n(p, __ATOMIC_ACQUIRE) in
+//     the poll loop. A plain store may sit in a store buffer or a cache line the GPU does not
+//     snoop; a plain load may be hoisted out of the loop.
+//   * Over PCIe a system-scope load is a round trip to host memory per spin; on the GB10 it
+//     is a coherent fabric read. Either way `max_spins` bounds the wait: a flag that never
+//     arrives writes -1 to out_iters and returns instead of hanging the device.
+//   * One trip is not one kernel launch: the host launches ping_pong once, then does `rounds`
+//     trips against it, each trip being the host writing req = i and spinning until ack == i.
+// unified_poll_flag: the GPU spins until *flag == expect, then writes the spin count (-1 on
+// timeout) to out_iters. unified_set_flag: the GPU writes value to *flag (release), for the
+// host to poll. unified_ping_pong: `rounds` trips of (wait req == i, store ack = i); out_iters
+// gets the mean spins per trip.
+void unified_poll_flag(volatile int* flag, int expect, int* out_iters, long long max_spins,
+                       cudaStream_t stream);
+void unified_set_flag(volatile int* flag, int value, cudaStream_t stream);
+void unified_ping_pong(volatile int* req, volatile int* ack, int rounds, int* out_iters,
+                       long long max_spins, cudaStream_t stream);
+
 }  // namespace spark

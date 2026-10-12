@@ -1296,4 +1296,95 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // The CPU-side ops for the GB10's Arm cores (python/csrc/cpu_bindings.cpp, no CUDA).
     void register_cpu_bindings(py::module_&);
     register_cpu_bindings(m);
+
+    // ---- unified memory experiments (docs/design/unified.md) -----------------------------
+    // The weight or the array may be a CUDA tensor, a pinned CPU tensor (cudaHostAlloc memory,
+    // readable by the GPU in place under unified addressing), or a plain CPU tensor on a device
+    // that reports pageableMemoryAccess (HMM / ATS). The launch goes on the current stream of
+    // the current CUDA device; a plain CPU tensor on a device without pageable access is
+    // refused here rather than faulting in the kernel.
+    m.def(
+        "unified_device_caps",
+        []() {
+            const spark::UnifiedDeviceCaps c = spark::unified_device_caps(-1);
+            py::dict d;
+            d["device"] = c.device;
+            d["sm_count"] = c.sm_count;
+            d["unified_addressing"] = static_cast<bool>(c.unified_addressing);
+            d["integrated"] = static_cast<bool>(c.integrated);
+            d["can_map_host_memory"] = static_cast<bool>(c.can_map_host_memory);
+            d["pageable_memory_access"] = static_cast<bool>(c.pageable_memory_access);
+            d["pageable_memory_access_uses_host_page_tables"] =
+                static_cast<bool>(c.pageable_memory_access_uses_host_page_tables);
+            d["concurrent_managed_access"] = static_cast<bool>(c.concurrent_managed_access);
+            d["direct_managed_mem_access_from_host"] =
+                static_cast<bool>(c.direct_managed_mem_access_from_host);
+            d["host_native_atomic_supported"] = static_cast<bool>(c.host_native_atomic_supported);
+            d["can_use_host_pointer_for_registered_mem"] =
+                static_cast<bool>(c.can_use_host_pointer_for_registered_mem);
+            return d;
+        },
+        "cudaDeviceGetAttribute's view of unified memory on the current device, as a dict");
+    m.def(
+        "unified_read_sum",
+        [](const Tensor& x, int variant) {
+            TORCH_CHECK(x.is_contiguous() && x.numel() > 0, "x must be contiguous and non-empty");
+            TORCH_CHECK(x.scalar_type() == at::kBFloat16, "unified_read_sum expects bfloat16");
+            const bool pageable = spark::unified_device_caps(-1).pageable_memory_access != 0;
+            TORCH_CHECK(x.is_cuda() || x.is_pinned() || pageable,
+                        "x is a pageable CPU tensor and this device has no pageableMemoryAccess; "
+                        "pass a CUDA tensor or one made with pin_memory=True");
+            const int v = resolve_variant(variant, spark::unified_read_num_variants());
+            const at::Device dev =
+                x.is_cuda() ? x.device() : at::Device(at::kCUDA, at::cuda::current_device());
+            const c10::cuda::CUDAGuard guard(dev);
+            Tensor sink = at::empty({spark::unified_read_sink_floats()},
+                                    at::TensorOptions().dtype(at::kFloat).device(dev));
+            spark::unified_read_bf16(reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+                                     sink.data_ptr<float>(), x.numel(), v, current_stream(sink));
+            return sink;
+        },
+        "stream a bf16 tensor (CUDA, pinned CPU, or plain CPU with pageableMemoryAccess) into "
+        "per-block fp32 partial sums on the current CUDA device; sum them for the total",
+        py::arg("x"), py::arg("variant") = -1);
+    m.def(
+        "unified_gemv",
+        [](const Tensor& a, const Tensor& w, int variant) {
+            check_cuda_contig(a, "a");
+            TORCH_CHECK(a.scalar_type() == at::kBFloat16 && w.scalar_type() == at::kBFloat16,
+                        "unified_gemv expects bfloat16 a and w");
+            TORCH_CHECK(a.dim() == 1 || (a.dim() == 2 && a.size(0) == 1),
+                        "a must be [K] or [1, K], got ", a.sizes());
+            TORCH_CHECK(w.dim() == 2 && w.is_contiguous() && w.numel() > 0,
+                        "w must be a contiguous [N, K] (K contiguous)");
+            const int64_t K = a.size(-1), N = w.size(0);
+            TORCH_CHECK(w.size(1) == K, "w is ", w.sizes(), ", expected [N, ", K, "]");
+            TORCH_CHECK(K % 8 == 0 && N <= INT32_MAX && K <= INT32_MAX,
+                        "unified_gemv needs K % 8 == 0, got K = ", K);
+            TORCH_CHECK(aligned16(a) && aligned16(w), "a and w need 16-byte aligned storage");
+            const bool pageable = spark::unified_device_caps(-1).pageable_memory_access != 0;
+            TORCH_CHECK(w.is_cuda() || w.is_pinned() || pageable,
+                        "w is a pageable CPU tensor and this device has no pageableMemoryAccess; "
+                        "pass a CUDA tensor or one made with pin_memory=True");
+            TORCH_CHECK(!w.is_cuda() || w.device() == a.device(), "w must be on a's device");
+            const c10::cuda::CUDAGuard guard(a.device());
+            Tensor y = a.dim() == 1 ? at::empty({N}, a.options()) : at::empty({1, N}, a.options());
+            const int v = resolve_variant(variant, spark::unified_gemv_num_variants());
+            spark::unified_gemv_bf16(bf16_ptr(a), reinterpret_cast<const __nv_bfloat16*>(w.data_ptr()),
+                                     bf16_ptr_mut(y), static_cast<int>(N), static_cast<int>(K), v,
+                                     current_stream(a));
+            return y;
+        },
+        "decode GEMV: a [K] or [1, K] bf16 on the device times w [N, K] bf16 in any memory the "
+        "GPU can read (CUDA, pinned CPU, or plain CPU with pageableMemoryAccess) -> [N] or "
+        "[1, N] bf16, fp32 accumulate",
+        py::arg("a"), py::arg("w"), py::arg("variant") = -1);
+    m.def(
+        "unified_num_variants",
+        [](const std::string& name) {
+            if (name == "unified_read") return spark::unified_read_num_variants();
+            if (name == "unified_gemv") return spark::unified_gemv_num_variants();
+            throw std::invalid_argument("unknown unified kernel: " + name);
+        },
+        "number of variants of unified_read or unified_gemv", py::arg("name"));
 }
