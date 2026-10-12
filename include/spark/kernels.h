@@ -701,5 +701,32 @@ void unified_poll_flag(volatile int* flag, int expect, int* out_iters, long long
 void unified_set_flag(volatile int* flag, int value, cudaStream_t stream);
 void unified_ping_pong(volatile int* req, volatile int* ack, int rounds, int* out_iters,
                        long long max_spins, cudaStream_t stream);
+// ---- fused MoE expert step for decode (src/kernels/w1moe_decode.cu) --------------------------
+// For T <= 8 tokens: y[t] = sum over the topk experts e of token t of
+//     expert_weights[t, slot] * (silu(x[t] Wgate[e]) * (x[t] Wup[e])) Wdown[e]
+// with the routed experts in the w1gemm format: packed_gate_up [E, 2I, K bits / 32] (gate
+// columns 0..I-1 then up columns I..2I-1 of a [K, 2I] weight per expert, MoEBlock1Bit's
+// layout), scales_gate_up [E, K / 128, 2I]; packed_down [E, K, I bits / 32], scales_down
+// [E, I / 128, K]. x [T, K] and y [T, K] bf16, expert_ids int32 [T, topk], expert_weights
+// bf16 [T, topk] (the renormalized routing weights). fp32 accumulation; the gate, up and
+// SwiGLU values are rounded to bf16 where the sorted w1gemm_moe path rounds them. The shared
+// expert and the router are the caller's. Needs 1 <= T <= 8, T * topk <= 64, bits 1 or 2,
+// K % 256 == 0, K <= 16384, I % 128 == 0, 16-byte aligned x and packed weights.
+// variant 0: three passes through global memory (gate|up GEMV per (token, slot), SwiGLU,
+//            down GEMV summing the slots), scalar dequant
+// variant 1: one persistent kernel; a work item is (expert, 128 columns of I): the block runs
+//            gate and up for every token of the expert, the SwiGLU in shared memory, then its
+//            128 rows of Wdown over all K with fp32 atomics into y; the intermediate never
+//            touches DRAM. CUDA-core fp32 adds over the sign bits, no mma (see the source)
+// variant 2: variant 1 with the routing weight folded into the down epilogue and the next
+//            item's first gate|up groups in flight during the SwiGLU and the down pass
+// Variants 1 and 2 add into y with atomics, so the last bits can differ run to run.
+void w1moe_decode_bf16(const __nv_bfloat16* x, const int32_t* expert_ids,
+                       const __nv_bfloat16* expert_weights, const uint32_t* packed_gate_up,
+                       const __nv_bfloat16* scales_gate_up, const uint32_t* packed_down,
+                       const __nv_bfloat16* scales_down, __nv_bfloat16* y, int T, int topk, int E,
+                       int K, int I, int bits, int variant, cudaStream_t stream);
+int w1moe_decode_num_variants();
+bool w1moe_decode_supports(int T, int topk, int K, int I, int bits, int variant);
 
 }  // namespace spark
