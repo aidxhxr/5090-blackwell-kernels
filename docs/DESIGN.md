@@ -106,3 +106,4 @@ docs:
 - [parity on real weights: the engine against transformers and an fp32 reference](design/llm_parity.md)
 - [low-precision weights on a real Llama-3-8B: int4, fp8 and fp4 quality and speed](design/llm_quant.md)
 - [more models and long context: Llama 3.1 rope scaling, Mistral, chunked prefill, 100K tokens](design/llm_models.md)
+- [the Grace side: the 1-bit GEMV, routing, sampling and a bandwidth probe on the GB10's Arm cores, and whether sharing the 273 GB/s gains anything](design/grace.md) (not measured yet)
