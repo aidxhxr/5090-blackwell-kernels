@@ -757,6 +757,29 @@ GEMMs takes 3.4 GiB of device memory outside torch's allocator. Next to 15 GiB o
 a 12 GiB cache, that doesn't fit, so the 100K run uses the Stream-K GEMM for prefill. Details in
 [docs/design/llm_models.md](docs/design/llm_models.md).
 
+## experiments for the DGX Spark
+
+The GB10 is the machine this repo was named for, and it is a different machine from the 5090
+in every way that matters to a decode step: 48 SMs instead of 170, 273 GB/s of LPDDR5X instead
+of 1.5 TB/s, a 24 MB L2, 128 GB that the GPU shares with 20 Arm cores, and no PCIe between
+them. None of the kernels above were tuned for that, so these are the experiments I want to
+run the day it arrives. All of it is written, none of it has compiled against `sm_121` or run.
+Every note below says so and names what to run first.
+
+| experiment | question | code |
+|---|---|---|
+| unified memory | does a kernel streaming weights from managed, host-mapped or plain `malloc` memory read at the same GB/s as from `cudaMalloc`, what each `cudaMemAdvise` changes, and how long after the CPU writes a flag a running kernel sees it | `unified_read`, `unified_gemv`, `unified_ping_pong`; `bench_unified` |
+| decode grids on 48 SMs | how many bytes have to be in flight per SM to fill 273 GB/s, how the split-K factor should follow the SM count, and whether an int4 or 1-bit weight that fits the 24 MB L2 stays there across steps | `launch_config`, the decode paths of `hgemm`, `w4gemm` and `w1gemm`; `bench_decode_spark` |
+| the Grace cores | what fraction of the 273 GB/s ten Cortex-X925 cores pull on a 1-bit GEMV, and whether routing and sampling belong there | `src/cpu/`, `cpu_w1gemv`, `cpu_route`, `cpu_sample`; `bench_cpu`, which builds without CUDA |
+| DeepSeek V4.1 Flash at 1 bit on 128 GB | at 1 bit the whole model fits with room to spare, at ternary it does not (144 GB of experts), so what is a decode step: six experts' gate, up and down fused in one persistent kernel with the intermediate in shared memory, the 31 MB active set against the 24 MB L2, and the floor at 273 GB/s | `w1moe_decode`, `MoEBlock1Bit.decode`; `bench_w1moe_decode`, `scripts/bench_deepseek_spark.py` |
+
+The decode-grid change is the one that touches kernels with measured numbers: the grids
+that used to assume 170 SMs now ask the device, and on a device that reports 170 they pick
+the same constants as before. `SPARK_FORCE_SMS=48` makes the 5090 launch the Spark's grid, so
+that path can be checked before the box is here. Notes: [unified](docs/design/unified.md),
+[decode grids](docs/design/decode_spark.md), [grace](docs/design/grace.md),
+[moe on the Spark](docs/design/moe_spark.md), and [the GB10 sheet](docs/GB10.md).
+
 ## the memory-bound kernels
 
 RMSNorm, SwiGLU and softmax move bytes and do almost no math, so the only question is whether
@@ -807,6 +830,9 @@ default stays on the CUDA cores.
 | `fp4gemm` NVFP4, MXFP4 | naive `mma.sync.m16n8k64.kind::mxf4nvf4`, the swizzled cp.async tile with the block scales staged beside it, TMA with bulk-copied scales; a bf16 -> fp4 quantizer | cuBLASLt NVFP4 (bit-identical), `F.scaled_mm` |
 | `w4gemm` W4A16 | thread per output; a warp per 16 columns with the repacked int4 fragments and the activations straight into registers; warps along K on a cp.async pipeline for M <= 8 and independent warps for M <= 16, Stream-K tiles above; round-to-nearest quantizer and the offline repack | the bf16 `hgemm` on the dequantized weights, cuBLAS |
 | `w1gemm`, `w1gemm_moe` W1A16 | thread per output; a warp per 16 columns with the sign bits XORed into bf16x2 fragments and the activations straight into registers; warps along K for M <= 16; the grouped form over experts from sorted rows and offsets; the absmean quantizer at 1 and 2 bits | the bf16 `hgemm` on the dequantized weights, cuBLAS; unmeasured |
+| `w1moe_decode` | three passes through global memory; one persistent kernel per (expert, 128 columns) with the intermediate in shared memory and fp32 atomics into y; the routing weight folded into the down epilogue with the next expert's words in flight | the sorted `w1gemm_moe` path and a dense torch reference; unmeasured |
+| `unified_read`, `unified_gemv` | scalar, 16-byte, four 16-byte loads in flight; a warp per row, a warp per 4 rows, a persistent grid from the SM count; over `cudaMalloc`, managed, host-mapped and system memory | CPU double sum, cuBLAS on a device copy; unmeasured |
+| `cpu_w1gemv`, `cpu_route`, `cpu_sample` | the 1-bit GEMV on the Arm cores: scalar, NEON sign masks in fp32, NEON int8 dot products; sigmoid top-k routing and top-k / top-p sampling, no CUDA | the scalar path, `reference.w1_dequantize`, `moe.route`; runs on any Arm machine |
 | `attention` bf16 | warp per row, CUDA-core flash attention, `mma.sync` flash attention, split-KV tail, TMA mbarrier pipeline, persistent tile queue with a producer warp; GQA and a flash-decoding kernel | `F.scaled_dot_product_attention` |
 | `attention_fp8` e4m3 | warp per row on dequantized inputs, variant 5's persistent TMA kernel with both products on the block-scaled fp8 `mma.sync`, P rounded to e4m3 in registers, V transposed by `ldmatrix.trans` and byte permutes | the bf16 kernel, `F.scaled_dot_product_attention` in bf16 |
 | `attention_bwd` bf16 | warp per row, FlashAttention-2's key-tile loop on `mma.sync`, V in registers with a double-buffered Q/dO tile and a simulated split, TMA and mbarriers with no block barrier; GQA, a deterministic dQ pass, an autograd Function | torch autograd through `F.scaled_dot_product_attention` (flash and cuDNN) |
@@ -826,6 +852,7 @@ newer). The extension builds as C++20 because the torch headers ask for it.
 
 ```bash
 make build            # sm_120 (the fp8 and fp4 kernels as sm_120a); ARCH=121 for the GB10
+make bench-cpu        # the Arm-side ops, no CUDA needed; results/cpu.json
 make bench            # every bench_* binary, validates each variant, writes results/*.json
 make results          # docs/RESULTS.md, results/headline.md, results/roofline.png
 
@@ -892,14 +919,16 @@ numbers, the sweeps that picked the constants, and which Nsight metric moved:
 
 - [docs/DESIGN.md](docs/DESIGN.md), conventions and how things are measured
 - [docs/RTX5090.md](docs/RTX5090.md), the card, measured
-- [docs/GB10.md](docs/GB10.md), the card that hasn't arrived
+- [docs/GB10.md](docs/GB10.md), the card that hasn't arrived, and the experiments waiting for it
 - [bandwidth](docs/design/bandwidth.md), [rmsnorm](docs/design/rmsnorm.md),
   [swiglu](docs/design/swiglu.md), [softmax](docs/design/softmax.md),
   [sgemm](docs/design/sgemm.md), [hgemm](docs/design/hgemm.md),
   [fp8gemm](docs/design/fp8gemm.md), [fp4gemm](docs/design/fp4gemm.md),
   [w4gemm](docs/design/w4gemm.md), [w1gemm](docs/design/w1gemm.md),
   [attention](docs/design/attention.md),
-  [layer](docs/design/layer.md), [serving](docs/design/serving.md)
+  [layer](docs/design/layer.md), [serving](docs/design/serving.md),
+  [unified memory](docs/design/unified.md), [decode grids on 48 SMs](docs/design/decode_spark.md),
+  [the Grace cores](docs/design/grace.md), [DeepSeek V4.1 Flash on 128 GB](docs/design/moe_spark.md)
 
 Things I'd still like to do: a 128-key tile for attention, which would halve how often the
 two warps of a scheduler land in their softmaxes together (the 3% of tensor pipe still idle);
