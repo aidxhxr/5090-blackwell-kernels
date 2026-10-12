@@ -39,8 +39,16 @@ nvcc_flags = [
 ] + gencode_flags
 
 # setuptools refuses absolute source paths, so everything is relative to the project root.
-sources = [os.path.join("python", "csrc", "bindings.cpp")] + sorted(
+sources = [os.path.join("python", "csrc", "bindings.cpp"),
+           os.path.join("python", "csrc", "cpu_bindings.cpp")] + sorted(
     os.path.relpath(p, ROOT) for p in glob.glob(os.path.join(ROOT, "src", "kernels", "*.cu"))
+)
+# The CPU-side ops (include/spark/cpu.h): plain C++, NEON under __ARM_NEON, which the host
+# compiler defines on aarch64 (the DGX Spark); on x86 the scalar rungs are what is built.
+# bench_cpu.cpp is a standalone binary (CMake's bench_cpu target), not part of the extension.
+sources += sorted(
+    os.path.relpath(p, ROOT) for p in glob.glob(os.path.join(ROOT, "src", "cpu", "*.cpp"))
+    if os.path.basename(p) != "bench_cpu.cpp"
 )
 
 ext = CUDAExtension(

@@ -19,6 +19,7 @@ find_package(CUDAToolkit 13.0 REQUIRED)
 
 option(SPARK_BUILD_BENCH "Build benchmark binaries (needs cuBLAS)" ON)
 option(SPARK_LINEINFO "Embed line info for Nsight Compute source view" ON)
+option(SPARK_BUILD_CPU "Build the CPU-side ops (spark_cpu) and bench_cpu" ON)
 
 # The architecture-specific form of each requested arch ("120a"): the block-scaled fp8
 # mma.sync (.kind::mxf8f6f4) that gives the fp8 GEMM its full rate, and the fp4 one
@@ -69,4 +70,27 @@ if(SPARK_BUILD_BENCH)
   endforeach()
   # bench_peak measures the block-scaled fp8 instruction, so it needs the "a" arch too.
   set_target_properties(bench_peak PROPERTIES CUDA_ARCHITECTURES "${SPARK_CUDA_ARCHITECTURES_A}")
+endif()
+
+# ---- CPU-side ops (the GB10's Arm cores) ----------------------------------------------------
+# include/spark/cpu.h and src/cpu/*.cpp: a 1-bit GEMV, routing, sampling and a bandwidth
+# probe in plain C++17, no CUDA. On aarch64 (the DGX Spark) it is built for Arm v9 with SVE2
+# so the NEON paths and the dot-product extension are in; elsewhere only the scalar rungs
+# compile (the NEON code sits behind __ARM_NEON). bench_cpu links against spark_cpu alone.
+if(SPARK_BUILD_CPU)
+  file(GLOB SPARK_CPU_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/cpu/*.cpp)
+  list(REMOVE_ITEM SPARK_CPU_SOURCES ${CMAKE_SOURCE_DIR}/src/cpu/bench_cpu.cpp)
+  add_library(spark_cpu STATIC ${SPARK_CPU_SOURCES})
+  target_include_directories(spark_cpu PUBLIC ${CMAKE_SOURCE_DIR}/include)
+  set_target_properties(spark_cpu PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  find_package(Threads REQUIRED)
+  target_link_libraries(spark_cpu PUBLIC Threads::Threads)
+  set(SPARK_CPU_FLAGS -O3 -Wall)
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$" AND NOT APPLE)
+    list(APPEND SPARK_CPU_FLAGS -march=armv9-a+sve2)
+  endif()
+  target_compile_options(spark_cpu PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${SPARK_CPU_FLAGS}>)
+  add_executable(bench_cpu ${CMAKE_SOURCE_DIR}/src/cpu/bench_cpu.cpp)
+  target_link_libraries(bench_cpu PRIVATE spark_cpu)
+  target_compile_options(bench_cpu PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${SPARK_CPU_FLAGS}>)
 endif()

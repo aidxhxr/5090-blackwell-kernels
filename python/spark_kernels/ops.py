@@ -731,3 +731,45 @@ def attention_with_grad(
     enable_gqa=True)` in training code, for bfloat16 [B, H, S, D] tensors with D 64 or 128.
     """
     return AttentionFunction.apply(q, k, v, causal, variant, bwd_variant, deterministic)
+
+
+# ---------------------------------------------------------------------------
+# CPU-side ops: the GB10's Arm cores (include/spark/cpu.h, docs/design/grace.md)
+# ---------------------------------------------------------------------------
+def cpu_w1gemv(a: torch.Tensor, w: W1Weight, threads: int = 1, variant: int = -1) -> torch.Tensor:
+    """`w1gemm` on the CPU cores: a [K] or [M, K] bfloat16 @ the sign or ternary weight ->
+    [N] or [M, N] bfloat16, fp32 accumulate per group, one GEMV per row of `a`.
+
+    Every tensor must be on the CPU (the Spark's unified memory means a `.cpu()` of a weight
+    is a copy today, so quantize on the host or move once). `threads` splits the rows over
+    std::threads in a fixed partition. Variant -1 is the top rung the build has: 0 scalar,
+    1 NEON fp32 (exact up to summation order), 2 NEON int8 dot products (the activations
+    rounded to int8 per group).
+    """
+    return _C.cpu_w1gemv(a, w.packed, w.scales, w.bits, threads, variant)
+
+
+def cpu_route(logits: torch.Tensor, top_k: int, bias: torch.Tensor | None = None,
+              scale: float = 1.0) -> tuple[torch.Tensor, torch.Tensor]:
+    """`spark_kernels.moe.route` on the CPU cores, token by token: fp32 logits [E] or [T, E]
+    -> (expert ids int32, gate weights fp32) of shape [k] or [T, k]. The top_k of
+    sigmoid(logits) + bias picks, the unbiased sigmoid scores renormalized to sum `scale`
+    weight. A partial selection, no sort of the E experts."""
+    return _C.cpu_route(logits, top_k, bias, scale)
+
+
+def cpu_sample(logits: torch.Tensor, temperature: float, top_k: int = 0, top_p: float = 1.0,
+               seed: int = 0, offset: int = 0) -> torch.Tensor:
+    """One token per bfloat16 logit row ([V] or [B, V]) on the CPU cores, int64. temperature
+    <= 0 is argmax (the first index of the max); otherwise top-k by a partial selection, top-p
+    over what top-k kept, and a draw from splitmix64(seed, offset + row). Reproducible for a
+    (seed, offset), but not the GPU `sample`'s Philox stream: the two do not agree token for
+    token."""
+    return _C.cpu_sample(logits, temperature, top_k, top_p, seed, offset)
+
+
+def cpu_bandwidth_probe(bytes: int, threads: int, iters: int = 5) -> float:
+    """GB/s the CPU cores stream from a private buffer of `bytes` with 16-byte NEON loads on
+    `threads` threads: the median over `iters` sweeps of the slowest thread's wall time. On
+    the GB10 this is the share of the 273 GB/s the Arm side gets on its own."""
+    return _C.cpu_bandwidth_probe(bytes, threads, iters)

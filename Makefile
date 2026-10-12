@@ -8,7 +8,7 @@ ARCH  ?= 120
 CXX_SOURCES = $(shell find include src python/csrc -type f \
 	\( -name '*.cu' -o -name '*.cuh' -o -name '*.h' -o -name '*.hpp' -o -name '*.cpp' \))
 
-.PHONY: all help configure build bench python test lint format ncu results env clean
+.PHONY: all help configure build bench bench-cpu python test lint format ncu results env clean
 
 all: build
 
@@ -16,6 +16,7 @@ help:
 	@echo "configure  cmake configure only, for sm_$(ARCH) into $(BUILD)/ (ARCH=121 for the DGX Spark)"
 	@echo "build      cmake configure + build for sm_$(ARCH) into $(BUILD)/"
 	@echo "bench      run every bench_* binary, write results/*.json and results/env.txt (GPU state)"
+	@echo "bench-cpu  build and run bench_cpu (the Arm cores alone, no CUDA) into results/cpu.json"
 	@echo "results    docs/RESULTS.md, results/headline.md, results/roofline.png"
 	@echo "python     pip install -e . (PyTorch extension)"
 	@echo "test       install the extension, then pytest parity tests for every variant"
@@ -33,6 +34,12 @@ build: configure
 
 bench: build
 	./scripts/run_all_benches.sh $(BUILD)
+
+# The CPU-side bench needs no GPU: configure once (the CUDA language still has to resolve,
+# so this runs where nvcc is), build only bench_cpu, write its rows next to the GPU ones.
+bench-cpu: configure
+	cmake --build $(BUILD) -j --target bench_cpu
+	./$(BUILD)/bench_cpu > results/cpu.json
 
 results:
 	python3 scripts/make_results_table.py

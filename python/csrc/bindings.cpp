@@ -1293,4 +1293,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("v_scale") = py::none());
     m.def("num_variants", &num_variants, "number of implementation variants for a kernel",
           py::arg("name"));
+    // The CPU-side ops for the GB10's Arm cores (python/csrc/cpu_bindings.cpp, no CUDA).
+    void register_cpu_bindings(py::module_&);
+    register_cpu_bindings(m);
 }
