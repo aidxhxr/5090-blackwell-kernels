@@ -54,6 +54,86 @@ def time_ms(fn, iters: int, warmup: int = 3) -> float:
     return statistics.median(out)
 
 
+def bench_shape(sk, ref, args, name, m, w, T):
+    """Check and time one model at one token count; returns the result rows."""
+    E, k, K, N = m["E"], m["k"], m["K"], m["N"]
+    rows = []
+    ids = ref.moe_route(T, E, k, seed=T)
+    order, offsets = sk.moe_offsets(ids, E)
+    rows_n = T * k
+    a = (torch.rand(rows_n, K, device="cuda") * 2 - 1).to(torch.bfloat16)
+    offs = offsets.tolist()
+    flops = 2.0 * rows_n * N * K
+    shape = f"{name} t={T}"
+
+    def loop(offs=offs):
+        out = torch.empty(rows_n, N, device="cuda", dtype=torch.bfloat16)
+        for e in range(E):
+            lo, hi = offs[e], offs[e + 1]
+            if hi > lo:
+                torch.matmul(a[lo:hi], w[e].t(), out=out[lo:hi])
+        return out
+
+    def loop_sync():
+        return loop(offsets.tolist())
+
+    got = sk.grouped_gemm(a, w, offsets)
+    want = loop()
+    err = (got.float() - want.float()).abs().max().item()
+    scale = want.float().abs().max().item()
+    assert err <= 1e-2 * scale, f"{shape}: grouped bf16 off by {err} (max {scale})"
+
+    t_loop = time_ms(loop, args.iters)
+    res = {"torch_loop": t_loop,
+           "torch_loop_sync": time_ms(loop_sync, args.iters),
+           "grouped": time_ms(lambda: sk.grouped_gemm(a, w, offsets), args.iters)}
+
+    if not args.no_fp8:
+        a8 = a.to(torch.float8_e4m3fn)
+        w8 = w.to(torch.float8_e4m3fn)
+        sa = torch.tensor([1.0], device="cuda")
+        sb = torch.ones(E, device="cuda")
+        one = torch.tensor(1.0, device="cuda")
+        # _scaled_mm wants M a multiple of 16: each expert's rows padded on a copy.
+        pad = [((offs[e + 1] - offs[e] + 15) // 16) * 16 for e in range(E)]
+        poffs = [0]
+        for p_ in pad:
+            poffs.append(poffs[-1] + p_)
+        a8p = torch.zeros(poffs[-1], K, device="cuda", dtype=torch.float8_e4m3fn)
+        for e in range(E):
+            n_ = offs[e + 1] - offs[e]
+            a8p[poffs[e]:poffs[e] + n_] = a8[offs[e]:offs[e + 1]]
+
+        def loop8():
+            out = torch.empty(poffs[-1], N, device="cuda", dtype=torch.bfloat16)
+            for e in range(E):
+                lo, hi = poffs[e], poffs[e + 1]
+                if hi > lo:
+                    out[lo:hi] = torch._scaled_mm(a8p[lo:hi], w8[e].t(), scale_a=one,
+                                                  scale_b=one, out_dtype=torch.bfloat16)
+            return out
+
+        got8 = sk.grouped_gemm(a8, w8, offsets, sa, sb)
+        want8 = ref.grouped_gemm(a8, w8, offsets, sa, sb)
+        err8 = (got8.float() - want8.float()).abs().max().item()
+        scale8 = want8.float().abs().max().item()
+        assert err8 <= 1e-2 * scale8, f"{shape}: grouped fp8 off by {err8}"
+        try:
+            res["torch_fp8_loop"] = time_ms(loop8, args.iters)
+        except RuntimeError as exc:  # no fp8 _scaled_mm on this build
+            print(f"# torch._scaled_mm failed: {exc}")
+        res["grouped_fp8"] = time_ms(lambda: sk.grouped_gemm(a8, w8, offsets, sa, sb),
+                                     args.iters)
+
+    for impl, ms in res.items():
+        tf = flops / (ms * 1e-3) / 1e12
+        print(f"{shape:<20} {impl:<16} {ms:9.4f} {tf:8.1f} {t_loop / ms:7.2f}x")
+        rows.append({"device": torch.cuda.get_device_name(), "kernel": "grouped_gemm",
+                     "impl": impl, "shape": shape, "E": E, "top_k": k, "K": K, "N": N,
+                     "tokens": T, "rows": rows_n, "median_ms": ms, "tflops": tf})
+    return rows
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", nargs="*", default=list(MODELS))
@@ -69,84 +149,10 @@ def main() -> None:
     print(f"{'shape':<20} {'impl':<16} {'ms':>9} {'TFLOPS':>8} {'vs loop':>8}")
     for name in args.model:
         m = MODELS[name]
-        E, k, K, N = m["E"], m["k"], m["K"], m["N"]
+        E, K, N = m["E"], m["K"], m["N"]
         w = (torch.rand(E, N, K, device="cuda") * 2 - 1).to(torch.bfloat16)
         for T in args.tokens:
-            ids = ref.moe_route(T, E, k, seed=T)
-            order, offsets = sk.moe_offsets(ids, E)
-            rows_n = T * k
-            a = (torch.rand(rows_n, K, device="cuda") * 2 - 1).to(torch.bfloat16)
-            offs = offsets.tolist()
-            flops = 2.0 * rows_n * N * K
-            shape = f"{name} t={T}"
-
-            def loop(offs=offs):
-                out = torch.empty(rows_n, N, device="cuda", dtype=torch.bfloat16)
-                for e in range(E):
-                    lo, hi = offs[e], offs[e + 1]
-                    if hi > lo:
-                        torch.matmul(a[lo:hi], w[e].t(), out=out[lo:hi])
-                return out
-
-            def loop_sync():
-                return loop(offsets.tolist())
-
-            got = sk.grouped_gemm(a, w, offsets)
-            want = loop()
-            err = (got.float() - want.float()).abs().max().item()
-            scale = want.float().abs().max().item()
-            assert err <= 1e-2 * scale, f"{shape}: grouped bf16 off by {err} (max {scale})"
-
-            t_loop = time_ms(loop, args.iters)
-            res = {"torch_loop": t_loop,
-                   "torch_loop_sync": time_ms(loop_sync, args.iters),
-                   "grouped": time_ms(lambda: sk.grouped_gemm(a, w, offsets), args.iters)}
-
-            if not args.no_fp8:
-                a8 = a.to(torch.float8_e4m3fn)
-                w8 = w.to(torch.float8_e4m3fn)
-                sa = torch.tensor([1.0], device="cuda")
-                sb = torch.ones(E, device="cuda")
-                one = torch.tensor(1.0, device="cuda")
-                # _scaled_mm wants M a multiple of 16: each expert's rows padded on a copy.
-                pad = [((offs[e + 1] - offs[e] + 15) // 16) * 16 for e in range(E)]
-                poffs = [0]
-                for p_ in pad:
-                    poffs.append(poffs[-1] + p_)
-                a8p = torch.zeros(poffs[-1], K, device="cuda", dtype=torch.float8_e4m3fn)
-                for e in range(E):
-                    n_ = offs[e + 1] - offs[e]
-                    a8p[poffs[e]:poffs[e] + n_] = a8[offs[e]:offs[e + 1]]
-
-                def loop8():
-                    out = torch.empty(poffs[-1], N, device="cuda", dtype=torch.bfloat16)
-                    for e in range(E):
-                        lo, hi = poffs[e], poffs[e + 1]
-                        if hi > lo:
-                            out[lo:hi] = torch._scaled_mm(a8p[lo:hi], w8[e].t(), scale_a=one,
-                                                          scale_b=one, out_dtype=torch.bfloat16)
-                    return out
-
-                got8 = sk.grouped_gemm(a8, w8, offsets, sa, sb)
-                want8 = ref.grouped_gemm(a8, w8, offsets, sa, sb)
-                err8 = (got8.float() - want8.float()).abs().max().item()
-                scale8 = want8.float().abs().max().item()
-                assert err8 <= 1e-2 * scale8, f"{shape}: grouped fp8 off by {err8}"
-                try:
-                    res["torch_fp8_loop"] = time_ms(loop8, args.iters)
-                except RuntimeError as exc:  # no fp8 _scaled_mm on this build
-                    print(f"# torch._scaled_mm failed: {exc}")
-                res["grouped_fp8"] = time_ms(lambda: sk.grouped_gemm(a8, w8, offsets, sa, sb),
-                                             args.iters)
-                del a8, w8, a8p
-
-            for impl, ms in res.items():
-                tf = flops / (ms * 1e-3) / 1e12
-                print(f"{shape:<20} {impl:<16} {ms:9.4f} {tf:8.1f} {t_loop / ms:7.2f}x")
-                rows.append({"device": torch.cuda.get_device_name(), "kernel": "grouped_gemm",
-                             "impl": impl, "shape": shape, "E": E, "top_k": k, "K": K, "N": N,
-                             "tokens": T, "rows": rows_n, "median_ms": ms, "tflops": tf})
-            del a
+            rows += bench_shape(sk, ref, args, name, m, w, T)
         del w
         torch.cuda.empty_cache()
 
