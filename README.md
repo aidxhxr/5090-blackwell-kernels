@@ -190,6 +190,18 @@ TFLOPS, all from one run. Variant 5 only takes grids of at least one 128 x 128 t
 at 1024 cubed variant 6 runs variant 4's smaller tiles. On a 17 us kernel the extension's
 host path is a visible share of the torch column; the C++ bench has it at 102.3% of cuBLAS.
 
+### model shapes
+
+Those are squares. A prefill or a batched decode step is M = 128 to 4096 tokens against a
+real projection, and there the 128 x 128 grid is a fraction of a wave on 170 SMs: 128 tokens
+on a Llama 3 8B q_proj is 32 tiles, and variant 6 hands everything under about 512 tokens on
+a 4096-wide model to variant 4's slower `cp.async` tiles. `bench_hgemm --models` runs twenty
+weights from Llama 3 8B and 70B, Qwen 3 and a DeepSeek expert at M = 128 to 4096 against
+cuBLAS, with B rotated past L2. Variant 6 now has 128 x 64, 64 x 128 and 128 x 256 TMA tiles
+and a per-shape rule that keeps every M > 64 on the TMA kernel
+([hgemm.md, "Model shapes"](docs/design/hgemm.md)). Both were written while the box was down:
+not compiled, not measured, and not the default. The table goes here when they are.
+
 ### decode
 
 With 1 to 64 tokens against a 4096 x 4096 weight matrix the GEMM is 32 MB of weights and
