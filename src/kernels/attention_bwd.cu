@@ -119,7 +119,8 @@ __device__ __forceinline__ void red_add2(float* p, float a, float b) {
 
 // ---------------------------------------------------------------------------------------
 // Preprocess: ld[bh * S_pad + i] = {L_i log2(e), dO_i . O_i}, {0, 0} for the padding rows,
-// and the fp32 dQ rows zeroed when dq_acc is not null. One warp per padded row. Zeroing here
+// the fp32 dQ rows zeroed when dq_acc is not null, and the persistent kernel's item counter
+// zeroed when `counter` is not null. One warp per padded row. Zeroing here
 // rather than after the previous call has a side effect worth keeping: the zeroed lines are in
 // L2 when the key-tile kernel's atomics arrive (moving the zeroing into the dQ conversion of
 // the previous call measured 4% slower at 4096 tokens).
@@ -127,11 +128,12 @@ __device__ __forceinline__ void red_add2(float* p, float a, float b) {
 template <int D>
 __global__ void bwd_preprocess_kernel(const bf16* __restrict__ O, const bf16* __restrict__ dO,
                                       const float* __restrict__ lse, float2* __restrict__ ld,
-                                      float* __restrict__ dq_acc, int S_q, int S_pad,
-                                      int rows_pad) {
+                                      float* __restrict__ dq_acc, int* __restrict__ counter,
+                                      int S_q, int S_pad, int rows_pad) {
     constexpr int VEC = D / 32;
     const int lane = threadIdx.x & 31;
     const int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    if (counter != nullptr && blockIdx.x == 0 && threadIdx.x == 0) *counter = 0;
     if (row >= rows_pad) return;
     const int bh = row / S_pad, i = row - bh * S_pad;
     if (i >= S_q) {
@@ -341,15 +343,15 @@ __host__ __device__ __forceinline__ void tile_coords(int t, int bkv_count, int k
 
 // The block's tile and its [ib, ie) of the `total` iterations of that tile, and whether the
 // tile is split (so the block adds to the workspace).
-__device__ __forceinline__ void block_work(const Sched& s, int& tile, int& item, int& piece,
-                                           int& pieces) {
+__device__ __forceinline__ void block_work(const Sched& s, int idx, int& tile, int& item,
+                                           int& piece, int& pieces) {
     const int head = s.n_items - s.tail;
-    if (static_cast<int>(blockIdx.x) < head) {
-        item = blockIdx.x;
+    if (idx < head) {
+        item = idx;
         piece = 0;
         pieces = 1;
     } else {
-        const int r = blockIdx.x - head;
+        const int r = idx - head;
         item = head + r / s.s2;
         piece = r % s.s2;
         pieces = s.s2;
@@ -413,7 +415,7 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
     const int g = lane >> 2, c2 = (lane & 3) * 2;
 
     int tile, item, piece, pieces;
-    block_work(sched, tile, item, piece, pieces);
+    block_work(sched, blockIdx.x, tile, item, piece, pieces);
     int bkv, kt;
     tile_coords(tile, sched.bkv_count, sched.kv_tiles, sched.chunk, bkv, kt);
     const int k0 = kt * BN;
@@ -850,6 +852,148 @@ __device__ __forceinline__ void bulk_load(void* smem_dst, const void* src, unsig
         : "memory");
 }
 
+// The five products' per-warp part of one Q tile (S^T, P^T, dP^T, dV, dS^T, dK) for the warp's
+// 16 keys: dk and dv accumulate, and pa returns dS^T packed as bf16 A fragments for the dS^T
+// store. qs and dos are the tile's Q and dO in the TMA box layout, lds its (L, Dv) rows, vf the
+// warp's V fragments. Shared by variant 3 and its persistent form.
+template <int D, int BQ, bool EARLY>
+__device__ __forceinline__ void tile_grads(const bf16* Ks, const bf16* qs, const bf16* dos,
+                                           const float* lds, const unsigned (&vf)[D / 16][4],
+                                           float (&dk)[D / 8][4], float (&dv)[D / 8][4],
+                                           unsigned (&pa)[BQ / 16][4], int lane, int arow, int g,
+                                           int c2, int q0, int kw0, int S_kv, bool kv_tail,
+                                           int causal, float scale_log2) {
+    constexpr int KT = D / 16, DT = D / 8, NQ = BQ / 8, QK = BQ / 16;
+    float s[NQ][4], dp_[NQ][4];
+#pragma unroll
+    for (int n = 0; n < NQ; ++n)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) s[n][e] = dp_[n][e] = 0.f;
+#pragma unroll
+    for (int kk = 0; kk < KT; ++kk) {
+        unsigned a[4];
+        ldmatrix_x4(a, Ks + arow * D + swz(arow, 2 * kk + (lane >> 4)) * 8);
+#pragma unroll
+        for (int n = 0; n < NQ; n += 2) {
+            unsigned r[4];
+            ldmatrix_x4(r, qs + box_off<BQ>(n * 8 + (lane & 15), 2 * kk + (lane >> 4)));
+            const unsigned b0[2] = {r[0], r[2]};
+            const unsigned b1[2] = {r[1], r[3]};
+            mma_bf16_16816(s[n], a, b0);
+            mma_bf16_16816(s[n + 1], a, b1);
+        }
+    }
+    // P^T of n8 tile n in place, and the tile's Dv. Lane (g, c) holds keys g (e = 0, 1)
+    // and g + 8 (e = 2, 3) against rows 8n + 2c (e even) and 8n + 2c + 1 (e odd).
+    float dvec[NQ][2];
+    auto expo = [&](int n) {
+        const float4 l4 = *reinterpret_cast<const float4*>(lds + 2 * (n * 8 + c2));
+        s[n][0] = ex2(fmaf(s[n][0], scale_log2, -l4.x));
+        s[n][1] = ex2(fmaf(s[n][1], scale_log2, -l4.z));
+        s[n][2] = ex2(fmaf(s[n][2], scale_log2, -l4.x));
+        s[n][3] = ex2(fmaf(s[n][3], scale_log2, -l4.z));
+        dvec[n][0] = l4.y;
+        dvec[n][1] = l4.w;
+    };
+    auto mask = [&]() {
+        if ((causal && q0 < kw0 + 15) || kv_tail) {
+#pragma unroll
+            for (int n = 0; n < NQ; ++n)
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const int key = kw0 + g + (e >> 1) * 8;
+                    const int q = q0 + n * 8 + c2 + (e & 1);
+                    if ((causal && key > q) || key >= S_kv) s[n][e] = 0.f;
+                }
+        }
+    };
+    auto dsform = [&](int n) {
+        s[n][0] *= dp_[n][0] - dvec[n][0];
+        s[n][1] *= dp_[n][1] - dvec[n][1];
+        s[n][2] *= dp_[n][2] - dvec[n][0];
+        s[n][3] *= dp_[n][3] - dvec[n][1];
+    };
+    if constexpr (!EARLY) {
+#pragma unroll
+        for (int n = 0; n < NQ; ++n) expo(n);
+        mask();
+    }
+    // dP^T = V_w dO^T. With EARLY it is issued straight after S^T and the exponentials
+    // of P^T are spread between its mma (n8 tile n after k step n * KT / NQ), all in
+    // one basic block, so the scheduler can fill the warp's gaps between mma issues with
+    // MUFU work instead of the warp running its exponentials with the pipe idle; the
+    // mask (a warp-uniform branch, which would end the block) comes after.
+#pragma unroll
+    for (int kk = 0; kk < KT; ++kk) {
+#pragma unroll
+        for (int n = 0; n < NQ; n += 2) {
+            unsigned r[4];
+            ldmatrix_x4(r, dos + box_off<BQ>(n * 8 + (lane & 15), 2 * kk + (lane >> 4)));
+            const unsigned b0[2] = {r[0], r[2]};
+            const unsigned b1[2] = {r[1], r[3]};
+            mma_bf16_16816(dp_[n], vf[kk], b0);
+            mma_bf16_16816(dp_[n + 1], vf[kk], b1);
+        }
+        if constexpr (EARLY) {
+#pragma unroll
+            for (int n = 0; n < NQ; ++n)
+                if (n * KT / NQ == kk) expo(n);
+        }
+    }
+    if constexpr (EARLY) mask();
+#pragma unroll
+    for (int kq = 0; kq < QK; ++kq) {
+        pa[kq][0] = pack_bf16x2(s[2 * kq][0], s[2 * kq][1]);
+        pa[kq][1] = pack_bf16x2(s[2 * kq][2], s[2 * kq][3]);
+        pa[kq][2] = pack_bf16x2(s[2 * kq + 1][0], s[2 * kq + 1][1]);
+        pa[kq][3] = pack_bf16x2(s[2 * kq + 1][2], s[2 * kq + 1][3]);
+    }
+    // dV += P^T dO; with EARLY, dS^T = P^T (dP^T - Dv) of n8 tile n is formed after
+    // step n * STEPS / NQ of it (P^T is already packed in pa).
+    constexpr int STEPS = QK * (DT / 2);
+#pragma unroll
+    for (int kq = 0; kq < QK; ++kq) {
+#pragma unroll
+        for (int dj = 0; dj < DT; dj += 2) {
+            unsigned r[4];
+            ldmatrix_x4_trans(r, dos + box_off<BQ>(kq * 16 + (lane & 15), dj + (lane >> 4)));
+            const unsigned b0[2] = {r[0], r[1]};
+            const unsigned b1[2] = {r[2], r[3]};
+            mma_bf16_16816(dv[dj], pa[kq], b0);
+            mma_bf16_16816(dv[dj + 1], pa[kq], b1);
+            if constexpr (EARLY) {
+                const int step = kq * (DT / 2) + dj / 2;
+#pragma unroll
+                for (int n = 0; n < NQ; ++n)
+                    if (n * STEPS / NQ == step) dsform(n);
+            }
+        }
+    }
+    if constexpr (!EARLY) {
+#pragma unroll
+        for (int n = 0; n < NQ; ++n) dsform(n);
+    }
+#pragma unroll
+    for (int kq = 0; kq < QK; ++kq) {
+        pa[kq][0] = pack_bf16x2(s[2 * kq][0], s[2 * kq][1]);
+        pa[kq][1] = pack_bf16x2(s[2 * kq][2], s[2 * kq][3]);
+        pa[kq][2] = pack_bf16x2(s[2 * kq + 1][0], s[2 * kq + 1][1]);
+        pa[kq][3] = pack_bf16x2(s[2 * kq + 1][2], s[2 * kq + 1][3]);
+    }
+#pragma unroll
+    for (int kq = 0; kq < QK; ++kq) {
+#pragma unroll
+        for (int dj = 0; dj < DT; dj += 2) {
+            unsigned r[4];
+            ldmatrix_x4_trans(r, qs + box_off<BQ>(kq * 16 + (lane & 15), dj + (lane >> 4)));
+            const unsigned b0[2] = {r[0], r[1]};
+            const unsigned b1[2] = {r[2], r[3]};
+            mma_bf16_16816(dk[dj], pa[kq], b0);
+            mma_bf16_16816(dk[dj + 1], pa[kq], b1);
+        }
+    }
+}
+
 template <int D, int BQ, bool DQ, bool SKIP, bool EARLY>
 __global__ void __launch_bounds__(THREADS, 1)
     bwd_kv_tma_kernel(const __grid_constant__ CUtensorMap tmQ,
@@ -858,7 +1002,7 @@ __global__ void __launch_bounds__(THREADS, 1)
                       float* __restrict__ dq_acc, bf16* __restrict__ dK, bf16* __restrict__ dV,
                       int S_q, int S_kv, float scale_log2, float scale, int causal, Sched sched) {
     using C = Cfg<D, BQ, DQ>;
-    constexpr int CH = D / 8, KT = D / 16, DT = D / 8, NQ = BQ / 8, QK = BQ / 16;
+    constexpr int CH = D / 8, KT = D / 16, DT = D / 8, QK = BQ / 16;
     constexpr int BOXES = D / BOX;
 
     extern __shared__ __align__(1024) unsigned char smem[];
@@ -877,7 +1021,7 @@ __global__ void __launch_bounds__(THREADS, 1)
     const int g = lane >> 2, c2 = (lane & 3) * 2;
 
     int tile, item, piece, pieces;
-    block_work(sched, tile, item, piece, pieces);
+    block_work(sched, blockIdx.x, tile, item, piece, pieces);
     int bkv, kt;
     tile_coords(tile, sched.bkv_count, sched.kv_tiles, sched.chunk, bkv, kt);
     const int k0 = kt * BN;
@@ -1022,135 +1166,8 @@ __global__ void __launch_bounds__(THREADS, 1)
 
         const bool dead = SKIP && causal && q0 + BQ - 1 < kw0;
         if (!dead) {
-            float s[NQ][4], dp_[NQ][4];
-#pragma unroll
-            for (int n = 0; n < NQ; ++n)
-#pragma unroll
-                for (int e = 0; e < 4; ++e) s[n][e] = dp_[n][e] = 0.f;
-#pragma unroll
-            for (int kk = 0; kk < KT; ++kk) {
-                unsigned a[4];
-                ldmatrix_x4(a, Ks + arow * D + swz(arow, 2 * kk + (lane >> 4)) * 8);
-#pragma unroll
-                for (int n = 0; n < NQ; n += 2) {
-                    unsigned r[4];
-                    ldmatrix_x4(r, qs + box_off<BQ>(n * 8 + (lane & 15), 2 * kk + (lane >> 4)));
-                    const unsigned b0[2] = {r[0], r[2]};
-                    const unsigned b1[2] = {r[1], r[3]};
-                    mma_bf16_16816(s[n], a, b0);
-                    mma_bf16_16816(s[n + 1], a, b1);
-                }
-            }
-            // P^T of n8 tile n in place, and the tile's Dv. Lane (g, c) holds keys g (e = 0, 1)
-            // and g + 8 (e = 2, 3) against rows 8n + 2c (e even) and 8n + 2c + 1 (e odd).
-            float dvec[NQ][2];
-            auto expo = [&](int n) {
-                const float4 l4 = *reinterpret_cast<const float4*>(lds + 2 * (n * 8 + c2));
-                s[n][0] = ex2(fmaf(s[n][0], scale_log2, -l4.x));
-                s[n][1] = ex2(fmaf(s[n][1], scale_log2, -l4.z));
-                s[n][2] = ex2(fmaf(s[n][2], scale_log2, -l4.x));
-                s[n][3] = ex2(fmaf(s[n][3], scale_log2, -l4.z));
-                dvec[n][0] = l4.y;
-                dvec[n][1] = l4.w;
-            };
-            auto mask = [&]() {
-                if ((causal && q0 < kw0 + 15) || kv_tail) {
-#pragma unroll
-                    for (int n = 0; n < NQ; ++n)
-#pragma unroll
-                        for (int e = 0; e < 4; ++e) {
-                            const int key = kw0 + g + (e >> 1) * 8;
-                            const int q = q0 + n * 8 + c2 + (e & 1);
-                            if ((causal && key > q) || key >= S_kv) s[n][e] = 0.f;
-                        }
-                }
-            };
-            auto dsform = [&](int n) {
-                s[n][0] *= dp_[n][0] - dvec[n][0];
-                s[n][1] *= dp_[n][1] - dvec[n][1];
-                s[n][2] *= dp_[n][2] - dvec[n][0];
-                s[n][3] *= dp_[n][3] - dvec[n][1];
-            };
-            if constexpr (!EARLY) {
-#pragma unroll
-                for (int n = 0; n < NQ; ++n) expo(n);
-                mask();
-            }
-            // dP^T = V_w dO^T. With EARLY it is issued straight after S^T and the exponentials
-            // of P^T are spread between its mma (n8 tile n after k step n * KT / NQ), all in
-            // one basic block, so the scheduler can fill the warp's gaps between mma issues with
-            // MUFU work instead of the warp running its exponentials with the pipe idle; the
-            // mask (a warp-uniform branch, which would end the block) comes after.
-#pragma unroll
-            for (int kk = 0; kk < KT; ++kk) {
-#pragma unroll
-                for (int n = 0; n < NQ; n += 2) {
-                    unsigned r[4];
-                    ldmatrix_x4(r, dos + box_off<BQ>(n * 8 + (lane & 15), 2 * kk + (lane >> 4)));
-                    const unsigned b0[2] = {r[0], r[2]};
-                    const unsigned b1[2] = {r[1], r[3]};
-                    mma_bf16_16816(dp_[n], vf[kk], b0);
-                    mma_bf16_16816(dp_[n + 1], vf[kk], b1);
-                }
-                if constexpr (EARLY) {
-#pragma unroll
-                    for (int n = 0; n < NQ; ++n)
-                        if (n * KT / NQ == kk) expo(n);
-                }
-            }
-            if constexpr (EARLY) mask();
-#pragma unroll
-            for (int kq = 0; kq < QK; ++kq) {
-                pa[kq][0] = pack_bf16x2(s[2 * kq][0], s[2 * kq][1]);
-                pa[kq][1] = pack_bf16x2(s[2 * kq][2], s[2 * kq][3]);
-                pa[kq][2] = pack_bf16x2(s[2 * kq + 1][0], s[2 * kq + 1][1]);
-                pa[kq][3] = pack_bf16x2(s[2 * kq + 1][2], s[2 * kq + 1][3]);
-            }
-            // dV += P^T dO; with EARLY, dS^T = P^T (dP^T - Dv) of n8 tile n is formed after
-            // step n * STEPS / NQ of it (P^T is already packed in pa).
-            constexpr int STEPS = QK * (DT / 2);
-#pragma unroll
-            for (int kq = 0; kq < QK; ++kq) {
-#pragma unroll
-                for (int dj = 0; dj < DT; dj += 2) {
-                    unsigned r[4];
-                    ldmatrix_x4_trans(r,
-                                      dos + box_off<BQ>(kq * 16 + (lane & 15), dj + (lane >> 4)));
-                    const unsigned b0[2] = {r[0], r[1]};
-                    const unsigned b1[2] = {r[2], r[3]};
-                    mma_bf16_16816(dv[dj], pa[kq], b0);
-                    mma_bf16_16816(dv[dj + 1], pa[kq], b1);
-                    if constexpr (EARLY) {
-                        const int step = kq * (DT / 2) + dj / 2;
-#pragma unroll
-                        for (int n = 0; n < NQ; ++n)
-                            if (n * STEPS / NQ == step) dsform(n);
-                    }
-                }
-            }
-            if constexpr (!EARLY) {
-#pragma unroll
-                for (int n = 0; n < NQ; ++n) dsform(n);
-            }
-#pragma unroll
-            for (int kq = 0; kq < QK; ++kq) {
-                pa[kq][0] = pack_bf16x2(s[2 * kq][0], s[2 * kq][1]);
-                pa[kq][1] = pack_bf16x2(s[2 * kq][2], s[2 * kq][3]);
-                pa[kq][2] = pack_bf16x2(s[2 * kq + 1][0], s[2 * kq + 1][1]);
-                pa[kq][3] = pack_bf16x2(s[2 * kq + 1][2], s[2 * kq + 1][3]);
-            }
-#pragma unroll
-            for (int kq = 0; kq < QK; ++kq) {
-#pragma unroll
-                for (int dj = 0; dj < DT; dj += 2) {
-                    unsigned r[4];
-                    ldmatrix_x4_trans(r, qs + box_off<BQ>(kq * 16 + (lane & 15), dj + (lane >> 4)));
-                    const unsigned b0[2] = {r[0], r[1]};
-                    const unsigned b1[2] = {r[2], r[3]};
-                    mma_bf16_16816(dk[dj], pa[kq], b0);
-                    mma_bf16_16816(dk[dj + 1], pa[kq], b1);
-                }
-            }
+            tile_grads<D, BQ, EARLY>(Ks, qs, dos, lds, vf, dk, dv, pa, lane, arow, g, c2, q0, kw0,
+                                     S_kv, kv_tail, causal, scale_log2);
         } else {
 #pragma unroll
             for (int kq = 0; kq < QK; ++kq)
@@ -1215,6 +1232,326 @@ __global__ void __launch_bounds__(THREADS, 1)
                 red_add2(w + BN * D + lrow * D + dj * 8 + c2, dv[dj][2 * h], dv[dj][2 * h + 1]);
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Variant 3 on a persistent grid (SPARK_ATTN_BWD_PERSIST=1, atomic dQ only). One block per SM
+// walks variant 3's blocks as items, in variant 3's order (heaviest first, then the split
+// tail): its first item is blockIdx.x, the rest come from a global counter the preprocess
+// zeroes. Per item it reloads K and V and runs variant 3's loop and epilogue, but:
+//   - the barriers are initialized once, and the stage and dS^T rings keep counting across
+//     items (load J of the block lives in stage J % 3, dS^T buffer J & 1), so the producer
+//     lane issues the first two Q/dO tiles of the next item while the warps finish this one;
+//   - V goes from global memory straight into the warp's A fragments (the stage region holds
+//     the next item's tiles by then), and the next item's K and V rows are prefetched into L2
+//     when the item is taken, so the reload at the boundary reads L2;
+//   - the next item's index is published through two int slots in shared memory, read after
+//     the one block-wide barrier per item (which also says every warp is done with K).
+// What it saves is variant 3's per-block start: the barrier setup, the K and V load from DRAM,
+// the wait for the first Q/dO tile, and the block scheduler's gap between blocks.
+// ---------------------------------------------------------------------------------------
+struct Item {
+    int tile, bkv, k0, bh0, qt0, nq, ib, ie;
+    bool partial;
+};
+struct Prod {
+    Item pc, pn;
+    int pc_u0, pn_u0, issued, pn_ok;
+};
+
+__device__ __forceinline__ Item decode_item(const Sched& s, int idx, int BQ, int causal) {
+    Item w;
+    int item, piece, pieces, kt;
+    block_work(s, idx, w.tile, item, piece, pieces);
+    tile_coords(w.tile, s.bkv_count, s.kv_tiles, s.chunk, w.bkv, kt);
+    w.k0 = kt * BN;
+    const int b = w.bkv / s.H_kv, kvh = w.bkv - b * s.H_kv;
+    w.bh0 = b * s.H_q + kvh * s.group;
+    w.qt0 = causal ? min(w.k0 / BQ, s.q_tiles) : 0;
+    w.nq = s.q_tiles - w.qt0;
+    const int total = s.group * w.nq;
+    const int sub = item % s.s1;
+    const int lo = sub * total / s.s1, hi = (sub + 1) * total / s.s1;
+    w.ib = lo + piece * (hi - lo) / pieces;
+    w.ie = lo + (piece + 1) * (hi - lo) / pieces;
+    w.partial = s.s1 > 1 || pieces > 1;
+    return w;
+}
+
+// Pull `bytes` at `p` into L2 through the copy engine (no completion to wait for).
+__device__ __forceinline__ void prefetch_l2(const void* p, unsigned bytes) {
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(p), "r"(bytes) : "memory");
+}
+
+template <int D, int BQ, bool EARLY>
+__global__ void __launch_bounds__(THREADS, 1)
+    bwd_kv_persist_kernel(const __grid_constant__ CUtensorMap tmQ,
+                          const __grid_constant__ CUtensorMap tmO, const bf16* __restrict__ K,
+                          const bf16* __restrict__ V, const float2* __restrict__ ld,
+                          float* __restrict__ dq_acc, bf16* __restrict__ dK, bf16* __restrict__ dV,
+                          int S_q, int S_kv, float scale_log2, float scale, int causal, Sched sched,
+                          int n_work, int* __restrict__ counter) {
+    using C = Cfg<D, BQ, true>;
+    constexpr int CH = D / 8, KT = D / 16, DT = D / 8, QK = BQ / 16;
+    constexpr int BOXES = D / BOX;
+
+    extern __shared__ __align__(1024) unsigned char smem[];
+    if (smem_u32(smem) % 1024 != 0) __trap();
+    bf16* Ks = reinterpret_cast<bf16*>(smem);
+    unsigned char* stages = smem + C::OFF_STAGES;
+    float* lds_base = reinterpret_cast<float*>(smem + C::OFF_LD);
+    bf16* dS_base = reinterpret_cast<bf16*>(smem + C::OFF_DS);
+    uint64_t* full = reinterpret_cast<uint64_t*>(smem + C::OFF_BAR);
+    uint64_t* empty = full + STAGES;
+    uint64_t* ds_full = empty + STAGES;
+    uint64_t* ds_empty = ds_full + 2;
+    int* next_slot = reinterpret_cast<int*>(ds_empty + 2);  // two ints in the barrier block
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31, warp = tid >> 5;
+    const int g = lane >> 2, c2 = (lane & 3) * 2;
+    const int arow = warp * 16 + (lane & 15);
+
+    if (tid == 0) {
+#pragma unroll
+        for (int s = 0; s < STAGES; ++s) {
+            mbar_init(&full[s], 1);
+            mbar_init(&empty[s], WARPS);
+        }
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            mbar_init(&ds_full[i], THREADS);
+            mbar_init(&ds_empty[i], THREADS);
+        }
+        fence_mbar_init();
+        prefetch_tensormap(&tmQ);
+        prefetch_tensormap(&tmO);
+    }
+    __syncthreads();
+
+    // Producer state, touched by thread 0 only and kept in shared memory so it costs the other
+    // 255 threads no registers: the item the warps are on and the next one, the global index
+    // of each one's first load, and the loads issued so far.
+    Prod* pr = reinterpret_cast<Prod*>(smem + C::SMEM);
+    auto issue = [&](const Item& w, int u, int U) {
+        const int s = U % STAGES, use = U / STAGES;
+        if (use > 0) mbar_wait(&empty[s], (use - 1) & 1);
+        const int bh = w.bh0 + u / w.nq;
+        const int q0 = (w.qt0 + u % w.nq) * BQ;
+        unsigned char* dst = stages + s * C::STAGE_BYTES;
+        mbar_arrive_expect_tx(&full[s], C::STAGE_BYTES + C::LD_BYTES);
+#pragma unroll
+        for (int bx = 0; bx < BOXES; ++bx) {
+            tma_load_3d(dst + bx * BQ * BOX * 2, &tmQ, &full[s], bx * BOX, q0, bh);
+            tma_load_3d(dst + C::QT_BYTES + bx * BQ * BOX * 2, &tmO, &full[s], bx * BOX, q0, bh);
+        }
+        bulk_load(lds_base + s * (C::LD_BYTES / 4), ld + static_cast<size_t>(bh) * sched.S_pad + q0,
+                  C::LD_BYTES, &full[s]);
+    };
+    // Issue loads up to (not including) global index U_end, as far as the known items reach.
+    auto produce_upto = [&](int U_end) {
+        int u = pr->issued;
+        while (u < U_end) {
+            if (u < pr->pc_u0 + (pr->pc.ie - pr->pc.ib))
+                issue(pr->pc, pr->pc.ib + u - pr->pc_u0, u);
+            else if (pr->pn_ok && u < pr->pn_u0 + (pr->pn.ie - pr->pn.ib))
+                issue(pr->pn, pr->pn.ib + u - pr->pn_u0, u);
+            else
+                break;
+            ++u;
+        }
+        pr->issued = u;
+    };
+
+    int idx = blockIdx.x;  // the item, the same on every thread
+    int U0 = 0;            // loads (= Q tiles) of the block before this item
+    int k = 0;             // items done
+    while (idx < n_work) {
+        const Item w = decode_item(sched, idx, BQ, causal);
+        const int n_it = w.ie - w.ib;
+        if (tid == 0) {
+            if (k == 0) pr->issued = 0;
+            pr->pc = w;
+            pr->pc_u0 = U0;
+            pr->pn_ok = 0;
+            produce_upto(U0 + 2);  // only the first item's: later ones were issued ahead
+            const int nxt = static_cast<int>(gridDim.x) + atomicAdd(counter, 1);
+            next_slot[(k + 1) & 1] = nxt;
+            if (nxt < n_work) {
+                const Item pn = decode_item(sched, nxt, BQ, causal);
+                pr->pn = pn;
+                pr->pn_u0 = U0 + n_it;
+                pr->pn_ok = 1;
+                const int rows = min(BN, S_kv - pn.k0);
+                const size_t off = (static_cast<size_t>(pn.bkv) * S_kv + pn.k0) * D;
+                prefetch_l2(K + off, static_cast<unsigned>(rows) * D * 2);
+                prefetch_l2(V + off, static_cast<unsigned>(rows) * D * 2);
+            }
+        }
+
+        // K by cp.async (the barrier that ended the last item says no warp still reads K); V
+        // from global straight into the A fragment layout ldmatrix gives variant 3: lane (g, c)
+        // holds keys g and g + 8 of the warp, columns 16kk + 2c (+1) and 16kk + 8 + 2c (+1).
+        {
+            const bf16* Kg = K + static_cast<size_t>(w.bkv) * S_kv * D;
+            for (int i = tid; i < BN * CH; i += THREADS) {
+                const int row = i / CH, ch = i - row * CH;
+                const bool ok = w.k0 + row < S_kv;
+                const size_t off = static_cast<size_t>(ok ? w.k0 + row : 0) * D + ch * 8;
+                cp_async_16_zfill(Ks + row * D + swz(row, ch) * 8, Kg + off, ok);
+            }
+            cp_async_commit();
+        }
+        unsigned vf[KT][4];
+        {
+            const int r_lo = w.k0 + warp * 16 + g, r_hi = r_lo + 8;
+            const bool ok_lo = r_lo < S_kv, ok_hi = r_hi < S_kv;
+            const bf16* Vg = V + static_cast<size_t>(w.bkv) * S_kv * D + c2;
+            const unsigned* vlo =
+                reinterpret_cast<const unsigned*>(Vg + static_cast<size_t>(ok_lo ? r_lo : 0) * D);
+            const unsigned* vhi =
+                reinterpret_cast<const unsigned*>(Vg + static_cast<size_t>(ok_hi ? r_hi : 0) * D);
+#pragma unroll
+            for (int kk = 0; kk < KT; ++kk) {
+                vf[kk][0] = ok_lo ? vlo[8 * kk] : 0u;
+                vf[kk][1] = ok_hi ? vhi[8 * kk] : 0u;
+                vf[kk][2] = ok_lo ? vlo[8 * kk + 4] : 0u;
+                vf[kk][3] = ok_hi ? vhi[8 * kk + 4] : 0u;
+            }
+        }
+        cp_async_wait<0>();
+        __syncthreads();  // K is in shared memory
+
+        // dQ tile of iteration u (global load U0 + u - ib), as variant 3's dq_product.
+        auto dq_product = [&](int u) {
+            constexpr int MQ = BQ / 16, NW = WARPS / MQ, DTW = DT / NW;
+            static_assert(WARPS % MQ == 0 && DT % NW == 0 && DTW % 2 == 0, "dQ tile split");
+            const int J = U0 + u - w.ib, buf = J & 1;
+            const bf16* dsb = dS_base + buf * BN * BQ;
+            const int bh = w.bh0 + u / w.nq;
+            const int q0 = (w.qt0 + u % w.nq) * BQ;
+            const int mt = warp % MQ, nw = warp / MQ;
+            mbar_wait(&ds_full[buf], (J >> 1) & 1);
+            float acc[DTW][4];
+#pragma unroll
+            for (int dj = 0; dj < DTW; ++dj)
+#pragma unroll
+                for (int e = 0; e < 4; ++e) acc[dj][e] = 0.f;
+#pragma unroll
+            for (int kk = 0; kk < BN / 16; ++kk) {
+                unsigned a[4];
+                {
+                    const int i = lane >> 3;
+                    const int krow = kk * 16 + (i >> 1) * 8 + (lane & 7);
+                    ldmatrix_x4_trans(a, dsb + ds_off<BQ>(krow, mt * 2 + (i & 1)));
+                }
+#pragma unroll
+                for (int dj = 0; dj < DTW; dj += 2) {
+                    const int row = kk * 16 + (lane & 15);
+                    unsigned r[4];
+                    ldmatrix_x4_trans(r, Ks + row * D + swz(row, nw * DTW + dj + (lane >> 4)) * 8);
+                    const unsigned b0[2] = {r[0], r[1]};
+                    const unsigned b1[2] = {r[2], r[3]};
+                    mma_bf16_16816(acc[dj], a, b0);
+                    mma_bf16_16816(acc[dj + 1], a, b1);
+                }
+            }
+            mbar_arrive(&ds_empty[buf]);
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int q = q0 + mt * 16 + g + h * 8;
+                if (q >= S_q) continue;
+                float* dst = dq_acc + (static_cast<size_t>(bh) * S_q + q) * D + nw * DTW * 8 + c2;
+#pragma unroll
+                for (int dj = 0; dj < DTW; ++dj)
+                    red_add2(dst + dj * 8, acc[dj][2 * h], acc[dj][2 * h + 1]);
+            }
+        };
+
+        float dk[DT][4], dv[DT][4];
+#pragma unroll
+        for (int dj = 0; dj < DT; ++dj)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) dk[dj][e] = dv[dj][e] = 0.f;
+        const int kw0 = w.k0 + warp * 16;
+        const bool kv_tail = w.k0 + BN > S_kv;
+
+        for (int it = w.ib; it < w.ie; ++it) {
+            const int jl = it - w.ib, J = U0 + jl, st = J % STAGES;
+            const int q0 = (w.qt0 + it % w.nq) * BQ;
+            const bf16* qs = reinterpret_cast<const bf16*>(stages + st * C::STAGE_BYTES);
+            const bf16* dos = qs + BQ * D;
+            const float* lds = lds_base + st * (C::LD_BYTES / 4);
+            unsigned pa[QK][4];
+            mbar_wait(&full[st], (J / STAGES) & 1);
+            const bool dead = causal && q0 + BQ - 1 < kw0;
+            if (!dead) {
+                tile_grads<D, BQ, EARLY>(Ks, qs, dos, lds, vf, dk, dv, pa, lane, arow, g, c2, q0,
+                                         kw0, S_kv, kv_tail, causal, scale_log2);
+            } else {
+#pragma unroll
+                for (int kq = 0; kq < QK; ++kq)
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) pa[kq][e] = 0u;
+            }
+            fence_proxy_async_smem();
+            __syncwarp();
+            if (lane == 0) mbar_arrive(&empty[st]);
+
+            const int buf = J & 1;
+            if (J >= 2) mbar_wait(&ds_empty[buf], ((J >> 1) - 1) & 1);
+            bf16* dSs = dS_base + buf * BN * BQ;
+            const int r0 = warp * 16 + g;
+#pragma unroll
+            for (int kq = 0; kq < QK; ++kq) {
+                *reinterpret_cast<unsigned*>(dSs + ds_off<BQ>(r0, 2 * kq) + c2) = pa[kq][0];
+                *reinterpret_cast<unsigned*>(dSs + ds_off<BQ>(r0 + 8, 2 * kq) + c2) = pa[kq][1];
+                *reinterpret_cast<unsigned*>(dSs + ds_off<BQ>(r0, 2 * kq + 1) + c2) = pa[kq][2];
+                *reinterpret_cast<unsigned*>(dSs + ds_off<BQ>(r0 + 8, 2 * kq + 1) + c2) = pa[kq][3];
+            }
+            mbar_arrive(&ds_full[buf]);
+            if (jl >= 1) dq_product(it - 1);
+            // Loads through global index J + 2: the stage of J - 1 is free (the full wait in the
+            // dQ product above, or the end of the previous item when jl = 0).
+            if (tid == 0) produce_upto(J + 3);
+        }
+        if (n_it > 0) dq_product(w.ie - 1);
+
+        if (!w.partial) {
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int key = kw0 + g + h * 8;
+                if (key >= S_kv) continue;
+                bf16* dkr = dK + (static_cast<size_t>(w.bkv) * S_kv + key) * D + c2;
+                bf16* dvr = dV + (static_cast<size_t>(w.bkv) * S_kv + key) * D + c2;
+#pragma unroll
+                for (int dj = 0; dj < DT; ++dj) {
+                    *reinterpret_cast<unsigned*>(dkr + dj * 8) =
+                        pack_bf16x2(dk[dj][2 * h] * scale, dk[dj][2 * h + 1] * scale);
+                    *reinterpret_cast<unsigned*>(dvr + dj * 8) =
+                        pack_bf16x2(dv[dj][2 * h], dv[dj][2 * h + 1]);
+                }
+            }
+        } else {
+            float* ws = sched.ws + static_cast<size_t>(w.tile - sched.ws_tile0) * 2 * BN * D;
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int lrow = warp * 16 + g + h * 8;
+#pragma unroll
+                for (int dj = 0; dj < DT; ++dj) {
+                    red_add2(ws + lrow * D + dj * 8 + c2, dk[dj][2 * h] * scale,
+                             dk[dj][2 * h + 1] * scale);
+                    red_add2(ws + BN * D + lrow * D + dj * 8 + c2, dv[dj][2 * h],
+                             dv[dj][2 * h + 1]);
+                }
+            }
+        }
+
+        U0 += n_it;
+        ++k;
+        __syncthreads();  // every warp is past its last K read; next_slot[k & 1] is written
+        idx = next_slot[k & 1];
     }
 }
 
@@ -1416,7 +1753,7 @@ T* buffer(Buffer& b, size_t count) {
     }
     return static_cast<T*>(b.p);
 }
-Buffer g_ld, g_dq, g_dkv;
+Buffer g_ld, g_dq, g_dkv, g_ctr;
 
 // Knobs, read once: SPARK_ATTN_BWD_SPLIT = n forces every key tile of variants 1 and 2 into n
 // slices (0: the default rule, which splits only the tail of the last wave).
@@ -1434,6 +1771,16 @@ bool env_early() {
     static int v = -1;
     if (v == -1) {
         const char* e = std::getenv("SPARK_ATTN_BWD_EARLY");
+        v = e != nullptr && std::atoi(e) != 0;
+    }
+    return v != 0;
+}
+
+// SPARK_ATTN_BWD_PERSIST = 1: variant 3 with atomic dQ runs on the persistent grid.
+bool env_persist() {
+    static int v = -1;
+    if (v == -1) {
+        const char* e = std::getenv("SPARK_ATTN_BWD_PERSIST");
         v = e != nullptr && std::atoi(e) != 0;
     }
     return v != 0;
@@ -1525,6 +1872,7 @@ struct Args {
     const bf16 *Q, *K, *V, *dO;
     const float2* ld;
     float* dq_acc;
+    int* counter;  // the persistent kernel's item counter, zeroed by the preprocess
     bf16 *dQ, *dK, *dV;
     int B, H_q, H_kv, S_q, S_kv, S_pad;
     float scale_log2, scale;
@@ -1637,6 +1985,33 @@ void launch_kv_tma(const Args& a, bool split_tail, cudaStream_t stream) {
     launch_split_convert<D, kvt::BN>(a, s, ws_tiles, stream);
 }
 
+template <int D, int BQ, bool EARLY>
+void launch_kv_persist(const Args& a, cudaStream_t stream) {
+    using C = kvt::Cfg<D, BQ, true>;
+    constexpr int bytes = C::SMEM + 128;  // and the producer's state
+    static_assert(sizeof(kvt::Prod) <= 128 && bytes <= 99 * 1024, "");
+    auto kernel = kvt::bwd_kv_persist_kernel<D, BQ, EARLY>;
+    static bool opted = false;
+    if (!opted) {
+        SPARK_CUDA_CHECK(
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+        opted = true;
+    }
+    const uint64_t BHq = static_cast<uint64_t>(a.B) * a.H_q;
+    const CUtensorMap tmQ =
+        make_tensor_map_3d_bf16(a.Q, D, a.S_q, BHq, kvt::BOX, BQ, CU_TENSOR_MAP_SWIZZLE_128B);
+    const CUtensorMap tmO =
+        make_tensor_map_3d_bf16(a.dO, D, a.S_q, BHq, kvt::BOX, BQ, CU_TENSOR_MAP_SWIZZLE_128B);
+    int ws_tiles = 0, items = 0;
+    const kv::Sched s = build_sched(a, kvt::BN, BQ, D, true, stream, ws_tiles, items);
+    const int grid = std::min(items, num_sms());
+    kernel<<<grid, kvt::THREADS, bytes, stream>>>(tmQ, tmO, a.K, a.V, a.ld, a.dq_acc, a.dK, a.dV,
+                                                  a.S_q, a.S_kv, a.scale_log2, a.scale,
+                                                  a.causal ? 1 : 0, s, items, a.counter);
+    SPARK_CHECK_LAUNCH();
+    launch_split_convert<D, kvt::BN>(a, s, ws_tiles, stream);
+}
+
 template <int D>
 void launch_dq_pass(const Args& a, cudaStream_t stream) {
     constexpr int bytes = dqp::smem_bytes<D>();
@@ -1709,16 +2084,18 @@ void attention_bwd_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __
     float2* ld = buffer<float2>(g_ld, rows_pad);
     a.ld = ld;
     a.dq_acc = atomic_dq ? buffer<float>(g_dq, n_q) : nullptr;
+    const bool persist = variant == 3 && atomic_dq && env_persist();
+    a.counter = persist ? buffer<int>(g_ctr, 1) : nullptr;
 
     {
         constexpr int threads = 256;
         const int grid = cdiv(rows_pad, threads / 32);
         if (D == 64)
-            bwd_preprocess_kernel<64>
-                <<<grid, threads, 0, stream>>>(O, dO, lse, ld, a.dq_acc, S_q, S_pad, rows_pad);
+            bwd_preprocess_kernel<64><<<grid, threads, 0, stream>>>(
+                O, dO, lse, ld, a.dq_acc, a.counter, S_q, S_pad, rows_pad);
         else
-            bwd_preprocess_kernel<128>
-                <<<grid, threads, 0, stream>>>(O, dO, lse, ld, a.dq_acc, S_q, S_pad, rows_pad);
+            bwd_preprocess_kernel<128><<<grid, threads, 0, stream>>>(
+                O, dO, lse, ld, a.dq_acc, a.counter, S_q, S_pad, rows_pad);
         SPARK_CHECK_LAUNCH();
     }
 
@@ -1749,7 +2126,12 @@ void attention_bwd_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __
             case 3: {
                 constexpr int BQ = DD == 128 ? 32 : 64;
                 const bool early = env_early();
-                if (atomic_dq) {
+                if (persist) {
+                    if (early)
+                        launch_kv_persist<DD, BQ, true>(a, stream);
+                    else
+                        launch_kv_persist<DD, BQ, false>(a, stream);
+                } else if (atomic_dq) {
                     if (early)
                         launch_kv_tma<DD, BQ, true, true>(a, true, stream);
                     else
