@@ -401,6 +401,57 @@ GQA groups of 4 and 8), the forward's L against `torch.logsumexp` for every forw
 including the decode shapes, the autograd Function end to end, GQA against the same inputs
 with K and V repeated, and repeated calls on two streams.
 
+## Written, not yet measured
+
+Three changes against variant 3, each behind an environment knob that is off by default.
+The GPU box was down the whole session they were written in, so none of them has been
+compiled, checked or timed; the default stays variant 3 as measured above until each one
+beats it in `bench_attention_bwd` (which checks every run against the CPU reference, so
+running the sweep with a knob set is the test).
+
+| knob | change | what it is after |
+|---|---|---|
+| `SPARK_ATTN_BWD_EARLY=1` | dP^T issued right after S^T, the exponentials of n8 tile n placed after k step `n · KT / NQ` of it, dS^T formed during the dV product | the tiles where both warps of a scheduler are in their exponentials at once |
+| `SPARK_ATTN_BWD_PERSIST=1` | variant 3 on 170 resident blocks taking variant 3's blocks as items from a counter, rings that keep counting across items, V from global memory into fragments, the next item's K and V prefetched into L2 | the per-block start: barrier setup, 64 KB of K and V, the first Q/dO wait |
+| `SPARK_ATTN_BWD_ZERO4=1` | the preprocess zeroes the dQ buffer with one float4 store per lane | four masked 4-byte writes per sector in the 46 µs preprocess |
+
+**EARLY.** In variant 3 the exponentials sit between S^T and the mask, and the mask is a
+warp-uniform branch, so they form a basic block with no `mma` in it: the scheduler cannot
+move them in between `HMMA` issues, and a warp spends that stretch with nothing for the
+tensor pipe. dP^T does not depend on P, so it can go first, with the exponentials
+interleaved in the same block and the mask after it. The instruction count is the same;
+whether `ptxas` actually interleaves them is the first thing to check in the SASS.
+
+**PERSIST.** The forward measured its per-block start at 3.0 µs (variant 5's section of the
+forward note). Here a block also loads 64 KB of K and V before its first `mma`, against the
+forward's 16 KB of Q, over 1,024 blocks on the causal 4096 shape. Variant 3's producer is
+lane 0 of warp 0, not a ninth warp, and stays that way: at 252 registers a ninth warp would
+cut every thread to 168. So the producer's state (the current and next item, the load
+cursor) lives in shared memory, 88 bytes after the barriers, where it costs the other 255
+threads no registers. V cannot be staged through the stage region as variant 3 does it,
+because by the time a new item starts that region holds the item's first Q/dO tiles, so
+each lane loads its fragments from global memory with 32 4-byte loads, which the L2 prefetch
+issued a whole item earlier should turn into hits. K is reloaded with `cp.async` after one
+block-wide barrier per item.
+
+**ZERO4.** The loop `dq_acc[r · D + lane · 4 + e] = 0` compiles to four `STG.32` per lane:
+the compiler cannot see that the buffer is 16-byte aligned. Each warp instruction then writes
+4 bytes into each of 32 places 16 bytes apart, so every sector is written four times with a
+byte mask. One `float4` store per lane writes each sector once.
+
+### Not built: dQ through a TMA reduce
+
+FlashAttention-3 takes the dQ atomics out of the compute warps by writing each dQ tile to
+shared memory and adding it to global memory with one `cp.reduce.async.bulk.tensor ... .add`
+(f32 add is in the PTX ISA for the bulk tensor reduce from sm_90 on). At `D = 128` the fp32
+tile is 32 x 128 x 4 = 16 KB, and variant 3 uses 99,200 of the 101,376 bytes a block can
+have. The only 16 KB to give back is one of the three Q/dO stages, and with two stages the
+producer could refill a stage only at the point where a warp has already reached the tile
+that needs it, which puts the load latency back into every tile. At `D = 64` the tile is
+16 KB too and the budget is the same. The atomics also cost little where they are: eight
+`RED.E.ADD.F32x2` per thread per tile against 160 `HMMA` per warp, each one covering eight
+full 32-byte sectors. So I did not build it.
+
 ## What remains
 
 - **The dQ round trip.** The preprocess (46 µs at 4096 tokens, mostly the zeroing) and the
@@ -416,6 +467,7 @@ with K and V repeated, and repeated calls on two streams.
   across all heads is still the best order measured; splitting the launch per batch element,
   or accumulating dQ for a group of heads at a time, has not been tried.
 - **A persistent grid**, the forward's variant 5: 1,024 blocks each load their K and V tile,
-  read V's fragments and initialize their barriers before the first `mma`.
+  read V's fragments and initialize their barriers before the first `mma`. Written
+  (`SPARK_ATTN_BWD_PERSIST`, above), not measured.
 - **Scope.** `D` in {64, 128}, no dropout, no attention bias, no sliding window, and sm_120
   only as measured (the GB10 build compiles the same source and is untested).
