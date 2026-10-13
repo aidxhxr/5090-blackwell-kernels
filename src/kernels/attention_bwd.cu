@@ -120,16 +120,19 @@ __device__ __forceinline__ void red_add2(float* p, float a, float b) {
 // ---------------------------------------------------------------------------------------
 // Preprocess: ld[bh * S_pad + i] = {L_i log2(e), dO_i . O_i}, {0, 0} for the padding rows,
 // the fp32 dQ rows zeroed when dq_acc is not null, and the persistent kernel's item counter
-// zeroed when `counter` is not null. One warp per padded row. Zeroing here
-// rather than after the previous call has a side effect worth keeping: the zeroed lines are in
-// L2 when the key-tile kernel's atomics arrive (moving the zeroing into the dQ conversion of
-// the previous call measured 4% slower at 4096 tokens).
+// zeroed when `counter` is not null. One warp per padded row. Zeroing here rather than after
+// the previous call has a side effect worth keeping: the zeroed lines are in L2 when the
+// key-tile kernel's atomics arrive (moving the zeroing into the dQ conversion of the previous
+// call measured 4% slower at 4096 tokens). With `vec` a lane zeroes its VEC floats with one
+// vector store (the buffer is cudaMalloc'd, its rows 256-byte multiples); without it, VEC
+// scalar stores, which is what the compiler makes of the loop since it cannot see the
+// alignment: four partial-sector writes per sector instead of one full one.
 // ---------------------------------------------------------------------------------------
 template <int D>
 __global__ void bwd_preprocess_kernel(const bf16* __restrict__ O, const bf16* __restrict__ dO,
                                       const float* __restrict__ lse, float2* __restrict__ ld,
                                       float* __restrict__ dq_acc, int* __restrict__ counter,
-                                      int S_q, int S_pad, int rows_pad) {
+                                      int S_q, int S_pad, int rows_pad, int vec) {
     constexpr int VEC = D / 32;
     const int lane = threadIdx.x & 31;
     const int row = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
@@ -150,8 +153,16 @@ __global__ void bwd_preprocess_kernel(const bf16* __restrict__ O, const bf16* __
     dot = warp_reduce_sum(dot);
     if (lane == 0) ld[row] = make_float2(lse[r] * kLog2e, dot);
     if (dq_acc != nullptr) {
+        float* z = dq_acc + r * D + lane * VEC;
+        if (vec) {
+            if constexpr (VEC == 4)
+                *reinterpret_cast<float4*>(z) = make_float4(0.f, 0.f, 0.f, 0.f);
+            else
+                *reinterpret_cast<float2*>(z) = make_float2(0.f, 0.f);
+        } else {
 #pragma unroll
-        for (int e = 0; e < VEC; ++e) dq_acc[r * D + lane * VEC + e] = 0.f;
+            for (int e = 0; e < VEC; ++e) z[e] = 0.f;
+        }
     }
 }
 
@@ -1786,6 +1797,16 @@ bool env_persist() {
     return v != 0;
 }
 
+// SPARK_ATTN_BWD_ZERO4 = 1: the preprocess zeroes the dQ buffer with vector stores.
+bool env_zero4() {
+    static int v = -1;
+    if (v == -1) {
+        const char* e = std::getenv("SPARK_ATTN_BWD_ZERO4");
+        v = e != nullptr && std::atoi(e) != 0;
+    }
+    return v != 0;
+}
+
 int env_split() {
     static int v = -2;
     if (v == -2) {
@@ -2090,12 +2111,13 @@ void attention_bwd_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __
     {
         constexpr int threads = 256;
         const int grid = cdiv(rows_pad, threads / 32);
+        const int vec = env_zero4() ? 1 : 0;
         if (D == 64)
             bwd_preprocess_kernel<64><<<grid, threads, 0, stream>>>(
-                O, dO, lse, ld, a.dq_acc, a.counter, S_q, S_pad, rows_pad);
+                O, dO, lse, ld, a.dq_acc, a.counter, S_q, S_pad, rows_pad, vec);
         else
             bwd_preprocess_kernel<128><<<grid, threads, 0, stream>>>(
-                O, dO, lse, ld, a.dq_acc, a.counter, S_q, S_pad, rows_pad);
+                O, dO, lse, ld, a.dq_acc, a.counter, S_q, S_pad, rows_pad, vec);
         SPARK_CHECK_LAUNCH();
     }
 
