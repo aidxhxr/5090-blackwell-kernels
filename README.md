@@ -14,7 +14,7 @@ the memory floor on decode shapes. The fp8 GEMM is level with or ahead of cuBLAS
 fp4 GEMM gives cuBLASLt's NVFP4 bits at 96% of its speed on the big squares. The
 attention kernel is 18 to 38% ahead of PyTorch's FlashAttention-2 on prefill and streams a
 128K-token cache faster than `cudaMemcpy` copies it, and its backward pass is 1 to 40% ahead
-of FlashAttention-2's backward. The fp8 attention runs at 630 TFLOPS, 2.6 times the bf16
+of FlashAttention-2's backward. The fp8 attention runs at 648 TFLOPS, 2.7 times the bf16
 kernel. With int4 weights a batch-1 decode GEMM is 3.7 times the bf16 one, because a decode
 step is a weight stream and the weights got four times smaller. Put together on a paged
 cache, the kernels run the whole 32-layer Llama-3-8B for a batch of mixed-length requests,
@@ -49,7 +49,7 @@ PyTorch" column is eager PyTorch on the same shapes through the extension.
 | int4 weights, decode | 1 x 28672 x 4096 | v2 | 39.7 us | 1,525 GB/s | 3.70x over bf16 `hgemm` | |
 | attention | 32 heads, 4096 x 128, causal | v5 | 0.582 ms | 236 TFLOPS | | 1.34x over flash |
 | attention | 32 heads, 8192 x 128, causal | v5 | 2.30 ms | 240 TFLOPS | | 1.18x over flash |
-| attention, fp8 | 32 heads, 8192 x 128, causal | v1 | 0.873 ms | 630 TFLOPS | 2.63x over bf16 v5 | 3.06x over flash |
+| attention, fp8 | 32 heads, 8192 x 128, causal | v1 | 0.848 ms | 648 TFLOPS | 2.71x over bf16 v5 | 3.27x over flash |
 | attention, backward | 32 heads, 4096 x 128, causal | v3 | 1.64 ms | 209 TFLOPS | | 1.13x over flash |
 | attention, decode | 1 query, 4096 keys, 32 heads | v3 | 46 us | 1,461 GB/s | | 1.43x over flash |
 | attention, GQA decode | 1 query, 128K keys, 32/8 heads | v3 | 324 us | 1,655 GB/s | | 1.09x over flash |
@@ -567,6 +567,15 @@ TFLOPS. The bf16 column is variant 5 timed in the same process on the same shape
 fp8 attention for this card, so the flash column is its bf16 kernel. A sustained fp8 loop holds
 the card at its power cap near 2.4 GHz, and the 16K rows, 4 to 8 ms a launch, are long enough
 to show it.
+
+On 2026-10-13 the row sum of P moved onto the tensor pipe at D = 128: one more `QMMA` per k32
+step of `P V` against an all-ones B, in place of 32 `FADD` per lane per tile. Variant 1 alone
+on the default sweep, the same day, before and after: 636 to 648 TFLOPS at 8192 causal, 636 to
+647 at 4096, 552 to 569 at 2048 causal, 596 to 613 at 16K causal; 6% fewer instructions. The
+table above is the earlier run; the headline row uses the new number against the same day's
+bf16 kernel (239 TFLOPS) and the earlier flash time. Half-precision exponentials
+(`ex2.approx.f16x2`), the softmax on f16 pairs, and a two-buffer software pipeline all
+measured slower; the design note has them.
 
 | shape (B x H x S x D) | v0 | v1 | v2 | v3 | v4 | v5 | flash | v5 / flash |
 |---|---|---|---|---|---|---|---|---|

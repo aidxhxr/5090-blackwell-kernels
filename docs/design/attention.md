@@ -684,7 +684,7 @@ next to `hgemm`.
 | variant | idea | what it fixes |
 |---|---|---|
 | 0 | one warp per query row, every element dequantized to fp32, P in fp32 | baseline: the arithmetic of the quantized inputs, with no rounding of P |
-| 1 | variant 5's persistent TMA kernel on e4m3: both products on `mma.sync.m16n8k32` (block-scaled, unit scales), P rounded to e4m3 in registers, V transposed by `ldmatrix.trans` and byte permutes, the O rescale skipped while no row max moves | the bf16 `mma` roof |
+| 1 | variant 5's persistent TMA kernel on e4m3: both products on `mma.sync.m16n8k32` (block-scaled, unit scales), P rounded to e4m3 in registers, V transposed by `ldmatrix.trans` and byte permutes, the O rescale skipped while no row max moves, at D = 128 the row sum as one more `QMMA` | the bf16 `mma` roof |
 
 ### The three problems
 
@@ -822,6 +822,65 @@ heads x 4096 x 128 bytes, 32 MB of traffic, about 22 us against a 440 us kernel,
 kernel reads V as it lies. A K/V cache that stores V in fragment order as it is appended is
 the one layout that would gain, at most 3%.
 
+### Fewer softmax instructions
+
+The table above says the softmax is the bottleneck because it is a long chain issued by two
+warps, not because one pipe is full: `MUFU` is 18.6% busy. So the target is the count of
+softmax instructions per tile, which is also the joules per FLOP at the power cap (below).
+FlashAttention-4 attacks the exponential on Blackwell; here the exponential is one of four
+equal pieces (scale-and-bias `FFMA`, `MUFU`, row-sum `FADD`, row-max `FMNMX`, 32 of each per
+lane per 64-key tile). With `-DSPARK_ATTN_FP8_EXPERIMENTS`, `SPARK_ATTN_FP8_MODE` takes a bit
+mask:
+
+| bit | change | per lane per tile, from the source |
+|---|---|---|
+| 1 `kExpH2` | `ex2.approx.f16x2`, two exponentials per `MUFU`, then `cvt.rn.satfinite.e4m3x2.f16x2` straight to P; the row sum in `f16x2` | 32 `MUFU` to 16, 32 `FADD` to 16 `HADD2`, plus 16 `F2FP` to pack the `FFMA` results |
+| 2 `kSumMMA` | the row sum as one more `QMMA` per k32 step of `P V`, with an all-ones B (e4m3 1.0 is `0x38`); every column of that accumulator is the row sum, rescaled with O under the same vote | the 32 `FADD` and the final shuffles go, 2 `QMMA` come (2 x 16 pipe cycles against 1,024) |
+| 4 `kPipe` | `Q K^T` of tile t+1 issued before the softmax of tile t, two S buffers of 32 registers | none; the overlap the half-tile version lost to spills, with whole tiles |
+| 8 `kHalfS` | S to `f16x2` right after the product; the power of two of the score scale goes into the ue8m0 scale byte of the `Q K^T` mma, so S lands in f16 range and the softmax multiplies by the mantissa in [1, 2); max, scale-and-bias and exponential all on pairs | 32 `FFMA` to 16 `HFMA2`, 32 `FMNMX` to 15 `HMNMX2` and one `FMNMX` |
+
+`bench_attention_fp8 --variant=1`, 1 x 32 heads, D = 128, TFLOPS, two rounds through the
+modes back to back (every mode passes the bench's check):
+
+| mode | 8192 causal | 4096 no mask |
+|---|---|---|
+| 0 (variant 1 before) | 631 / 630 | 636 / 635 |
+| 1 `kExpH2` | 608 / 620 | 613 / 614 |
+| **2 `kSumMMA`** | **646 / 642** | **645 / 640** |
+| 3 `kExpH2` + `kSumMMA` | 628 / 627 | 629 / 628 |
+| 9 `kExpH2` + `kHalfS` | 600 / 607 | 600 / 601 |
+| 11 `kExpH2` + `kSumMMA` + `kHalfS` | 640 / 639 | 638 / 640 |
+| 4 `kPipe` | 512 / 511 | 498 / 498 |
+| 15 all four | 378 / 377 | 357 / 360 |
+
+Nsight, 4096 no mask, one launch: mode 0 242.3 M instructions and 1,192 K cycles, mode 2
+228.9 M and 1,174 K (6% fewer instructions, 1.5% fewer cycles), 168 registers both. The
+default sweep with variant 1 only, mode 0 then mode 2: 636 to 647 at 4096, 636 to 648 at 8192
+causal, 552 to 569 at 2048 causal, 404 to 445 at 1024 causal, 596 to 613 at 16K causal, 625
+to 643 for GQA 4096 causal, 569 to 582 for the batch of four; 16K without a mask moved from
+573 to 572, inside noise.
+
+- **The row sum on the tensor pipe wins** and is the default at D = 128. It is also the sum
+  of the P that `P V` actually multiplies (the rounded e4m3 values), so it is no less
+  accurate: bench errors against the fp64 attention of the unquantized inputs are the same to
+  three digits (uniform, Gaussian and outlier inputs, 4096 causal: Gaussian max 1.019e-1 /
+  mean 2.50e-3 in both). At D = 64 it loses 7 to 10% (529 to 477 causal, 519 to 481 without
+  a mask, two rounds each): `P V` there is half the products, the two extra `QMMA` a larger
+  share, and the tile has fewer softmax instructions to save. D = 64 keeps the `FADD`s.
+- **Half-precision exponentials lose 3 to 4%.** Halving the `MUFU`s costs a `F2FP` to pack
+  each pair first, and `MUFU` was not the limit (18.6% busy). Moving the whole softmax onto
+  f16 pairs (`kHalfS`) loses 5%, more instructions removed than `kExpH2` alone, and still
+  slower; with the row sum on the tensor pipe as well (mode 11) it ties mode 0 and stays
+  under mode 2. My reading, not profiled: the f16 chain has longer latencies between dependent instructions (the
+  `F2FP` and `HMNMX2` sit on the same chain as the `MUFU`), and this kernel is bound by the
+  chain, not by issue slots. Accuracy did not move (Gaussian 4096 causal mean 2.49e-3).
+- **The two-buffer pipeline loses 19 to 22%.** Two S buffers in flight is 32 more live
+  registers in a 168-register kernel; I did not profile it, but it repeats the half-tile
+  result above, with whole tiles.
+- **Not tried:** emulating part of the exponentials with a polynomial on the FMA pipe
+  (FlashAttention-4's other trick). It adds about six FMA-pipe instructions per exponential
+  to save one `MUFU`, and `MUFU` is not the busy pipe here.
+
 ### Power
 
 `nvidia-smi` at 250 ms during 8,000 back-to-back launches of the 4096 no-mask shape:
@@ -950,7 +1009,8 @@ stream.
 
 ### What remains for fp8
 
-- **The softmax chain.** 69% of the pipe. The rows above are the ways that did not work; the
+- **The softmax chain.** 69% of the pipe (the row sum on the tensor pipe took 1.5% of the
+  cycles). The rows above are the ways that did not work; the
   one left is ptxas-proof interleaving: writing the half-tile pipeline so that the `QMMA`s of
   one half and the softmax instructions of the other alternate in the source, one `QMMA`
   per handful of softmax instructions, and freeing the 32 registers it needs by keeping Q in
