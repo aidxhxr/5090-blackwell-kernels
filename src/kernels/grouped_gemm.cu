@@ -85,11 +85,11 @@ static_assert(smem_bytes<128, 3>() <= 101376, "three 32 KB stages and the prefix
 struct Params {
     const int32_t* offsets;
     int E, N;
-    int tiles_n;  // N / BN
-    int KT;       // k-steps per tile
-    int grid;     // resident blocks in the launch
-    float* slots;                // 2 * grid Stream-K tiles of BM x BN fp32
-    unsigned long long* flags;   // per Stream-K tile: (epoch << 32) | k-steps accumulated
+    int tiles_n;                // N / BN
+    int KT;                     // k-steps per tile
+    int grid;                   // resident blocks in the launch
+    float* slots;               // 2 * grid Stream-K tiles of BM x BN fp32
+    unsigned long long* flags;  // per Stream-K tile: (epoch << 32) | k-steps accumulated
     unsigned epoch;
     const float* scale_a;  // fp8: [1] or null (1)
     const float* scale_b;  // fp8: [E] or null (1)
@@ -183,9 +183,8 @@ __device__ __forceinline__ void bf16_stage(const unsigned char* as, const unsign
 
 template <bool FP8, int BKB, int STAGES>
 __global__ void __launch_bounds__(THREADS, 1)
-    grouped_kernel(const __grid_constant__ CUtensorMap tmA,
-                   const __grid_constant__ CUtensorMap tmW, __nv_bfloat16* __restrict__ Cout,
-                   Params p) {
+    grouped_kernel(const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMap tmW,
+                   __nv_bfloat16* __restrict__ Cout, Params p) {
     using C = TileCfg<BKB, STAGES>;
     static_assert(BKB == 64 || BKB == 128, "the TMA swizzles cover 64 B and 128 B rows");
     constexpr int A_STAGE = C::A_STAGE, STAGE_BYTES = C::STAGE;
@@ -412,8 +411,8 @@ int resident_blocks() {
 }
 
 template <bool FP8, int BKB, int STAGES>
-void launch(const void* A, const void* W, const int32_t* offsets, __nv_bfloat16* Cout, int T,
-            int E, int N, int K, const float* scale_a, const float* scale_b, cudaStream_t stream) {
+void launch(const void* A, const void* W, const int32_t* offsets, __nv_bfloat16* Cout, int T, int E,
+            int N, int K, const float* scale_a, const float* scale_b, cudaStream_t stream) {
     constexpr int bytes = smem_bytes<BKB, STAGES>();
     const int grid = resident_blocks<FP8, BKB, STAGES>();
     const int kbytes = K * (FP8 ? 1 : 2);
@@ -495,7 +494,8 @@ void grouped_gemm_bf16(const __nv_bfloat16* A, const __nv_bfloat16* W, const int
     SPARK_REQUIRE(grouped_gemm_supports(E, N, K, false),
                   "grouped_gemm (bf16): requires 1 <= E <= 512, N % 128 == 0 and K % 64 == 0");
     SPARK_REQUIRE(A && W && offsets && C, "grouped_gemm: null pointer");
-    SPARK_REQUIRE(is_aligned16(A) && is_aligned16(W), "grouped_gemm: A and W must be 16-byte aligned");
+    SPARK_REQUIRE(is_aligned16(A) && is_aligned16(W),
+                  "grouped_gemm: A and W must be 16-byte aligned");
     if (T <= 0) return;
     int cfg = gg::forced_config();
     if (cfg < 0) cfg = gg::CONFIG_BF16;
@@ -508,7 +508,8 @@ void grouped_gemm_fp8(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* W, const int3
     SPARK_REQUIRE(grouped_gemm_supports(E, N, K, true),
                   "grouped_gemm (fp8): requires 1 <= E <= 512, N % 128 == 0 and K % 128 == 0");
     SPARK_REQUIRE(A && W && offsets && C, "grouped_gemm: null pointer");
-    SPARK_REQUIRE(is_aligned16(A) && is_aligned16(W), "grouped_gemm: A and W must be 16-byte aligned");
+    SPARK_REQUIRE(is_aligned16(A) && is_aligned16(W),
+                  "grouped_gemm: A and W must be 16-byte aligned");
     if (T <= 0) return;
     int cfg = gg::forced_config();
     if (cfg < 0) cfg = gg::CONFIG_FP8;

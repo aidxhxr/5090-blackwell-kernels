@@ -386,7 +386,7 @@ __global__ void __launch_bounds__(THREADS, 1)
     // the producer warp rewrites each V tile into this order once, in place, and the consumer
     // warps read their four registers with one 16-byte load each; without it every consumer
     // warp does the transposing load and the permutes itself.
-    auto v_frag = [&](const unsigned char* vs, int kt, int j, unsigned (&f)[4]) {
+    auto v_frag = [&](const unsigned char* vs, int kt, int j, unsigned(&f)[4]) {
         unsigned r[4];
         ldmatrix_x4_trans(r, vs + tile_off<D>(kt * 32 + lane, j));
         f[0] = __byte_perm(r[0], r[1], 0x6420);
@@ -567,7 +567,8 @@ __global__ void __launch_bounds__(THREADS, 1)
     unsigned qf[KT][4];
     float o[DT][4];
     float m[2], l[2] = {0.f, 0.f};
-    float lsum[4] = {0.f, 0.f, 0.f, 0.f};  // kSumMMA: the row sums as one more n8 tile of P V (rows g, g+8)
+    float lsum[4] = {0.f, 0.f, 0.f,
+                     0.f};  // kSumMMA: the row sums as one more n8 tile of P V (rows g, g+8)
     float sacc[NT][4];
     float sacc2[NT][4];  // kPipe: the S of the next tile
     unsigned pa[PT][4];
@@ -585,7 +586,7 @@ __global__ void __launch_bounds__(THREADS, 1)
     // each tile's two registers come back adjacent (r0, r1 and r2, r3), the register pair the
     // mma takes. The order the fp8 GEMM uses (matrices 0, 2 and 1, 3) costs 32 MOVs a tile.
     const int k_row = (lane & 7) + ((lane >> 4) << 3), k_ch = (lane >> 3) & 1;
-    auto qk = [&](float (&sa)[NT][4], const unsigned char* ks) {
+    auto qk = [&](float(&sa)[NT][4], const unsigned char* ks) {
 #pragma unroll
         for (int nj = 0; nj < NT; ++nj)
 #pragma unroll
@@ -610,7 +611,7 @@ __global__ void __launch_bounds__(THREADS, 1)
     };
     // Mask, online softmax on the S accumulators (rows g and g+8), the O rescale, and P as the
     // e4m3 A fragments of P V. The probabilities are 2^(s - m + p_shift).
-    auto softmax = [&](float (&sa)[NT][4], int t) {
+    auto softmax = [&](float(&sa)[NT][4], int t) {
         const int kv0 = t * BN;
         if (kv0 + BN > S_kv || (causal && kv0 + BN - 1 > q0)) {  // warp-uniform
 #pragma unroll
@@ -700,9 +701,8 @@ __global__ void __launch_bounds__(THREADS, 1)
                     } else {
                         h01 = ex2_f16x2(f16x2_of(fmaf(sa[t0][2 * r], qk_scale, bias[r]),
                                                  fmaf(sa[t0][2 * r + 1], qk_scale, bias[r])));
-                        h23 =
-                            ex2_f16x2(f16x2_of(fmaf(sa[t0 + 1][2 * r], qk_scale, bias[r]),
-                                               fmaf(sa[t0 + 1][2 * r + 1], qk_scale, bias[r])));
+                        h23 = ex2_f16x2(f16x2_of(fmaf(sa[t0 + 1][2 * r], qk_scale, bias[r]),
+                                                 fmaf(sa[t0 + 1][2 * r + 1], qk_scale, bias[r])));
                     }
                     if constexpr ((MODE & kSumMMA) == 0)
                         hs[r] = add_f16x2(hs[r], add_f16x2(h01, h23));
@@ -731,10 +731,8 @@ __global__ void __launch_bounds__(THREADS, 1)
                 const int t0 = 4 * kt;
                 pa[kt][0] = pack_e4m3x4(sa[t0][0], sa[t0][1], sa[t0 + 1][0], sa[t0 + 1][1]);
                 pa[kt][1] = pack_e4m3x4(sa[t0][2], sa[t0][3], sa[t0 + 1][2], sa[t0 + 1][3]);
-                pa[kt][2] =
-                    pack_e4m3x4(sa[t0 + 2][0], sa[t0 + 2][1], sa[t0 + 3][0], sa[t0 + 3][1]);
-                pa[kt][3] =
-                    pack_e4m3x4(sa[t0 + 2][2], sa[t0 + 2][3], sa[t0 + 3][2], sa[t0 + 3][3]);
+                pa[kt][2] = pack_e4m3x4(sa[t0 + 2][0], sa[t0 + 2][1], sa[t0 + 3][0], sa[t0 + 3][1]);
+                pa[kt][3] = pack_e4m3x4(sa[t0 + 2][2], sa[t0 + 2][3], sa[t0 + 3][2], sa[t0 + 3][3]);
             }
         }
         // kSumMMA: the row sum on the tensor pipe, two QMMA a tile in place of 32 FADD, and it
@@ -824,8 +822,7 @@ __global__ void __launch_bounds__(THREADS, 1)
                 if (!dead) {
                     qk(sacc, stage_of(g_cons));
                     softmax(sacc, t);
-                    if constexpr (VT)
-                        mbar_wait(&vready[g_cons % STAGES], (g_cons / STAGES) & 1);
+                    if constexpr (VT) mbar_wait(&vready[g_cons % STAGES], (g_cons / STAGES) & 1);
                     pv(stage_of(g_cons) + BN * D);
                 }
                 release_load(g_cons);
@@ -835,9 +832,8 @@ __global__ void __launch_bounds__(THREADS, 1)
             // so the products of one tile run under the softmax of the other inside one warp.
             // The live tiles are a prefix [tb, t_live) under the causal mask; the dead ones
             // after it are waited for and released as before.
-            const int t_live =
-                causal ? max(tb, min(te, (q0 + warp * 16 + 15) / BN + 1)) : te;
-            auto step = [&](float (&cur)[NT][4], float (&nxt)[NT][4], int t) {
+            const int t_live = causal ? max(tb, min(te, (q0 + warp * 16 + 15) / BN + 1)) : te;
+            auto step = [&](float(&cur)[NT][4], float(&nxt)[NT][4], int t) {
                 if (t + 1 < t_live) {
                     wait_load(g_cons + 1);
                     qk(nxt, stage_of(g_cons + 1));
@@ -1104,8 +1100,8 @@ void launch_mode(const fp8* q, const fp8* k, const fp8* v, bf16* O, int B, int H
                  int mode, cudaStream_t stream) {
     if (mode & v1::kHalfS) mode |= v1::kExpH2;
     switch (mode & 15) {
-#define SPARK_FP8_MODE_CASE(M)                                                                 \
-    case M:                                                                                    \
+#define SPARK_FP8_MODE_CASE(M)                                                                    \
+    case M:                                                                                       \
         launch_mode_t<M>(q, k, v, O, B, H_q, H_kv, S_q, S_kv, D, scale_log2, sc, causal, stream); \
         break;
         SPARK_FP8_MODE_CASE(0)

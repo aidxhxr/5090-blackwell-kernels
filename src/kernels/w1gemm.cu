@@ -145,8 +145,8 @@ __device__ __forceinline__ void group_mma(float (&acc)[NT][4], const GroupWords<
 
 // Store one m16n8 accumulator tile: rows are output columns n0 + g and n0 + g + 8, columns
 // tokens m0 + 2c and m0 + 2c + 1, rows at or past m_end dropped.
-__device__ __forceinline__ void store_tile(const float (&d)[4], __nv_bfloat16* C, int m_end,
-                                           int N, int n0, int m0, int lane) {
+__device__ __forceinline__ void store_tile(const float (&d)[4], __nv_bfloat16* C, int m_end, int N,
+                                           int n0, int m0, int lane) {
     const int g = lane >> 2, c = lane & 3;
     const int m = m0 + 2 * c;
     if (m < m_end) {
@@ -166,8 +166,8 @@ template <int BITS>
 __device__ __forceinline__ void strip_chunk(const __nv_bfloat16* __restrict__ A,
                                             const uint32_t* __restrict__ packed,
                                             const __nv_bfloat16* __restrict__ scales,
-                                            __nv_bfloat16* __restrict__ C, int m0, int m_end,
-                                            int N, int K, int n0, int lane) {
+                                            __nv_bfloat16* __restrict__ C, int m0, int m_end, int N,
+                                            int K, int n0, int lane) {
     const int g = lane >> 2, c = lane & 3;
     const int wpr = w1::words_per_row(K, BITS);
     const bool has_row = m0 + g < m_end;
@@ -218,8 +218,8 @@ constexpr int kSplitDepth = 2;
 template <int BITS>
 __global__ void __launch_bounds__(kSplitWarps * 32)
     w1_split_kernel(const __nv_bfloat16* __restrict__ A, const uint32_t* __restrict__ packed,
-                    const __nv_bfloat16* __restrict__ scales, __nv_bfloat16* __restrict__ C,
-                    int M, int N, int K) {
+                    const __nv_bfloat16* __restrict__ scales, __nv_bfloat16* __restrict__ C, int M,
+                    int N, int K) {
     constexpr int NT = 2, WK = kSplitWarps, D = kSplitDepth;
     constexpr int E = NT * 4;  // accumulator elements per lane
     __shared__ float red[WK * E * 32];
@@ -238,8 +238,7 @@ __global__ void __launch_bounds__(kSplitWarps * 32)
         const int tw = nt * 8 + g;
         arow[nt] = m0 + tw < M;
         abase[nt] =
-            reinterpret_cast<const uint4*>(A + static_cast<size_t>(arow[nt] ? m0 + tw : 0) * K) +
-            c;
+            reinterpret_cast<const uint4*>(A + static_cast<size_t>(arow[nt] ? m0 + tw : 0) * K) + c;
     }
 
     GroupWords<BITS> wr[D][2];
@@ -273,8 +272,8 @@ __global__ void __launch_bounds__(kSplitWarps * 32)
                 for (int nt = 0; nt < NT; ++nt)
 #pragma unroll
                     for (int q = 0; q < 4; ++q)
-                        act[nt][q] = arow[nt] ? __ldg(abase[nt] + grp * 16 + 4 * q)
-                                              : make_uint4(0, 0, 0, 0);
+                        act[nt][q] =
+                            arow[nt] ? __ldg(abase[nt] + grp * 16 + 4 * q) : make_uint4(0, 0, 0, 0);
                 group_mma<BITS, NT>(acc, wr[d][0], wr[d][1], w1::splat(sr[d][0]),
                                     w1::splat(sr[d][1]), act, c);
                 if (i + D < ng) load_w(d, wk + (i + D) * WK);
@@ -379,8 +378,8 @@ void launch_v2(const __nv_bfloat16* A, const uint32_t* packed, const __nv_bfloat
 
 }  // namespace
 
-void w1_quantize_bf16(const __nv_bfloat16* W, uint32_t* packed, __nv_bfloat16* scales, int K,
-                      int N, int bits, cudaStream_t stream) {
+void w1_quantize_bf16(const __nv_bfloat16* W, uint32_t* packed, __nv_bfloat16* scales, int K, int N,
+                      int bits, cudaStream_t stream) {
     SPARK_REQUIRE(K > 0 && N > 0 && K % kG == 0 && N % 16 == 0,
                   "w1_quantize: needs K % 128 == 0 and N % 16 == 0");
     SPARK_REQUIRE(bits == 1 || bits == 2, "w1_quantize: bits must be 1 or 2");
@@ -398,8 +397,8 @@ int w1gemm_num_variants() {
 }
 
 bool w1gemm_supports(int M, int N, int K, int bits, int variant) {
-    return variant >= 0 && variant < w1gemm_num_variants() && (bits == 1 || bits == 2) &&
-           M >= 1 && N > 0 && K > 0 && N % 16 == 0 && K % kG == 0;
+    return variant >= 0 && variant < w1gemm_num_variants() && (bits == 1 || bits == 2) && M >= 1 &&
+           N > 0 && K > 0 && N % 16 == 0 && K % kG == 0;
 }
 
 void w1gemm_bf16(const __nv_bfloat16* A, const uint32_t* packed, const __nv_bfloat16* scales,
@@ -433,9 +432,9 @@ void w1gemm_bf16(const __nv_bfloat16* A, const uint32_t* packed, const __nv_bflo
     }
 }
 
-void w1gemm_moe_bf16(const __nv_bfloat16* A, const uint32_t* packed,
-                     const __nv_bfloat16* scales, const int32_t* offsets, __nv_bfloat16* C,
-                     int E, int N, int K, int bits, int variant, cudaStream_t stream) {
+void w1gemm_moe_bf16(const __nv_bfloat16* A, const uint32_t* packed, const __nv_bfloat16* scales,
+                     const int32_t* offsets, __nv_bfloat16* C, int E, int N, int K, int bits,
+                     int variant, cudaStream_t stream) {
     SPARK_REQUIRE(variant >= 0 && variant < w1gemm_num_variants(), "w1gemm_moe: bad variant");
     SPARK_REQUIRE(E >= 1 && w1gemm_supports(1, N, K, bits, variant),
                   "w1gemm_moe: needs E >= 1, bits 1 or 2, N % 16 == 0 and K % 128 == 0");

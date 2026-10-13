@@ -396,7 +396,7 @@ struct PipeCfg {
     static constexpr int kZBytes = ASYM ? WK * kBN : 0;
     static constexpr int kStage = kABytes + kBBytes + kSBytes + kZBytes;
     static constexpr int kPipe = STAGES * kStage;
-    static constexpr int kRed = WK > 1 ? kThreads * MTW * NT * 4 * 4 : 0;  // fp32 partials
+    static constexpr int kRed = WK > 1 ? kThreads* MTW* NT * 4 * 4 : 0;  // fp32 partials
     static constexpr int kSmem = kPipe > kRed ? kPipe : kRed;
 };
 
@@ -409,7 +409,7 @@ __device__ __forceinline__ int swz(int row, int ch) {
 }
 
 template <int MTW, int NT, int TW, int WM, int WN, int WK, int STAGES, bool ASYM>
-__global__ void __launch_bounds__(WM * WN * WK * 32) w4_pipe_kernel(PipeParams p) {
+__global__ void __launch_bounds__(WM* WN* WK * 32) w4_pipe_kernel(PipeParams p) {
     using C_ = PipeCfg<MTW, NT, TW, WM, WN, WK, STAGES, ASYM>;
     constexpr int THREADS = C_::kThreads, BN = C_::kBN, BM = C_::kBM, KS = C_::kKS;
     constexpr int CPR = KS / 8;  // 16-byte chunks per activation row of a stage

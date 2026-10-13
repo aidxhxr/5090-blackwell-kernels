@@ -401,8 +401,8 @@ void launch(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, in
         tmA, tmB, C, M, N, K, p, env().serial, hgemm_epi::make(ep));
 }
 
-using LaunchFn = void (*)(const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, int,
-                          int, cudaStream_t, const HgemmEpilogue&, const hgemm_sk::Knobs&);
+using LaunchFn = void (*)(const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, int, int,
+                          cudaStream_t, const HgemmEpilogue&, const hgemm_sk::Knobs&);
 
 // A tile and pipeline configuration with a plain and a fused instantiation; the plain one's
 // residency is what the choice below is made from (the two agree: smem sets it).
@@ -413,10 +413,10 @@ struct Config {
     int (*resident)();
     int bm, bn, bk;
 };
-#define SPARK_V6_CONFIG(name, T, BK, ST, MB)                                         \
-    {                                                                                \
-        name, launch<T, BK, ST, MB, false>, launch<T, BK, ST, MB, true>,              \
-            resident_blocks<T, BK, ST, MB, false>, T::BM, T::BN, BK                  \
+#define SPARK_V6_CONFIG(name, T, BK, ST, MB)                             \
+    {                                                                    \
+        name, launch<T, BK, ST, MB, false>, launch<T, BK, ST, MB, true>, \
+            resident_blocks<T, BK, ST, MB, false>, T::BM, T::BN, BK      \
     }
 
 // Pipeline configurations of the 128x128 tile (BK, stages, blocks per SM), the same six as
@@ -493,8 +493,8 @@ Route route_rule(int M, int N, int K) {
     const Config& big = CONFIGS[CONFIG_DEFAULT];
     if (N % big.bn == 0 && tiles(big) >= quarter && share_of(big, M, N, K) >= e.knobs.min_share)
         return {Route::CONFIG, CONFIG_DEFAULT, e.knobs.min_share};
-    const int small = (N % 128 != 0 || cdiv(M, 128) * 128 <= cdiv(M, 64) * 64) ? kTile128x64
-                                                                                 : kTile64x128;
+    const int small =
+        (N % 128 != 0 || cdiv(M, 128) * 128 <= cdiv(M, 64) * 64) ? kTile128x64 : kTile64x128;
     if (tiles(TILES[small]) < quarter) return {Route::V4, 0, 0};
     if (share_of(TILES[small], M, N, K) >= e.knobs.min_share)
         return {Route::TILE, small, e.knobs.min_share};
@@ -512,8 +512,7 @@ Route choose(int M, int N, int K) {
     if (M <= 64)  // decode: stream B (hgemm_decode.cu), or variant 4's 64-row tile
         return {hgemm_decode::supports(M, N, K) ? Route::DECODE : Route::V4, 0, 0};
     const int r = route_slot().load(std::memory_order_relaxed);
-    if (r >= 0 && r < NUM_TILES && N % TILES[r].bn == 0)
-        return {Route::TILE, r, e.knobs.min_share};
+    if (r >= 0 && r < NUM_TILES && N % TILES[r].bn == 0) return {Route::TILE, r, e.knobs.min_share};
     if (r != HGEMM_V6_ROUTE_LEGACY && e.cfg < 0) return route_rule(M, N, K);
     // The route before the model-shape sweep (and the one SPARK_HGEMM_V6_CONFIG sweeps):
     // the 128x128 tile when each block's share of the (tile, k-step) space is at least

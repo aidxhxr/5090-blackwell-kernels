@@ -34,15 +34,15 @@ namespace spark::launch {
 struct DeviceShape {
     int sm_count;
     int64_t l2_bytes;
-    int memory_clock_khz;      // cudaDevAttrMemoryClockRate, 0 when the runtime reports nothing
-    int bus_width_bits;        // cudaDevAttrGlobalMemoryBusWidth, 0 likewise
-    double spec_gbps;          // DRAM spec: 2 x clock x width / 8 from the attributes, or the
-                               // named number when they are missing
-    int64_t bytes_in_flight;   // what the whole device must keep outstanding to stream at
-                               // spec_gbps: measured on the 5090, bandwidth x assumed latency
-                               // elsewhere
-    bool forced;               // SPARK_FORCE_SMS was set: sm_count is the override, the rest
-                               // is the real device
+    int memory_clock_khz;     // cudaDevAttrMemoryClockRate, 0 when the runtime reports nothing
+    int bus_width_bits;       // cudaDevAttrGlobalMemoryBusWidth, 0 likewise
+    double spec_gbps;         // DRAM spec: 2 x clock x width / 8 from the attributes, or the
+                              // named number when they are missing
+    int64_t bytes_in_flight;  // what the whole device must keep outstanding to stream at
+                              // spec_gbps: measured on the 5090, bandwidth x assumed latency
+                              // elsewhere
+    bool forced;              // SPARK_FORCE_SMS was set: sm_count is the override, the rest
+                              // is the real device
 };
 
 // GB/s x ns is bytes: 1e9 B/s x 1e-9 s.
@@ -59,14 +59,15 @@ constexpr int kGB10LoadedLatencyNs = 800;
 // RTX 5090: 170 SMs, 96 MB L2, GDDR7 at 28 Gbps on 512 bits (the runtime reports half the
 // data rate as the memory clock, 14,001 MHz, so 2 x 14.001e9 x 64 B = 1,792 GB/s). Bytes in
 // flight: the 64 CTAs x 24 KB of hgemm.md, measured.
-constexpr DeviceShape kRTX5090 = {170, int64_t{96} << 20, 14001000, 512, 1792.0,
-                                  int64_t{64} * 24 * 1024, false};
+constexpr DeviceShape kRTX5090 = {170,    int64_t{96} << 20,       14001000, 512,
+                                  1792.0, int64_t{64} * 24 * 1024, false};
 
 // GB10: 48 SMs, 24 MB L2, LPDDR5X at 8,533 MT/s on 256 bits (273 GB/s; the clock attribute
 // is expected to read 4,266.5 MHz by the same half-rate convention, unverified). Bytes in
 // flight from Little's law at the assumed latency: 273 x 800 = 218,400 B.
-constexpr DeviceShape kGB10 = {48, int64_t{24} << 20, 4266500, 256, 273.0,
-                               bytes_in_flight_for(273.0, kGB10LoadedLatencyNs), false};
+constexpr DeviceShape kGB10 = {
+    48,   int64_t{24} << 20, 4266500, 256, 273.0, bytes_in_flight_for(273.0, kGB10LoadedLatencyNs),
+    false};
 
 // Bytes in flight per SM, the number a kernel's tile and stage count has to supply when
 // every SM holds one CTA. Derivation: bandwidth x latency / SMs. GB10 at 800 ns: 218,400 /

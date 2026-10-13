@@ -205,8 +205,7 @@ UnifiedDeviceCaps unified_device_caps(int device) {
     c.pageable_memory_access_uses_host_page_tables =
         attr(cudaDevAttrPageableMemoryAccessUsesHostPageTables, device);
     c.concurrent_managed_access = attr(cudaDevAttrConcurrentManagedAccess, device);
-    c.direct_managed_mem_access_from_host =
-        attr(cudaDevAttrDirectManagedMemAccessFromHost, device);
+    c.direct_managed_mem_access_from_host = attr(cudaDevAttrDirectManagedMemAccessFromHost, device);
     c.host_native_atomic_supported = attr(cudaDevAttrHostNativeAtomicSupported, device);
     c.can_use_host_pointer_for_registered_mem =
         attr(cudaDevAttrCanUseHostPointerForRegisteredMem, device);
@@ -267,8 +266,8 @@ UnifiedAlloc unified_alloc(UnifiedKind kind, size_t bytes) {
             break;
         }
         case UnifiedKind::host_mapped: {
-            SPARK_CUDA_CHECK(cudaHostAlloc(&a.host_ptr, bytes,
-                                           cudaHostAllocMapped | cudaHostAllocPortable));
+            SPARK_CUDA_CHECK(
+                cudaHostAlloc(&a.host_ptr, bytes, cudaHostAllocMapped | cudaHostAllocPortable));
             // Under unified addressing the two are the same pointer; ask anyway.
             SPARK_CUDA_CHECK(cudaHostGetDevicePointer(&a.ptr, a.host_ptr, 0));
             break;
@@ -290,8 +289,8 @@ UnifiedAlloc unified_alloc(UnifiedKind kind, size_t bytes) {
             } else {
                 // No pageable access: pin and map the pages the old way, which makes this
                 // kind the same thing as host_mapped with a different allocator.
-                SPARK_CUDA_CHECK(cudaHostRegister(p, rounded,
-                                                  cudaHostRegisterPortable | cudaHostRegisterMapped));
+                SPARK_CUDA_CHECK(cudaHostRegister(
+                    p, rounded, cudaHostRegisterPortable | cudaHostRegisterMapped));
                 SPARK_CUDA_CHECK(cudaHostGetDevicePointer(&a.ptr, p, 0));
                 a.registered = true;
             }
@@ -384,7 +383,8 @@ void unified_read_bf16(const __nv_bfloat16* x, float* sink, int64_t n, int varia
     if (variant == 0) {
         read_scalar_kernel<<<grid, kBlock, 0, stream>>>(x, sink, n);
     } else {
-        SPARK_REQUIRE(is_aligned16(x), "unified_read: vectorized variants need a 16-byte aligned x");
+        SPARK_REQUIRE(is_aligned16(x),
+                      "unified_read: vectorized variants need a 16-byte aligned x");
         if (variant == 1)
             read_vec_kernel<<<grid, kBlock, 0, stream>>>(x, sink, n);
         else

@@ -62,7 +62,7 @@ using spark::UnifiedAlloc;
 using spark::UnifiedKind;
 
 constexpr long long kMaxSpins = 20'000'000;  // per round; bounds a flag that never arrives
-constexpr double kHostTimeoutS = 5.0;         // per round, host side
+constexpr double kHostTimeoutS = 5.0;        // per round, host side
 
 struct Options {
     std::vector<UnifiedKind> kinds;
@@ -225,8 +225,8 @@ bool run_read(const Buffer& b, const Staging& st, const std::string& advice, int
     SPARK_CUDA_CHECK(cudaEventElapsedTime(&first_ms, e0, e1));
     SPARK_CUDA_CHECK(cudaEventDestroy(e0));
     SPARK_CUDA_CHECK(cudaEventDestroy(e1));
-    std::fprintf(stderr, "  %s/%s: first touch %.3f ms (%.1f GB/s)\n", kind.c_str(),
-                 advice.c_str(), first_ms, bytes / (first_ms * 1e-3) / 1e9);
+    std::fprintf(stderr, "  %s/%s: first touch %.3f ms (%.1f GB/s)\n", kind.c_str(), advice.c_str(),
+                 first_ms, bytes / (first_ms * 1e-3) / 1e9);
 
     for (int v = 0; v < spark::unified_read_num_variants(); ++v) {
         spark::unified_read_bf16(b.x(), d_sink, n, v, stream);
@@ -270,8 +270,8 @@ struct GemvShape {
 
 // y[N] = W[N, K] . a[K] through column-major cuBLAS: C(N x 1) = W^T(N x K, W stored K x N
 // column-major with ld K) * a(K x 1).
-void cublas_gemv(cublasHandle_t h, const __nv_bfloat16* W, const __nv_bfloat16* A,
-                 __nv_bfloat16* y, int N, int K) {
+void cublas_gemv(cublasHandle_t h, const __nv_bfloat16* W, const __nv_bfloat16* A, __nv_bfloat16* y,
+                 int N, int K) {
     const float alpha = 1.0f, beta = 0.0f;
     CUBLAS_CHECK(cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, N, 1, K, &alpha, W, CUDA_R_16BF, K, A,
                               CUDA_R_16BF, K, &beta, y, CUDA_R_16BF, N, CUBLAS_COMPUTE_32F,
@@ -355,7 +355,8 @@ bool run_gemv(cublasHandle_t handle, const Buffer& b, size_t bytes, const std::s
         print_unified_row(r, kind, advice, path_of(b.a), nW * 2);
         all_ok = all_ok && ok;
     }
-    std::fprintf(stderr, "    %s: cuBLAS on the device copy %.1f us, weight rotated over %d copies\n",
+    std::fprintf(stderr,
+                 "    %s: cuBLAS on the device copy %.1f us, weight rotated over %d copies\n",
                  s.what, t_ref.median_ms * 1e3, copies);
     SPARK_CUDA_CHECK(cudaFree(dA));
     SPARK_CUDA_CHECK(cudaFree(dW));
@@ -387,7 +388,8 @@ double copy_round_trip_us(int trips, cudaStream_t stream) {
         SPARK_CUDA_CHECK(cudaStreamSynchronize(stream));
         const auto t1 = SteadyClock::now();
         us.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
-        if (h_out != i) std::fprintf(stderr, "  copy round trip: read back %d, wrote %d\n", h_out, i);
+        if (h_out != i)
+            std::fprintf(stderr, "  copy round trip: read back %d, wrote %d\n", h_out, i);
     }
     SPARK_CUDA_CHECK(cudaFree(d_flag));
     return median_us(us);
@@ -449,8 +451,7 @@ bool run_signal(UnifiedKind kind, const std::string& advice_name, bool advise_cp
         const auto t0 = SteadyClock::now();
         __atomic_store_n(h_req, i, __ATOMIC_RELEASE);
         while (__atomic_load_n(h_ack, __ATOMIC_ACQUIRE) != i) {
-            const double waited =
-                std::chrono::duration<double>(SteadyClock::now() - t0).count();
+            const double waited = std::chrono::duration<double>(SteadyClock::now() - t0).count();
             if (waited > kHostTimeoutS) {
                 timed_out = true;
                 break;
@@ -478,8 +479,10 @@ bool run_signal(UnifiedKind kind, const std::string& advice_name, bool advise_cp
     r.max_abs_err = spins < 0 ? 1.0 : 0.0;
     r.ok = ok;
     print_unified_row(r, kind_s, advice_name, path_of(f), 8);
-    std::fprintf(stderr, "    round trip median %.2f us, min %.2f us, copy path %.2f us, %d GPU spins per trip\n",
-                 r.median_ms * 1e3, r.min_ms * 1e3, copy_us, spins);
+    std::fprintf(
+        stderr,
+        "    round trip median %.2f us, min %.2f us, copy path %.2f us, %d GPU spins per trip\n",
+        r.median_ms * 1e3, r.min_ms * 1e3, copy_us, spins);
     spark::unified_free(f);
     return ok;
 }
@@ -514,8 +517,9 @@ int run(int argc, char** argv) {
     o.signal = !args.has("skip-signal");
     for (const auto& k : split(args.get("kinds", "device,managed,host_mapped,system")))
         o.kinds.push_back(kind_of(k));
-    for (const auto& a : split(args.get(
-             "advice", "none,preferred_gpu,preferred_cpu,accessed_by_gpu,read_mostly,prefetch_gpu")))
+    for (const auto& a : split(
+             args.get("advice",
+                      "none,preferred_gpu,preferred_cpu,accessed_by_gpu,read_mostly,prefetch_gpu")))
         o.advice.push_back(advice_of(a));
 
     cudaStream_t stream;
@@ -545,9 +549,9 @@ int run(int argc, char** argv) {
                     continue;
                 Buffer b = make_buffer(kind, st, adv, device, stream);
                 if (!b.advised) {
-                    std::fprintf(stderr, "  %s: the runtime refused %s on this memory (path %s); no row\n",
-                                 spark::unified_kind_name(kind), adv_s.c_str(),
-                                 path_of(b.a).c_str());
+                    std::fprintf(
+                        stderr, "  %s: the runtime refused %s on this memory (path %s); no row\n",
+                        spark::unified_kind_name(kind), adv_s.c_str(), path_of(b.a).c_str());
                     spark::unified_free(b.a);
                     continue;
                 }
@@ -566,8 +570,9 @@ int run(int argc, char** argv) {
         for (UnifiedKind kind : o.kinds) {
             if (kind == UnifiedKind::device) continue;  // the host cannot write it in place
             if (kind == UnifiedKind::managed && !caps.concurrent_managed_access) {
-                std::fprintf(stderr, "  managed: no concurrentManagedAccess, a host touch during "
-                                     "the kernel would fault; skipped\n");
+                std::fprintf(stderr,
+                             "  managed: no concurrentManagedAccess, a host touch during "
+                             "the kernel would fault; skipped\n");
                 continue;
             }
             all_ok = run_signal(kind, "none", false, o.trips, copy_us, device, stream) && all_ok;

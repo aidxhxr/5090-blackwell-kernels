@@ -25,8 +25,6 @@
 // 1, 2, 4, 8, 10, 20 threads is the first number to read on the Spark: it is the fraction of
 // the 273 GB/s the cores can pull without the GPU, and run concurrently with bench_w1gemm
 // it says whether the two sides add or split (docs/design/grace.md).
-#include "spark/cpu.h"
-
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -37,6 +35,8 @@
 #include <stdexcept>
 #include <thread>
 #include <vector>
+
+#include "spark/cpu.h"
 
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -187,7 +187,9 @@ int64_t sample_bf16(const bf16* logits, int V, float temperature, int top_k, flo
     // The kept set as indices: top_k largest by a partial selection, or everything.
     std::vector<int32_t> idx(static_cast<size_t>(V));
     std::iota(idx.begin(), idx.end(), 0);
-    const auto greater = [&](int32_t i, int32_t j) { return x[i] > x[j] || (x[i] == x[j] && i < j); };
+    const auto greater = [&](int32_t i, int32_t j) {
+        return x[i] > x[j] || (x[i] == x[j] && i < j);
+    };
     int kept = V;
     if (top_k > 0 && top_k < V) {
         std::nth_element(idx.begin(), idx.begin() + (top_k - 1), idx.end(), greater);
@@ -209,7 +211,8 @@ int64_t sample_bf16(const bf16* logits, int V, float temperature, int top_k, flo
         // Descending by value; only what top-k kept is sorted.
         std::vector<int32_t> order(static_cast<size_t>(kept));
         std::iota(order.begin(), order.end(), 0);
-        std::sort(order.begin(), order.end(), [&](int32_t i, int32_t j) { return greater(idx[i], idx[j]); });
+        std::sort(order.begin(), order.end(),
+                  [&](int32_t i, int32_t j) { return greater(idx[i], idx[j]); });
         const double limit = std::max(top_p, 0.f) * Z;
         double before = 0.0;
         int n = 0;
@@ -268,8 +271,9 @@ double bandwidth_probe(size_t bytes, int threads, int iters) {
             acc ^= sweep(p, slice);
             barrier.wait();
             if (t == 0) {
-                ms[it] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
-                             .count();
+                ms[it] =
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                        .count();
             }
         }
         sink.fetch_xor(acc, std::memory_order_relaxed);

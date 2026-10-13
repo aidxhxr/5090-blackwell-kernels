@@ -27,11 +27,11 @@
 // system-scope atomic (cuda::atomic_ref<int, cuda::thread_scope_system> here,
 // __atomic_load_n / __atomic_store_n with acquire / release on the host), and every spin is
 // bounded so a flag that never arrives fails a row instead of hanging the card.
-#include <cuda/atomic>
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <climits>
+#include <cuda/atomic>
 
 #include "spark/common.cuh"
 #include "spark/kernels.h"
@@ -155,8 +155,8 @@ __global__ void __launch_bounds__(kGemvBlock)
 int persistent_blocks_per_sm() {
     static int per_sm = 0;
     if (per_sm == 0) {
-        SPARK_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, gemv_v2_kernel,
-                                                                        kGemvBlock, 0));
+        SPARK_CUDA_CHECK(
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, gemv_v2_kernel, kGemvBlock, 0));
         if (per_sm <= 0) per_sm = 8;
     }
     return per_sm;

@@ -134,17 +134,18 @@ Layer make_layer(int E, int K, int I, int bits, cudaStream_t stream) {
     fill_words(L.dn_packed, L.dn_words_per_expert * E, bits, 3, stream);
     fill_scales(L.dn_scales, L.dn_scales_per_expert * E, 4, stream);
     SPARK_CUDA_CHECK(cudaStreamSynchronize(stream));
-    std::fprintf(stderr, "  layer: %d experts x (%d -> %d -> %d) at %d bit%s: %.2f GB (%.2f MB per expert)\n",
-                 E, K, I, K, bits, bits == 1 ? "" : "s", L.bytes_total() / 1e9,
-                 L.bytes_per_expert() / 1e6);
+    std::fprintf(
+        stderr,
+        "  layer: %d experts x (%d -> %d -> %d) at %d bit%s: %.2f GB (%.2f MB per expert)\n", E, K,
+        I, K, bits, bits == 1 ? "" : "s", L.bytes_total() / 1e9, L.bytes_per_expert() / 1e6);
     return L;
 }
 
 // A routing: topk distinct experts per token, weights summing to one.
 struct Routing {
-    std::vector<int32_t> ids;          // [T][topk]
-    std::vector<__nv_bfloat16> wts;    // [T][topk]
-    std::vector<float> wts_f;          // the bf16 values, as the kernel sees them
+    std::vector<int32_t> ids;        // [T][topk]
+    std::vector<__nv_bfloat16> wts;  // [T][topk]
+    std::vector<float> wts_f;        // the bf16 values, as the kernel sees them
     int distinct = 0;
     int32_t* d_ids = nullptr;
     __nv_bfloat16* d_wts = nullptr;
@@ -228,8 +229,8 @@ std::vector<float> reference(const Layer& L, const Routing& r, const std::vector
     std::vector<float> xt(K), h(I);
     int last_e = -1;
     for (int t = 0; t < T; ++t) {
-        std::copy(x.begin() + static_cast<size_t>(t) * K, x.begin() + static_cast<size_t>(t + 1) * K,
-                  xt.begin());
+        std::copy(x.begin() + static_cast<size_t>(t) * K,
+                  x.begin() + static_cast<size_t>(t + 1) * K, xt.begin());
         for (int slot = 0; slot < topk; ++slot) {
             const int e = r.ids[t * topk + slot];
             if (e != last_e) {
@@ -251,7 +252,8 @@ std::vector<float> reference(const Layer& L, const Routing& r, const std::vector
             }
             gemv_host(h, dn.data(), dns.data(), I, K, L.bits, d_out);
             const float w = r.wts_f[t * topk + slot];
-            for (int n = 0; n < K; ++n) y[static_cast<size_t>(t) * K + n] += w * static_cast<float>(d_out[n]);
+            for (int n = 0; n < K; ++n)
+                y[static_cast<size_t>(t) * K + n] += w * static_cast<float>(d_out[n]);
         }
     }
     return y;
@@ -288,8 +290,8 @@ bool run_t(cudaStream_t stream, const Layer& L, int T, const std::vector<int>& v
     }
     mean_distinct /= n_routings;
 
-    std::fprintf(stderr, "  T=%d bits=%d: reference on %d experts of the first routing...\n", T, L.bits,
-                 routings[0].distinct);
+    std::fprintf(stderr, "  T=%d bits=%d: reference on %d experts of the first routing...\n", T,
+                 L.bits, routings[0].distinct);
     const auto ref = reference(L, routings[0], hx, T, topk);
     double max_ref = 0.0;
     for (float v : ref) max_ref = std::max(max_ref, std::fabs(static_cast<double>(v)));
@@ -312,14 +314,15 @@ bool run_t(cudaStream_t stream, const Layer& L, int T, const std::vector<int>& v
     for (int v : variants) {
         SPARK_CUDA_CHECK(cudaMemset(dY, 0, nX * 2));
         spark::w1moe_decode_bf16(dX, routings[0].d_ids, routings[0].d_wts, L.gu_packed, L.gu_scales,
-                                 L.dn_packed, L.dn_scales, dY, T, topk, L.E, K, I, L.bits, v, stream);
+                                 L.dn_packed, L.dn_scales, dY, T, topk, L.E, K, I, L.bits, v,
+                                 stream);
         SPARK_CUDA_CHECK(cudaStreamSynchronize(stream));
         const auto got = to_host_f32(dY, nX);
         const auto err = spark::bench::compare(got.data(), ref.data(), nX);
         const bool ok = err.max_abs <= tol;
         if (!ok)
-            std::fprintf(stderr, "  FAIL variant %d bits=%d T=%d: max_abs=%.4e tol=%.4e\n", v, L.bits,
-                         T, err.max_abs, tol);
+            std::fprintf(stderr, "  FAIL variant %d bits=%d T=%d: max_abs=%.4e tol=%.4e\n", v,
+                         L.bits, T, err.max_abs, tol);
 
         int turn = 0;
         const int it = v == 0 ? std::min(iters, 3) : iters;
@@ -402,7 +405,8 @@ int run(int argc, char** argv) {
     bool all_ok = true;
     for (int bits : bits_list) {
         Layer L = make_layer(E, kHidden, kInter, bits, stream);
-        for (int T : ts) all_ok = run_t(stream, L, T, variants, iters, n_routings, repeat) && all_ok;
+        for (int T : ts)
+            all_ok = run_t(stream, L, T, variants, iters, n_routings, repeat) && all_ok;
         L.free_all();
     }
     if (!all_ok) {

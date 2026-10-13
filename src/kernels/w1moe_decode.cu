@@ -66,13 +66,13 @@ namespace spark {
 
 namespace {
 
-constexpr int kG = kW1GroupSize;      // 128 k per scale, and the slice of I per item
-constexpr int kThreads = 256;         // 128 gate columns + 128 up columns of the slice
-constexpr int kMaxPairs = 64;         // T * topk
-constexpr int kMaxTok = 8;            // T
-constexpr int kMaxGroups = 128;       // K / 128 (K <= 16384)
-constexpr int kXFloats = 8192;        // the fp32 activation stage: 32 KB
-constexpr int kPF = 4;                // groups of a column in flight ahead of the compute
+constexpr int kG = kW1GroupSize;  // 128 k per scale, and the slice of I per item
+constexpr int kThreads = 256;     // 128 gate columns + 128 up columns of the slice
+constexpr int kMaxPairs = 64;     // T * topk
+constexpr int kMaxTok = 8;        // T
+constexpr int kMaxGroups = 128;   // K / 128 (K <= 16384)
+constexpr int kXFloats = 8192;    // the fp32 activation stage: 32 KB
+constexpr int kPF = 4;            // groups of a column in flight ahead of the compute
 
 // The dequantized weight of one code, as the kernels and the reference see it.
 __device__ __forceinline__ float dequant_scalar(int code, float s, int bits) {
@@ -116,8 +116,8 @@ __global__ void v0_gate_up_kernel(const __nv_bfloat16* __restrict__ x,
 }
 
 // h[r, i] = bf16(silu(gate) * up) over rows of [2I] gate-then-up values.
-__global__ void v0_swiglu_kernel(const __nv_bfloat16* __restrict__ gu, __nv_bfloat16* __restrict__ h,
-                                 int rows, int I) {
+__global__ void v0_swiglu_kernel(const __nv_bfloat16* __restrict__ gu,
+                                 __nv_bfloat16* __restrict__ h, int rows, int I) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= rows * I) return;
     const int r = idx / I, i = idx % I;
@@ -157,21 +157,21 @@ __global__ void v0_down_kernel(const __nv_bfloat16* __restrict__ h, const int32_
 
 // One work item's expert and its tokens, resolved by the block into shared memory.
 struct Item {
-    int id;             // item index, >= n_items when there is nothing left
-    int e;              // expert
-    int ne;             // tokens routed to it (1..T)
-    int slice;          // i0 / 128
-    int toks[kMaxTok];  // their rows of x and y, ascending
-    float wts[kMaxTok]; // their routing weights
+    int id;              // item index, >= n_items when there is nothing left
+    int e;               // expert
+    int ne;              // tokens routed to it (1..T)
+    int slice;           // i0 / 128
+    int toks[kMaxTok];   // their rows of x and y, ascending
+    float wts[kMaxTok];  // their routing weights
 };
 
 struct Smem {
-    alignas(16) float x_s[kXFloats];            // activations of the chunk, [k][TP] fp32
-    alignas(16) float h_s[kG * kMaxTok];        // the slice of the intermediate, [i][TP]
-    alignas(16) float u_s[kG * kMaxTok];        // the up values handed to the gate threads
-    float x_all[kMaxGroups * kMaxTok];          // sum of x over each 128-k group, [grp][8]
-    float h_part[4 * kMaxTok];                  // per-warp partial sums of h, [warp][t]
-    float h_all[kMaxTok];                       // sum of h over the slice, per token
+    alignas(16) float x_s[kXFloats];      // activations of the chunk, [k][TP] fp32
+    alignas(16) float h_s[kG * kMaxTok];  // the slice of the intermediate, [i][TP]
+    alignas(16) float u_s[kG * kMaxTok];  // the up values handed to the gate threads
+    float x_all[kMaxGroups * kMaxTok];    // sum of x over each 128-k group, [grp][8]
+    float h_part[4 * kMaxTok];            // per-warp partial sums of h, [warp][t]
+    float h_all[kMaxTok];                 // sum of h over the slice, per token
     Item item[2];
     int owned;
 };
@@ -295,8 +295,8 @@ __device__ __forceinline__ void stage_x(const __nv_bfloat16* __restrict__ x, con
 
 // Resolve item `id` for the block: its expert, whether this block owns it (the pair is the
 // first with that expert) and the expert's tokens. Advances over unowned items. Block-wide.
-__device__ void resolve_item(Smem& sm, Item& it, int id, int n_items, int n_slices, int T,
-                             int topk, const int32_t* __restrict__ ids,
+__device__ void resolve_item(Smem& sm, Item& it, int id, int n_items, int n_slices, int T, int topk,
+                             const int32_t* __restrict__ ids,
                              const __nv_bfloat16* __restrict__ wts) {
     const int n_pairs = T * topk;
     for (;;) {
@@ -312,7 +312,8 @@ __device__ void resolve_item(Smem& sm, Item& it, int id, int n_items, int n_slic
             for (int j = threadIdx.x; j < n_pairs; j += 32)
                 if (ids[j] == e) first = min(first, j);
 #pragma unroll
-            for (int o = 16; o > 0; o >>= 1) first = min(first, __shfl_xor_sync(kFullMask, first, o));
+            for (int o = 16; o > 0; o >>= 1)
+                first = min(first, __shfl_xor_sync(kFullMask, first, o));
             if (threadIdx.x == 0) {
                 sm.owned = first == pair;
                 if (sm.owned) {
@@ -340,12 +341,13 @@ __device__ void resolve_item(Smem& sm, Item& it, int id, int n_items, int n_slic
 
 // The first kPF groups of this thread's gate|up row of item `it` into the ring.
 template <int BITS>
-__device__ __forceinline__ void prefetch_gate_up(const uint32_t* __restrict__ packed_gu, const Item& it,
-                                                 int K, int I, Group<BITS> (&ring)[kPF]) {
+__device__ __forceinline__ void prefetch_gate_up(const uint32_t* __restrict__ packed_gu,
+                                                 const Item& it, int K, int I,
+                                                 Group<BITS> (&ring)[kPF]) {
     const int G = K / kG;
     const int wpr = w1::words_per_row(K, BITS);
-    const int col = threadIdx.x < kG ? it.slice * kG + threadIdx.x
-                                     : I + it.slice * kG + threadIdx.x - kG;
+    const int col =
+        threadIdx.x < kG ? it.slice * kG + threadIdx.x : I + it.slice * kG + threadIdx.x - kG;
     const uint32_t* row = packed_gu + (static_cast<size_t>(it.e) * 2 * I + col) * wpr;
 #pragma unroll
     for (int d = 0; d < kPF; ++d)
@@ -355,14 +357,12 @@ __device__ __forceinline__ void prefetch_gate_up(const uint32_t* __restrict__ pa
 // One item: the gate|up GEMVs of the slice, the SwiGLU, the down projection of the slice.
 // FOLD: the routing weight goes into the down epilogue (variant 2) instead of into h.
 template <int BITS, int TP, bool FOLD>
-__device__ __forceinline__ void run_item(Smem& sm, const Item& it, const __nv_bfloat16* __restrict__ x,
-                                         const uint32_t* __restrict__ packed_gu,
-                                         const __nv_bfloat16* __restrict__ scales_gu,
-                                         const uint32_t* __restrict__ packed_dn,
-                                         const __nv_bfloat16* __restrict__ scales_dn,
-                                         float* __restrict__ yacc, int K, int I,
-                                         Group<BITS> (&ring)[kPF], const Item* next,
-                                         int next_valid) {
+__device__ __forceinline__ void run_item(
+    Smem& sm, const Item& it, const __nv_bfloat16* __restrict__ x,
+    const uint32_t* __restrict__ packed_gu, const __nv_bfloat16* __restrict__ scales_gu,
+    const uint32_t* __restrict__ packed_dn, const __nv_bfloat16* __restrict__ scales_dn,
+    float* __restrict__ yacc, int K, int I, Group<BITS> (&ring)[kPF], const Item* next,
+    int next_valid) {
     const int tid = threadIdx.x;
     const int G = K / kG;
     const int N = 2 * I;
@@ -474,8 +474,8 @@ __global__ void __launch_bounds__(kThreads, 2)
                        const uint32_t* __restrict__ packed_gu,
                        const __nv_bfloat16* __restrict__ scales_gu,
                        const uint32_t* __restrict__ packed_dn,
-                       const __nv_bfloat16* __restrict__ scales_dn, float* __restrict__ yacc,
-                       int T, int topk, int K, int I, int n_items) {
+                       const __nv_bfloat16* __restrict__ scales_dn, float* __restrict__ yacc, int T,
+                       int topk, int K, int I, int n_items) {
     __shared__ Smem sm;
     const int n_slices = I / kG;
     Group<BITS> ring[kPF];
@@ -496,21 +496,21 @@ __global__ void __launch_bounds__(kThreads, 2)
         }
         switch (it.ne) {
             case 1:
-                run_item<BITS, 1, FOLD>(sm, it, x, packed_gu, scales_gu, packed_dn, scales_dn,
-                                        yacc, K, I, ring, &nx, next_valid);
+                run_item<BITS, 1, FOLD>(sm, it, x, packed_gu, scales_gu, packed_dn, scales_dn, yacc,
+                                        K, I, ring, &nx, next_valid);
                 break;
             case 2:
-                run_item<BITS, 2, FOLD>(sm, it, x, packed_gu, scales_gu, packed_dn, scales_dn,
-                                        yacc, K, I, ring, &nx, next_valid);
+                run_item<BITS, 2, FOLD>(sm, it, x, packed_gu, scales_gu, packed_dn, scales_dn, yacc,
+                                        K, I, ring, &nx, next_valid);
                 break;
             case 3:
             case 4:
-                run_item<BITS, 4, FOLD>(sm, it, x, packed_gu, scales_gu, packed_dn, scales_dn,
-                                        yacc, K, I, ring, &nx, next_valid);
+                run_item<BITS, 4, FOLD>(sm, it, x, packed_gu, scales_gu, packed_dn, scales_dn, yacc,
+                                        K, I, ring, &nx, next_valid);
                 break;
             default:
-                run_item<BITS, 8, FOLD>(sm, it, x, packed_gu, scales_gu, packed_dn, scales_dn,
-                                        yacc, K, I, ring, &nx, next_valid);
+                run_item<BITS, 8, FOLD>(sm, it, x, packed_gu, scales_gu, packed_dn, scales_dn, yacc,
+                                        K, I, ring, &nx, next_valid);
                 break;
         }
         if (!FOLD) {
@@ -598,8 +598,8 @@ void w1moe_decode_bf16(const __nv_bfloat16* x, const int32_t* expert_ids,
         v0_gate_up_kernel<<<dim3(cdiv(2 * I, 256), n_pairs), 256, 0, stream>>>(
             x, expert_ids, packed_gate_up, scales_gate_up, gu, topk, K, I, bits);
         SPARK_CHECK_LAUNCH();
-        v0_swiglu_kernel<<<cdiv(static_cast<int>(h_elems), 256), 256, 0, stream>>>(
-            gu, h, n_pairs, I);
+        v0_swiglu_kernel<<<cdiv(static_cast<int>(h_elems), 256), 256, 0, stream>>>(gu, h, n_pairs,
+                                                                                   I);
         SPARK_CHECK_LAUNCH();
         v0_down_kernel<<<dim3(cdiv(K, 256), T), 256, 0, stream>>>(
             h, expert_ids, expert_weights, packed_down, scales_down, y, topk, K, I, bits);

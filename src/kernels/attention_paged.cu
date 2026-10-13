@@ -445,7 +445,8 @@ __global__ void __launch_bounds__(THREADS, 1) paged_decode_kernel(Params p) {
     [[maybe_unused]] const int t4 = lane & 3;
     const int B = p.B, H_kv = p.H_kv;
 
-    block_prefix(B, [&](int b) { return cdiv(max(0, p.lens[b]), SLAB); }, s_pre, s_scan);
+    block_prefix(
+        B, [&](int b) { return cdiv(max(0, p.lens[b]), SLAB); }, s_pre, s_scan);
     if (blockIdx.x == 0)
         for (int b = tid; b <= B; b += THREADS) p.meta[b] = s_pre[b];
     const int T = s_pre[B] * H_kv;
@@ -981,7 +982,8 @@ __global__ void __launch_bounds__(THREADS, 1) varlen_kernel(Params p) {
     // Q tiles of each sequence, then this block's (sequence, tile, head). Block order is
     // tile-major over the heads, so the heads that share a K/V head are neighbours, and
     // within a sequence the tiles run heaviest first under the causal mask.
-    block_prefix(p.B, [&](int b) { return cdiv(p.cu_q[b + 1] - p.cu_q[b], BM); }, s_pre, s_scan);
+    block_prefix(
+        p.B, [&](int b) { return cdiv(p.cu_q[b + 1] - p.cu_q[b], BM); }, s_pre, s_scan);
     const int tile = blockIdx.x / p.H_q, h = blockIdx.x - tile * p.H_q;
     if (tile >= s_pre[p.B]) return;  // the grid is an upper bound on the tile count
     const int b = find_seq(s_pre, p.B, tile);

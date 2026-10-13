@@ -41,8 +41,6 @@
 // numbers side by side. Rows are split across std::threads in a fixed partition; there is
 // no OpenMP and no pool, a thread per call, which is fine for a bench and a reference and
 // is the first thing a serving loop would replace.
-#include "spark/cpu.h"
-
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -50,6 +48,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#include "spark/cpu.h"
 
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -76,7 +76,9 @@ inline bf16 f32_to_bf16(float f) {
     return static_cast<bf16>(u >> 16);
 }
 
-inline int words_per_row(int K, int bits) { return K * bits / 32; }
+inline int words_per_row(int K, int bits) {
+    return K * bits / 32;
+}
 
 // The code of weight (n, k) from the packed array, the GPU helper's rule.
 inline int code_at(const uint32_t* row, int k, int bits) {
@@ -186,8 +188,8 @@ void rows_neon_f32(const float* af, const uint32_t* packed, const bf16* scales, 
                     const uint16x8_t hi = vdupq_n_u16(static_cast<uint16_t>(word >> 16));
                     const float* a = ag + 16 * i;
                     acc = add_ternary8(acc, vtstq_u16(lo, tern_odd), vtstq_u16(lo, tern_even), a);
-                    acc = add_ternary8(acc, vtstq_u16(hi, tern_odd), vtstq_u16(hi, tern_even),
-                                       a + 8);
+                    acc =
+                        add_ternary8(acc, vtstq_u16(hi, tern_odd), vtstq_u16(hi, tern_even), a + 8);
                 }
             }
             total = vfmaq_n_f32(total, acc, bf16_to_f32(scales[static_cast<size_t>(g) * N + n]));
@@ -202,8 +204,8 @@ void rows_neon_f32(const float* af, const uint32_t* packed, const bf16* scales, 
 
 alignas(16) const uint8_t kSign8x2[16] = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
 alignas(16) const uint8_t kTernEven8[16] = {1, 4, 16, 64, 1, 4, 16, 64, 1, 4, 16, 64, 1, 4, 16, 64};
-alignas(16) const uint8_t kTernOdd8[16] = {2, 8, 32, 128, 2, 8, 32, 128, 2, 8, 32, 128,
-                                           2, 8, 32, 128};
+alignas(16) const uint8_t kTernOdd8[16] = {2, 8, 32, 128, 2, 8, 32, 128,
+                                           2, 8, 32, 128, 2, 8, 32, 128};
 alignas(16) const uint8_t kByteIdx[16] = {0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3};
 
 // The activation row as int8 per group of 128 with one fp32 scale each.
@@ -232,7 +234,8 @@ QuantA quantize_a(const float* af, int K) {
             const int32x4_t q3 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(a + k + 12), inv));
             const int16x8_t h0 = vcombine_s16(vqmovn_s32(q0), vqmovn_s32(q1));
             const int16x8_t h1 = vcombine_s16(vqmovn_s32(q2), vqmovn_s32(q3));
-            vst1q_s8(qa.q.data() + g * kW1GroupSize + k, vcombine_s8(vqmovn_s16(h0), vqmovn_s16(h1)));
+            vst1q_s8(qa.q.data() + g * kW1GroupSize + k,
+                     vcombine_s8(vqmovn_s16(h0), vqmovn_s16(h1)));
         }
     }
     return qa;
@@ -243,7 +246,7 @@ inline int8x16_t sign_lanes(uint16_t chunk, uint8x16_t sel) {
     const uint8x16_t bytes = vcombine_u8(vdup_n_u8(static_cast<uint8_t>(chunk & 0xFFu)),
                                          vdup_n_u8(static_cast<uint8_t>(chunk >> 8)));
     const int8x16_t set = vreinterpretq_s8_u8(vtstq_u8(bytes, sel));  // -1 where code 1
-    return vorrq_s8(vmvnq_s8(set), vdupq_n_s8(1));                   // 1 where set, -1 where not
+    return vorrq_s8(vmvnq_s8(set), vdupq_n_s8(1));                    // 1 where set, -1 where not
 }
 
 // 16 ternary codes (one word) -> int8 lanes +1 / 0 / -1.
@@ -312,7 +315,9 @@ void over_rows(int N, int threads, const F& fn) {
 
 }  // namespace
 
-int w1gemv_num_variants() { return 3; }
+int w1gemv_num_variants() {
+    return 3;
+}
 
 bool w1gemv_supports(int variant) {
     if (variant == 0) return true;
@@ -370,9 +375,8 @@ void w1gemv_bf16(const bf16* a, const uint32_t* packed, const bf16* scales, bf16
 #if defined(__ARM_FEATURE_DOTPROD)
     if (variant == 2) {
         const QuantA qa = quantize_a(af.data(), K);
-        over_rows(N, threads, [&](int n0, int n1) {
-            rows_neon_i8(qa, packed, scales, y, n0, n1, N, K, bits);
-        });
+        over_rows(N, threads,
+                  [&](int n0, int n1) { rows_neon_i8(qa, packed, scales, y, n0, n1, N, K, bits); });
         return;
     }
 #endif

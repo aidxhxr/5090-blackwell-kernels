@@ -109,8 +109,8 @@ struct Weight {
         return deq + static_cast<size_t>(c % bf16_copies) * K * N;
     }
     void free_all() {
-        for (void* x : {static_cast<void*>(packed), static_cast<void*>(scales),
-                        static_cast<void*>(deq)})
+        for (void* x :
+             {static_cast<void*>(packed), static_cast<void*>(scales), static_cast<void*>(deq)})
             if (x) SPARK_CUDA_CHECK(cudaFree(x));
     }
 };
@@ -188,8 +188,9 @@ Weight make_weight(const std::vector<__nv_bfloat16>& hW, int N, int K, int bits,
         for (int n = 0; n < N; ++n)
             bad += code_of(hq, n, k, K, bits) != rq[static_cast<size_t>(k) * N + n];
     if (bad) {
-        std::fprintf(stderr, "  FAIL w1_quantize %dx%d bits=%d: %zu codes/scales differ from the CPU\n",
-                     K, N, bits, bad);
+        std::fprintf(stderr,
+                     "  FAIL w1_quantize %dx%d bits=%d: %zu codes/scales differ from the CPU\n", K,
+                     N, bits, bad);
         w.quant_ok = false;
     }
 
@@ -210,8 +211,8 @@ Weight make_weight(const std::vector<__nv_bfloat16>& hW, int N, int K, int bits,
     for (int c = 0; c < w.bf16_copies; ++c)
         SPARK_CUDA_CHECK(cudaMemcpy(w.deq + c * nW, hdb.data(), nW * 2, cudaMemcpyHostToDevice));
     for (int c = 1; c < w.copies; ++c) {
-        SPARK_CUDA_CHECK(cudaMemcpy(w.packed + c * w.words, w.packed, w.words * 4,
-                                    cudaMemcpyDeviceToDevice));
+        SPARK_CUDA_CHECK(
+            cudaMemcpy(w.packed + c * w.words, w.packed, w.words * 4, cudaMemcpyDeviceToDevice));
         SPARK_CUDA_CHECK(cudaMemcpy(w.scales + c * w.groups_n, w.scales, w.groups_n * 2,
                                     cudaMemcpyDeviceToDevice));
     }
@@ -238,8 +239,8 @@ W4Weight make_w4(const std::vector<__nv_bfloat16>& hW, int N, int K, cudaStream_
     spark::w4_repack(dq, w.packed, K, N, stream);
     SPARK_CUDA_CHECK(cudaStreamSynchronize(stream));
     for (int c = 1; c < w.copies; ++c) {
-        SPARK_CUDA_CHECK(cudaMemcpy(w.packed + c * w.words, w.packed, w.words * 4,
-                                    cudaMemcpyDeviceToDevice));
+        SPARK_CUDA_CHECK(
+            cudaMemcpy(w.packed + c * w.words, w.packed, w.words * 4, cudaMemcpyDeviceToDevice));
         SPARK_CUDA_CHECK(cudaMemcpy(w.scales + c * w.groups_n, w.scales, w.groups_n * 2,
                                     cudaMemcpyDeviceToDevice));
     }
@@ -295,8 +296,8 @@ bool run_m(cudaStream_t stream, const Weight& w, const W4Weight* w4, int M,
     double t_bf16 = 0.0;
     if (hgemm_ok)
         t_bf16 = spark::bench::time_kernel(
-                     [&] { spark::hgemm_bf16(dA, w.d(turn++), dC, M, N, K, 6, stream); },
-                     stream, 5, iters)
+                     [&] { spark::hgemm_bf16(dA, w.d(turn++), dC, M, N, K, 6, stream); }, stream, 5,
+                     iters)
                      .median_ms;
     double t_w4 = 0.0;
     if (w4 && spark::w4gemm_supports(M, N, K, 2))

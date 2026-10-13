@@ -373,8 +373,8 @@ constexpr int kW1GroupSize = 128;
 // (an all-zero group gets s = 0). Output packed: uint32 [N, K * bits / 32] with k ascending
 // from the lowest bits of the lowest word (bits==1: bit k%32 of word k/32; bits==2: bits
 // 2*(k%16) of word k/16), scales [K/128, N] bf16. K % 128 == 0, N % 16 == 0.
-void w1_quantize_bf16(const __nv_bfloat16* W, uint32_t* packed, __nv_bfloat16* scales, int K,
-                      int N, int bits, cudaStream_t stream);
+void w1_quantize_bf16(const __nv_bfloat16* W, uint32_t* packed, __nv_bfloat16* scales, int K, int N,
+                      int bits, cudaStream_t stream);
 // C[M, N] = A[M, K] bf16 * dequant(packed, scales), fp32 accumulate, bf16 out. The
 // dequantized weight is bf16(s * (2 code - 1)) for bits == 1 and bf16(s * (code - 1)) for
 // bits == 2, so it is bit for bit what a dequantize-then-bf16-GEMM reference multiplies.
@@ -387,17 +387,16 @@ void w1_quantize_bf16(const __nv_bfloat16* W, uint32_t* packed, __nv_bfloat16* s
 //            M > 16: block tile with warps along N and M sharing activations through shared
 //            memory
 void w1gemm_bf16(const __nv_bfloat16* A, const uint32_t* packed, const __nv_bfloat16* scales,
-                 __nv_bfloat16* C, int M, int N, int K, int bits, int variant,
-                 cudaStream_t stream);
+                 __nv_bfloat16* C, int M, int N, int K, int bits, int variant, cudaStream_t stream);
 int w1gemm_num_variants();
 bool w1gemm_supports(int M, int N, int K, int bits, int variant);
 // Grouped form over E experts for a mixture-of-experts layer: A is [T, K], its rows sorted
 // by expert so expert e owns rows offsets[e]..offsets[e+1]-1 (offsets is int32 [E + 1] on
 // the device, offsets[E] == T, empty experts allowed); packed is E stacked [N, K*bits/32]
 // weights and scales E stacked [K/128, N]; C is [T, N]. One launch for every expert.
-void w1gemm_moe_bf16(const __nv_bfloat16* A, const uint32_t* packed,
-                     const __nv_bfloat16* scales, const int32_t* offsets, __nv_bfloat16* C,
-                     int E, int N, int K, int bits, int variant, cudaStream_t stream);
+void w1gemm_moe_bf16(const __nv_bfloat16* A, const uint32_t* packed, const __nv_bfloat16* scales,
+                     const int32_t* offsets, __nv_bfloat16* C, int E, int N, int K, int bits,
+                     int variant, cudaStream_t stream);
 
 // ---- Grouped GEMM for MoE prefill (src/kernels/grouped_gemm.cu) --------------------------
 // Every expert's GEMM in one persistent launch:
@@ -664,8 +663,7 @@ enum class UnifiedAdvice : int {
 };
 constexpr int kUnifiedNumAdvice = 7;
 const char* unified_advice_name(UnifiedAdvice advice);
-bool unified_advise(void* ptr, size_t bytes, UnifiedAdvice advice, int device,
-                    cudaStream_t stream);
+bool unified_advise(void* ptr, size_t bytes, UnifiedAdvice advice, int device, cudaStream_t stream);
 
 // What the device says about unified memory, from cudaDeviceGetAttribute. The GB10 is expected
 // to report pageableMemoryAccess, concurrentManagedAccess and

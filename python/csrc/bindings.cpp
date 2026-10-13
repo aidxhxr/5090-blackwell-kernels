@@ -667,8 +667,10 @@ int64_t check_w1_weight(const Tensor& a, const Tensor& packed, const Tensor& sca
                         int64_t K, const char* op) {
     check_cuda_contig(packed, "packed");
     check_cuda_contig(scales, "scales");
-    TORCH_CHECK(packed.scalar_type() == at::kInt, op, " expects packed as the int32 tensor "
-                "from w1_quantize, got ", packed.scalar_type());
+    TORCH_CHECK(packed.scalar_type() == at::kInt, op,
+                " expects packed as the int32 tensor "
+                "from w1_quantize, got ",
+                packed.scalar_type());
     const int64_t N = packed.size(-2);
     TORCH_CHECK(packed.size(-1) == K * bits / 32, "packed is ", packed.sizes(),
                 ", expected a trailing [N, K * bits / 32] = [N, ", K * bits / 32, "] for K = ", K,
@@ -689,8 +691,7 @@ int64_t check_w1_weight(const Tensor& a, const Tensor& packed, const Tensor& sca
 
 // a [M, K] bf16 times the sign or ternary weight (packed [N, K * bits / 32] int32, scales
 // [K/128, N] bf16 from w1_quantize) -> [M, N] bf16, fp32 accumulate.
-Tensor w1gemm(const Tensor& a, const Tensor& packed, const Tensor& scales, int bits,
-              int variant) {
+Tensor w1gemm(const Tensor& a, const Tensor& packed, const Tensor& scales, int bits, int variant) {
     check_cuda_contig(a, "a");
     check_w1_bits(bits, "w1gemm");
     TORCH_CHECK(a.scalar_type() == at::kBFloat16 && a.dim() == 2,
@@ -704,8 +705,8 @@ Tensor w1gemm(const Tensor& a, const Tensor& packed, const Tensor& scales, int b
     Tensor c = at::empty({M, N}, a.options());
     const int v = resolve_variant(variant, spark::w1gemm_num_variants());
     spark::w1gemm_bf16(bf16_ptr(a), reinterpret_cast<const uint32_t*>(packed.data_ptr<int32_t>()),
-                       bf16_ptr(scales), bf16_ptr_mut(c), static_cast<int>(M),
-                       static_cast<int>(N), static_cast<int>(K), bits, v, current_stream(a));
+                       bf16_ptr(scales), bf16_ptr_mut(c), static_cast<int>(M), static_cast<int>(N),
+                       static_cast<int>(K), bits, v, current_stream(a));
     return c;
 }
 
@@ -734,11 +735,10 @@ Tensor w1gemm_moe(const Tensor& a, const Tensor& packed, const Tensor& scales,
     const c10::cuda::CUDAGuard guard(a.device());
     Tensor c = at::empty({T, N}, a.options());
     const int v = resolve_variant(variant, spark::w1gemm_num_variants());
-    spark::w1gemm_moe_bf16(bf16_ptr(a),
-                           reinterpret_cast<const uint32_t*>(packed.data_ptr<int32_t>()),
-                           bf16_ptr(scales), offsets.data_ptr<int32_t>(), bf16_ptr_mut(c),
-                           static_cast<int>(E), static_cast<int>(N), static_cast<int>(K), bits, v,
-                           current_stream(a));
+    spark::w1gemm_moe_bf16(
+        bf16_ptr(a), reinterpret_cast<const uint32_t*>(packed.data_ptr<int32_t>()),
+        bf16_ptr(scales), offsets.data_ptr<int32_t>(), bf16_ptr_mut(c), static_cast<int>(E),
+        static_cast<int>(N), static_cast<int>(K), bits, v, current_stream(a));
     return c;
 }
 
@@ -1283,8 +1283,8 @@ int num_variants(const std::string& name) {
 
 // The fused decode-step over the routed experts (w1moe_decode_bf16): x [T, K] bf16,
 // expert_ids int32 [T, topk], expert_weights bf16 [T, topk], the gate|up experts (packed
-// [E, 2I, K * bits / 32], scales [E, K/128, 2I]) and the down experts (packed [E, K, I * bits / 32],
-// scales [E, I/128, K]) -> y [T, K] bf16. T <= 8.
+// [E, 2I, K * bits / 32], scales [E, K/128, 2I]) and the down experts (packed [E, K, I * bits /
+// 32], scales [E, I/128, K]) -> y [T, K] bf16. T <= 8.
 Tensor w1moe_decode(const Tensor& x, const Tensor& expert_ids, const Tensor& expert_weights,
                     const Tensor& packed_gu, const Tensor& scales_gu, const Tensor& packed_dn,
                     const Tensor& scales_dn, int bits, int variant) {
@@ -1294,9 +1294,10 @@ Tensor w1moe_decode(const Tensor& x, const Tensor& expert_ids, const Tensor& exp
     check_w1_bits(bits, "w1moe_decode");
     TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.dim() == 2,
                 "w1moe_decode expects a 2-D bfloat16 x [T, K]");
-    TORCH_CHECK(packed_gu.dim() == 3 && scales_gu.dim() == 3 && packed_dn.dim() == 3 &&
-                    scales_dn.dim() == 3,
-                "w1moe_decode expects stacked expert weights [E, N, K * bits / 32] / [E, K/128, N]");
+    TORCH_CHECK(
+        packed_gu.dim() == 3 && scales_gu.dim() == 3 && packed_dn.dim() == 3 &&
+            scales_dn.dim() == 3,
+        "w1moe_decode expects stacked expert weights [E, N, K * bits / 32] / [E, K/128, N]");
     const int64_t T = x.size(0), K = x.size(1);
     const int64_t E = packed_gu.size(0);
     TORCH_CHECK(scales_gu.size(0) == E && packed_dn.size(0) == E && scales_dn.size(0) == E,
@@ -1306,23 +1307,26 @@ Tensor w1moe_decode(const Tensor& x, const Tensor& expert_ids, const Tensor& exp
     const int64_t I = N_gu / 2;
     TORCH_CHECK(packed_dn.scalar_type() == at::kInt && packed_dn.size(1) == K &&
                     packed_dn.size(2) == I * bits / 32,
-                "w1moe_decode: down packed must be int32 [E, K, I * bits / 32] = [", E, ", ", K, ", ",
-                I * bits / 32, "], got ", packed_dn.sizes());
+                "w1moe_decode: down packed must be int32 [E, K, I * bits / 32] = [", E, ", ", K,
+                ", ", I * bits / 32, "], got ", packed_dn.sizes());
     TORCH_CHECK(scales_dn.scalar_type() == at::kBFloat16 &&
                     scales_dn.size(1) == I / spark::kW1GroupSize && scales_dn.size(2) == K,
-                "w1moe_decode: down scales must be bfloat16 [E, I/128, K], got ", scales_dn.sizes());
+                "w1moe_decode: down scales must be bfloat16 [E, I/128, K], got ",
+                scales_dn.sizes());
     check_cuda_contig(packed_dn, "packed_down");
     check_cuda_contig(scales_dn, "scales_down");
-    TORCH_CHECK(expert_ids.scalar_type() == at::kInt && expert_ids.dim() == 2 &&
-                    expert_ids.size(0) == T,
-                "w1moe_decode: expert_ids must be int32 [T, topk], got ", expert_ids.scalar_type(),
-                " ", expert_ids.sizes());
+    TORCH_CHECK(
+        expert_ids.scalar_type() == at::kInt && expert_ids.dim() == 2 && expert_ids.size(0) == T,
+        "w1moe_decode: expert_ids must be int32 [T, topk], got ", expert_ids.scalar_type(), " ",
+        expert_ids.sizes());
     const int64_t topk = expert_ids.size(1);
     TORCH_CHECK(expert_weights.scalar_type() == at::kBFloat16 &&
                     expert_weights.sizes() == expert_ids.sizes(),
                 "w1moe_decode: expert_weights must be bfloat16 [T, topk]");
-    TORCH_CHECK(T >= 1 && T <= 8 && T * topk <= 64, "w1moe_decode takes 1 <= T <= 8 tokens and "
-                "T * topk <= 64, got T = ", T, ", topk = ", topk);
+    TORCH_CHECK(T >= 1 && T <= 8 && T * topk <= 64,
+                "w1moe_decode takes 1 <= T <= 8 tokens and "
+                "T * topk <= 64, got T = ",
+                T, ", topk = ", topk);
     TORCH_CHECK(K % 256 == 0 && K <= 16384 && I % spark::kW1GroupSize == 0,
                 "w1moe_decode needs K % 256 == 0, K <= 16384 and I % 128 == 0, got K = ", K,
                 ", I = ", I);
@@ -1333,13 +1337,12 @@ Tensor w1moe_decode(const Tensor& x, const Tensor& expert_ids, const Tensor& exp
     const c10::cuda::CUDAGuard guard(x.device());
     Tensor y = at::empty({T, K}, x.options());
     const int v = resolve_variant(variant, spark::w1moe_decode_num_variants());
-    spark::w1moe_decode_bf16(bf16_ptr(x), expert_ids.data_ptr<int32_t>(), bf16_ptr(expert_weights),
-                             reinterpret_cast<const uint32_t*>(packed_gu.data_ptr<int32_t>()),
-                             bf16_ptr(scales_gu),
-                             reinterpret_cast<const uint32_t*>(packed_dn.data_ptr<int32_t>()),
-                             bf16_ptr(scales_dn), bf16_ptr_mut(y), static_cast<int>(T),
-                             static_cast<int>(topk), static_cast<int>(E), static_cast<int>(K),
-                             static_cast<int>(I), bits, v, current_stream(x));
+    spark::w1moe_decode_bf16(
+        bf16_ptr(x), expert_ids.data_ptr<int32_t>(), bf16_ptr(expert_weights),
+        reinterpret_cast<const uint32_t*>(packed_gu.data_ptr<int32_t>()), bf16_ptr(scales_gu),
+        reinterpret_cast<const uint32_t*>(packed_dn.data_ptr<int32_t>()), bf16_ptr(scales_dn),
+        bf16_ptr_mut(y), static_cast<int>(T), static_cast<int>(topk), static_cast<int>(E),
+        static_cast<int>(K), static_cast<int>(I), bits, v, current_stream(x));
     return y;
 }
 
@@ -1543,9 +1546,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             const c10::cuda::CUDAGuard guard(a.device());
             Tensor y = a.dim() == 1 ? at::empty({N}, a.options()) : at::empty({1, N}, a.options());
             const int v = resolve_variant(variant, spark::unified_gemv_num_variants());
-            spark::unified_gemv_bf16(bf16_ptr(a), reinterpret_cast<const __nv_bfloat16*>(w.data_ptr()),
-                                     bf16_ptr_mut(y), static_cast<int>(N), static_cast<int>(K), v,
-                                     current_stream(a));
+            spark::unified_gemv_bf16(
+                bf16_ptr(a), reinterpret_cast<const __nv_bfloat16*>(w.data_ptr()), bf16_ptr_mut(y),
+                static_cast<int>(N), static_cast<int>(K), v, current_stream(a));
             return y;
         },
         "decode GEMV: a [K] or [1, K] bf16 on the device times w [N, K] bf16 in any memory the "
@@ -1584,6 +1587,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("fits_l2", &fits_l2, "whether a weight of `bytes` is L2-resident on a device",
           py::arg("bytes"), py::arg("device") = "");
     m.def("decode_force_split_k", &spark::decode_force_split_k,
-          "force the K split of every decode kernel that has one (0 = the rule)",
-          py::arg("split"));
+          "force the K split of every decode kernel that has one (0 = the rule)", py::arg("split"));
 }

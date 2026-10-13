@@ -331,7 +331,7 @@ __device__ __forceinline__ void mainloop(const unsigned char* __restrict__ A,
 #pragma unroll
             for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.f;
 
-    // Prologue: the first STAGES-1 tiles are in flight before any compute starts.
+                // Prologue: the first STAGES-1 tiles are in flight before any compute starts.
 #pragma unroll
     for (int s = 0; s < STAGES - 1; ++s) {
         if (s < nkt) load_stage(s, s * BK);

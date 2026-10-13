@@ -495,7 +495,6 @@ const FusedRow fused_rows[] = {
     {{16, 11008, 4096}, "residual"},    {{16, 22016, 4096}, "swiglu"},
 };
 
-
 // ---- model shapes (--models) ----------------------------------------------------------------
 //
 // The projections of real checkpoints at M = 128 to 4096 tokens, the region between the
@@ -505,7 +504,8 @@ const FusedRow fused_rows[] = {
 // output is checked on the device against cuBLAS with the tolerance run_one uses, and B is
 // rotated over copies that exceed L2 whenever one copy would fit, as a real forward pass
 // sees each layer's weight once. Rows are "MxNxK@label" with label v3, v4, v5, v6old
-// (variant 6's route before this sweep), v6 (the default, the per-shape rule) and, with --tiles, v6t<n> (TMA tile n forced).
+// (variant 6's route before this sweep), v6 (the default, the per-shape rule) and, with --tiles,
+// v6t<n> (TMA tile n forced).
 
 struct Weight {
     const char* model;
@@ -577,8 +577,8 @@ __global__ void max_err_kernel(const __nv_bfloat16* __restrict__ got,
 }
 
 // {max |got - ref|, max |ref|}.
-std::pair<double, double> max_err_dev(const __nv_bfloat16* got, const __nv_bfloat16* ref,
-                                      size_t n, unsigned* scratch, cudaStream_t stream) {
+std::pair<double, double> max_err_dev(const __nv_bfloat16* got, const __nv_bfloat16* ref, size_t n,
+                                      unsigned* scratch, cudaStream_t stream) {
     SPARK_CUDA_CHECK(cudaMemsetAsync(scratch, 0, 2 * sizeof(unsigned), stream));
     max_err_kernel<<<1024, 256, 0, stream>>>(got, ref, n, scratch);
     SPARK_CUDA_CHECK(cudaGetLastError());
@@ -679,8 +679,8 @@ bool run_models_weight(cublasHandle_t handle, cudaStream_t stream, const Weight&
             all_ok = all_ok && ok;
             turn = 0;
             const auto t = spark::bench::time_kernel(
-                [&] { spark::hgemm_bf16(dA, next_b(), dC, M, N, K, c.variant, stream); }, stream,
-                5, iters);
+                [&] { spark::hgemm_bf16(dA, next_b(), dC, M, N, K, c.variant, stream); }, stream, 5,
+                iters);
             spark::bench::Row row;
             row.kernel = "hgemm_models";
             row.dtype = "bf16";

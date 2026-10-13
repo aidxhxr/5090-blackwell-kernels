@@ -16,8 +16,6 @@
 // (the JSON device field; default "cpu" plus the hardware thread count), --quick (small
 // shapes and a 64 MB probe, to shake out the build on any Arm machine). Not run on a GB10:
 // every number this prints is from whatever host built it.
-#include "spark/cpu.h"
-
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -31,6 +29,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#include "spark/cpu.h"
 
 namespace {
 
@@ -120,8 +120,8 @@ struct Args {
         size_t start = 0;
         while (start <= v.size()) {
             const size_t comma = v.find(',', start);
-            const std::string item = v.substr(start, comma == std::string::npos ? std::string::npos
-                                                                                : comma - start);
+            const std::string item =
+                v.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
             if (!item.empty()) out.push_back(std::atoi(item.c_str()));
             if (comma == std::string::npos) break;
             start = comma + 1;
@@ -142,8 +142,9 @@ Timing time_fn(const std::function<void()>& fn, int warmup, int iters) {
     for (int i = 0; i < iters; ++i) {
         const auto t0 = std::chrono::steady_clock::now();
         fn();
-        ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
-                         .count());
+        ms.push_back(
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                .count());
     }
     std::sort(ms.begin(), ms.end());
     return {ms[ms.size() / 2], ms.front()};
@@ -194,7 +195,9 @@ std::vector<bf16> random_row(int K, uint32_t seed) {
     return a;
 }
 
-std::string shape_str(int N, int K) { return "N" + std::to_string(N) + "xK" + std::to_string(K); }
+std::string shape_str(int N, int K) {
+    return "N" + std::to_string(N) + "xK" + std::to_string(K);
+}
 
 // ---- validation --------------------------------------------------------------------------------
 
@@ -369,15 +372,15 @@ int main(int argc, char** argv) {
             float temperature, top_p;
             int top_k;
         };
-        const Case cases[] = {{"greedy", 0.f, 1.f, 0}, {"k50 p0.9", 0.7f, 0.9f, 50},
-                              {"p0.95", 0.7f, 0.95f, 0}};
+        const Case cases[] = {
+            {"greedy", 0.f, 1.f, 0}, {"k50 p0.9", 0.7f, 0.9f, 50}, {"p0.95", 0.7f, 0.95f, 0}};
         uint64_t offset = 0;
         int64_t sink = 0;
         for (const Case& c : cases) {
             const Timing t = time_fn(
                 [&] {
-                    sink ^= spark::cpu::sample_bf16(logits.data(), V, c.temperature, c.top_k, c.top_p,
-                                                    1234, offset++);
+                    sink ^= spark::cpu::sample_bf16(logits.data(), V, c.temperature, c.top_k,
+                                                    c.top_p, 1234, offset++);
                 },
                 2, iters);
             Row r;

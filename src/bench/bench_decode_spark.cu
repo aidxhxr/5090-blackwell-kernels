@@ -89,17 +89,15 @@ struct Weight {
     int copies = 1;
     int64_t bytes = 0;  // streamed per call: the weight as the kernel reads it, scales included
     // bf16: the matrix itself; int4 / 1-bit: packed words and scales.
-    __nv_bfloat16* w = nullptr;    // copies x K x N (bf16 only)
-    int32_t* packed4 = nullptr;    // copies x K N / 8 (int4)
-    uint32_t* packed1 = nullptr;   // copies x K N / 32 (1-bit)
+    __nv_bfloat16* w = nullptr;       // copies x K x N (bf16 only)
+    int32_t* packed4 = nullptr;       // copies x K N / 8 (int4)
+    uint32_t* packed1 = nullptr;      // copies x K N / 32 (1-bit)
     __nv_bfloat16* scales = nullptr;  // copies x (K / 128) x N
     size_t words = 0, groups_n = 0;
     int deq_copies = 1;
     __nv_bfloat16* deq = nullptr;  // deq_copies x K x N, what the kernel multiplies
 
-    const __nv_bfloat16* wb(int c) const {
-        return w + static_cast<size_t>(c % copies) * K * N;
-    }
+    const __nv_bfloat16* wb(int c) const { return w + static_cast<size_t>(c % copies) * K * N; }
     const int32_t* p4(int c) const { return packed4 + static_cast<size_t>(c % copies) * words; }
     const uint32_t* p1(int c) const { return packed1 + static_cast<size_t>(c % copies) * words; }
     const __nv_bfloat16* s(int c) const {
@@ -109,9 +107,9 @@ struct Weight {
         return deq + static_cast<size_t>(c % deq_copies) * K * N;
     }
     void free_all() {
-        for (void* x : {static_cast<void*>(w), static_cast<void*>(packed4),
-                        static_cast<void*>(packed1), static_cast<void*>(scales),
-                        static_cast<void*>(deq)})
+        for (void* x :
+             {static_cast<void*>(w), static_cast<void*>(packed4), static_cast<void*>(packed1),
+              static_cast<void*>(scales), static_cast<void*>(deq)})
             if (x) SPARK_CUDA_CHECK(cudaFree(x));
     }
 };
@@ -483,8 +481,10 @@ int run(int argc, char** argv) {
         // Llama-3-8B: the fused q|k|v projection (4096 -> 4096 + 2 x 1024), o, the fused
         // gate|up and down; then one DeepSeek V4.1 Flash routed expert, up (5120 -> 2304) and
         // down (2304 -> 5120). Batch 1 and batch 16.
-        shapes = {{"llama_qkv", 4096, 6144, {1, 16}},   {"llama_o", 4096, 4096, {1, 16}},
-                  {"llama_gate_up", 4096, 28672, {1, 16}}, {"llama_down", 14336, 4096, {1, 16}},
+        shapes = {{"llama_qkv", 4096, 6144, {1, 16}},
+                  {"llama_o", 4096, 4096, {1, 16}},
+                  {"llama_gate_up", 4096, 28672, {1, 16}},
+                  {"llama_down", 14336, 4096, {1, 16}},
                   {"dsflash_expert_up", 5120, 2304, {1, 16}},
                   {"dsflash_expert_down", 2304, 5120, {1, 16}}};
     }

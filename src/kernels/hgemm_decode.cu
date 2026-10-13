@@ -62,7 +62,7 @@ constexpr int smem_bytes() {
 // FUSED applies p.ep (hgemm_epilogue.cuh) wherever bf16 is stored: by the block itself when K
 // is not split, by the last K-slice to arrive at a strip when it is.
 template <int BM, int BN, int BK, int STAGES, int WM, int WN, bool FUSED>
-__global__ void __launch_bounds__(WM * WN * 32) decode_kernel(Params p) {
+__global__ void __launch_bounds__(WM* WN * 32) decode_kernel(Params p) {
     constexpr int THREADS = WM * WN * 32;
     constexpr int WROWS = BM / WM;  // rows per warp
     constexpr int WCOLS = BN / WN;  // columns per warp
@@ -140,7 +140,7 @@ __global__ void __launch_bounds__(WM * WN * 32) decode_kernel(Params p) {
 #pragma unroll
             for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.f;
 
-    // Prologue: STAGES-1 tiles in flight before any compute.
+                // Prologue: STAGES-1 tiles in flight before any compute.
 #pragma unroll
     for (int s = 0; s < STAGES - 1; ++s) {
         if (s < nkt) load_stage(s, s * BK);
@@ -327,10 +327,9 @@ void launch_cfg(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C
     // Old: p.split = std::min(K / BK, std::max(1, cdiv(kMinCtas, strips))) with kMinCtas = 64.
     // New: the same number on 170 SMs (see kDecodeCtaInFlight), the device's number elsewhere,
     // a forced split (decode_force_split_k) for the sweeps.
-    p.split = launch::split_k_for(static_cast<int64_t>(K) * N * sizeof(__nv_bfloat16), strips,
-                                  K / BK, kDecodeCtaInFlight,
-                                  slots<BM, BN, BK, STAGES, WM, WN, FUSED>(),
-                                  launch::device_shape());
+    p.split = launch::split_k_for(
+        static_cast<int64_t>(K) * N * sizeof(__nv_bfloat16), strips, K / BK, kDecodeCtaInFlight,
+        slots<BM, BN, BK, STAGES, WM, WN, FUSED>(), launch::device_shape());
     p.ws = nullptr;
     p.counters = nullptr;
     if (p.split > 1) {

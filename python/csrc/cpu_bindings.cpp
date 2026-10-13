@@ -51,15 +51,14 @@ Tensor cpu_w1gemv(const Tensor& a, const Tensor& packed, const Tensor& scales, i
     TORCH_CHECK(scales.size(0) == K / spark::cpu::kW1GroupSize && scales.size(1) == N,
                 "scales must be [K / 128, N]");
     const int64_t M = a.dim() == 1 ? 1 : a.size(0);
-    Tensor y = at::empty(a.dim() == 1 ? std::vector<int64_t>{N} : std::vector<int64_t>{M, N},
-                         a.options());
+    Tensor y =
+        at::empty(a.dim() == 1 ? std::vector<int64_t>{N} : std::vector<int64_t>{M, N}, a.options());
     try {
         for (int64_t m = 0; m < M; ++m) {
-            spark::cpu::w1gemv_bf16(bf16_ptr(a) + m * K,
-                                    reinterpret_cast<const uint32_t*>(packed.data_ptr<int32_t>()),
-                                    bf16_ptr(scales), bf16_ptr_mut(y) + m * N, static_cast<int>(N),
-                                    static_cast<int>(K), static_cast<int>(bits),
-                                    static_cast<int>(threads), static_cast<int>(variant));
+            spark::cpu::w1gemv_bf16(
+                bf16_ptr(a) + m * K, reinterpret_cast<const uint32_t*>(packed.data_ptr<int32_t>()),
+                bf16_ptr(scales), bf16_ptr_mut(y) + m * N, static_cast<int>(N), static_cast<int>(K),
+                static_cast<int>(bits), static_cast<int>(threads), static_cast<int>(variant));
         }
     } catch (const std::invalid_argument& e) {
         throw py::value_error(e.what());
@@ -80,17 +79,19 @@ std::tuple<Tensor, Tensor> cpu_route(const Tensor& logits, int64_t top_k,
     const float* bias_ptr = nullptr;
     if (bias.has_value()) {
         check_cpu_contig(*bias, "bias");
-        TORCH_CHECK(bias->scalar_type() == at::kFloat && bias->numel() == E, "bias must be [E] float32");
+        TORCH_CHECK(bias->scalar_type() == at::kFloat && bias->numel() == E,
+                    "bias must be [E] float32");
         bias_ptr = bias->data_ptr<float>();
     }
-    const auto shape = logits.dim() == 1 ? std::vector<int64_t>{top_k} : std::vector<int64_t>{T, top_k};
+    const auto shape =
+        logits.dim() == 1 ? std::vector<int64_t>{top_k} : std::vector<int64_t>{T, top_k};
     Tensor ids = at::empty(shape, logits.options().dtype(at::kInt));
     Tensor weights = at::empty(shape, logits.options());
     for (int64_t t = 0; t < T; ++t) {
-        spark::cpu::route_sigmoid_topk(logits.data_ptr<float>() + t * E, bias_ptr, static_cast<int>(E),
-                                       static_cast<int>(top_k), static_cast<float>(scale),
-                                       ids.data_ptr<int32_t>() + t * top_k,
-                                       weights.data_ptr<float>() + t * top_k);
+        spark::cpu::route_sigmoid_topk(
+            logits.data_ptr<float>() + t * E, bias_ptr, static_cast<int>(E),
+            static_cast<int>(top_k), static_cast<float>(scale), ids.data_ptr<int32_t>() + t * top_k,
+            weights.data_ptr<float>() + t * top_k);
     }
     return {ids, weights};
 }
@@ -120,8 +121,12 @@ double cpu_bandwidth_probe(int64_t bytes, int64_t threads, int64_t iters) {
                                        static_cast<int>(iters));
 }
 
-int64_t cpu_w1gemv_num_variants() { return spark::cpu::w1gemv_num_variants(); }
-bool cpu_w1gemv_supports(int64_t variant) { return spark::cpu::w1gemv_supports(static_cast<int>(variant)); }
+int64_t cpu_w1gemv_num_variants() {
+    return spark::cpu::w1gemv_num_variants();
+}
+bool cpu_w1gemv_supports(int64_t variant) {
+    return spark::cpu::w1gemv_supports(static_cast<int>(variant));
+}
 
 }  // namespace
 
@@ -139,7 +144,8 @@ void register_cpu_bindings(py::module_& m) {
           "on the CPU: sigmoid gating over fp32 logits [E] or [T, E] -> (expert ids int32, gate "
           "weights fp32), the top_k of sigmoid + bias, weights the unbiased sigmoid renormalized "
           "to sum `scale`",
-          py::arg("logits"), py::arg("top_k"), py::arg("bias") = py::none(), py::arg("scale") = 1.0);
+          py::arg("logits"), py::arg("top_k"), py::arg("bias") = py::none(),
+          py::arg("scale") = 1.0);
     m.def("cpu_sample", &cpu_sample,
           "on the CPU: one token per bf16 logit row; temperature <= 0 is argmax, then top-k, "
           "top-p and a splitmix64 draw from (seed, offset + row)",

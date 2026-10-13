@@ -162,8 +162,20 @@ struct CublasGroups {
 
     void build(const std::vector<int>& offs, int E, int N, int K, const __nv_bfloat16* W,
                const __nv_bfloat16* A, __nv_bfloat16* C, const std::vector<float>& alphas) {
-        ta.clear(); tb.clear(); m.clear(); n.clear(); k.clear(); lda.clear(); ldb.clear();
-        ldc.clear(); size.clear(); alpha.clear(); beta.clear(); hA.clear(); hB.clear(); hC.clear();
+        ta.clear();
+        tb.clear();
+        m.clear();
+        n.clear();
+        k.clear();
+        lda.clear();
+        ldb.clear();
+        ldc.clear();
+        size.clear();
+        alpha.clear();
+        beta.clear();
+        hA.clear();
+        hB.clear();
+        hC.clear();
         for (int e = 0; e < E; ++e) {
             const int rows = offs[e + 1] - offs[e];
             if (rows == 0) continue;
@@ -190,12 +202,12 @@ struct CublasGroups {
         }
     }
     void upload(cudaStream_t s) {
-        SPARK_CUDA_CHECK(cudaMemcpyAsync(dA, hA.data(), count * sizeof(void*),
-                                         cudaMemcpyHostToDevice, s));
-        SPARK_CUDA_CHECK(cudaMemcpyAsync(dB, hB.data(), count * sizeof(void*),
-                                         cudaMemcpyHostToDevice, s));
-        SPARK_CUDA_CHECK(cudaMemcpyAsync(dC, hC.data(), count * sizeof(void*),
-                                         cudaMemcpyHostToDevice, s));
+        SPARK_CUDA_CHECK(
+            cudaMemcpyAsync(dA, hA.data(), count * sizeof(void*), cudaMemcpyHostToDevice, s));
+        SPARK_CUDA_CHECK(
+            cudaMemcpyAsync(dB, hB.data(), count * sizeof(void*), cudaMemcpyHostToDevice, s));
+        SPARK_CUDA_CHECK(
+            cudaMemcpyAsync(dC, hC.data(), count * sizeof(void*), cudaMemcpyHostToDevice, s));
     }
     void run(cublasHandle_t h) {
         CUBLAS_CHECK(cublasGemmGroupedBatchedEx(
@@ -253,7 +265,8 @@ bool run_one(cublasHandle_t handle, cudaStream_t stream, const Model& md, int to
     const int empty = static_cast<int>(std::count(counts.begin(), counts.end(), 0));
     std::ostringstream shape;
     shape << md.name << " t=" << tokens;
-    std::fprintf(stderr, "# %s: E=%d top-%d K=%d N=%d, %d rows, mean %.1f per expert, max %d, "
+    std::fprintf(stderr,
+                 "# %s: E=%d top-%d K=%d N=%d, %d rows, mean %.1f per expert, max %d, "
                  "min %d, %d empty\n",
                  shape.str().c_str(), E, md.top_k, K, N, T, static_cast<double>(T) / E, busiest,
                  idlest, empty);
@@ -266,7 +279,8 @@ bool run_one(cublasHandle_t handle, cudaStream_t stream, const Model& md, int to
     __nv_bfloat16* dC = dmalloc<__nv_bfloat16>(nC);
     __nv_bfloat16* dRef = dmalloc<__nv_bfloat16>(nC);
     int32_t* dOff = dmalloc<int32_t>(E + 1);
-    SPARK_CUDA_CHECK(cudaMemcpy(dOff, offs.data(), (E + 1) * sizeof(int32_t), cudaMemcpyHostToDevice));
+    SPARK_CUDA_CHECK(
+        cudaMemcpy(dOff, offs.data(), (E + 1) * sizeof(int32_t), cudaMemcpyHostToDevice));
     fill(dA, nA, 11u);
     fill(dW, nW, 23u);
     SPARK_CUDA_CHECK(cudaDeviceSynchronize());
@@ -316,7 +330,8 @@ bool run_one(cublasHandle_t handle, cudaStream_t stream, const Model& md, int to
         spark::bench::print_row(make_row("cublas_grouped", "bf16", shape.str(), t_cg, flops, 0));
         spark::bench::print_row(make_row("cublas_gsync", "bf16", shape.str(), t_gsync, flops, 0));
         spark::bench::print_row(make_row("cublas_loop", "bf16", shape.str(), t_loop, flops, 0));
-        std::fprintf(stderr, "#   bf16 speedup: %.2fx over cuBLAS grouped, %.2fx over it with "
+        std::fprintf(stderr,
+                     "#   bf16 speedup: %.2fx over cuBLAS grouped, %.2fx over it with "
                      "the sync, %.2fx over the per-expert loop\n",
                      t_cg.median_ms / t_sk.median_ms, t_gsync.median_ms / t_sk.median_ms,
                      t_loop.median_ms / t_sk.median_ms);

@@ -419,9 +419,11 @@ __global__ void __launch_bounds__((WARPS_M * WARPS_N + 1) * 32, 1)
             prefetch_tensormap(&tmB);
             unsigned short mask_a = 0, mask_b = 0;  // the cluster row, the cluster column
 #pragma unroll
-            for (int j = 0; j < CLN; ++j) mask_a |= static_cast<unsigned short>(1u << (ci + CLM * j));
+            for (int j = 0; j < CLN; ++j)
+                mask_a |= static_cast<unsigned short>(1u << (ci + CLM * j));
 #pragma unroll
-            for (int i = 0; i < CLM; ++i) mask_b |= static_cast<unsigned short>(1u << (i + CLM * cj));
+            for (int i = 0; i < CLM; ++i)
+                mask_b |= static_cast<unsigned short>(1u << (i + CLM * cj));
             const int a_row = bm + cj * A_ROWS;  // this block's slice of the shared A tile
             const int b_row = bn + ci * B_ROWS;
             for (int kt = 0; kt < nkt; ++kt) {
@@ -681,9 +683,9 @@ bool launch_cl(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* C
     cfg.stream = stream;
     cfg.attrs = attr;
     cfg.numAttrs = 1;
-    SPARK_CUDA_CHECK(cudaLaunchKernelEx(&cfg,
-                                        fp8gemm_cl_kernel<BN_, BK, STAGES, WARPS_M, WARPS_N, CLM, CLN>,
-                                        tmA, tmB, Cout, M, N, K, scale_a, scale_b, s));
+    SPARK_CUDA_CHECK(
+        cudaLaunchKernelEx(&cfg, fp8gemm_cl_kernel<BN_, BK, STAGES, WARPS_M, WARPS_N, CLM, CLN>,
+                           tmA, tmB, Cout, M, N, K, scale_a, scale_b, s));
     return true;
 }
 

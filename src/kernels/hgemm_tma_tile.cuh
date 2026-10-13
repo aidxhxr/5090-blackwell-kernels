@@ -60,8 +60,9 @@ struct Tile {
     static_assert(CONSUMER_WARPS == 8, "the named barriers and the ring count eight warps");
     static_assert(BM % (16 * WARPS_M) == 0 && BM <= 256, "an A box is at most 256 rows");
     static_assert(WN % 16 == 0, "one ldmatrix.x4.trans loads two n8 tiles");
-    static_assert(BN % B_BOX_N == 0, "B is loaded as whole 64-column boxes, so a warp's 16-column "
-                                     "ldmatrix pairs never straddle two of them");
+    static_assert(BN % B_BOX_N == 0,
+                  "B is loaded as whole 64-column boxes, so a warp's 16-column "
+                  "ldmatrix pairs never straddle two of them");
 
     using Acc = float[MT][NT][4];
 

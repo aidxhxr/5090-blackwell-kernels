@@ -137,9 +137,11 @@ __global__ void __launch_bounds__((WARPS_M * WARPS_N + 1) * 32, MIN_BLOCKS)
             const size_t rb_step = static_cast<size_t>(sf.ktiles) * fp4gemm_tile::kSfTile;
             unsigned short mask_a = 0, mask_b = 0;  // the cluster row, the cluster column
 #pragma unroll
-            for (int j = 0; j < CLN; ++j) mask_a |= static_cast<unsigned short>(1u << (ci + CLM * j));
+            for (int j = 0; j < CLN; ++j)
+                mask_a |= static_cast<unsigned short>(1u << (ci + CLM * j));
 #pragma unroll
-            for (int i = 0; i < CLM; ++i) mask_b |= static_cast<unsigned short>(1u << (i + CLM * cj));
+            for (int i = 0; i < CLM; ++i)
+                mask_b |= static_cast<unsigned short>(1u << (i + CLM * cj));
             for (int kt = 0; kt < nkt; ++kt) {
                 const int s = kt % STAGES;
                 const unsigned use = kt / STAGES;
@@ -162,7 +164,7 @@ __global__ void __launch_bounds__((WARPS_M * WARPS_N + 1) * 32, MIN_BLOCKS)
                                           bn + ci * B_ROWS, mask_b);
                 else
                     tma_load_2d(as + A_STAGE, &tmB, &full_bar[s], k0, bn);
-                // The scale tiles: one contiguous run of TILES x 512 bytes per 128-row block.
+                    // The scale tiles: one contiguous run of TILES x 512 bytes per 128-row block.
 #pragma unroll
                 for (int rb = 0; rb < C::SA_RB; ++rb)
                     bulk_load(as + C::SA_OFF + rb * C::SA_RB_STRIDE,
@@ -456,12 +458,16 @@ struct Config {
     LaunchFn nv, mx;
     int bm, bn;
 };
-#define SPARK_FP4_V2_CONFIG(BM_, BN_, BK, ST, WM, WN, MB)                                      \
-    {launch<BM_, BN_, BK, ST, WM, WN, MB, NVFP4>, launch<BM_, BN_, BK, ST, WM, WN, MB, MXFP4>, \
-     BM_, BN_}
-#define SPARK_FP4_V2_CLUSTER(BM_, BN_, BK, ST, WM, WN, CLM, CLN)                        \
-    {launch_cl<BM_, BN_, BK, ST, WM, WN, NVFP4, CLM, CLN>,                              \
-     launch_cl<BM_, BN_, BK, ST, WM, WN, MXFP4, CLM, CLN>, 128, 128}
+#define SPARK_FP4_V2_CONFIG(BM_, BN_, BK, ST, WM, WN, MB)                                         \
+    {                                                                                             \
+        launch<BM_, BN_, BK, ST, WM, WN, MB, NVFP4>, launch<BM_, BN_, BK, ST, WM, WN, MB, MXFP4>, \
+            BM_, BN_                                                                              \
+    }
+#define SPARK_FP4_V2_CLUSTER(BM_, BN_, BK, ST, WM, WN, CLM, CLN)           \
+    {                                                                      \
+        launch_cl<BM_, BN_, BK, ST, WM, WN, NVFP4, CLM, CLN>,              \
+            launch_cl<BM_, BN_, BK, ST, WM, WN, MXFP4, CLM, CLN>, 128, 128 \
+    }
 constexpr Config CONFIGS[] = {
     SPARK_FP4_V2_CONFIG(128, 128, 128, 2, 2, 4, 1),  // 0: 72 KB (NVFP4), 2x4 warps of 64x32
     SPARK_FP4_V2_CONFIG(128, 128, 64, 4, 2, 4, 1),   // 1: 72 KB, four 64-byte stages
