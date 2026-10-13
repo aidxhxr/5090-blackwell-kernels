@@ -50,7 +50,7 @@ def _agree(weights, rope, prompts, want, got, **kw):
     ref, n = None, 0
     for i in range(len(want)):
         a, b = want[i], got[i]
-        d = next((j for j, (x, y) in enumerate(zip(a, b)) if x != y), None)
+        d = next((j for j, (x, y) in enumerate(zip(a, b, strict=False)) if x != y), None)
         if d is None:
             assert a == b, f"request {i}: {len(a)} tokens against {len(b)}"
             continue
@@ -270,9 +270,12 @@ def test_stop_ids(sk, weights):
     stop = int(counts.argmax())
     want = {sid: o[:o.index(stop) + 1] if stop in o else o for sid, o in full.items()}
     got, st = run([stop])
-    assert got == want
+    # Retiring a sequence changes the prefill and decode batches of the others, and the
+    # GEMM's K split follows M, so a near tie can flip a token; past it the cut moves too.
     early = sum(len(want[i]) < news[i] for i in range(len(news)))
-    assert early > 0 and st.stopped == early
+    assert early > 0
+    if _agree(weights, rope, prompts, want, got) == 0:
+        assert st.stopped == early
 
 
 def test_chunked_prefill_matches_whole(sk, weights):
@@ -298,7 +301,7 @@ def test_chunked_prefill_matches_whole(sk, weights):
 def test_chunked_prefill_with_mixed_steps(sk, weights):
     """Long prompts chunked under a 96-token budget while other sequences decode (their
     rows ride in the first chunk's forward of a mixed step): the same tokens as whole-prompt
-    prefills with separate decode steps, and every page comes back."""
+    prefills with separate decode steps up to a near tie, and every page comes back."""
     rope = L.RoPE(1024)
     g = torch.Generator().manual_seed(17)
     lens = [int(x) for x in torch.randint(1, 400, (10,), generator=g)]
@@ -314,7 +317,7 @@ def test_chunked_prefill_with_mixed_steps(sk, weights):
         stats.append(eng.run())
         outs.append(eng.outputs())
         _all_back(eng)
-    assert outs[0] == outs[1]
+    _agree(weights, rope, prompts, outs[0], outs[1])
     assert stats[1].mixed_rows > 0 and stats[1].prefill_batches > stats[0].prefill_batches
 
 
@@ -546,7 +549,7 @@ def test_prefix_cache_whole_prompt_hit_computes_last_token(sk, weights):
     holding the last token is never shared), so the first token comes from its own logits;
     the second identical request matches all but that page."""
     rope = L.RoPE(512)
-    p = torch.randint(0, VOCAB, (64,))
+    p = torch.randint(0, VOCAB, (64,), generator=torch.Generator().manual_seed(29))
     outs = []
     for prefix in (False, True):
         eng = E.Engine(E.SparkModel(weights, rope), N_LAYERS, max_batch=2, max_seq=256,
@@ -554,7 +557,9 @@ def test_prefix_cache_whole_prompt_hit_computes_last_token(sk, weights):
         o, st = _run_waves(eng, [p, p, p[:50]], [6, 6, 6], (1, 1, 1))
         outs.append(o)
         _all_back(eng)
-    assert outs[0] == outs[1] and outs[1][0] == outs[1][1]
+    prompts = [p, p, p[:50]]
+    _agree(weights, rope, prompts, outs[0], outs[1])
+    _agree(weights, rope, prompts[:1], [outs[1][0]], [outs[1][1]])
     assert st.prefix_hit_tokens == 48 + 48  # three of four pages twice
     assert st.prefill_tokens == 64 + 16 + 2
 

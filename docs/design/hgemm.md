@@ -1277,6 +1277,14 @@ take as it is; a deterministic split-K for problems this small is the open item.
 wins a handful of the larger rows by 1 to 2% (2048×4096×14336 118.3% against 116.9%,
 1024×8192×8192 115.4% against 113.0%).
 
+One thing the rule gave up: a row's bits now depend on M. Every call is still the same bits
+run to run, but the tile and the Stream-K split follow the tile count, so the same row inside
+a 64-token prefill and a 200-token one is summed in a different order. Under the old route the
+engine's rows matched at every M it used. The engine tests already allowed for this in paged
+decode, which splits keys over the whole batch; three more of them now compare two schedules
+up to a near tie instead of bit for bit, and all three pass bit for bit with
+`SPARK_HGEMM_V6_ROUTE=-2`.
+
 fp8gemm's mid-M shapes were not touched: its TMA kernel has variant 5's split-K tail, not
 Stream-K, so the same work there starts with porting the schedule.
 
