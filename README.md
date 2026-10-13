@@ -436,6 +436,36 @@ weights with a mean-abs scale are lossy on a checkpoint trained in higher precis
 `scripts/eval_ppl.py` on the real weights is where that gets measured. Details, the floors per
 shape and what to measure first in [the design note](docs/design/w1gemm.md).
 
+## grouped GEMM for MoE prefill
+
+A prefill batch routed top-k over E experts is E GEMMs of different heights. Most code runs
+them as a loop: copy the per-expert counts to the host (a sync), then one matmul per expert,
+128 or 256 launches for Qwen3 or DeepSeek, each with a tail where a 16-row expert holds 16
+SMs and the other 154 wait. `grouped_gemm` is one persistent launch for all of them, bf16 or
+e4m3 (per-tensor activation scale, one weight scale per expert, on fp8gemm's block-scaled
+instruction with unit block scales). Tokens sorted by expert with int32 offsets, the
+`w1gemm_moe` convention, and the weight as `[E, N, K]`.
+
+- the tile list is built on the device: each block scans `offsets` into a prefix of
+  128-row m-tiles per expert in shared memory, so the host never reads the counts;
+- the last partial wave and one full wave are split along K into equal ranges (hgemm
+  variant 6's Stream-K schedule and deterministic chain fixup), so an expert with 3 rows costs
+  one tile's k-steps and no SM idles while a large expert drains;
+- the mainloop is fp8gemm variant 2's TMA stage for both types: A from a 2-D map, W from one
+  3-D map with the expert as the outer coordinate. For bf16 the same ldmatrix fragments feed
+  `m16n8k16` instead of `m16n8k32`.
+
+**Not measured.** The box was down while this was written; the kernel has not been compiled
+and the tests have not run. The baselines are in place: `bench_grouped_gemm` against cuBLAS
+grouped GEMM (`cublasGemmGroupedBatchedEx`, with and without the offsets sync it needs) and
+the per-expert cuBLAS loop, and `scripts/bench_grouped.py` against the torch loop, on
+Mixtral 8x7B (8 experts, top-2, 4096 -> 14336), Qwen3-30B-A3B (128, top-8, 2048 -> 768) and
+a DeepSeek V3-like layer (256, top-8, 7168 -> 2048) at 512 to 8192 tokens. What the shapes
+need on paper: at 512 and 2048 tokens every one of them is bound by the weight bytes (DeepSeek's
+7.5 GB of bf16 experts is 5.0 ms at the copy rate, against 0.47 ms of math at the bf16 peak).
+The floors per shape, the padded-rows question for small experts and what to run first are
+in [the design note](docs/design/grouped_gemm.md).
+
 ## attention
 
 Fused scaled-dot-product attention, forward, bf16 in and out, fp32 math. Head sizes 64 and
@@ -842,6 +872,7 @@ default stays on the CUDA cores.
 | `fp4gemm` NVFP4, MXFP4 | naive `mma.sync.m16n8k64.kind::mxf4nvf4`, the swizzled cp.async tile with the block scales staged beside it, TMA with bulk-copied scales; a bf16 -> fp4 quantizer | cuBLASLt NVFP4 (bit-identical), `F.scaled_mm` |
 | `w4gemm` W4A16 | thread per output; a warp per 16 columns with the repacked int4 fragments and the activations straight into registers; warps along K on a cp.async pipeline for M <= 8 and independent warps for M <= 16, Stream-K tiles above; round-to-nearest quantizer and the offline repack | the bf16 `hgemm` on the dequantized weights, cuBLAS |
 | `w1gemm`, `w1gemm_moe` W1A16 | thread per output; a warp per 16 columns with the sign bits XORed into bf16x2 fragments and the activations straight into registers; warps along K for M <= 16; the grouped form over experts from sorted rows and offsets; the absmean quantizer at 1 and 2 bits | the bf16 `hgemm` on the dequantized weights, cuBLAS; unmeasured |
+| `grouped_gemm` bf16, e4m3 | every MoE expert in one persistent launch: the tile list scanned from device offsets, Stream-K over the last waves, fp8gemm's TMA stage with W through one 3-D map | cuBLAS grouped GEMM, the per-expert cuBLAS loop, the torch loop; unmeasured |
 | `w1moe_decode` | three passes through global memory; one persistent kernel per (expert, 128 columns) with the intermediate in shared memory and fp32 atomics into y; the routing weight folded into the down epilogue with the next expert's words in flight | the sorted `w1gemm_moe` path and a dense torch reference; unmeasured |
 | `unified_read`, `unified_gemv` | scalar, 16-byte, four 16-byte loads in flight; a warp per row, a warp per 4 rows, a persistent grid from the SM count; over `cudaMalloc`, managed, host-mapped and system memory | CPU double sum, cuBLAS on a device copy; unmeasured |
 | `cpu_w1gemv`, `cpu_route`, `cpu_sample` | the 1-bit GEMV on the Arm cores: scalar, NEON sign masks in fp32, NEON int8 dot products; sigmoid top-k routing and top-k / top-p sampling, no CUDA | the scalar path, `reference.w1_dequantize`, `moe.route`; runs on any Arm machine |
