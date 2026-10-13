@@ -4,6 +4,7 @@
 //   ./bench_hgemm --m=4096 --n=4096 --k=4096 --variant=2 --iters=50
 //   ./bench_hgemm --m=4096 --n=4096 --k=4096 --bias --act=gelu --residual   # fused epilogue
 //   ./bench_hgemm --m=16 --n=22016 --k=4096 --swiglu   # interleaved gate/up, C is [16][11008]
+//   ./bench_hgemm --models[=llama3-8b] [--ms=128,512] [--tiles]   # real projection shapes
 //
 // Fused rows (--bias, --act=silu|gelu|relu, --residual, --accumulate for C += ..., --swiglu;
 // variant 6 unless --variant says otherwise) are validated against the fused math applied on
@@ -20,8 +21,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <exception>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "bench_common.hpp"
@@ -492,6 +495,217 @@ const FusedRow fused_rows[] = {
     {{16, 11008, 4096}, "residual"},    {{16, 22016, 4096}, "swiglu"},
 };
 
+
+// ---- model shapes (--models) ----------------------------------------------------------------
+//
+// The projections of real checkpoints at M = 128 to 4096 tokens, the region between the
+// decode rows (M <= 64) and the big squares, where the grid of 128x128 tiles is one wave or
+// less on 170 SMs. Every row runs cuBLAS and each applicable variant on the same buffers: the
+// weight is generated on the device once per shape (a 128256-column lm_head is 1 GB), the
+// output is checked on the device against cuBLAS with the tolerance run_one uses, and B is
+// rotated over copies that exceed L2 whenever one copy would fit, as a real forward pass
+// sees each layer's weight once. Rows are "MxNxK@label" with label v3, v4, v5, v6 (the
+// default route), v6auto (the per-shape rule) and, with --tiles, v6t<n> (TMA tile n forced).
+
+struct Weight {
+    const char* model;
+    const char* name;
+    int N, K;  // B is [K][N]: K in, N out
+};
+const Weight model_weights[] = {
+    {"llama3-8b", "q_proj/o_proj", 4096, 4096},
+    {"llama3-8b", "k_proj/v_proj", 1024, 4096},
+    {"llama3-8b", "qkv fused", 6144, 4096},
+    {"llama3-8b", "gate/up", 14336, 4096},
+    {"llama3-8b", "down", 4096, 14336},
+    {"llama3-8b", "lm_head", 128256, 4096},
+    {"llama3-70b", "q_proj/o_proj", 8192, 8192},
+    {"llama3-70b", "qkv fused", 10240, 8192},
+    {"llama3-70b", "gate/up", 28672, 8192},
+    {"llama3-70b", "down", 8192, 28672},
+    {"qwen3-8b", "gate/up", 12288, 4096},
+    {"qwen3-8b", "down", 4096, 12288},
+    {"qwen3-32b", "qkv fused", 10240, 5120},
+    {"qwen3-32b", "o_proj", 5120, 8192},
+    {"qwen3-32b", "gate/up", 25600, 5120},
+    {"qwen3-32b", "down", 5120, 25600},
+    {"qwen3-30b-a3b", "expert gate/up", 768, 2048},
+    {"qwen3-30b-a3b", "expert down", 2048, 768},
+    {"deepseek", "expert up", 2304, 5120},
+    {"deepseek", "expert down", 5120, 2304},
+};
+
+// Uniform bf16 in [-1, 1) from a hash of the index: a 1 GB weight in a few milliseconds.
+__global__ void fill_uniform_kernel(__nv_bfloat16* p, size_t n, unsigned seed) {
+    for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        unsigned x = static_cast<unsigned>(i) * 0x9E3779B1u ^ static_cast<unsigned>(i >> 32) ^ seed;
+        x ^= x >> 16;
+        x *= 0x7FEB352Du;
+        x ^= x >> 15;
+        x *= 0x846CA68Bu;
+        x ^= x >> 16;
+        p[i] = __float2bfloat16(static_cast<float>(x >> 8) * (2.0f / 16777216.0f) - 1.0f);
+    }
+}
+
+void fill_uniform_dev(__nv_bfloat16* p, size_t n, unsigned seed) {
+    fill_uniform_kernel<<<1024, 256>>>(p, n, seed);
+    SPARK_CUDA_CHECK(cudaGetLastError());
+}
+
+// out[0] = max |got - ref| (a NaN counts as infinite), out[1] = max |ref|, as float bits:
+// non-negative floats order like their bit patterns, so atomicMax on unsigned works.
+__global__ void max_err_kernel(const __nv_bfloat16* __restrict__ got,
+                               const __nv_bfloat16* __restrict__ ref, size_t n, unsigned* out) {
+    float d = 0.f, r = 0.f;
+    for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        const float g = __bfloat162float(got[i]), x = __bfloat162float(ref[i]);
+        const float e = fabsf(g - x);
+        d = fmaxf(d, isnan(e) ? INFINITY : e);
+        r = fmaxf(r, fabsf(x));
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        d = fmaxf(d, __shfl_xor_sync(0xffffffffu, d, o));
+        r = fmaxf(r, __shfl_xor_sync(0xffffffffu, r, o));
+    }
+    if ((threadIdx.x & 31) == 0) {
+        atomicMax(out, __float_as_uint(d));
+        atomicMax(out + 1, __float_as_uint(r));
+    }
+}
+
+// {max |got - ref|, max |ref|}.
+std::pair<double, double> max_err_dev(const __nv_bfloat16* got, const __nv_bfloat16* ref,
+                                      size_t n, unsigned* scratch, cudaStream_t stream) {
+    SPARK_CUDA_CHECK(cudaMemsetAsync(scratch, 0, 2 * sizeof(unsigned), stream));
+    max_err_kernel<<<1024, 256, 0, stream>>>(got, ref, n, scratch);
+    SPARK_CUDA_CHECK(cudaGetLastError());
+    unsigned h[2];
+    SPARK_CUDA_CHECK(cudaMemcpy(h, scratch, sizeof(h), cudaMemcpyDeviceToHost));
+    float d, r;
+    std::memcpy(&d, &h[0], sizeof(float));
+    std::memcpy(&r, &h[1], sizeof(float));
+    return {d, r};
+}
+
+std::vector<int> parse_list(const std::string& s) {
+    std::vector<int> out;
+    size_t i = 0;
+    while (i < s.size()) {
+        size_t j = s.find(',', i);
+        if (j == std::string::npos) j = s.size();
+        if (j > i) out.push_back(std::stoi(s.substr(i, j - i)));
+        i = j + 1;
+    }
+    return out;
+}
+
+// One weight at every M of `ms`. Returns false on a correctness failure.
+bool run_models_weight(cublasHandle_t handle, cudaStream_t stream, const Weight& w,
+                       const std::vector<int>& ms, bool tiles, int iters) {
+    const int N = w.N, K = w.K;
+    const int max_m = *std::max_element(ms.begin(), ms.end());
+    const size_t nB = static_cast<size_t>(K) * N;
+    const size_t b_bytes = nB * sizeof(__nv_bfloat16);
+    // One copy at or past 256 MB already streams from DRAM; anything smaller is rotated.
+    const int copies =
+        b_bytes >= (size_t{256} << 20) ? 1 : static_cast<int>((size_t{256} << 20) / b_bytes) + 1;
+    const size_t nA = static_cast<size_t>(max_m) * K, nC = static_cast<size_t>(max_m) * N;
+    __nv_bfloat16 *dA = nullptr, *dB = nullptr, *dC = nullptr, *dRef = nullptr;
+    unsigned* scratch = nullptr;
+    SPARK_CUDA_CHECK(cudaMalloc(&dA, nA * sizeof(__nv_bfloat16)));
+    SPARK_CUDA_CHECK(cudaMalloc(&dB, copies * b_bytes));
+    SPARK_CUDA_CHECK(cudaMalloc(&dC, nC * sizeof(__nv_bfloat16)));
+    SPARK_CUDA_CHECK(cudaMalloc(&dRef, nC * sizeof(__nv_bfloat16)));
+    SPARK_CUDA_CHECK(cudaMalloc(&scratch, 2 * sizeof(unsigned)));
+    fill_uniform_dev(dA, nA, 1234u);
+    fill_uniform_dev(dB, nB, 5678u);
+    for (int c = 1; c < copies; ++c)
+        SPARK_CUDA_CHECK(cudaMemcpy(dB + c * nB, dB, b_bytes, cudaMemcpyDeviceToDevice));
+    SPARK_CUDA_CHECK(cudaDeviceSynchronize());
+
+    // The candidates: label, variant, v6 route.
+    struct Cand {
+        std::string label;
+        int variant;
+        int route;
+    };
+    std::vector<Cand> cands = {{"v3", 3, spark::HGEMM_V6_ROUTE_DEFAULT},
+                               {"v4", 4, spark::HGEMM_V6_ROUTE_DEFAULT},
+                               {"v5", 5, spark::HGEMM_V6_ROUTE_DEFAULT},
+                               {"v6", 6, spark::HGEMM_V6_ROUTE_DEFAULT},
+                               {"v6auto", 6, spark::HGEMM_V6_ROUTE_AUTO}};
+    if (tiles)
+        for (int t = 0; t < spark::hgemm_v6_num_tiles(); ++t)
+            cands.push_back({"v6t" + std::to_string(t), 6, t});
+
+    bool all_ok = true;
+    const int saved_route = spark::hgemm_v6_route();
+    for (int M : ms) {
+        const size_t nc = static_cast<size_t>(M) * N;
+        const std::string shape =
+            std::to_string(M) + "x" + std::to_string(N) + "x" + std::to_string(K);
+        std::fprintf(stderr, "  %s %s, M = %d (B %.1f MB%s)\n", w.model, w.name, M, b_bytes / 1e6,
+                     copies > 1 ? ", rotated over copies past L2" : "");
+        cublas_gemm(handle, dA, dB, dRef, M, N, K);
+        int turn = 0;
+        auto next_b = [&] { return dB + static_cast<size_t>(turn++ % copies) * nB; };
+        const auto t_ref = spark::bench::time_kernel(
+            [&] { cublas_gemm(handle, dA, next_b(), dC, M, N, K); }, stream, 5, iters);
+        const double flops = 2.0 * M * N * static_cast<double>(K);
+        std::fprintf(stderr, "    cuBLAS %.4f ms, %.1f TFLOPS\n", t_ref.median_ms,
+                     flops / (t_ref.median_ms * 1e-3) / 1e12);
+        for (const auto& c : cands) {
+            if (!spark::hgemm_supports(M, N, K, c.variant)) continue;
+            if (c.route >= 0) {
+                // A forced tile that does not divide N falls back to the rule, and a forced
+                // tile the rule picks anyway is the v6auto row: skip both duplicates.
+                spark::hgemm_v6_set_route(spark::HGEMM_V6_ROUTE_AUTO);
+                const std::string by_rule = spark::hgemm_v6_route_name(M, N, K);
+                spark::hgemm_v6_set_route(c.route);
+                if (by_rule == spark::hgemm_v6_route_name(M, N, K)) continue;
+            }
+            spark::hgemm_v6_set_route(c.route);
+            SPARK_CUDA_CHECK(cudaMemsetAsync(dC, 0, nc * sizeof(__nv_bfloat16), stream));
+            spark::hgemm_bf16(dA, dB, dC, M, N, K, c.variant, stream);
+            const auto err = max_err_dev(dC, dRef, nc, scratch, stream);
+            const double tol = 2e-2 * err.second + 1e-3;
+            const bool ok = err.first <= tol;
+            if (!ok)
+                std::fprintf(stderr, "  FAIL %s %s: max_abs=%.4e tol=%.4e\n", shape.c_str(),
+                             c.label.c_str(), err.first, tol);
+            all_ok = all_ok && ok;
+            turn = 0;
+            const auto t = spark::bench::time_kernel(
+                [&] { spark::hgemm_bf16(dA, next_b(), dC, M, N, K, c.variant, stream); }, stream,
+                5, iters);
+            spark::bench::Row row;
+            row.kernel = "hgemm_models";
+            row.dtype = "bf16";
+            row.variant = c.variant;
+            row.shape = shape + "@" + c.label;
+            row.median_ms = t.median_ms;
+            row.min_ms = t.min_ms;
+            row.tflops = flops / (t.median_ms * 1e-3) / 1e12;
+            row.gbps = 2.0 * (static_cast<double>(M) * K + nB + nc) / (t.median_ms * 1e-3) / 1e9;
+            row.ref_ms = t_ref.median_ms;
+            row.max_abs_err = err.first;
+            row.max_rel_err = err.second > 0 ? err.first / err.second : 0.0;
+            row.ok = ok;
+            spark::bench::print_row(row);
+            std::fprintf(stderr, "    %-7s %-30s %.1f%% of cuBLAS\n", c.label.c_str(),
+                         c.variant == 6 ? spark::hgemm_v6_route_name(M, N, K) : "",
+                         100.0 * t_ref.median_ms / t.median_ms);
+        }
+    }
+    spark::hgemm_v6_set_route(saved_route);
+    for (auto* d : {dA, dB, dC, dRef}) SPARK_CUDA_CHECK(cudaFree(d));
+    SPARK_CUDA_CHECK(cudaFree(scratch));
+    return all_ok;
+}
+
 }  // namespace
 
 int run(int argc, char** argv) {
@@ -534,7 +748,16 @@ int run(int argc, char** argv) {
 
     spark::bench::print_header();
     bool all_ok = true;
-    if (fused.any()) {
+    if (args.has("models")) {
+        // --models[=<model substring>] [--ms=128,256,...] [--tiles]
+        const std::string filter = args.get("models", "1");
+        const std::vector<int> ms = parse_list(args.get("ms", "128,256,512,1024,2048,4096"));
+        SPARK_REQUIRE(!ms.empty(), "--ms: expected a comma-separated list of M");
+        for (const auto& w : model_weights) {
+            if (filter != "1" && std::string(w.model).find(filter) == std::string::npos) continue;
+            all_ok = run_models_weight(handle, stream, w, ms, args.has("tiles"), iters) && all_ok;
+        }
+    } else if (fused.any()) {
         const int v = args.has("variant") ? args.geti("variant", 6) : 6;
         for (const auto& s : shapes)
             all_ok = run_fused(handle, stream, s, fused, v, iters) && all_ok;
