@@ -213,7 +213,10 @@ __global__ void __launch_bounds__((WARPS_M * WARPS_N + 1) * 32, MIN_BLOCKS)
     // proxy fence is needed for a read followed by an async-proxy write (the fence and the
     // MEMBAR it compiles to cost 6 instructions per stage and a stall).
     auto consume = [&](const unsigned char* as, uint64_t* full, uint64_t* empty, unsigned parity) {
-        mbar_wait(full, parity);
+        if constexpr (CL > 1)
+            mbar_wait_poll(full, parity);
+        else
+            mbar_wait(full, parity);
         fp4gemm_tile::mma_stage<C>(as, as + A_STAGE, as + C::SA_OFF, as + C::SB_OFF, wm, wn, lane,
                                    qa0, qb0, acc);
         __syncwarp();

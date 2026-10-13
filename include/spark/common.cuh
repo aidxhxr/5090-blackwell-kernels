@@ -515,7 +515,7 @@ __device__ __forceinline__ void mbar_wait_cluster(uint64_t* bar, unsigned parity
         "{\n"
         ".reg .pred p;\n"
         "SPARK_MBAR_WAIT_CL:\n"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [%0], %1;\n"
+        "mbarrier.test_wait.parity.acquire.cluster.shared::cta.b64 p, [%0], %1;\n"
         "@p bra SPARK_MBAR_DONE_CL;\n"
         "bra SPARK_MBAR_WAIT_CL;\n"
         "SPARK_MBAR_DONE_CL:\n"
@@ -523,8 +523,25 @@ __device__ __forceinline__ void mbar_wait_cluster(uint64_t* bar, unsigned parity
         "r"(parity)
         : "memory");
 }
+// mbar_wait without the suspend: test_wait polls. Used where a barrier is completed from
+// another block of the cluster (a remote arrive, a peer's multicast bytes).
+__device__ __forceinline__ void mbar_wait_poll(uint64_t* bar, unsigned parity) {
+    asm volatile(
+        "{\n"
+        ".reg .pred p;\n"
+        "SPARK_MBAR_WAIT_P:\n"
+        "mbarrier.test_wait.parity.shared::cta.b64 p, [%0], %1;\n"
+        "@p bra SPARK_MBAR_DONE_P;\n"
+        "bra SPARK_MBAR_WAIT_P;\n"
+        "SPARK_MBAR_DONE_P:\n"
+        "}\n" ::"r"(smem_u32(bar)),
+        "r"(parity)
+        : "memory");
+}
 // tma_load_2d into every block of `mask` (bit i = cluster rank i): the box lands at the same
 // smem offset in each, and each one's barrier at the offset of `bar` counts its bytes.
+// Measured on the RTX 5090: correct, but about 20,000 times slower than tma_load_2d, even with
+// a mask of only the issuing block (docs/design/fp8gemm.md). Do not use it on sm_120.
 __device__ __forceinline__ void tma_load_2d_multicast(void* smem_dst, const CUtensorMap* map,
                                                       uint64_t* bar, int c0, int c1,
                                                       unsigned short mask) {

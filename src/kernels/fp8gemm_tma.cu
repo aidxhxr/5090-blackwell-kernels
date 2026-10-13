@@ -63,6 +63,7 @@ struct Sched {
     int split;
     float* ws;
     int* counters;
+    int nomc = 0;  // cluster kernel, experiment: every block copies its whole stage
 };
 
 template <int BK, int STAGES, int WARPS_M, int WARPS_N, int MIN_BLOCKS, bool MX, int SFW>
@@ -437,6 +438,28 @@ __global__ void __launch_bounds__((WARPS_M * WARPS_N + 1) * 32, 1)
                 unsigned char* as = smem + s * STAGE_BYTES;
                 unsigned char* a_dst = as + cj * A_ROWS * BK;
                 unsigned char* b_dst = as + A_STAGE + ci * B_ROWS * BK;
+                if (CL > 1 && sched.nomc) {
+                    const unsigned short self = static_cast<unsigned short>(1u << rank);
+#pragma unroll
+                    for (int j = 0; j < CLN; ++j) {
+                        if (sched.nomc == 2)
+                            tma_load_2d_multicast(as + j * A_ROWS * BK, &tmA, &full_bar[s], k0,
+                                                  bm + j * A_ROWS, self);
+                        else
+                            tma_load_2d(as + j * A_ROWS * BK, &tmA, &full_bar[s], k0,
+                                        bm + j * A_ROWS);
+                    }
+#pragma unroll
+                    for (int i = 0; i < CLM; ++i) {
+                        if (sched.nomc == 2)
+                            tma_load_2d_multicast(as + A_STAGE + i * B_ROWS * BK, &tmB,
+                                                  &full_bar[s], k0, bn + i * B_ROWS, self);
+                        else
+                            tma_load_2d(as + A_STAGE + i * B_ROWS * BK, &tmB, &full_bar[s], k0,
+                                        bn + i * B_ROWS);
+                    }
+                    continue;
+                }
                 if constexpr (CLN > 1)
                     tma_load_2d_multicast(a_dst, &tmA, &full_bar[s], k0, a_row, mask_a);
                 else
@@ -480,7 +503,10 @@ __global__ void __launch_bounds__((WARPS_M * WARPS_N + 1) * 32, 1)
 
     const fp8gemm_tile::MxFrag<C> none{};
     auto consume = [&](const unsigned char* as, uint64_t* full, uint64_t* empty, unsigned parity) {
-        mbar_wait(full, parity);
+        if constexpr (CL > 1)
+            mbar_wait_poll(full, parity);
+        else
+            mbar_wait(full, parity);
         fp8gemm_tile::mma_stage<C, false>(as, as + A_STAGE, wm, wn, lane, acc, none);
         __syncwarp();
         if constexpr (CL > 1) {
@@ -624,6 +650,7 @@ bool launch_cl(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* C
 
     Sched s;
     s.tiles_n = N / (BN * CLN);
+    s.nomc = std::getenv("SPARK_FP8GEMM_NOMC") ? std::atoi(std::getenv("SPARK_FP8GEMM_NOMC")) : 0;
     const int ctiles = (M / (BM * CLM)) * s.tiles_n;
     const int KT = K / BK;
     const int tail = ctiles % resident;
@@ -707,7 +734,10 @@ constexpr LaunchFn CONFIGS[] = {
     launch_cl_or_v2<256, 64, 4, 2, 4, 2, 1, MX>,   // 19: 128x256, 64-byte stages, 2x1 cluster
 };
 constexpr int NUM_CONFIGS = static_cast<int>(sizeof(CONFIGS<false>) / sizeof(CONFIGS<false>[0]));
-constexpr int CONFIG_WAVES = 1;  // grids of more than two blocks per SM
+// Grids of more than two blocks per SM: the 128x256 tile with 64x64 warp tiles (config 16),
+// 754 against config 1's 675 TFLOPS at 8192^3, at the clock cuBLASLt holds under 600 W
+// (docs/design/fp8gemm.md). It runs config 1 when N % 256 != 0.
+constexpr int CONFIG_WAVES = 16;
 constexpr int CONFIG_SMALL = 3;  // up to two blocks per SM: two resident blocks, no tail
 // MX mode: the consumer warps carry the scale fetches and shuffles, and a deeper pipeline of
 // 64-byte stages hides what that costs them better than three 128-byte stages (the sweep in
