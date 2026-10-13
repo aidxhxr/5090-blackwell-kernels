@@ -63,6 +63,59 @@ __device__ __forceinline__ unsigned pack_e4m3x4(float x0, float x1, float x2, fl
     return r;
 }
 
+// The half-precision path of the softmax (variant 1, kExpH2): two fp32 exponents to one f16x2
+// (lo in the low half), 2^x on both halves with one MUFU, the f16x2 sum, and two f16x2 to four
+// e4m3 bytes (the low half of h01 in the low byte).
+__device__ __forceinline__ unsigned f16x2_of(float lo, float hi) {
+    unsigned r;
+    asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(hi), "f"(lo));
+    return r;
+}
+__device__ __forceinline__ unsigned ex2_f16x2(unsigned x) {
+    unsigned y;
+    asm("ex2.approx.f16x2 %0, %1;" : "=r"(y) : "r"(x));
+    return y;
+}
+__device__ __forceinline__ unsigned add_f16x2(unsigned a, unsigned b) {
+    unsigned y;
+    asm("add.rn.f16x2 %0, %1, %2;" : "=r"(y) : "r"(a), "r"(b));
+    return y;
+}
+__device__ __forceinline__ unsigned max_f16x2(unsigned a, unsigned b) {
+    unsigned y;
+    asm("max.f16x2 %0, %1, %2;" : "=r"(y) : "r"(a), "r"(b));
+    return y;
+}
+__device__ __forceinline__ unsigned fma_f16x2(unsigned a, unsigned b, unsigned c) {
+    unsigned y;
+    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(y) : "r"(a), "r"(b), "r"(c));
+    return y;
+}
+__device__ __forceinline__ float max_halves_f16x2(unsigned x) {
+    unsigned short lo, hi;
+    float a, b;
+    asm("mov.b32 {%0, %1}, %2;" : "=h"(lo), "=h"(hi) : "r"(x));
+    asm("cvt.f32.f16 %0, %1;" : "=f"(a) : "h"(lo));
+    asm("cvt.f32.f16 %0, %1;" : "=f"(b) : "h"(hi));
+    return fmaxf(a, b);
+}
+__device__ __forceinline__ float sum_f16x2(unsigned x) {
+    unsigned short lo, hi;
+    float a, b;
+    asm("mov.b32 {%0, %1}, %2;" : "=h"(lo), "=h"(hi) : "r"(x));
+    asm("cvt.f32.f16 %0, %1;" : "=f"(a) : "h"(lo));
+    asm("cvt.f32.f16 %0, %1;" : "=f"(b) : "h"(hi));
+    return a + b;
+}
+__device__ __forceinline__ unsigned pack_e4m3x4_f16(unsigned h01, unsigned h23) {
+    unsigned short lo, hi;
+    unsigned r;
+    asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;" : "=h"(lo) : "r"(h01));
+    asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;" : "=h"(hi) : "r"(h23));
+    asm("mov.b32 %0, {%1, %2};" : "=r"(r) : "h"(lo), "h"(hi));
+    return r;
+}
+
 // ---------------------------------------------------------------------------------------
 // Variant 0: attention variant 0 on dequantized e4m3. Lane l owns bytes l*VEC .. l*VEC+VEC-1
 // of q, of every key and value row, and of the fp32 output row.
@@ -176,7 +229,9 @@ void launch(const fp8* Q, const fp8* K, const fp8* V, bf16* O, int B, int H_q, i
 //     final division cancels it;
 //   * the O rescale is lazy: a row keeps its running max until a new score beats it by more
 //     than 0.8 (log2 units; p then peaks at 2^8.8 = 446, still inside e4m3's 448), and the 64
-//     multiplies run only on a tile where some row of the warp moved.
+//     multiplies run only on a tile where some row of the warp moved;
+//   * at D = 128 the row sum is one more QMMA per k32 step of P V against an all-ones B, so it
+//     is the sum of the rounded P and costs no FADD (kSumMMA below).
 // O's n8 tiles 2j and 2j+1 hold d = 16j + 4c + {0, 2} and {1, 3} for lane (g, c): four
 // adjacent columns per row, one 8-byte store.
 //
@@ -192,6 +247,23 @@ constexpr int BM = 16 * CONSUMER_WARPS;
 constexpr int ITEM_DEPTH = 2;
 constexpr float kPShift = 8.f;  // P is 2^8 times the probability before the e4m3 rounding
 constexpr float kLag = 0.8f;    // a row max may run this far (log2) ahead of the one in use
+
+// Softmax variants, a bit mask (SPARK_ATTN_FP8_MODE under -DSPARK_ATTN_FP8_EXPERIMENTS):
+//   kExpH2  the exponentials two at a time, ex2.approx.f16x2, and P from f16x2 to e4m3;
+//   kSumMMA the row sum as one more QMMA per k32 step of P V, against an all-ones B;
+//   kPipe   Q K^T of tile t+1 issued before the softmax of tile t, two S buffers;
+//   kHalfS  (with kExpH2) S itself to f16x2 right after Q K^T, the row max, the scale-and-bias
+//           FMA and the exponential all on pairs. The power of two of the score scale goes
+//           into the ue8m0 scale of the Q K^T mma, so S lands in f16 range and the FMA
+//           multiplies by the mantissa, in [1, 2).
+constexpr int kExpH2 = 1, kSumMMA = 2, kPipe = 4, kHalfS = 8;
+// The default: the row sum on the tensor pipe at D = 128 (1.5 to 3% faster on the 4096 and
+// 8192 shapes); at D = 64, where P V is half the products, its two extra QMMA a tile cost 7
+// to 10%. docs/design/attention.md, "Fewer softmax instructions".
+template <int D>
+constexpr int default_mode() {
+    return D == 128 ? kSumMMA : 0;
+}
 
 // Four 16 KB stages at D = 128 (a sweep of 3 to 6 moved nothing beyond noise: the tiles come
 // from L2 and two in flight already cover its latency), six of 8 KB at D = 64.
@@ -248,7 +320,7 @@ __device__ __forceinline__ void decode_item(int w, const Sched& s, int& tile, in
     }
 }
 
-template <int D, bool VT>
+template <int D, bool VT, int MODE>
 __global__ void __launch_bounds__(THREADS, 1)
     attention_fp8_v1_kernel(const __grid_constant__ CUtensorMap tmQ,
                             const __grid_constant__ CUtensorMap tmK,
@@ -494,11 +566,18 @@ __global__ void __launch_bounds__(THREADS, 1)
 
     unsigned qf[KT][4];
     float o[DT][4];
-    float m[2], l[2];
+    float m[2], l[2] = {0.f, 0.f};
+    float lsum[4] = {0.f, 0.f, 0.f, 0.f};  // kSumMMA: the row sums as one more n8 tile of P V (rows g, g+8)
     float sacc[NT][4];
+    float sacc2[NT][4];  // kPipe: the S of the next tile
     unsigned pa[PT][4];
     int q0 = 0;
     float qk_scale = 0.f;
+    unsigned qk_sa = 0x7F7F7F7Fu;  // kHalfS: the ue8m0 scale of Q in Q K^T
+    unsigned qk_s2 = 0u;           // kHalfS: qk_scale in both halves
+    // kSumMMA: an all-ones B fragment (e4m3 1.0 is 0x38): P times it is the row sum of the
+    // rounded P in every column of the accumulator.
+    const unsigned ones[2] = {0x38383838u, 0x38383838u};
 
     // S = Q K^T: 16 rows x 64 keys per warp. One ldmatrix.x4 on 16 key rows x 32 bytes gives
     // the B fragments of two n8 key tiles. Lanes 0-7 address keys +0..7 at the first 16 bytes
@@ -506,11 +585,11 @@ __global__ void __launch_bounds__(THREADS, 1)
     // each tile's two registers come back adjacent (r0, r1 and r2, r3), the register pair the
     // mma takes. The order the fp8 GEMM uses (matrices 0, 2 and 1, 3) costs 32 MOVs a tile.
     const int k_row = (lane & 7) + ((lane >> 4) << 3), k_ch = (lane >> 3) & 1;
-    auto qk = [&](const unsigned char* ks) {
+    auto qk = [&](float (&sa)[NT][4], const unsigned char* ks) {
 #pragma unroll
         for (int nj = 0; nj < NT; ++nj)
 #pragma unroll
-            for (int e = 0; e < 4; ++e) sacc[nj][e] = 0.f;
+            for (int e = 0; e < 4; ++e) sa[nj][e] = 0.f;
 #pragma unroll
         for (int kk = 0; kk < KT; ++kk) {
 #pragma unroll
@@ -519,14 +598,19 @@ __global__ void __launch_bounds__(THREADS, 1)
                 ldmatrix_x4(r, ks + tile_off<D>(nj * 8 + k_row, 2 * kk + k_ch));
                 const unsigned b0[2] = {r[0], r[1]};
                 const unsigned b1[2] = {r[2], r[3]};
-                mma_e4m3_16832(sacc[nj], qf[kk], b0);
-                mma_e4m3_16832(sacc[nj + 1], qf[kk], b1);
+                if constexpr ((MODE & kHalfS) != 0) {
+                    mma_e4m3_16832_mx<0>(sa[nj], qf[kk], b0, qk_sa, 0x7F7F7F7Fu);
+                    mma_e4m3_16832_mx<0>(sa[nj + 1], qf[kk], b1, qk_sa, 0x7F7F7F7Fu);
+                } else {
+                    mma_e4m3_16832(sa[nj], qf[kk], b0);
+                    mma_e4m3_16832(sa[nj + 1], qf[kk], b1);
+                }
             }
         }
     };
     // Mask, online softmax on the S accumulators (rows g and g+8), the O rescale, and P as the
     // e4m3 A fragments of P V. The probabilities are 2^(s - m + p_shift).
-    auto softmax = [&](int t) {
+    auto softmax = [&](float (&sa)[NT][4], int t) {
         const int kv0 = t * BN;
         if (kv0 + BN > S_kv || (causal && kv0 + BN - 1 > q0)) {  // warp-uniform
 #pragma unroll
@@ -535,16 +619,33 @@ __global__ void __launch_bounds__(THREADS, 1)
                 for (int e = 0; e < 4; ++e) {
                     const int i = q0 + warp * 16 + g + (e >> 1) * 8;
                     const int j = kv0 + nj * 8 + 2 * c + (e & 1);
-                    if (j >= S_kv || (causal && j > i)) sacc[nj][e] = -INFINITY;
+                    if (j >= S_kv || (causal && j > i)) sa[nj][e] = -INFINITY;
                 }
         }
-        float alpha[2];
+        float alpha[2], bias[2];
+        unsigned hs_s[NT][2];  // kHalfS: S of row g / g+8 of n8 tile nj, keys 2c, 2c+1
+        if constexpr ((MODE & kHalfS) != 0) {
+#pragma unroll
+            for (int nj = 0; nj < NT; ++nj) {
+                hs_s[nj][0] = f16x2_of(sa[nj][0], sa[nj][1]);
+                hs_s[nj][1] = f16x2_of(sa[nj][2], sa[nj][3]);
+            }
+        }
 #pragma unroll
         for (int r = 0; r < 2; ++r) {
-            float mx = fmaxf(sacc[0][2 * r], sacc[0][2 * r + 1]);
+            float mx;
+            if constexpr ((MODE & kHalfS) != 0) {
+                unsigned hm = max_f16x2(hs_s[0][r], hs_s[1][r]);
 #pragma unroll
-            for (int nj = 1; nj < NT; ++nj)
-                mx = fmaxf(mx, fmaxf(sacc[nj][2 * r], sacc[nj][2 * r + 1]));
+                for (int nj = 2; nj < NT; nj += 2)
+                    hm = max_f16x2(hm, max_f16x2(hs_s[nj][r], hs_s[nj + 1][r]));
+                mx = max_halves_f16x2(hm);
+            } else {
+                mx = fmaxf(sa[0][2 * r], sa[0][2 * r + 1]);
+#pragma unroll
+                for (int nj = 1; nj < NT; ++nj)
+                    mx = fmaxf(mx, fmaxf(sa[nj][2 * r], sa[nj][2 * r + 1]));
+            }
             mx = fmaxf(mx, __shfl_xor_sync(kFullMask, mx, 1));
             mx = fmaxf(mx, __shfl_xor_sync(kFullMask, mx, 2));
             // A row keeps its old max while the new one exceeds it by at most `lag` (log2
@@ -554,17 +655,7 @@ __global__ void __launch_bounds__(THREADS, 1)
             if (m_new - m[r] <= lag) m_new = m[r];
             const float m_use = m_new == -INFINITY ? 0.f : m_new;
             alpha[r] = ex2(m[r] - m_use);
-            const float bias = p_shift - m_use;
-            float rs = 0.f;
-#pragma unroll
-            for (int nj = 0; nj < NT; ++nj) {
-                const float p0 = ex2(fmaf(sacc[nj][2 * r], qk_scale, bias));
-                const float p1 = ex2(fmaf(sacc[nj][2 * r + 1], qk_scale, bias));
-                sacc[nj][2 * r] = p0;
-                sacc[nj][2 * r + 1] = p1;
-                rs += p0 + p1;
-            }
-            l[r] = fmaf(l[r], alpha[r], rs);
+            bias[r] = p_shift - m_use;
             m[r] = m_new;
         }
         // The 64 multiplies of the O rescale run only when some row of the warp moved its max
@@ -577,19 +668,80 @@ __global__ void __launch_bounds__(THREADS, 1)
                 o[dj][2] *= alpha[1];
                 o[dj][3] *= alpha[1];
             }
+            if constexpr ((MODE & kSumMMA) != 0) {
+                lsum[0] *= alpha[0];
+                lsum[1] *= alpha[0];
+                lsum[2] *= alpha[1];
+                lsum[3] *= alpha[1];
+            }
         }
-        // a[0] = row g, keys {2c, 2c+1, 8+2c, 9+2c} of the first 16 of the k32 step: the
-        // accumulators of n8 tiles 4kt and 4kt+1; a[1] the same for row g+8; a[2], a[3] the
-        // second 16 keys, tiles 4kt+2 and 4kt+3.
+        // pa[kt][0] = row g, keys {2c, 2c+1, 8+2c, 9+2c} of the first 16 of the k32 step: the
+        // accumulators of n8 tiles 4kt and 4kt+1; pa[kt][1] the same for row g+8; pa[kt][2],
+        // pa[kt][3] the second 16 keys, tiles 4kt+2 and 4kt+3.
+        if constexpr ((MODE & kExpH2) != 0) {
+            // Two exponentials per MUFU in half precision, and P straight from f16x2 to e4m3:
+            // f16 keeps 11 bits where e4m3 keeps 4, and p <= 2^(p_shift + lag) < 448 is far
+            // inside its range.
+            unsigned hs[2] = {0u, 0u};
+            unsigned bias2[2] = {0u, 0u};
+            if constexpr ((MODE & kHalfS) != 0) {
+                bias2[0] = f16x2_of(bias[0], bias[0]);
+                bias2[1] = f16x2_of(bias[1], bias[1]);
+            }
 #pragma unroll
-        for (int kt = 0; kt < PT; ++kt) {
-            const int t0 = 4 * kt;
-            pa[kt][0] = pack_e4m3x4(sacc[t0][0], sacc[t0][1], sacc[t0 + 1][0], sacc[t0 + 1][1]);
-            pa[kt][1] = pack_e4m3x4(sacc[t0][2], sacc[t0][3], sacc[t0 + 1][2], sacc[t0 + 1][3]);
-            pa[kt][2] =
-                pack_e4m3x4(sacc[t0 + 2][0], sacc[t0 + 2][1], sacc[t0 + 3][0], sacc[t0 + 3][1]);
-            pa[kt][3] =
-                pack_e4m3x4(sacc[t0 + 2][2], sacc[t0 + 2][3], sacc[t0 + 3][2], sacc[t0 + 3][3]);
+            for (int kt = 0; kt < PT; ++kt)
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    const int r = q & 1, t0 = 4 * kt + 2 * (q >> 1);
+                    unsigned h01, h23;
+                    if constexpr ((MODE & kHalfS) != 0) {
+                        h01 = ex2_f16x2(fma_f16x2(hs_s[t0][r], qk_s2, bias2[r]));
+                        h23 = ex2_f16x2(fma_f16x2(hs_s[t0 + 1][r], qk_s2, bias2[r]));
+                    } else {
+                        h01 = ex2_f16x2(f16x2_of(fmaf(sa[t0][2 * r], qk_scale, bias[r]),
+                                                 fmaf(sa[t0][2 * r + 1], qk_scale, bias[r])));
+                        h23 =
+                            ex2_f16x2(f16x2_of(fmaf(sa[t0 + 1][2 * r], qk_scale, bias[r]),
+                                               fmaf(sa[t0 + 1][2 * r + 1], qk_scale, bias[r])));
+                    }
+                    if constexpr ((MODE & kSumMMA) == 0)
+                        hs[r] = add_f16x2(hs[r], add_f16x2(h01, h23));
+                    pa[kt][q] = pack_e4m3x4_f16(h01, h23);
+                }
+            if constexpr ((MODE & kSumMMA) == 0) {
+                l[0] = fmaf(l[0], alpha[0], sum_f16x2(hs[0]));
+                l[1] = fmaf(l[1], alpha[1], sum_f16x2(hs[1]));
+            }
+        } else {
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                float rs = 0.f;
+#pragma unroll
+                for (int nj = 0; nj < NT; ++nj) {
+                    const float p0 = ex2(fmaf(sa[nj][2 * r], qk_scale, bias[r]));
+                    const float p1 = ex2(fmaf(sa[nj][2 * r + 1], qk_scale, bias[r]));
+                    sa[nj][2 * r] = p0;
+                    sa[nj][2 * r + 1] = p1;
+                    rs += p0 + p1;
+                }
+                if constexpr ((MODE & kSumMMA) == 0) l[r] = fmaf(l[r], alpha[r], rs);
+            }
+#pragma unroll
+            for (int kt = 0; kt < PT; ++kt) {
+                const int t0 = 4 * kt;
+                pa[kt][0] = pack_e4m3x4(sa[t0][0], sa[t0][1], sa[t0 + 1][0], sa[t0 + 1][1]);
+                pa[kt][1] = pack_e4m3x4(sa[t0][2], sa[t0][3], sa[t0 + 1][2], sa[t0 + 1][3]);
+                pa[kt][2] =
+                    pack_e4m3x4(sa[t0 + 2][0], sa[t0 + 2][1], sa[t0 + 3][0], sa[t0 + 3][1]);
+                pa[kt][3] =
+                    pack_e4m3x4(sa[t0 + 2][2], sa[t0 + 2][3], sa[t0 + 3][2], sa[t0 + 3][3]);
+            }
+        }
+        // kSumMMA: the row sum on the tensor pipe, two QMMA a tile in place of 32 FADD, and it
+        // is the sum of the P that P V actually multiplies.
+        if constexpr ((MODE & kSumMMA) != 0) {
+#pragma unroll
+            for (int kt = 0; kt < PT; ++kt) mma_e4m3_16832(lsum, pa[kt], ones);
         }
     };
     // O += P V. Lane l addresses key 32kt + l at chunk j, so the four matrices of the
@@ -633,6 +785,14 @@ __global__ void __launch_bounds__(THREADS, 1)
         decode_item(w, sched, tile, slice, split);
         geometry(tile, slice, split, bh, bkv, q0, tb, te);
         qk_scale = scale_log2 * sc.q[sc.stride * bh] * sc.k[sc.stride * bkv];
+        if constexpr ((MODE & kHalfS) != 0) {
+            // qk_scale = 2^(e - 127) x mantissa: the biased exponent e is the ue8m0 byte that
+            // scales Q in the mma, the mantissa is what the softmax multiplies by.
+            const unsigned bits = __float_as_uint(qk_scale);
+            qk_sa = ((bits >> 23) & 0xFFu) * 0x01010101u;
+            qk_scale = __uint_as_float((bits & 0x007FFFFFu) | 0x3F800000u);
+            qk_s2 = f16x2_of(qk_scale, qk_scale);
+        }
 
         // Q tile into A fragments: qf[kk] covers d = 32kk .. 32kk+31. Then its stage is free.
         wait_load(g_cons);
@@ -652,19 +812,54 @@ __global__ void __launch_bounds__(THREADS, 1)
             for (int e = 0; e < 4; ++e) o[dj][e] = 0.f;
         m[0] = m[1] = -INFINITY;
         l[0] = l[1] = 0.f;
+#pragma unroll
+        for (int e = 0; e < 4; ++e) lsum[e] = 0.f;
 
-        for (int t = tb; t < te; ++t, ++g_cons) {
-            // Under the causal mask the keys of a tile may all follow every row of this warp:
-            // every p is 0, and the warp goes on to the next item instead (variant 5).
-            const bool dead = causal && t * BN > q0 + warp * 16 + 15;
-            wait_load(g_cons);
-            if (!dead) {
-                qk(stage_of(g_cons));
-                softmax(t);
+        if constexpr ((MODE & kPipe) == 0) {
+            for (int t = tb; t < te; ++t, ++g_cons) {
+                // Under the causal mask the keys of a tile may all follow every row of this
+                // warp: every p is 0, and the warp goes on to the next item instead (variant 5).
+                const bool dead = causal && t * BN > q0 + warp * 16 + 15;
+                wait_load(g_cons);
+                if (!dead) {
+                    qk(sacc, stage_of(g_cons));
+                    softmax(sacc, t);
+                    if constexpr (VT)
+                        mbar_wait(&vready[g_cons % STAGES], (g_cons / STAGES) & 1);
+                    pv(stage_of(g_cons) + BN * D);
+                }
+                release_load(g_cons);
+            }
+        } else {
+            // kPipe: Q K^T of tile t+1 is issued before the softmax of tile t, into a second S,
+            // so the products of one tile run under the softmax of the other inside one warp.
+            // The live tiles are a prefix [tb, t_live) under the causal mask; the dead ones
+            // after it are waited for and released as before.
+            const int t_live =
+                causal ? max(tb, min(te, (q0 + warp * 16 + 15) / BN + 1)) : te;
+            auto step = [&](float (&cur)[NT][4], float (&nxt)[NT][4], int t) {
+                if (t + 1 < t_live) {
+                    wait_load(g_cons + 1);
+                    qk(nxt, stage_of(g_cons + 1));
+                }
+                softmax(cur, t);
                 if constexpr (VT) mbar_wait(&vready[g_cons % STAGES], (g_cons / STAGES) & 1);
                 pv(stage_of(g_cons) + BN * D);
+                release_load(g_cons);
+                ++g_cons;
+            };
+            if (tb < t_live) {
+                wait_load(g_cons);
+                qk(sacc, stage_of(g_cons));
             }
-            release_load(g_cons);
+            for (int t = tb; t < t_live; t += 2) {
+                step(sacc, sacc2, t);
+                if (t + 1 < t_live) step(sacc2, sacc, t + 1);
+            }
+            for (int t = t_live; t < te; ++t, ++g_cons) {
+                wait_load(g_cons);
+                release_load(g_cons);
+            }
         }
 
         // Epilogue: lane (g, c) holds d = 16j + 4c .. 16j + 4c + 3 of rows g and g+8 in tiles
@@ -673,9 +868,14 @@ __global__ void __launch_bounds__(THREADS, 1)
         const float vs = sc.v[sc.stride * bkv];
 #pragma unroll
         for (int rr = 0; rr < 2; ++rr) {
-            float ls = l[rr];
-            ls += __shfl_xor_sync(kFullMask, ls, 1);
-            ls += __shfl_xor_sync(kFullMask, ls, 2);
+            float ls;
+            if constexpr ((MODE & kSumMMA) != 0) {
+                ls = lsum[2 * rr];
+            } else {
+                ls = l[rr];
+                ls += __shfl_xor_sync(kFullMask, ls, 1);
+                ls += __shfl_xor_sync(kFullMask, ls, 2);
+            }
             const int lrow = warp * 16 + g + 8 * rr;
             if (split == 1) {
                 const int row = q0 + lrow;
@@ -765,6 +965,7 @@ struct Env {
     float p_shift = kPShift;
     float lag = kLag;
     int vt = 0;
+    int mode = -1;  // -1: default_mode<D>()
 };
 const Env& env() {
     static Env e;
@@ -776,6 +977,7 @@ const Env& env() {
             e.p_shift = static_cast<float>(std::atoi(s));
         if (const char* s = std::getenv("SPARK_ATTN_FP8_LAG")) e.lag = std::atof(s);
         if (const char* s = std::getenv("SPARK_ATTN_FP8_VT")) e.vt = std::atoi(s);
+        if (const char* s = std::getenv("SPARK_ATTN_FP8_MODE")) e.mode = std::atoi(s);
         // p may reach 2^(p_shift + lag), which must stay within e4m3's 448
         e.lag = std::min(e.lag, std::log2(448.f) - e.p_shift);
     }
@@ -803,16 +1005,16 @@ unsigned* queue_for(cudaStream_t stream) {
     return base + 2 * it->second;
 }
 
-template <int D, bool VT>
+template <int D, bool VT, int MODE>
 int resident_blocks() {
     constexpr int bytes = smem_bytes<D>();
     static int resident = 0;
     if (resident == 0) {
-        SPARK_CUDA_CHECK(cudaFuncSetAttribute(attention_fp8_v1_kernel<D, VT>,
+        SPARK_CUDA_CHECK(cudaFuncSetAttribute(attention_fp8_v1_kernel<D, VT, MODE>,
                                               cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
         int per_sm = 0;
         SPARK_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &per_sm, attention_fp8_v1_kernel<D, VT>, THREADS, bytes));
+            &per_sm, attention_fp8_v1_kernel<D, VT, MODE>, THREADS, bytes));
         resident = (per_sm > 0 ? per_sm : 1) * num_sms();
     }
     return resident;
@@ -835,11 +1037,11 @@ float* workspace(size_t floats) {
 // fewer tiles than resident blocks, off under the causal mask once there is a full wave (the
 // heaviest-first queue balances it). The tail tiles are the last in the order, so the last
 // has the fewest KV tiles; every slice gets at least one.
-template <int D, bool VT>
+template <int D, bool VT, int MODE = default_mode<D>()>
 void launch(const fp8* Q, const fp8* K, const fp8* V, bf16* O, int B, int H_q, int H_kv, int S_q,
             int S_kv, float scale_log2, const Scales& sc, bool causal, cudaStream_t stream) {
     constexpr int bytes = smem_bytes<D>();
-    const int resident = resident_blocks<D, VT>();
+    const int resident = resident_blocks<D, VT, MODE>();
     constexpr CUtensorMapSwizzle swz =
         D == 128 ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_64B;
     const uint64_t BHq = static_cast<uint64_t>(B) * H_q;
@@ -872,7 +1074,7 @@ void launch(const fp8* Q, const fp8* K, const fp8* V, bf16* O, int B, int H_q, i
     }
     const int n_items = s.dp_tiles + (tiles - s.dp_tiles) * s.split;
     const int grid = std::min(resident, n_items);
-    attention_fp8_v1_kernel<D, VT><<<grid, THREADS, bytes, stream>>>(
+    attention_fp8_v1_kernel<D, VT, MODE><<<grid, THREADS, bytes, stream>>>(
         tmQ, tmK, tmV, O, S_q, S_kv, scale_log2, env().p_shift, env().lag, sc, causal ? 1 : 0, s,
         n_items, queue_for(stream));
     if (s.split > 1) {
@@ -882,6 +1084,46 @@ void launch(const fp8* Q, const fp8* K, const fp8* V, bf16* O, int B, int H_q, i
 }
 
 }  // namespace v1
+
+#ifdef SPARK_ATTN_FP8_EXPERIMENTS
+// Variant 1 with the softmax variant `mode` (the kExpH2 / kSumMMA / kPipe bits), for the
+// tables in docs/design/attention.md.
+template <int MODE>
+void launch_mode_t(const fp8* q, const fp8* k, const fp8* v, bf16* O, int B, int H_q, int H_kv,
+                   int S_q, int S_kv, int D, float scale_log2, const Scales& sc, bool causal,
+                   cudaStream_t stream) {
+    if (D == 64)
+        v1::launch<64, false, MODE>(q, k, v, O, B, H_q, H_kv, S_q, S_kv, scale_log2, sc, causal,
+                                    stream);
+    else
+        v1::launch<128, false, MODE>(q, k, v, O, B, H_q, H_kv, S_q, S_kv, scale_log2, sc, causal,
+                                     stream);
+}
+void launch_mode(const fp8* q, const fp8* k, const fp8* v, bf16* O, int B, int H_q, int H_kv,
+                 int S_q, int S_kv, int D, float scale_log2, const Scales& sc, bool causal,
+                 int mode, cudaStream_t stream) {
+    if (mode & v1::kHalfS) mode |= v1::kExpH2;
+    switch (mode & 15) {
+#define SPARK_FP8_MODE_CASE(M)                                                                 \
+    case M:                                                                                    \
+        launch_mode_t<M>(q, k, v, O, B, H_q, H_kv, S_q, S_kv, D, scale_log2, sc, causal, stream); \
+        break;
+        SPARK_FP8_MODE_CASE(0)
+        SPARK_FP8_MODE_CASE(1)
+        SPARK_FP8_MODE_CASE(2)
+        SPARK_FP8_MODE_CASE(3)
+        SPARK_FP8_MODE_CASE(4)
+        SPARK_FP8_MODE_CASE(5)
+        SPARK_FP8_MODE_CASE(6)
+        SPARK_FP8_MODE_CASE(7)
+        SPARK_FP8_MODE_CASE(9)
+        SPARK_FP8_MODE_CASE(11)
+        SPARK_FP8_MODE_CASE(13)
+        SPARK_FP8_MODE_CASE(15)
+#undef SPARK_FP8_MODE_CASE
+    }
+}
+#endif
 
 }  // namespace
 
@@ -936,6 +1178,11 @@ void attention_fp8(const __nv_fp8_e4m3* Q, const __nv_fp8_e4m3* K, const __nv_fp
                 else
                     v1::launch<128, true>(q, k, v, O, B, H_q, H_kv, S_q, S_kv, scale_log2, sc,
                                           causal, stream);
+                break;
+            }
+            if (v1::env().mode >= 0) {
+                launch_mode(q, k, v, O, B, H_q, H_kv, S_q, S_kv, D, scale_log2, sc, causal,
+                            v1::env().mode, stream);
                 break;
             }
 #endif
