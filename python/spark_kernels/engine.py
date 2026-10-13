@@ -47,8 +47,13 @@ copies a token to the host. A request submitted with SamplingParams (temperature
 top-p, seed) is sampled instead: its parameters sit in per-slot device tensors, and while any
 running request samples, the steps run `sk.sample` over every slot (a greedy slot still gets
 its argmax) from a second set of captured graphs. Each request draws from its own Philox
-stream (its seed) at the offset of the token's index in its output, so its tokens do not
-depend on what else is in the batch, on which slot it runs in, or on being preempted.
+stream (its seed) at the offset of the token's index in its output, so its random draws do
+not depend on what else is in the batch, on which slot it runs in, or on being preempted.
+The logits they are drawn from can: paged_decode splits the keys of the whole batch over the
+SMs, and a mixed step's decode row and a resumed sequence's first token go through
+attention_varlen, so another schedule rounds them differently. Greedy and sampled tokens
+alike can change at a near tie (top logits one bf16 ulp apart), and the run goes on from
+there; the same schedule gives the same tokens every time.
 
 Weights: `ModelWeights.random()` draws every matrix on the GPU. w_gate_up is stored in the
 interleaved layout of `interleave_gate_up` (gate_j at column 2j, up_j at 2j + 1), the layout

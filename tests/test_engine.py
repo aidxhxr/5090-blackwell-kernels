@@ -30,6 +30,40 @@ def _all_back(eng):
     t = eng.cache.table
     t.check()
     assert not any(t.refs) and eng.cache.available() == eng.cache.num_pages - 1
+    return True
+
+
+# The top two logits of a greedy step can be one bf16 ulp apart or equal (logits near 3 with a
+# 1024-token vocabulary), and the kernels round differently with the batch around a sequence:
+# paged_decode splits the keys of the whole batch over the SMs, a mixed step's decode row and
+# a resumed sequence's first token go through attention_varlen instead. So two schedules agree
+# token for token only until such a near tie; after it the continuations are different but
+# equally greedy. TIE is the logit gap that counts as a tie (three ulps at 2 to 4).
+TIE = 0.05
+
+
+def _agree(weights, rope, prompts, want, got, **kw):
+    """want[i] and got[i] (the tokens of prompt i) are equal, or equal up to a step where both
+    tokens are within TIE of the top logit of the prompt and want's tokens before it
+    (computed once more by a prefill, nothing batched around it). Returns how many diverge."""
+    assert len(want) == len(got)
+    ref, n = None, 0
+    for i in range(len(want)):
+        a, b = want[i], got[i]
+        d = next((j for j, (x, y) in enumerate(zip(a, b)) if x != y), None)
+        if d is None:
+            assert a == b, f"request {i}: {len(a)} tokens against {len(b)}"
+            continue
+        n += 1
+        if ref is None:
+            ref = E.Engine(E.SparkModel(weights, rope), N_LAYERS, max_batch=1, max_seq=1024,
+                           num_pages=128, graphs=False, prefix_cache=False, **kw)
+        ctx = torch.cat([prompts[i].flatten(), torch.tensor(a[:d], dtype=torch.long)])
+        lg = ref.prompt_logits([ctx])[0][-1].float()
+        top = lg.max().item()
+        gaps = top - lg[a[d]].item(), top - lg[b[d]].item()
+        assert max(gaps) <= TIE, f"request {i} token {d}: {a[d]} vs {b[d]}, gaps {gaps}"
+    return n
 
 
 def test_spark_model_matches_torch_model(sk, weights):
@@ -310,7 +344,7 @@ def test_preemption_keeps_tokens_in_a_small_cache(sk, weights):
         stats.append(eng.run())
         outs.append(eng.outputs())
         _all_back(eng)
-    assert outs[0] == outs[1]
+    _agree(weights, rope, prompts, outs[0], outs[1])
     assert [len(outs[1][i]) for i in range(len(lens))] == news
     assert stats[0].preempted == 0 and stats[1].preempted > 0
     assert stats[1].recomputed_tokens > 0
@@ -342,7 +376,7 @@ def test_preemption_with_stop_ids_and_mixed_steps(sk, weights):
     stop = int(counts.argmax())
     want = {sid: o[:o.index(stop) + 1] if stop in o else o for sid, o in full.items()}
     got, st = run(32, [stop])
-    assert got == want
+    _agree(weights, rope, prompts, want, got)
     assert st.preempted > 0 and st.finished == len(lens)
 
 
@@ -401,7 +435,7 @@ def test_speculative_same_tokens(sk, weights):
     want, plain = _serve(weights, rope, prompts, news, **kw)
     for k in (4, 8):
         got, st = _serve(weights, rope, prompts, news, speculative=k, **kw)
-        assert got == want
+        _agree(weights, rope, prompts, want, got)
         assert st.spec_proposed > 0 and st.spec_steps > 0
         assert st.generated == plain.generated == sum(news)
         assert st.forwards == st.prefill_batches + st.decode_steps + st.spec_steps
@@ -419,7 +453,7 @@ def test_speculative_accept_and_rollback(sk, weights):
     kw = dict(max_batch=4, max_seq=512, num_pages=160, prefill_tokens=256)
     want, plain = _serve(weights, rope, prompts, news, **kw)
     got, st = _serve(weights, rope, prompts, news, oracle=want, speculative=6, **kw)
-    assert got == want
+    _agree(weights, rope, prompts, want, got)
     assert 0 < st.spec_accepted < st.spec_proposed
     assert st.forwards < plain.forwards
     assert st.generated == sum(news)
@@ -439,13 +473,13 @@ def test_speculative_preemption_and_stop_ids(sk, weights):
     counts = torch.bincount(torch.tensor([t for o in full.values() for t in o[1:]]))
     stop = int(counts.argmax())
     want = {sid: o[:o.index(stop) + 1] if stop in o else o for sid, o in full.items()}
-    got, st = _serve(weights, rope, prompts, news, oracle=full, num_pages=32,
+    got, st = _serve(weights, rope, prompts, news, oracle=full, num_pages=20,
                      stop_ids=[stop], speculative=8, **kw)
-    assert got == want
+    _agree(weights, rope, prompts, want, got)
     assert st.preempted > 0 and st.finished == len(lens) and st.spec_accepted > 0
-    got, st = _serve(weights, rope, prompts, news, num_pages=32, stop_ids=[stop],
+    got, st = _serve(weights, rope, prompts, news, num_pages=20, stop_ids=[stop],
                      speculative=4, **kw)
-    assert got == want
+    _agree(weights, rope, prompts, want, got)
 
 
 def test_speculative_refuses_torch_model(sk, weights):
@@ -499,7 +533,7 @@ def test_prefix_cache_same_tokens(sk, weights):
         _all_back(eng)
         if prefix:
             assert len(eng.cache.table.evictable) > 0  # the prefixes stay cached
-    assert outs[0] == outs[1]
+    _agree(weights, rope, prompts, outs[0], outs[1])
     assert [len(o) for o in outs[1]] == news
     assert stats[0].prefix_hit_tokens == stats[0].prefix_queries == 0
     assert stats[1].prefix_hit_tokens > 0
@@ -538,7 +572,7 @@ def test_prefix_cache_evicts_in_a_small_cache(sk, weights):
     eng = E.Engine(E.SparkModel(weights, rope), N_LAYERS, max_batch=4, max_seq=512,
                    num_pages=72, graphs=True, log_tokens=True, prefix_cache=True)
     got, st = _run_waves(eng, prompts, news, (5, 5, 5, 5, 5, 5))
-    assert got == want
+    _agree(weights, rope, prompts, want, got)
     assert eng.cache.table.evicted > 0 and st.prefix_hit_tokens > 0
     _all_back(eng)
 
@@ -564,10 +598,11 @@ def test_prefix_cache_with_preemption_chunks_and_stops(sk, weights):
     stop = int(counts.argmax())
     want = [o[:o.index(stop) + 1] if stop in o else o for o in full]
     got, st = run(48, True, [stop])
-    assert got == want
+    _agree(weights, rope, prompts, want, got)
     assert st.preempted > 0 and st.prefix_hit_tokens > 0 and st.finished == len(prompts)
     plain, st = run(48, True, None)
-    assert plain == full and st.preempted > 0
+    _agree(weights, rope, prompts, full, plain)
+    assert st.preempted > 0
 
 
 def test_prefix_cache_reserve_mode(sk, weights):
@@ -584,7 +619,8 @@ def test_prefix_cache_reserve_mode(sk, weights):
         outs.append(o)
         assert st.preempted == 0
         _all_back(eng)
-    assert outs[0] == outs[1] and st.prefix_hit_tokens > 0
+    _agree(weights, rope, prompts, outs[0], outs[1])
+    assert st.prefix_hit_tokens > 0
 
 
 def test_prefix_cache_needs_a_context_prefill(sk, weights):
@@ -627,9 +663,16 @@ def test_sampling_reproducible_and_independent_of_the_batch(sk, weights):
     want, _ = run(params)
     assert [len(want[i]) for i in range(len(lens))] == news
     assert run(params)[0] == want
-    assert run(params, max_batch=8, compact=False)[0] == want
+    # another schedule rounds the logits differently (see _agree), which can move a sampled
+    # token across a step of the distribution as well as break a greedy tie: the greedy
+    # requests are held to _agree, every request to its length
+    gi = [i for i, sp in enumerate(params) if sp.greedy]
     small, st = run(params, num_pages=16)
-    assert st.preempted > 0 and small == want
+    assert st.preempted > 0
+    for other in (run(params, max_batch=8, compact=False)[0], small):
+        assert [len(other[i]) for i in range(len(lens))] == news
+        _agree(weights, rope, [prompts[i] for i in gi], [want[i] for i in gi],
+               [other[i] for i in gi])
     greedy, _ = run([E.SamplingParams()] * len(lens))
     for i, sp in enumerate(params):
         if sp.greedy:
@@ -709,7 +752,8 @@ def test_fp8_cache_engine_graphs_mixed_preemption(sk, weights):
         stats.append(eng.run())
         outs.append(eng.outputs())
         assert _all_back(eng)
-    assert outs[0] == outs[1] == outs[2]
+    assert outs[0] == outs[1]  # the same steps, graphed and eager
+    _agree(weights, rope, prompts, outs[0], outs[2], kv_format="fp8")
     assert [len(outs[0][i]) for i in range(len(lens))] == news
     assert stats[2].preempted > 0
     nb = 1 << 26
