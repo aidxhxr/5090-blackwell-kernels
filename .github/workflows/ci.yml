@@ -39,14 +39,14 @@ jobs:
     name: cuda-compile (sm_${{ matrix.arch }})
     steps:
       - uses: actions/checkout@v4
-      - name: install CUDA 13.0 toolkit (nvcc, cudart, cuda.h for the TMA tensor maps, cuBLAS and cuBLASLt headers)
+      - name: install CUDA 13.0 toolkit (nvcc, cudart, cuda.h for the TMA tensor maps, cuBLAS and cuBLASLt headers, cuRAND for the sampler's Philox)
         run: |
           wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
           sudo dpkg -i cuda-keyring_1.1-1_all.deb
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends \
             cuda-compiler-13-0 cuda-cudart-dev-13-0 cuda-driver-dev-13-0 cuda-cccl-13-0 \
-            libcublas-dev-13-0
+            libcublas-dev-13-0 libcurand-dev-13-0
           echo "/usr/local/cuda-13.0/bin" >> "$GITHUB_PATH"
           echo "CUDACXX=/usr/local/cuda-13.0/bin/nvcc" >> "$GITHUB_ENV"
           echo "CUDAToolkit_ROOT=/usr/local/cuda-13.0" >> "$GITHUB_ENV"
