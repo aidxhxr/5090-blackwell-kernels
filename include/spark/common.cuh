@@ -476,6 +476,65 @@ __device__ __forceinline__ void named_barrier_arrive(int id, int nthreads) {
     asm volatile("bar.arrive %0, %1;\n" ::"r"(id), "r"(nthreads) : "memory");
 }
 
+// ---------------------------------------------------------------------------
+// Thread block clusters (sm_90+). A kernel launched with a cluster dimension runs its blocks in
+// groups that are co-resident on one GPC and can reach each other's shared memory: a TMA load
+// can write the same box into every block of a mask (.multicast::cluster), and a block can
+// arrive on another block's mbarrier. Used by the fp8gemm cluster configurations.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ unsigned cluster_ctarank() {
+    unsigned r;
+    asm volatile("mov.u32 %0, %%cluster_ctarank;\n" : "=r"(r));
+    return r;
+}
+// Every thread of every block in the cluster: release this thread's earlier memory accesses,
+// then wait for all of them (acquire). Before the first remote access (the peers' barriers are
+// initialized) and before a block exits (nobody arrives on or copies into its smem any more).
+__device__ __forceinline__ void cluster_sync() {
+    asm volatile(
+        "barrier.cluster.arrive.release;\n"
+        "barrier.cluster.wait.acquire;\n" ::
+            : "memory");
+}
+// Arrival on the barrier at the same smem offset as `bar` in block `cta` of the cluster (which
+// may be this block), with cluster-scope release: this warp's reads of a stage are ordered
+// before the producer that waits on that barrier refills the stage, in whichever block it is.
+__device__ __forceinline__ void mbar_arrive_cluster(uint64_t* bar, unsigned cta) {
+    asm volatile(
+        "{\n"
+        ".reg .b32 remote;\n"
+        "mapa.shared::cluster.u32 remote, %0, %1;\n"
+        "mbarrier.arrive.release.cluster.shared::cluster.b64 _, [remote];\n"
+        "}\n" ::"r"(smem_u32(bar)),
+        "r"(cta)
+        : "memory");
+}
+// mbar_wait with cluster-scope acquire, for a barrier that blocks of the cluster arrive on.
+__device__ __forceinline__ void mbar_wait_cluster(uint64_t* bar, unsigned parity) {
+    asm volatile(
+        "{\n"
+        ".reg .pred p;\n"
+        "SPARK_MBAR_WAIT_CL:\n"
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [%0], %1;\n"
+        "@p bra SPARK_MBAR_DONE_CL;\n"
+        "bra SPARK_MBAR_WAIT_CL;\n"
+        "SPARK_MBAR_DONE_CL:\n"
+        "}\n" ::"r"(smem_u32(bar)),
+        "r"(parity)
+        : "memory");
+}
+// tma_load_2d into every block of `mask` (bit i = cluster rank i): the box lands at the same
+// smem offset in each, and each one's barrier at the offset of `bar` counts its bytes.
+__device__ __forceinline__ void tma_load_2d_multicast(void* smem_dst, const CUtensorMap* map,
+                                                      uint64_t* bar, int c0, int c1,
+                                                      unsigned short mask) {
+    asm volatile(
+        "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes"
+        ".multicast::cluster [%0], [%1, {%3, %4}], [%2], %5;\n" ::"r"(smem_u32(smem_dst)),
+        "l"(reinterpret_cast<uint64_t>(map)), "r"(smem_u32(bar)), "r"(c0), "r"(c1), "h"(mask)
+        : "memory");
+}
+
 // Host side: encode a tensor map for a row-major 2-D bf16 matrix (rows x cols, cols
 // contiguous) with a box of box_rows x box_cols. The driver entry point is fetched through
 // the runtime, so nothing links against libcuda. Out-of-range boxes are zero-filled by the

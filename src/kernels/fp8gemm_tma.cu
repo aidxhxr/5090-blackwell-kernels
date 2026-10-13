@@ -19,6 +19,10 @@
 // MX mode: the consumer warps fetch their scale chunks (fp8gemm_tile.cuh, MxChunk) from
 // global memory one group of stages ahead, as variant 1 does; the producer and the stages
 // are unchanged.
+//
+// Configurations 11 to 19 run a second kernel (fp8gemm_cl_kernel, per-tensor mode): thread
+// block clusters whose blocks share A or Bt panels through multicast TMA loads, a 128x256
+// tile, and fp4gemm variant 2's unrolled consumer loop. Description above the kernel.
 
 #include <cuda_fp8.h>
 
@@ -308,6 +312,370 @@ void launch(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout
                                                                     scale_b, mx, stream);
 }
 
+// ---- the cluster kernel (per-tensor mode) ------------------------------------------------
+//
+// The same producer / consumer pipeline, with three changes aimed at the joules per FLOP of
+// the large shapes, where the kernel runs at the 600 W cap:
+//   * the consumer loop of fp4gemm variant 2: unrolled by the ring depth (every stage address
+//     and barrier an immediate, the parity one register flipped per round) and no
+//     fence.proxy.async before the release (a read followed by an async-proxy write is ordered
+//     by the arrive's release and the producer's acquire);
+//   * a BN of 128 or 256 (128x256 with 2x4 warps of 64x64: 8 ldmatrix per 32 mma instead of
+//     6 per 16, and a quarter less L2 traffic per FLOP);
+//   * a CLM x CLN cluster of blocks over a (CLM * 128) x (CLN * BN) cluster tile. Block (ci, cj)
+//     (cluster rank ci + CLM * cj) computes the 128 x BN tile (ci, cj). The CLN blocks of a
+//     cluster row need the same A rows: each copies 128 / CLN of them and multicasts the box to
+//     the whole row; likewise each of the CLM blocks of a cluster column copies BN / CLM rows of
+//     Bt for the column. Every stage still lands whole in every block, so the full barrier
+//     expects the same bytes, but the L2 -> SM traffic for A drops CLN-fold and for Bt
+//     CLM-fold. A block's stage is written by the producers of its row and its column, so
+//     each consumer warp releases a stage to all CLM + CLN - 1 of them (a remote arrive per
+//     block), and a producer waits for that many warps' releases before it refills a stage.
+// Host guarantees M % (128 * CLM) == 0, N % (BN * CLN) == 0, K % BK == 0.
+
+template <int BN_, int BK, int STAGES>
+constexpr int smem_bytes_cl() {
+    return (STAGES * (BM + BN_) * BK + 2 * STAGES * 8 + 16 + 1023) / 1024 * 1024;
+}
+
+constexpr int kMaxSplitCl = 8;  // fp4gemm variant 2's cap on tail slices
+
+template <int BN_, int BK, int STAGES, int WARPS_M, int WARPS_N, int CLM, int CLN>
+__global__ void __launch_bounds__((WARPS_M * WARPS_N + 1) * 32, 1)
+    fp8gemm_cl_kernel(const __grid_constant__ CUtensorMap tmA,
+                      const __grid_constant__ CUtensorMap tmB, __nv_bfloat16* __restrict__ Cout,
+                      int M, int N, int K, const float* __restrict__ scale_a,
+                      const float* __restrict__ scale_b, Sched sched) {
+    using C = fp8gemm_tile::Cfg<BM, BN_, BK, STAGES, WARPS_M, WARPS_N>;
+    constexpr int BN = BN_;
+    static_assert(BK == 64 || BK == 128, "the TMA swizzles cover 64 B and 128 B rows");
+    constexpr int CL = CLM * CLN;
+    static_assert(CL >= 1 && CL <= 8, "portable cluster sizes");
+    constexpr int CONSUMER_WARPS = WARPS_M * WARPS_N;
+    constexpr int CONSUMERS = CONSUMER_WARPS * 32;
+    constexpr int A_STAGE = C::A_STAGE, STAGE_BYTES = C::STAGE;
+    constexpr int WROWS = C::WROWS, WCOLS = C::WCOLS, MT = C::MT, NT = C::NT;
+    constexpr int A_ROWS = BM / CLN;  // rows of A this block copies for its cluster row
+    constexpr int B_ROWS = BN / CLM;  // rows of Bt this block copies for its cluster column
+    // Each slice starts on a swizzle span (the swizzle is keyed on the absolute address).
+    static_assert(A_ROWS * BK % 1024 == 0 && B_ROWS * BK % 1024 == 0, "slices of whole spans");
+    constexpr int PEERS = CLM + CLN - 1;  // blocks that write into this block's stages
+    static_assert(PEERS <= 32, "one lane per peer");
+
+    extern __shared__ __align__(1024) unsigned char smem[];
+    uint64_t* full_bar = reinterpret_cast<uint64_t*>(smem + STAGES * STAGE_BYTES);
+    uint64_t* empty_bar = full_bar + STAGES;
+    int* s_last = reinterpret_cast<int*>(empty_bar + STAGES);
+    if (smem_u32(smem) % 1024 != 0) __trap();
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+
+    unsigned rank = 0;
+    if constexpr (CL > 1) rank = cluster_ctarank();
+    const int ci = static_cast<int>(rank) % CLM;
+    const int cj = static_cast<int>(rank) / CLM;
+
+    // Variant 2's schedule on cluster tiles: every block of a cluster takes the same K slice.
+    const int cid = static_cast<int>(blockIdx.x) / CL;
+    const int KT = K / BK;
+    int ctile, kt_begin, kt_end;
+    if (cid < sched.dp_tiles) {
+        ctile = cid;
+        kt_begin = 0;
+        kt_end = KT;
+    } else {
+        const int r = cid - sched.dp_tiles;
+        ctile = sched.dp_tiles + r / sched.split;
+        const int slice = r % sched.split;
+        kt_begin = static_cast<int>(static_cast<long long>(slice) * KT / sched.split);
+        kt_end = static_cast<int>(static_cast<long long>(slice + 1) * KT / sched.split);
+    }
+    const int bm = (ctile / sched.tiles_n) * (BM * CLM) + ci * BM;
+    const int bn = (ctile % sched.tiles_n) * (BN * CLN) + cj * BN;
+    const int nkt = kt_end - kt_begin;
+
+    if (tid == 0) {
+#pragma unroll
+        for (int s = 0; s < STAGES; ++s) {
+            mbar_init(&full_bar[s], 1);
+            mbar_init(&empty_bar[s], CONSUMER_WARPS * PEERS);
+        }
+        fence_mbar_init();
+    }
+    // The peers' barriers must be initialized before any multicast or remote arrive.
+    if constexpr (CL > 1)
+        cluster_sync();
+    else
+        __syncthreads();
+
+    if (warp == CONSUMER_WARPS) {
+        // Producer warp, lane 0. Stage s serves k-tiles s, s+STAGES, ...; its n-th use waits
+        // for the (n-1)-th release by every consumer warp of every block it writes into.
+        if (lane == 0) {
+            prefetch_tensormap(&tmA);
+            prefetch_tensormap(&tmB);
+            unsigned short mask_a = 0, mask_b = 0;  // the cluster row, the cluster column
+#pragma unroll
+            for (int j = 0; j < CLN; ++j) mask_a |= static_cast<unsigned short>(1u << (ci + CLM * j));
+#pragma unroll
+            for (int i = 0; i < CLM; ++i) mask_b |= static_cast<unsigned short>(1u << (i + CLM * cj));
+            const int a_row = bm + cj * A_ROWS;  // this block's slice of the shared A tile
+            const int b_row = bn + ci * B_ROWS;
+            for (int kt = 0; kt < nkt; ++kt) {
+                const int s = kt % STAGES;
+                const unsigned use = kt / STAGES;
+                if (kt >= STAGES) {
+                    if constexpr (CL > 1)
+                        mbar_wait_cluster(&empty_bar[s], (use - 1) & 1);
+                    else
+                        mbar_wait(&empty_bar[s], (use - 1) & 1);
+                }
+                mbar_arrive_expect_tx(&full_bar[s], STAGE_BYTES);
+                const int k0 = (kt_begin + kt) * BK;
+                unsigned char* as = smem + s * STAGE_BYTES;
+                unsigned char* a_dst = as + cj * A_ROWS * BK;
+                unsigned char* b_dst = as + A_STAGE + ci * B_ROWS * BK;
+                if constexpr (CLN > 1)
+                    tma_load_2d_multicast(a_dst, &tmA, &full_bar[s], k0, a_row, mask_a);
+                else
+                    tma_load_2d(a_dst, &tmA, &full_bar[s], k0, a_row);
+                if constexpr (CLM > 1)
+                    tma_load_2d_multicast(b_dst, &tmB, &full_bar[s], k0, b_row, mask_b);
+                else
+                    tma_load_2d(b_dst, &tmB, &full_bar[s], k0, b_row);
+            }
+        }
+        if constexpr (CL > 1) {
+            __syncwarp();
+            cluster_sync();
+        }
+        return;
+    }
+
+    const int wm = warp / WARPS_N;
+    const int wn = warp % WARPS_N;
+    const float scale = *scale_a * *scale_b;
+
+    // The block this lane releases a stage to (lanes 0 .. PEERS-1): the CLN blocks of the
+    // cluster row, then the other CLM - 1 blocks of the cluster column.
+    unsigned peer = rank;
+    if constexpr (CL > 1) {
+        if (lane < CLN) {
+            peer = ci + CLM * lane;
+        } else if (lane < PEERS) {
+            const int i = lane - CLN;
+            peer = (i < ci ? i : i + 1) + CLM * cj;
+        }
+    }
+
+    typename C::Acc acc;
+#pragma unroll
+    for (int i = 0; i < MT; ++i)
+#pragma unroll
+        for (int j = 0; j < NT; ++j)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.f;
+
+    const fp8gemm_tile::MxFrag<C> none{};
+    auto consume = [&](const unsigned char* as, uint64_t* full, uint64_t* empty, unsigned parity) {
+        mbar_wait(full, parity);
+        fp8gemm_tile::mma_stage<C, false>(as, as + A_STAGE, wm, wn, lane, acc, none);
+        __syncwarp();
+        if constexpr (CL > 1) {
+            if (lane < PEERS) mbar_arrive_cluster(empty, peer);
+        } else {
+            if (lane == 0) mbar_arrive(empty);
+        }
+    };
+    int kt = 0;
+    unsigned parity = 0;
+    for (; kt + STAGES <= nkt; kt += STAGES, parity ^= 1u) {
+        fp8gemm_tile::static_for<STAGES>([&](auto st) {
+            constexpr int S = decltype(st)::value;
+            consume(smem + S * STAGE_BYTES, &full_bar[S], &empty_bar[S], parity);
+        });
+    }
+    for (int s = 0; kt < nkt; ++kt, ++s)
+        consume(smem + s * STAGE_BYTES, &full_bar[s], &empty_bar[s], parity);
+
+    // Nobody in the cluster copies into this block or arrives on its barriers past here.
+    if constexpr (CL > 1) cluster_sync();
+
+    if (ctile < sched.dp_tiles) {
+        fp8gemm_tile::store_bf16<C>(acc, scale, Cout, M, N, bm, bn);
+        return;
+    }
+
+    // Tail tile: the workspace holds one BM x BN tile per block of each tail cluster tile;
+    // the last slice to arrive converts it, zeroes it again and resets its counter, so the
+    // launcher never clears it (fp4gemm variant 2).
+    const int g = lane >> 2;
+    const int c2 = (lane & 3) * 2;
+    const int wt_idx = (ctile - sched.dp_tiles) * CL + static_cast<int>(rank);
+    float* wt = sched.ws + static_cast<size_t>(wt_idx) * BM * BN;
+#pragma unroll
+    for (int mi = 0; mi < MT; ++mi) {
+#pragma unroll
+        for (int nj = 0; nj < NT; ++nj) {
+            const int r0 = wm * WROWS + mi * 16 + g;
+            const int c0 = wn * WCOLS + nj * 8 + c2;
+            atomicAdd(wt + r0 * BN + c0, acc[mi][nj][0]);
+            atomicAdd(wt + r0 * BN + c0 + 1, acc[mi][nj][1]);
+            atomicAdd(wt + (r0 + 8) * BN + c0, acc[mi][nj][2]);
+            atomicAdd(wt + (r0 + 8) * BN + c0 + 1, acc[mi][nj][3]);
+        }
+    }
+    __threadfence();
+    named_barrier_sync(TAIL_BARRIER, CONSUMERS);
+    if (tid == 0) *s_last = atomicAdd(sched.counters + wt_idx, 1) == sched.split - 1;
+    named_barrier_sync(TAIL_BARRIER, CONSUMERS);
+    if (!*s_last) return;
+    __threadfence();
+    for (int i = tid; i < BM * BN / 2; i += CONSUMERS) {
+        const int r = (2 * i) / BN;
+        const int c = (2 * i) % BN;
+        float2* p = reinterpret_cast<float2*>(wt + r * BN + c);
+        const float2 v = __ldcg(p);
+        __stcg(p, make_float2(0.f, 0.f));
+        *reinterpret_cast<__nv_bfloat162*>(Cout + static_cast<size_t>(bm + r) * N + bn + c) =
+            __floats2bfloat162_rn(v.x * scale, v.y * scale);
+    }
+    if (tid == 0) sched.counters[wt_idx] = 0;
+}
+
+// Zeroed once when it grows; the kernel leaves it zeroed.
+struct WorkspaceCl {
+    float* ws = nullptr;
+    int* counters = nullptr;
+    size_t tiles = 0;
+    void reserve(size_t n, size_t tile_elems, cudaStream_t stream) {
+        if (tiles >= n) return;
+        if (ws) SPARK_CUDA_CHECK(cudaFree(ws));
+        if (counters) SPARK_CUDA_CHECK(cudaFree(counters));
+        tiles = n;
+        SPARK_CUDA_CHECK(cudaMalloc(&ws, tiles * tile_elems * sizeof(float)));
+        SPARK_CUDA_CHECK(cudaMalloc(&counters, tiles * sizeof(int)));
+        SPARK_CUDA_CHECK(cudaMemsetAsync(ws, 0, tiles * tile_elems * sizeof(float), stream));
+        SPARK_CUDA_CHECK(cudaMemsetAsync(counters, 0, tiles * sizeof(int), stream));
+    }
+};
+
+// Clusters resident at once (cudaOccupancyMaxActiveClusters: a cluster lives on one GPC, so
+// this can be less than SMs / CL), or 0 if the device cannot launch this cluster shape.
+template <int BN_, int BK, int STAGES, int WARPS_M, int WARPS_N, int CLM, int CLN>
+int resident_clusters() {
+    constexpr int bytes = smem_bytes_cl<BN_, BK, STAGES>();
+    constexpr int threads = (WARPS_M * WARPS_N + 1) * 32;
+    constexpr int CL = CLM * CLN;
+    static int resident = -1;
+    if (resident < 0) {
+        auto kernel = fp8gemm_cl_kernel<BN_, BK, STAGES, WARPS_M, WARPS_N, CLM, CLN>;
+        SPARK_CUDA_CHECK(
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+        resident = 0;
+        int dev = 0, cluster_ok = 0;
+        SPARK_CUDA_CHECK(cudaGetDevice(&dev));
+        SPARK_CUDA_CHECK(cudaDeviceGetAttribute(&cluster_ok, cudaDevAttrClusterLaunch, dev));
+        if (CL == 1) {
+            int per_sm = 0;
+            SPARK_CUDA_CHECK(
+                cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, threads, bytes));
+            resident = per_sm * num_sms();
+        } else if (cluster_ok) {
+            cudaLaunchConfig_t cfg = {};
+            cudaLaunchAttribute attr[1];
+            attr[0].id = cudaLaunchAttributeClusterDimension;
+            attr[0].val.clusterDim.x = CL;
+            attr[0].val.clusterDim.y = 1;
+            attr[0].val.clusterDim.z = 1;
+            cfg.gridDim = dim3(CL * num_sms());
+            cfg.blockDim = dim3(threads);
+            cfg.dynamicSmemBytes = bytes;
+            cfg.attrs = attr;
+            cfg.numAttrs = 1;
+            int n = 0;
+            if (cudaOccupancyMaxActiveClusters(&n, kernel, &cfg) == cudaSuccess) resident = n;
+            (void)cudaGetLastError();  // clear what an unsupported cluster shape reports
+        }
+        if (std::getenv("SPARK_FP8GEMM_VERBOSE"))
+            std::fprintf(stderr, "fp8gemm cluster config 128x%d BK %d x%d, %dx%d: %d resident\n",
+                         BN_, BK, STAGES, CLM, CLN, resident);
+    }
+    return resident;
+}
+
+// Returns false (nothing launched) if the shape does not tile or the cluster cannot launch.
+template <int BN_, int BK, int STAGES, int WARPS_M, int WARPS_N, int CLM, int CLN>
+bool launch_cl(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout, int M, int N,
+               int K, const float* scale_a, const float* scale_b, cudaStream_t stream) {
+    constexpr int BN = BN_, CL = CLM * CLN;
+    constexpr int bytes = smem_bytes_cl<BN_, BK, STAGES>();
+    constexpr int THREADS = (WARPS_M * WARPS_N + 1) * 32;
+    if (M % (BM * CLM) != 0 || N % (BN * CLN) != 0 || K % BK != 0) return false;
+    const int resident = resident_clusters<BN_, BK, STAGES, WARPS_M, WARPS_N, CLM, CLN>();
+    if (resident <= 0) return false;
+
+    constexpr CUtensorMapSwizzle swz =
+        BK == 64 ? CU_TENSOR_MAP_SWIZZLE_64B : CU_TENSOR_MAP_SWIZZLE_128B;
+    const CUtensorMap tmA = make_tensor_map_2d_u8(A, M, K, BM / CLN, BK, swz);
+    const CUtensorMap tmB = make_tensor_map_2d_u8(Bt, N, K, BN / CLM, BK, swz);
+
+    Sched s;
+    s.tiles_n = N / (BN * CLN);
+    const int ctiles = (M / (BM * CLM)) * s.tiles_n;
+    const int KT = K / BK;
+    const int tail = ctiles % resident;
+    s.split = tail > 0 ? std::min({KT, resident / tail, kMaxSplitCl}) : 1;
+    s.ws = nullptr;
+    s.counters = nullptr;
+    if (s.split <= 1) {
+        s.split = 1;
+        s.dp_tiles = ctiles;
+    } else {
+        s.dp_tiles = ctiles - tail;
+        static WorkspaceCl w;
+        w.reserve(static_cast<size_t>(tail) * CL, static_cast<size_t>(BM) * BN, stream);
+        s.ws = w.ws;
+        s.counters = w.counters;
+    }
+    const int grid = (s.dp_tiles + (ctiles - s.dp_tiles) * s.split) * CL;
+
+    cudaLaunchConfig_t cfg = {};
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeClusterDimension;
+    attr[0].val.clusterDim.x = CL;
+    attr[0].val.clusterDim.y = 1;
+    attr[0].val.clusterDim.z = 1;
+    cfg.gridDim = dim3(grid);
+    cfg.blockDim = dim3(THREADS);
+    cfg.dynamicSmemBytes = bytes;
+    cfg.stream = stream;
+    cfg.attrs = attr;
+    cfg.numAttrs = 1;
+    SPARK_CUDA_CHECK(cudaLaunchKernelEx(&cfg,
+                                        fp8gemm_cl_kernel<BN_, BK, STAGES, WARPS_M, WARPS_N, CLM, CLN>,
+                                        tmA, tmB, Cout, M, N, K, scale_a, scale_b, s));
+    return true;
+}
+
+// A cluster configuration as a CONFIGS entry: MX mode, and any shape or device the cluster
+// kernel does not take, runs the default configuration of variant 2 instead.
+template <int BN_, int BK, int STAGES, int WARPS_M, int WARPS_N, int CLM, int CLN, bool MX>
+void launch_cl_or_v2(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout, int M,
+                     int N, int K, const float* scale_a, const float* scale_b, MxScales mx,
+                     cudaStream_t stream) {
+    if constexpr (!MX) {
+        if (launch_cl<BN_, BK, STAGES, WARPS_M, WARPS_N, CLM, CLN>(A, Bt, Cout, M, N, K, scale_a,
+                                                                   scale_b, stream))
+            return;
+        launch<128, 3, 2, 4, 1, false>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
+    } else {
+        launch<64, 4, 2, 4, 1, true>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
+    }
+}
+
 // Pipeline configurations (BK in bytes, stages, consumer warp grid, blocks per SM the compiler
 // is asked to fit). SPARK_FP8GEMM_V2_CONFIG=<index> forces one; the sweep is in
 // docs/design/fp8gemm.md.
@@ -326,6 +694,17 @@ constexpr LaunchFn CONFIGS[] = {
     launch<64, 2, 2, 2, 2, MX>,   // 8: 32 KB, 2x2 warps of 64x64, two blocks per SM
     launch<64, 5, 2, 4, 1, MX>,   // 9: 80 KB, five stages of 64 B, one block per SM
     launch<64, 6, 2, 4, 1, MX>,   // 10: 96 KB, six stages of 64 B, one block per SM
+    // The cluster kernel (per-tensor mode only; MX runs config 4). Tile, BK, stages, warps,
+    // cluster CLM x CLN:
+    launch_cl_or_v2<128, 128, 3, 2, 4, 1, 1, MX>,  // 11: config 1 with the unrolled loop
+    launch_cl_or_v2<128, 128, 3, 2, 4, 2, 1, MX>,  // 12: 2x1 cluster, Bt multicast
+    launch_cl_or_v2<128, 128, 3, 2, 4, 1, 2, MX>,  // 13: 1x2 cluster, A multicast
+    launch_cl_or_v2<128, 128, 3, 2, 4, 2, 2, MX>,  // 14: 2x2 cluster, both
+    launch_cl_or_v2<128, 128, 3, 2, 4, 4, 1, MX>,  // 15: 4x1 cluster, Bt multicast
+    launch_cl_or_v2<256, 128, 2, 2, 4, 1, 1, MX>,  // 16: 128x256, 96 KB, 2x4 warps of 64x64
+    launch_cl_or_v2<256, 64, 4, 2, 4, 1, 1, MX>,   // 17: 128x256, four 64-byte stages
+    launch_cl_or_v2<256, 128, 2, 2, 4, 2, 1, MX>,  // 18: 128x256, 2x1 cluster
+    launch_cl_or_v2<256, 64, 4, 2, 4, 2, 1, MX>,   // 19: 128x256, 64-byte stages, 2x1 cluster
 };
 constexpr int NUM_CONFIGS = static_cast<int>(sizeof(CONFIGS<false>) / sizeof(CONFIGS<false>[0]));
 constexpr int CONFIG_WAVES = 1;  // grids of more than two blocks per SM
