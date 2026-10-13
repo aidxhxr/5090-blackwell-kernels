@@ -194,13 +194,32 @@ host path is a visible share of the torch column; the C++ bench has it at 102.3%
 
 Those are squares. A prefill or a batched decode step is M = 128 to 4096 tokens against a
 real projection, and there the 128 x 128 grid is a fraction of a wave on 170 SMs: 128 tokens
-on a Llama 3 8B q_proj is 32 tiles, and variant 6 hands everything under about 512 tokens on
-a 4096-wide model to variant 4's slower `cp.async` tiles. `bench_hgemm --models` runs twenty
-weights from Llama 3 8B and 70B, Qwen 3 and a DeepSeek expert at M = 128 to 4096 against
-cuBLAS, with B rotated past L2. Variant 6 now has 128 x 64, 64 x 128 and 128 x 256 TMA tiles
-and a per-shape rule that keeps every M > 64 on the TMA kernel
-([hgemm.md, "Model shapes"](docs/design/hgemm.md)). Both were written while the box was down:
-not compiled, not measured, and not the default. The table goes here when they are.
+on a Llama 3 8B q_proj is 32 tiles, and variant 6 used to hand everything under about 512
+tokens on a 4096-wide model to variant 4's slower `cp.async` tiles. It now has 128 x 64 and
+64 x 128 TMA tiles and picks per shape by one rule: the biggest tile with at least a quarter
+of the SMs' worth of tiles and enough k-steps per block, variant 4 only when even the
+64-wide tiles are too few. `bench_hgemm --models` runs twenty weights from Llama 3 8B and
+70B, Qwen 3 and a DeepSeek expert at M = 128 to 4096, B rotated past L2, against cuBLAS:
+
+| M x N x K | what it is | cuBLAS | before | after |
+|---|---|---|---|---|
+| 128 x 4096 x 4096 | Llama 3 8B q_proj, 128 tokens | 32.9 us | 104.5% | 112.1% |
+| 256 x 4096 x 4096 | same, 256 tokens | 52.3 us | 104.5% | 120.0% |
+| 128 x 6144 x 4096 | fused qkv | 52.3 us | 104.5% | 136.7% |
+| 512 x 1024 x 4096 | k/v proj | 29.8 us | 93.9% | 117.6% |
+| 128 x 5120 x 8192 | Qwen 3 32B o_proj | 61.2 us | 86.8% | 103.3% |
+| 256 x 2304 x 5120 | DeepSeek expert up | 39.0 us | 89.2% | 116.4% |
+| 128 x 5120 x 2304 | DeepSeek expert down | 23.6 us | 74.6% | 102.2% |
+| 1024 x 768 x 2048 | Qwen 3 30B-A3B expert | 29.8 us | 95.2% | 140.7% |
+| 4096 x 128256 x 4096 | Llama 3 8B lm_head | 18.15 ms | 103.5% | 103.5% |
+
+% of cuBLAS. Over all 120 shapes the geometric mean goes from 107.1% to 109.4%, and at 128
+tokens from 98.7% to 103.8%; 16 shapes move by more than 3%, all up, and the rest run the
+same kernel as before. Six are still below cuBLAS, all under 3 GFLOP except one (128 x 1024
+x 4096 at 78.7%, an expert at 128 tokens at 63.6%), where cuBLAS's split-K wins and ours would
+have to give up the same bits every run to follow it. A 128 x 256 tile with a 64 x 64 warp
+tile spilled at 168 registers and lost; it is not routed. Details in
+[hgemm.md, "Model shapes"](docs/design/hgemm.md), rows in `results/hgemm_models.json`.
 
 ### decode
 

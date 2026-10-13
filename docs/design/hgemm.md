@@ -1146,18 +1146,15 @@ What the numbers say:
 ### Model shapes: M = 128 to 4096 against real weights
 
 Source: the tiles in `src/kernels/hgemm_tma_tile.cuh`, the route in `src/kernels/hgemm_tma_sk.cu`
-(`route_auto`), the sweep in `bench_hgemm --models`.
-
-**Status: written, not compiled, not measured.** The box was down for the whole session this
-was written in. Nothing below is a measured number; the tables are the arithmetic the rule
-does. The default route is unchanged until the sweep says the rule wins.
+(`route_rule`), the sweep in `bench_hgemm --models`, the rows in `results/hgemm_models.json`
+(measured 2026-10-13, `--iters=20`).
 
 Every number above is a big square or a decode shape. A prefill or a batched decode step
 lives in between: M = 128 to 4096 tokens against the projections of a real checkpoint. That
-is where the 128×128 grid is one wave or less on 170 SMs and where variant 6's default hands
-shapes to variant 4's `cp.async` tiles:
+is where the 128×128 grid is one wave or less on 170 SMs, and where variant 6's route before
+this section handed shapes to variant 4's `cp.async` tiles:
 
-| shape | 128×128 tiles | waves of 170 | k-steps per block (BK = 64) | default route |
+| shape | 128×128 tiles | waves of 170 | k-steps per block (BK = 64) | old route |
 |---|---|---|---|---|
 | 128×4096×4096 (Llama 3 8B q/o, 128 tokens) | 32 | 0.19 | 12 | v4, 64×64×64 |
 | 256×4096×4096 | 64 | 0.38 | 24 | v4, 64×128 |
@@ -1167,11 +1164,6 @@ shapes to variant 4's `cp.async` tiles:
 | 128×5120×8192 (Qwen 3 32B o_proj) | 40 | 0.24 | 30 | v4, 64×128 |
 | 128×768×2048 (Qwen 3 30B-A3B expert) | 6 | 0.04 | 1 | v4, 64×64×64 |
 | 128×2304×5120 (DeepSeek expert) | 18 | 0.11 | 8 | v4, 64×64×64 |
-
-The default's rule is one number: the 128×128 TMA tile when every block gets kMinShare = 32
-k-steps of the (tile, k-step) space, variant 4 below that. Variant 4's mainloop is the one v5
-beat by 7 to 9%, and its tiles are 64 rows, so everything under about 512 tokens on a
-4096-wide model runs the slower mainloop.
 
 #### The sweep
 
@@ -1184,83 +1176,108 @@ expert (2048→768 and back) and a DeepSeek expert (5120→2304 and back). Every
 the device against cuBLAS with the tolerance of the other rows, and B is rotated over copies
 that exceed L2 whenever one copy would fit (4096×4096 is 32 MB; a forward pass sees each
 layer's weight once, so a resident weight would flatter both sides). Labels: `v3`, `v4`, `v5`,
-`v6` (default route), `v6auto` (the rule below), `v6t<n>` (TMA tile n forced, `--tiles`).
+`v6old` (variant 6's route before this section), `v6` (the default now), `v6t<n>` (TMA tile n
+forced, `--tiles`). cuBLAS is timed once per shape and every variant is compared to that.
+All 120 shapes pass on every variant, and the fused epilogue passes on the new tiles
+(128×4096×4096 residual, 256×6144×4096 bias + gelu, 128×12288×4096 SwiGLU, 512×1024×4096
+accumulate).
 
 #### The tiles
 
-The TMA tile header is now a template over the block tile and the consumer warp grid, always
+The TMA tile header is a template over the block tile and the consumer warp grid, always
 eight consumer warps and one producer warp, so the ring, the named barriers and the fixup are
 unchanged. B is loaded as BN / 64 boxes of 64 columns, one 128-byte swizzle span each, and a
-warp finds its 16-column `ldmatrix` pair in box `(wn WN + 8 nj) / 64`.
+warp finds its 16-column `ldmatrix` pair in box `(wn WN + 8 nj) / 64`. Registers from
+`cuobjdump -res-usage`, plain / fused instantiation:
 
-| tile | warp tile | accumulators per lane | stage (BK = 64) | stages, blocks per SM | smem per block | FLOP per byte of A + B from L2 |
+| tile | warp tile | stage (BK = 64) | stages, blocks per SM | smem per block | registers | stack |
 |---|---|---|---|---|---|---|
-| 128×128 (as before) | 64×32 | 64 | 32 KB | 2, 1 | 65 KB | 64 |
-| 128×256 | 64×64 | 128 | 48 KB | 2, 1 | 97 KB | 85 |
-| 128×64 | 32×32 | 32 | 24 KB | 4, 1 | 97 KB | 43 |
-| 64×128 | 32×32 | 32 | 24 KB | 4, 1 | 97 KB | 43 |
-| 128×64, 64×128 | 32×32 | 32 | 24 KB | 2, 2 | 49 KB | 43 |
+| 128×128 (as before) | 64×32 | 32 KB | 2, 1 | 65 KB | 160 / 168 | 8 |
+| 128×256 | 64×64 | 48 KB | 2, 1 | 97 KB | 168 / 168 | 48 / 400 (spills) |
+| 128×64 (4×2 warps) | 32×32 | 24 KB | 4, 1 | 97 KB | 93 / 135 | 8 |
+| 64×128 (2×4 warps) | 32×32 | 24 KB | 4, 1 | 97 KB | 93 / 135 | 8 |
+| 128×64, 64×128 | 32×32 | 24 KB | 2, 2 | 49 KB | 93 / 96 | 8 |
 
-128×256 is the 64×64 warp tile from the open list below: four A and four B `ldmatrix.x4` per
-32 `mma.sync` instead of four and two per 16, and A read from L2 half as often. Whether its
-128 accumulators fit in the 224 registers a single 288-thread block can have without spills
-is the first thing to check (`cuobjdump -sass | grep -c STL`). The 64-wide tiles hold 32
-accumulators, which leaves room under the 96-register cap that made the two-block 128×128
-configurations spill, so they get a two-block configuration too: 2 × (49 KB + the reserved
-KB) is exactly the 5090's 100 KB per SM.
+128×256 is the 64×64 warp tile from the open list below. ptxas held it at 168 registers and
+spilled, and it lost to 128×128 on every Llama 3 8B shape it was given: 125.4% of cuBLAS
+against 131.0% at 1024×4096×4096, 107.9% against 110.8% at 4096³, 103.2% against 123.1% at
+256×4096×14336. It won only on the lm_head at M ≥ 2048, by 0.3 to 0.4%. It stays as a forced tile
+(`hgemm_v6_set_route(1)`), not in the route. The 64-wide tiles fit in 93 registers, so the
+two-block configurations do not spill, unlike the 128×128 ones; on the Llama 3 8B shapes they
+were mostly 1 to 7% behind the four-stage one-block configuration (ahead once, 106.9%
+against 104.3% at 256×14336×4096), so the route uses the one-block configuration.
 
-#### The rule (`HGEMM_V6_ROUTE_AUTO`)
+#### The rule (the default route since this sweep)
 
-1. The largest tile that gives every block kMinShare = 32 k-steps: 128×256 (when N % 256 =
-   0), then 128×128, then the 64-wide tile of step 2. The share bound is the same for every
-   tile: a k-step's mma work and a piece's slot traffic both scale with BM × BN, so 32
-   k-steps keeps the fixup the same fraction of a piece whatever the tile.
-2. Between 128×64 and 64×128, which do the same work per k-step and read the same L2 bytes,
-   the one with fewer zero-filled rows past M; a tie goes to 128 rows, which reads B from L2
-   half as many times. N % 128 ≠ 0 leaves 128×64.
-3. If no tile reaches 32 k-steps per block, the tile of step 2 anyway with a floor of 8
-   k-steps per piece. Such a problem is a few microseconds of work; a grid that covers the
-   card is worth more than the chain links (128×1024×4096 on 128×64 is 16 tiles and 1,024
-   k-steps: 32 blocks at a floor of 32, 128 at 8).
+Besides the share, one quantity decides it: the number of tiles against a quarter of the
+resident blocks (42 of 170). With fewer tiles than that, every tile is cut four or more ways
+and the fixup chain costs more than the bigger tile saves.
 
-Every M > 64 then stays on the TMA kernel. M ≤ 64 is the decode kernel, as before. What the
-rule picks (static: equal (tile, k-step) ranges; queue: whole tiles plus geometric K-passes):
+1. 128×128 when there are at least 42 tiles and every block gets kMinShare = 32 k-steps.
+   That is the old route minus the shapes with too few tiles: 128×4096×14336 is 32 tiles and
+   ran 103.0% of cuBLAS on 128×128, 110.9% on 128×64.
+2. Otherwise the 64-wide tile with fewer zero-filled rows past M (128×64 on a tie, which
+   reads B from L2 half as many times; 128×64 when N % 128 ≠ 0), when it has at least 42
+   tiles. With kMinShare when its blocks get that many k-steps, else with a floor of 8
+   k-steps per piece so the grid covers the card (512×1024×4096: 117.6% of cuBLAS at the
+   floor, 101.6% at 32). The floor is skipped when K has fewer than 16 k-steps and there are
+   fewer tiles than blocks: 256×2048×768 measured 102.3% with it and 125.5% on variant 4.
+3. Fewer than 42 tiles even at 64 wide (128×1024×4096 is 16): variant 4's 64×64 tiles, two
+   blocks per SM and four times the tiles (79.0% against 69.1% on 128×64 there).
 
-| shape | default | rule | rule's grid |
+`hgemm_v6_set_route(HGEMM_V6_ROUTE_LEGACY)` (or `SPARK_HGEMM_V6_ROUTE=-2`) gives the old route
+back, and `SPARK_HGEMM_V6_CONFIG` still sweeps the 128×128 pipeline configurations on it.
+
+#### Measured
+
+% of cuBLAS (cuBLAS time over ours), one session. Every shape whose time moved by more than
+3% between the old route and the new one, all of them up:
+
+| shape | cuBLAS µs | old route | new route |
 |---|---|---|---|
-| 128×4096×4096 | v4 64×64×64 | 128×64, floor 8 | static, 170 blocks, 24 k-steps each, 64 tiles |
-| 256×4096×4096 | v4 64×128 | 128×64 | static, 170 blocks, 48 k-steps, 128 tiles |
-| 512×4096×4096 | TMA 128×128 | 128×128 | static, 170 blocks, 48 k-steps, 128 tiles |
-| 1024×4096×4096 | TMA 128×128 | 128×256 | static, 170 blocks, 48 k-steps, 128 tiles |
-| 4096×4096×4096 | TMA 128×128 | 128×256 | static, 170 blocks, 193 k-steps, 512 tiles |
-| 128×1024×4096 | v4 64×64×64 | 128×64, floor 8 | static, 128 blocks, 8 k-steps, 16 tiles |
-| 1024×1024×4096 | v4 64×128 | 128×64 | static, 170 blocks, 48 k-steps, 128 tiles |
-| 128×6144×4096 | v4 64×128 | 128×64 | static, 170 blocks, 36 k-steps, 96 tiles |
-| 128×14336×4096 | TMA 128×128 | 128×128 | static, 170 blocks, 42 k-steps, 112 tiles |
-| 1024×14336×4096 | TMA 128×128, queue | 128×256 | queue, 448 tiles, 2.6 waves |
-| 128×128256×4096 (lm_head) | TMA 128×128, queue | 128×256 | queue, 501 tiles, 2.95 waves |
-| 128×5120×8192 | v4 64×128 | 128×64 | static, 170 blocks, 60 k-steps, 80 tiles |
-| 128×768×2048 | v4 64×64×64 | 128×64, floor 8 | static, 48 blocks, 8 k-steps, 12 tiles |
-| 128×2304×5120 | v4 64×64×64 | 128×64, floor 8 | static, 170 blocks, 17 k-steps, 36 tiles |
+| 128×4096×4096 | 32.9 | 104.5% | 112.1% |
+| 256×4096×4096 | 52.3 | 104.5% | 120.0% |
+| 512×1024×4096 | 29.8 | 93.9% | 117.6% |
+| 1024×1024×4096 | 52.3 | 108.9% | 124.3% |
+| 128×6144×4096 | 52.3 | 104.5% | 136.7% |
+| 128×4096×14336 | 91.4 | 103.0% | 110.9% |
+| 128×4096×12288 | 80.8 | 104.7% | 114.7% |
+| 128×5120×8192 | 61.2 | 86.8% | 103.3% |
+| 512×768×2048 | 17.5 | 90.8% | 101.5% |
+| 1024×768×2048 | 29.8 | 95.2% | 140.7% |
+| 2048×768×2048 | 52.2 | 138.9% | 149.6% |
+| 1024×2048×768 | 23.6 | 101.5% | 109.3% |
+| 2048×2048×768 | 44.1 | 117.2% | 130.1% |
+| 256×2304×5120 | 39.0 | 89.2% | 116.4% |
+| 128×5120×2304 | 23.6 | 74.6% | 102.2% |
+| 256×5120×2304 | 34.0 | 94.4% | 101.0% |
 
-Two things in this table I expect the sweep to argue with. 128×256 takes every shape with
-N % 256 = 0 that has the k-steps for it, including the large squares where 128×128 measured
-103 to 130% of cuBLAS; if it spills or loses there, step 1 needs a second condition (tiles of
-128×256 at least a wave, say), not a different tile. And the floor of 8 in step 3 is a guess
-from the 1024³ result above (a 6 k-step share on the 128×128 TMA tile was 11% behind whole
-64×64 tiles); `SPARK_HGEMM_V6_MIN_SHARE_SMALL` sweeps it.
+Over all 120 shapes the geometric mean goes from 107.1% to 109.4% of cuBLAS; by M, from
+98.7% to 103.8% at 128 tokens, 106.7% to 109.2% at 256, 108.0% to 109.8% at 512, 108.0% to
+111.1% at 1024, 111.9% to 113.0% at 2048, and 109.8% both ways at 4096, where the route is
+the old one. Shapes below cuBLAS: 14 before, 6 after. The other 104 shapes run the same
+kernel either way and agree within run-to-run noise.
 
-#### To run first
+The six that are still below cuBLAS are the smallest problems; on four of them variant 3's
+split-K tail does better than either Stream-K kernel:
 
-```
-cmake --build build -j6 --target bench_hgemm
-cuobjdump -sass build/bench_hgemm | grep -c STL                    # spills per tile
-./build/bench_hgemm --models=llama3-8b --tiles --iters=20          # correctness of every tile
-./build/bench_hgemm --models --iters=20 > results/hgemm_models.json
-```
+| shape | cuBLAS µs | v6 | v3 |
+|---|---|---|---|
+| 128×768×2048 | 12.2 | 63.6% | 80.4% |
+| 256×768×2048 | 13.3 | 69.3% | 86.6% |
+| 128×2304×5120 | 23.8 | 70.7% | 85.7% |
+| 128×1024×4096 | 15.3 | 78.7% | 88.2% |
+| 256×1024×4096 | 19.5 | 91.4% | 87.2% |
+| 128×10240×8192 | 111.3 | 98.3% | 90.1% |
 
-Then the before/after table is the `v6` and `v6auto` rows against cuBLAS, and the `v6t<n>`
-rows say which step of the rule is wrong where it loses.
+The first five are 0.4 to 3 GFLOP and 12 to 24 µs, and cuBLAS takes them with split-K. Variant
+3's tail is fp32 atomics, not the same bits every run, so it is not a route variant 6 can
+take as it is; a deterministic split-K for problems this small is the open item. Variant 5
+wins a handful of the larger rows by 1 to 2% (2048×4096×14336 118.3% against 116.9%,
+1024×8192×8192 115.4% against 113.0%).
+
+fp8gemm's mid-M shapes were not touched: its TMA kernel has variant 5's split-K tail, not
+Stream-K, so the same work there starts with porting the schedule.
 
 ## Correctness
 
@@ -1400,9 +1417,11 @@ Still open:
   the producer warp in place than it was in v3.
 - **A 64-row TMA tile.** v6 hands 1024³, ragged small grids and N % 128 ≠ 0 to v4's 64-row
   `cp.async` tiles; the TMA tile forced onto 1024³ measured 111 TFLOPS against 124, because a
-  6 k-step share per block is all fixup. Written ("Model shapes": 128×64 and 64×128 TMA
-  tiles on the same ring, and the 128×256 tile with the 64×64 warp tile), not yet compiled
-  or measured.
+  6 k-step share per block is all fixup. Done ("Model shapes"): 128×64 and 64×128 TMA tiles
+  on the same ring, routed per shape, 16 of 120 model shapes faster by 3 to 37 points of
+  cuBLAS. The smallest shapes (under about 3 GFLOP) still want a deterministic split-K.
+- **The 64×64 warp tile.** Tried as 128×256: 168 registers, spills, behind 128×128 by 3 to
+  20 points except on the largest lm_head shapes.
 - **The 2 µs of launch and ramp** that a single decode launch pays over the back-to-back
   rate (23.5 against 21.5 µs at 32 MB). It is not in the kernel; CUDA graphs or a persistent
   megakernel across the decoder block are the ways at it.
