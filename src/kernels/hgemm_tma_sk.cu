@@ -33,7 +33,11 @@
 // block's share of the (tile, k-step) space is at least kMinShare k-steps; rows past M are
 // zero-filled by the copy engine (an out-of-range box row) and skipped by the epilogue.
 // Decode shapes (M <= 64) go to hgemm_decode.cu and everything else to variant 4's 64-row
-// tiles, the same routing variant 4 does itself.
+// tiles, the same routing variant 4 does itself. That is the default route. The kernel is
+// templated on the block tile (hgemm_tma_tile.cuh), and a second route (hgemm_v6_set_route,
+// HGEMM_V6_ROUTE_AUTO) picks per shape among 128x256, 128x128, 128x64 and 64x128 TMA tiles
+// and keeps every M > 64 on this kernel: the rule is route_auto below, the reasoning
+// docs/design/hgemm.md, "Model shapes".
 //
 // The fused epilogue (hgemm_epilogue.cuh) is applied by whichever piece stores a tile: a
 // whole tile, or the piece that ends a Stream-K chain after it has added the slot. The
@@ -41,6 +45,7 @@
 // residual and the gate/up product all happen once, on the finished sum. The FUSED
 // instantiation is separate from the plain one so the plain kernel is unchanged.
 
+#include <atomic>
 #include <cstdlib>
 
 #include "hgemm_epilogue.cuh"
@@ -72,19 +77,26 @@ constexpr int FIXUP_BARRIER = 1;  // named barrier id for the 256 consumer threa
 // Layout of the dynamic region: the stages (1 KB aligned, see hgemm_tma_tile.cuh), then the
 // item ring (16 B each), then the barriers: full/empty per stage, full/empty per ring slot,
 // and one "done" barrier for the serialized-prologue experiment.
-template <int BK, int STAGES>
+template <class T, int BK, int STAGES>
 constexpr int smem_bytes() {
-    return round_kb(STAGES * stage_bytes<BK>() + ITEM_DEPTH * 16 +
+    return round_kb(STAGES * T::template stage_bytes<BK>() + ITEM_DEPTH * 16 +
                     (2 * STAGES + 2 * ITEM_DEPTH + 1) * 8);
 }
 
-template <int BK, int STAGES, int MIN_BLOCKS, bool FUSED>
-__global__ void __launch_bounds__(THREADS, MIN_BLOCKS)
+// T is the block tile (hgemm_tma_tile.cuh): 128x128 by default, the others for the shapes in
+// the "Model shapes" section of docs/design/hgemm.md. The names below shadow the 128x128
+// ones at namespace scope.
+template <class T, int BK, int STAGES, int MIN_BLOCKS, bool FUSED>
+__global__ void __launch_bounds__(T::THREADS, MIN_BLOCKS)
     hgemm_v6_kernel(const __grid_constant__ CUtensorMap tmA,
                     const __grid_constant__ CUtensorMap tmB, __nv_bfloat16* __restrict__ C, int M,
                     int N, int K, Params p, int serial, hgemm_epi::Ep ep) {
     static_assert(BK == 32 || BK == 64, "the swizzle helpers assume 64 B or 128 B rows of A");
-    constexpr int STAGE_BYTES = stage_bytes<BK>();
+    constexpr int BM = T::BM, BN = T::BN, WM = T::WM, WN = T::WN, MT = T::MT, NT = T::NT;
+    constexpr int WARPS_N = T::WARPS_N;
+    constexpr int CONSUMER_WARPS = T::CONSUMER_WARPS, CONSUMERS = T::CONSUMERS;
+    using Acc = typename T::Acc;
+    constexpr int STAGE_BYTES = T::template stage_bytes<BK>();
 
     extern __shared__ __align__(1024) unsigned char smem[];
     int4* items = reinterpret_cast<int4*>(smem + STAGES * STAGE_BYTES);
@@ -146,8 +158,8 @@ __global__ void __launch_bounds__(THREADS, MIN_BLOCKS)
                     const int s = g_kt % STAGES;
                     const unsigned use_s = g_kt / STAGES;
                     if (g_kt >= STAGES) mbar_wait(&empty_bar[s], (use_s - 1) & 1);
-                    issue_stage<BK>(smem + s * STAGE_BYTES, &tmA, &tmB, &full_bar[s], kt * BK, bm,
-                                    bn);
+                    T::template issue_stage<BK>(smem + s * STAGE_BYTES, &tmA, &tmB, &full_bar[s],
+                                                kt * BK, bm, bn);
                 }
             };
 
@@ -227,11 +239,11 @@ __global__ void __launch_bounds__(THREADS, MIN_BLOCKS)
             if (ke == p.KT) hgemm_epi::prefetch(pre, ep, geo);
         }
 
-        zero_acc(acc);
+        T::zero_acc(acc);
         for (int kt = kb; kt < ke; ++kt, ++g_kt) {
             const int s = g_kt % STAGES;
             mbar_wait(&full_bar[s], (g_kt / STAGES) & 1);
-            consume_stage<BK>(acc, smem + s * STAGE_BYTES, wm, wn, lane);
+            T::template consume_stage<BK>(acc, smem + s * STAGE_BYTES, wm, wn, lane);
             // ldmatrix read the stage through the generic proxy; the refill comes through the
             // async proxy. The fence orders the reads before the release, one arrive per warp.
             fence_proxy_async_smem();
@@ -311,14 +323,23 @@ constexpr hgemm_sk::Knobs kKnobs = {hgemm_sk::kMinShare, hgemm_sk::kMinPass, hge
                                     /*static_waves_l2=*/0,
                                     /*group=*/-1};
 
+// The per-shape rule's share floor for a problem that no tile can give every block
+// kMinShare k-steps of: the smallest tile, cut into pieces of at least this many k-steps, so
+// that the grid covers more of the card (a 128 x 1024 x 4096 projection is 16 tiles of
+// 128 x 64 and 1,024 k-steps: 32 blocks at kMinShare, 128 at 8).
+constexpr int kMinShareSmall = 8;
+
 // Sweep overrides, read once: SPARK_HGEMM_V6_CONFIG forces a pipeline configuration (index
 // into CONFIGS below), SPARK_HGEMM_V6_GROUP the raster group, SPARK_HGEMM_V6_STATIC_WAVES
 // and SPARK_HGEMM_V6_STATIC_WAVES_L2 the static/queue crossover, SPARK_HGEMM_V6_MIN_SHARE
-// the least k-steps per block, SPARK_HGEMM_V6_MIN_PASS the shortest K-pass,
-// SPARK_HGEMM_V6_SERIAL=1 the serialized-prologue experiment.
+// the least k-steps per block, SPARK_HGEMM_V6_MIN_SHARE_SMALL the rule's floor above,
+// SPARK_HGEMM_V6_MIN_PASS the shortest K-pass, SPARK_HGEMM_V6_SERIAL=1 the
+// serialized-prologue experiment. SPARK_HGEMM_V6_ROUTE is the initial tile route
+// (hgemm_v6_set_route).
 struct Env {
     int cfg = -1;
     int serial = 0;
+    int min_share_small = kMinShareSmall;
     hgemm_sk::Knobs knobs = kKnobs;
 };
 const Env& env() {
@@ -332,6 +353,7 @@ const Env& env() {
         };
         e.cfg = geti("SPARK_HGEMM_V6_CONFIG", -1);
         e.serial = geti("SPARK_HGEMM_V6_SERIAL", 0);
+        e.min_share_small = geti("SPARK_HGEMM_V6_MIN_SHARE_SMALL", e.min_share_small);
         e.knobs.group = geti("SPARK_HGEMM_V6_GROUP", e.knobs.group);
         e.knobs.static_waves = geti("SPARK_HGEMM_V6_STATIC_WAVES", e.knobs.static_waves);
         e.knobs.static_waves_l2 = geti("SPARK_HGEMM_V6_STATIC_WAVES_L2", e.knobs.static_waves_l2);
@@ -341,89 +363,188 @@ const Env& env() {
     return e;
 }
 
-template <int BK, int STAGES, int MIN_BLOCKS, bool FUSED>
+// The tile route, settable at run time (hgemm_v6_set_route) so one bench process can sweep it.
+std::atomic<int>& route_slot() {
+    static std::atomic<int> slot([] {
+        const char* s = std::getenv("SPARK_HGEMM_V6_ROUTE");
+        return s ? std::atoi(s) : static_cast<int>(HGEMM_V6_ROUTE_DEFAULT);
+    }());
+    return slot;
+}
+
+template <class T, int BK, int STAGES, int MIN_BLOCKS, bool FUSED>
 int resident_blocks() {
-    constexpr int bytes = smem_bytes<BK, STAGES>();
+    constexpr int bytes = smem_bytes<T, BK, STAGES>();
     static int resident = 0;
     if (resident == 0) {
-        SPARK_CUDA_CHECK(cudaFuncSetAttribute(hgemm_v6_kernel<BK, STAGES, MIN_BLOCKS, FUSED>,
+        SPARK_CUDA_CHECK(cudaFuncSetAttribute(hgemm_v6_kernel<T, BK, STAGES, MIN_BLOCKS, FUSED>,
                                               cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
         int per_sm = 0;
         SPARK_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &per_sm, hgemm_v6_kernel<BK, STAGES, MIN_BLOCKS, FUSED>, THREADS, bytes));
+            &per_sm, hgemm_v6_kernel<T, BK, STAGES, MIN_BLOCKS, FUSED>, T::THREADS, bytes));
         resident = (per_sm > 0 ? per_sm : 1) * num_sms();
     }
     return resident;
 }
 
-template <int BK, int STAGES, int MIN_BLOCKS, bool FUSED>
+template <class T, int BK, int STAGES, int MIN_BLOCKS, bool FUSED>
 void launch(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N, int K,
-            cudaStream_t stream, const HgemmEpilogue& ep) {
-    constexpr int bytes = smem_bytes<BK, STAGES>();
+            cudaStream_t stream, const HgemmEpilogue& ep, const hgemm_sk::Knobs& knobs) {
+    constexpr int bytes = smem_bytes<T, BK, STAGES>();
     CUtensorMap tmA, tmB;
-    make_maps<BK>(A, B, M, N, K, tmA, tmB);
-    static hgemm_sk::Workspace w;  // one per pipeline configuration and epilogue instantiation
+    T::template make_maps<BK>(A, B, M, N, K, tmA, tmB);
+    static hgemm_sk::Workspace w;  // one per tile, pipeline configuration and instantiation
     Params p;
-    hgemm_sk::plan(p, w, M, N, K, BM, BN, BK, resident_blocks<BK, STAGES, MIN_BLOCKS, FUSED>(),
-                   env().knobs);
-    hgemm_v6_kernel<BK, STAGES, MIN_BLOCKS, FUSED><<<p.grid, THREADS, bytes, stream>>>(
+    hgemm_sk::plan(p, w, M, N, K, T::BM, T::BN, BK,
+                   resident_blocks<T, BK, STAGES, MIN_BLOCKS, FUSED>(), knobs);
+    hgemm_v6_kernel<T, BK, STAGES, MIN_BLOCKS, FUSED><<<p.grid, T::THREADS, bytes, stream>>>(
         tmA, tmB, C, M, N, K, p, env().serial, hgemm_epi::make(ep));
 }
 
-// Pipeline configurations (BK, stages, blocks per SM), the same six as variant 5. Index 0
-// wins or ties on every shape (docs/design/hgemm.md, "Variant 6"): the two-block
-// configurations spill inside the k-loop at the 96 registers the ninth warp leaves them.
-// Each configuration has a plain and a fused instantiation; the plain one's residency is
-// what the tile choice below is made from (the two agree: smem sets it).
+using LaunchFn = void (*)(const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, int,
+                          int, cudaStream_t, const HgemmEpilogue&, const hgemm_sk::Knobs&);
+
+// A tile and pipeline configuration with a plain and a fused instantiation; the plain one's
+// residency is what the choice below is made from (the two agree: smem sets it).
 struct Config {
-    void (*launch)(const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, int, int,
-                   cudaStream_t, const HgemmEpilogue&);
-    void (*launch_fused)(const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, int, int,
-                         cudaStream_t, const HgemmEpilogue&);
+    const char* name;
+    LaunchFn launch;
+    LaunchFn launch_fused;
     int (*resident)();
-    int bk;
+    int bm, bn, bk;
 };
-constexpr Config CONFIGS[] = {
-    // 0: 64 KB of smem, one block per SM
-    {launch<64, 2, 1, false>, launch<64, 2, 1, true>, resident_blocks<64, 2, 1, false>, 64},
-    // 1: 96 KB, one block per SM
-    {launch<64, 3, 1, false>, launch<64, 3, 1, true>, resident_blocks<64, 3, 1, false>, 64},
-    // 2: 48 KB, two blocks per SM
-    {launch<32, 3, 2, false>, launch<32, 3, 2, true>, resident_blocks<32, 3, 2, false>, 32},
-    // 3: 32 KB, two blocks per SM
-    {launch<32, 2, 2, false>, launch<32, 2, 2, true>, resident_blocks<32, 2, 2, false>, 32},
-    // 4: like 2 without the register cap
-    {launch<32, 3, 1, false>, launch<32, 3, 1, true>, resident_blocks<32, 3, 1, false>, 32},
-    // 5: 96 KB, one block per SM
-    {launch<32, 6, 1, false>, launch<32, 6, 1, true>, resident_blocks<32, 6, 1, false>, 32},
+#define SPARK_V6_CONFIG(name, T, BK, ST, MB)                                         \
+    {                                                                                \
+        name, launch<T, BK, ST, MB, false>, launch<T, BK, ST, MB, true>,              \
+            resident_blocks<T, BK, ST, MB, false>, T::BM, T::BN, BK                  \
+    }
+
+// Pipeline configurations of the 128x128 tile (BK, stages, blocks per SM), the same six as
+// variant 5. Index 0 wins or ties on every shape (docs/design/hgemm.md, "Variant 6"): the
+// two-block configurations spill inside the k-loop at the 96 registers the ninth warp leaves
+// them.
+const Config CONFIGS[] = {
+    SPARK_V6_CONFIG("tma 128x128 bk64 s2", Tile128, 64, 2, 1),     // 0: 64 KB, one per SM
+    SPARK_V6_CONFIG("tma 128x128 bk64 s3", Tile128, 64, 3, 1),     // 1: 96 KB, one per SM
+    SPARK_V6_CONFIG("tma 128x128 bk32 s3 x2", Tile128, 32, 3, 2),  // 2: 48 KB, two per SM
+    SPARK_V6_CONFIG("tma 128x128 bk32 s2 x2", Tile128, 32, 2, 2),  // 3: 32 KB, two per SM
+    SPARK_V6_CONFIG("tma 128x128 bk32 s3", Tile128, 32, 3, 1),     // 4: like 2 without the cap
+    SPARK_V6_CONFIG("tma 128x128 bk32 s6", Tile128, 32, 6, 1),     // 5: 96 KB, one per SM
 };
 constexpr int NUM_CONFIGS = static_cast<int>(sizeof(CONFIGS) / sizeof(CONFIGS[0]));
 constexpr int CONFIG_DEFAULT = 0;
 
+// Tiles for the model shapes, all BK = 64 and 288 threads (docs/design/hgemm.md, "Model
+// shapes"). 0 is CONFIGS[0]. 128x256 has a 64x64 warp tile, 128 fp32 accumulators per lane,
+// and two 48 KB stages. The 64-row and 64-column tiles have a 32x32 warp tile; with a 24 KB
+// stage they fit four stages at one block per SM, or two stages at two blocks per SM (2 x 49
+// KB plus the reserved KB per block is the 5090's 100 KB per SM exactly), where their 32
+// accumulators leave room under the 96-register cap that made the 128x128 two-block
+// configurations spill.
+using Tile128x256 = Tile<128, 256, 2, 4>;
+using Tile128x64 = Tile<128, 64, 4, 2>;
+using Tile64x128 = Tile<64, 128, 2, 4>;
+const Config TILES[] = {
+    SPARK_V6_CONFIG("tma 128x128 s2", Tile128, 64, 2, 1),       // 0
+    SPARK_V6_CONFIG("tma 128x256 s2", Tile128x256, 64, 2, 1),   // 1
+    SPARK_V6_CONFIG("tma 128x64 s4", Tile128x64, 64, 4, 1),     // 2
+    SPARK_V6_CONFIG("tma 64x128 s4", Tile64x128, 64, 4, 1),     // 3
+    SPARK_V6_CONFIG("tma 128x64 s2 x2", Tile128x64, 64, 2, 2),  // 4
+    SPARK_V6_CONFIG("tma 64x128 s2 x2", Tile64x128, 64, 2, 2),  // 5
+};
+#undef SPARK_V6_CONFIG
+constexpr int NUM_TILES = static_cast<int>(sizeof(TILES) / sizeof(TILES[0]));
+constexpr int kTile128 = 0, kTile128x256 = 1, kTile128x64 = 2, kTile64x128 = 3;
+
+// k-steps per block of a configuration on this shape, -1 when N does not tile.
+long long share_of(const Config& c, int M, int N, int K) {
+    if (N % c.bn != 0) return -1;
+    return static_cast<long long>(cdiv(M, c.bm)) * (N / c.bn) * (K / c.bk) / c.resident();
+}
+
+// What variant 6 runs for a shape.
+struct Route {
+    enum Kind { DECODE, V4, CONFIG, TILE } kind;
+    int index;      // into CONFIGS or TILES
+    int min_share;  // the static schedule's least k-steps per block
+};
+
+// The per-shape rule (HGEMM_V6_ROUTE_AUTO). Three steps, each from the arithmetic in
+// docs/design/hgemm.md, "Model shapes", not from a table of shapes:
+//   1. The largest tile whose every block gets kMinShare k-steps: 128x256 (N % 256 == 0),
+//      then 128x128, then the 8 K-element tile of step 2. A bigger tile reads fewer bytes
+//      from L2 per mma.sync (BM BN / (BM + BN) FLOP per byte: 85, 64, 43), and the share
+//      bound keeps the fixup a small part of each block's work; the bound is the same for
+//      every tile because the slot bytes and the work per k-step both scale with BM BN.
+//   2. Between 128x64 and 64x128 (the same work per k-step), the one with fewer zero-filled
+//      rows past M; a tie goes to 128 rows, which reads B from L2 half as many times. N %
+//      128 != 0 leaves 128x64.
+//   3. If no tile reaches kMinShare, the tile from step 2 with a floor of kMinShareSmall
+//      k-steps instead: the problem is too small to amortize a fixup either way, and a grid
+//      that covers the card matters more than the chain links.
+// Everything with M > 64 stays on the TMA kernel; variant 4's tiles are not used.
+Route route_auto(int M, int N, int K) {
+    const Env& e = env();
+    const int small = (N % 128 != 0 || cdiv(M, 128) * 128 <= cdiv(M, 64) * 64) ? kTile128x64
+                                                                                 : kTile64x128;
+    for (int t : {kTile128x256, kTile128, small})
+        if (share_of(TILES[t], M, N, K) >= e.knobs.min_share)
+            return {Route::TILE, t, e.knobs.min_share};
+    return {Route::TILE, small, e.min_share_small};
+}
+
+Route choose(int M, int N, int K) {
+    const Env& e = env();
+    if (M <= 64)  // decode: stream B (hgemm_decode.cu), or variant 4's 64-row tile
+        return {hgemm_decode::supports(M, N, K) ? Route::DECODE : Route::V4, 0, 0};
+    const int r = route_slot().load(std::memory_order_relaxed);
+    if (r >= 0 && r < NUM_TILES && N % TILES[r].bn == 0)
+        return {Route::TILE, r, e.knobs.min_share};
+    if (r >= 0 || r == HGEMM_V6_ROUTE_AUTO) return route_auto(M, N, K);
+    // The default: the 128x128 tile when each block's share of the (tile, k-step) space is
+    // at least kMinShare k-steps; below that the fixup outweighs the mma work and variant
+    // 4's smaller tiles take the shape.
+    int cfg = e.cfg;
+    if (cfg < 0 || cfg >= NUM_CONFIGS) cfg = CONFIG_DEFAULT;
+    if (share_of(CONFIGS[cfg], M, N, K) < e.knobs.min_share) return {Route::V4, 0, 0};
+    return {Route::CONFIG, cfg, e.knobs.min_share};
+}
+
 void launch_auto(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N,
                  int K, cudaStream_t stream, const HgemmEpilogue& ep) {
-    if (M <= 64) {  // decode: stream B (hgemm_decode.cu), or variant 4's 64-row tile
-        if (hgemm_decode::supports(M, N, K))
-            hgemm_decode::launch(A, B, C, M, N, K, stream, ep);
-        else
-            hgemm_streamk_bf16(A, B, C, M, N, K, stream, ep);
+    const Route r = choose(M, N, K);
+    if (r.kind == Route::DECODE) {
+        hgemm_decode::launch(A, B, C, M, N, K, stream, ep);
         return;
     }
-    int cfg = env().cfg;
-    if (cfg < 0 || cfg >= NUM_CONFIGS) cfg = CONFIG_DEFAULT;
-    const Config& c = CONFIGS[cfg];
-    // k-steps per block on the 128x128 tile; below kMinShare the fixup outweighs the mma
-    // work and variant 4's smaller tiles take the shape.
-    const long long share =
-        static_cast<long long>(cdiv(M, BM)) * (N / BN) * (K / c.bk) / c.resident();
-    if (N % BN != 0 || share < env().knobs.min_share) {
+    if (r.kind == Route::V4) {
         hgemm_streamk_bf16(A, B, C, M, N, K, stream, ep);
         return;
     }
+    const Config& c = r.kind == Route::CONFIG ? CONFIGS[r.index] : TILES[r.index];
+    hgemm_sk::Knobs knobs = env().knobs;
+    knobs.min_share = r.min_share;
     if (hgemm_epi::is_plain(ep))
-        c.launch(A, B, C, M, N, K, stream, ep);
+        c.launch(A, B, C, M, N, K, stream, ep, knobs);
     else
-        c.launch_fused(A, B, C, M, N, K, stream, ep);
+        c.launch_fused(A, B, C, M, N, K, stream, ep, knobs);
+}
+
+const char* route_name(int M, int N, int K) {
+    const Route r = choose(M, N, K);
+    switch (r.kind) {
+        case Route::DECODE:
+            return "decode";
+        case Route::V4:
+            return "v4 cp.async";
+        case Route::CONFIG:
+            return CONFIGS[r.index].name;
+        default:
+            if (r.min_share != env().knobs.min_share)
+                return r.index == kTile64x128 ? "tma 64x128 s4, small share"
+                                              : "tma 128x64 s4, small share";
+            return TILES[r.index].name;
+    }
 }
 
 }  // namespace v6
@@ -441,6 +562,23 @@ void hgemm_tma_sk(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16*
     SPARK_REQUIRE(is_aligned16(A) && is_aligned16(B),
                   "hgemm variant 6: A and B must be 16-byte aligned");
     v6::launch_auto(A, B, C, M, N, K, stream, ep);
+}
+
+void hgemm_v6_set_route(int route) {
+    v6::route_slot().store(route, std::memory_order_relaxed);
+}
+
+int hgemm_v6_route() {
+    return v6::route_slot().load(std::memory_order_relaxed);
+}
+
+int hgemm_v6_num_tiles() {
+    return v6::NUM_TILES;
+}
+
+const char* hgemm_v6_route_name(int M, int N, int K) {
+    if (!hgemm_tma_sk_supports(M, N, K)) return "unsupported";
+    return v6::route_name(M, N, K);
 }
 
 }  // namespace spark
