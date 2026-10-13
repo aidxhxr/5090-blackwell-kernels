@@ -455,16 +455,30 @@ instruction with unit block scales). Tokens sorted by expert with int32 offsets,
   3-D map with the expert as the outer coordinate. For bf16 the same ldmatrix fragments feed
   `m16n8k16` instead of `m16n8k32`.
 
-**Not measured.** The box was down while this was written; the kernel has not been compiled
-and the tests have not run. The baselines are in place: `bench_grouped_gemm` against cuBLAS
-grouped GEMM (`cublasGemmGroupedBatchedEx`, with and without the offsets sync it needs) and
-the per-expert cuBLAS loop, and `scripts/bench_grouped.py` against the torch loop, on
-Mixtral 8x7B (8 experts, top-2, 4096 -> 14336), Qwen3-30B-A3B (128, top-8, 2048 -> 768) and
-a DeepSeek V3-like layer (256, top-8, 7168 -> 2048) at 512 to 8192 tokens. What the shapes
-need on paper: at 512 and 2048 tokens every one of them is bound by the weight bytes (DeepSeek's
-7.5 GB of bf16 experts is 5.0 ms at the copy rate, against 0.47 ms of math at the bf16 peak).
-The floors per shape, the padded-rows question for small experts and what to run first are
-in [the design note](docs/design/grouped_gemm.md).
+Measured on the 5090 (medians, ms; the full tables, the routing and what did not fit are
+in [the design note](docs/design/grouped_gemm.md)). Mixtral 8x7B is 8 experts, top-2, 4096 ->
+14336; Qwen3-30B-A3B 128, top-8, 2048 -> 768; DeepSeek V3-like 256, top-8, 7168 -> 2048.
+cuBLAS grouped is `cublasGemmGroupedBatchedEx` with the counts already on the host (it needs
+them there; the sync costs up to another 0.03 ms), fp8 is compared with it in bf16.
+
+| shape | grouped bf16 | cuBLAS grouped | torch loop | grouped fp8 | torch fp8 loop (`_scaled_mm`) |
+|---|---|---|---|---|---|
+| Mixtral, 512 tokens | 0.865 | 1.038 | 0.998 | 0.347 | 0.489 |
+| Mixtral, 8192 | 8.024 (240 TFLOPS) | 9.231 | 8.237 | 3.123 (616 TFLOPS) | 3.991 |
+| Qwen3-30B-A3B, 512 | 0.222 | 0.219 | 1.074 | 0.114 | 2.258 |
+| Qwen3-30B-A3B, 2048 | 0.341 | 0.328 | 1.224 | 0.150 | 2.572 |
+| Qwen3-30B-A3B, 8192 | 0.932 | 0.999 | 1.724 | 0.353 | 2.561 |
+| DeepSeek V3-like, 512 | 3.184 | 3.164 | 5.780 | did not fit | |
+
+The torch-loop column comes from `scripts/bench_grouped.py`, whose router draws a different
+routing than the C++ bench's, so it lines up shape by shape, not to the microsecond. Against
+the loop most MoE code runs, the grouped kernel is 3.4x to 4.7x faster in bf16 on Qwen3
+below 8192 tokens, 1.6x on DeepSeek and 1.03x to 1.15x on Mixtral; in fp8 it is 7x to 19x
+faster than `_scaled_mm` per expert on Qwen3 and 1.3x to 1.4x on Mixtral. Against cuBLAS
+grouped, bf16 is 14 to 20% faster on Mixtral and at parity (0.96x to 0.99x) on the small
+experts, where both already read the weights at the copy rate: DeepSeek at 512 tokens reads
+its 167 used experts' 4.9 GB in 3.18 ms, 1.54 TB/s. fp8 is 1.9x to 3.0x faster than cuBLAS
+grouped in bf16. The 15 tests in `tests/test_grouped_gemm.py` pass.
 
 ## attention
 
@@ -875,7 +889,7 @@ default stays on the CUDA cores.
 | `fp4gemm` NVFP4, MXFP4 | naive `mma.sync.m16n8k64.kind::mxf4nvf4`, the swizzled cp.async tile with the block scales staged beside it, TMA with bulk-copied scales; a bf16 -> fp4 quantizer | cuBLASLt NVFP4 (bit-identical), `F.scaled_mm` |
 | `w4gemm` W4A16 | thread per output; a warp per 16 columns with the repacked int4 fragments and the activations straight into registers; warps along K on a cp.async pipeline for M <= 8 and independent warps for M <= 16, Stream-K tiles above; round-to-nearest quantizer and the offline repack | the bf16 `hgemm` on the dequantized weights, cuBLAS |
 | `w1gemm`, `w1gemm_moe` W1A16 | thread per output; a warp per 16 columns with the sign bits XORed into bf16x2 fragments and the activations straight into registers; warps along K for M <= 16; the grouped form over experts from sorted rows and offsets; the absmean quantizer at 1 and 2 bits | the bf16 `hgemm` on the dequantized weights, cuBLAS; unmeasured |
-| `grouped_gemm` bf16, e4m3 | every MoE expert in one persistent launch: the tile list scanned from device offsets, Stream-K over the last waves, fp8gemm's TMA stage with W through one 3-D map | cuBLAS grouped GEMM, the per-expert cuBLAS loop, the torch loop; unmeasured |
+| `grouped_gemm` bf16, e4m3 | every MoE expert in one persistent launch: the tile list scanned from device offsets, Stream-K over the last waves, fp8gemm's TMA stage with W through one 3-D map | cuBLAS grouped GEMM, the per-expert cuBLAS loop, the torch loop |
 | `w1moe_decode` | three passes through global memory; one persistent kernel per (expert, 128 columns) with the intermediate in shared memory and fp32 atomics into y; the routing weight folded into the down epilogue with the next expert's words in flight | the sorted `w1gemm_moe` path and a dense torch reference; unmeasured |
 | `unified_read`, `unified_gemv` | scalar, 16-byte, four 16-byte loads in flight; a warp per row, a warp per 4 rows, a persistent grid from the SM count; over `cudaMalloc`, managed, host-mapped and system memory | CPU double sum, cuBLAS on a device copy; unmeasured |
 | `cpu_w1gemv`, `cpu_route`, `cpu_sample` | the 1-bit GEMV on the Arm cores: scalar, NEON sign masks in fp32, NEON int8 dot products; sigmoid top-k routing and top-k / top-p sampling, no CUDA | the scalar path, `reference.w1_dequantize`, `moe.route`; runs on any Arm machine |

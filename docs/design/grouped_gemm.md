@@ -7,9 +7,11 @@ experts) and `reference.moe_route` (the seeded router the benches use). Bench:
 `bench_grouped_gemm` (against cuBLAS grouped and the per-expert cuBLAS loop) and
 `scripts/bench_grouped.py` (against the torch loop). Tests: `tests/test_grouped_gemm.py`.
 
-**Not measured.** The GPU box was down for the whole session this was written in: the
-kernel has not been compiled, the tests have not run, and every number below is a byte or
-FLOP count from the shapes, not a time. What to run first is at the end.
+Measured on the RTX 5090 (CUDA 13, torch 2.14+cu130) on 2026-10-13, with other tenants on
+the card holding about 18 GB, so the DeepSeek fp8 rows did not fit and are not measured.
+Every row below passed its correctness check first: `bench_grouped_gemm` against cuBLAS
+grouped to 1% of max|C|, `scripts/bench_grouped.py` against the torch loop, and the 15 tests
+in `tests/test_grouped_gemm.py`. The kernel compiled and passed on its first run.
 
 ## The problem
 
@@ -100,8 +102,71 @@ take; that is what caps E at 512.
 
 `SPARK_GROUPED_CONFIG=<i>` forces one: 0 = two 128-byte stages (64 KB, the bf16 default,
 hgemm variant 6's winner), 1 = three (96 KB, the fp8 default, fp8gemm variant 2's
-many-wave winner), 2 = four 64-byte stages, 3 = six. The defaults are borrowed from the
-plain GEMMs, not swept on grouped shapes.
+many-wave winner), 2 = four 64-byte stages, 3 = six. Swept on Qwen3 and Mixtral at 512 and
+8192 tokens: all four within 2% of each other on every row, and the defaults best on six of
+the eight rows and within 1% on the other two. The 64-byte stages are up to 5% slower on
+fp8. Defaults kept.
+
+## Results
+
+`bench_grouped_gemm`, medians of 10, ms. Routing from the bench's seeded router with a
+per-expert bias of N(0, 1), which leaves Qwen3 with 26, 12 and 6 empty experts and DeepSeek
+with 89 and 31 at 512 and 8192 tokens. cuBLAS grouped is `cublasGemmGroupedBatchedEx` with
+the counts already on the host; "+ sync" adds the offsets copy, the stream sync and the
+pointer arrays it needs; the loop is one `cublasGemmEx` per non-empty expert. fp8 is
+compared with cuBLAS grouped in bf16, since cuBLAS has no grouped fp8 path.
+
+| shape | grouped bf16 | cuBLAS grouped | + sync | cuBLAS loop | grouped fp8 | bf16 vs cuBLAS grouped | fp8 vs cuBLAS grouped |
+|---|---|---|---|---|---|---|---|
+| Mixtral, 512 tokens | 0.865 | 1.038 | 1.047 | 0.882 | 0.347 | 1.20x | 2.99x |
+| Mixtral, 2048 | 2.195 | 2.497 | 2.523 | 2.333 | 0.842 | 1.14x | 2.97x |
+| Mixtral, 8192 | 8.024 (240 TFLOPS) | 9.231 | 9.258 | 8.541 | 3.123 (616 TFLOPS) | 1.15x | 2.96x |
+| Qwen3-30B-A3B, 512 | 0.222 | 0.219 | 0.228 | 0.595 | 0.114 | 0.99x | 1.92x |
+| Qwen3-30B-A3B, 2048 | 0.341 | 0.328 | 0.337 | 0.876 | 0.150 | 0.96x | 2.19x |
+| Qwen3-30B-A3B, 8192 | 0.932 | 0.999 | 1.011 | 1.701 | 0.353 | 1.07x | 2.83x |
+| DeepSeek V3-like, 512 | 3.184 | 3.164 | 3.170 | 5.271 | out of memory | 0.99x | |
+| DeepSeek V3-like, 8192 | 10.247 | 10.030 | 10.038 | 13.326 | out of memory | 0.98x | |
+
+`scripts/bench_grouped.py`, the torch loop most MoE code runs (`a[lo:hi] @ w[e].T` per
+expert, counts on the host; fp8 is `torch._scaled_mm` per expert with rows padded to 16),
+medians of 10, ms. Its router is `reference.moe_route`, a different draw from the C++
+bench's, so the two tables agree in shape but not row for row.
+
+| shape | torch loop | grouped bf16 | speedup | torch fp8 loop | grouped fp8 | speedup over the fp8 loop |
+|---|---|---|---|---|---|---|
+| Mixtral, 512 | 0.998 | 0.866 | 1.15x | 0.489 | 0.352 | 1.39x |
+| Mixtral, 2048 | 2.275 | 2.158 | 1.05x | 1.106 | 0.805 | 1.37x |
+| Mixtral, 8192 | 8.237 | 8.001 | 1.03x | 3.991 | 2.990 | 1.33x |
+| Qwen3-30B-A3B, 512 | 1.074 | 0.228 | 4.71x | 2.258 | 0.119 | 19.0x |
+| Qwen3-30B-A3B, 2048 | 1.224 | 0.358 | 3.42x | 2.572 | 0.158 | 16.3x |
+| Qwen3-30B-A3B, 8192 | 1.724 | 0.952 | 1.81x | 2.561 | 0.357 | 7.2x |
+| DeepSeek V3-like, 512 | 5.780 | 3.642 | 1.59x | not run | not run | |
+| DeepSeek V3-like, 2048 | 7.390 | 4.744 | 1.56x | not run | not run | |
+
+The loop with the `offsets.tolist()` sync it needs is 1 to 2% slower again than the loop
+above (0.98x to 1.00x in the raw results).
+
+What the numbers say:
+
+* The win against what code actually runs is large where experts are many and small:
+  3.4x to 4.7x over the bf16 torch loop on Qwen3 below 8192 tokens, 1.6x on DeepSeek, and
+  7x to 19x for fp8, where `torch._scaled_mm` per expert is slower than the bf16 loop. The
+  per-expert cuBLAS loop in C++ shows the same gap without Python (2.6x on Qwen3 at 512).
+* Against cuBLAS grouped, bf16 is 14 to 20% faster on Mixtral's few large experts, 7%
+  faster on Qwen3 at 8192, and at parity (0.96x to 0.99x) where the experts are small. On
+  those shapes both are at the byte floor: DeepSeek at 512 tokens reads only the 167
+  non-empty experts' weights, 4.90 GB, which in 3.18 ms is 1.54 TB/s, the copy rate; Qwen3
+  at 512 reads 102 experts' 321 MB in 0.222 ms, 1.45 TB/s. Nothing grouped in bf16 can go
+  under that, so the host sync cuBLAS needs (about 0.01 ms here) is the only difference
+  left. The table above counts every expert's bytes; the real floor counts only the
+  experts the router used.
+* The padded rows of 128-row tiles did not cost anything visible: DeepSeek at 512 tokens
+  (16 rows per expert, about 8x padded rows) runs at the copy rate. A 64-row tile is not
+  worth adding for these shapes.
+* fp8 halves the bytes and runs the block-scaled instruction: 2.0x to 3.0x over cuBLAS
+  grouped in bf16, 616 to 643 TFLOPS on Mixtral at 8192 tokens.
+* Mixtral bf16 at 8192 tokens is 240 TFLOPS, the plain GEMM's sustained rate under the power
+  cap (hgemm variant 6: 243 at 8192^3), so the device-built schedule costs nothing there.
 
 ## What the shapes ask for
 
@@ -123,24 +188,14 @@ more.
 | DeepSeek V3-like, 2048 | 16,384 | 64 | 481 | 7.5 GB | 5.10 ms | 1.86 ms | 2.57 ms | 0.47 ms |
 | DeepSeek V3-like, 8192 | 65,536 | 256 | 1,924 | 7.5 GB | 5.70 ms | 7.44 ms | 2.94 ms | 1.90 ms |
 
-Two things this table says before anything runs. Most of these shapes are bound by the
-weight bytes, not the FLOPs: at 512 and 2048 tokens every model reads more bytes than it
-does math at either precision, which is where fp8 halves the floor and where the per-expert
-loop's launches and tails cost the most. And the 128-row tile wastes rows when experts are
-small: DeepSeek at 512 tokens has 16 rows per expert on average, so the tiles carry about 8x
-the useful rows, 0.96 TFLOP of mma for 0.12 of math, about 3.7 ms at the bf16 peak against
-the 5.0 ms byte floor. It still fits under the bytes on paper, but with no slack; a 64-row
-tile for experts under 64 rows is the first change to try if that shape comes out
-compute-bound.
+Before the runs this table read the shapes as weight-bound at 512 and 2048 tokens, and
+the results bear that out (the Results section). The padded-rows worry for DeepSeek at 512
+tokens (about 8x the useful rows in the 128-row tiles, 3.7 ms at the bf16 peak) did not
+show: that row runs at the copy rate on the experts it reads.
 
-## What to run first
+## Not measured
 
-1. `cmake --build build --target bench_grouped_gemm spark_kernels` and
-   `pytest tests/test_grouped_gemm.py`: the scan, the 3-D W map and the bf16 fragment
-   mapping are the new parts and the tests hit each (one-row and empty experts, 40 and 128
-   experts across scan rounds, a one-tile long-K shape that runs a Stream-K chain).
-2. `bench_grouped_gemm` for the three models at 512, 2048 and 8192 tokens, then the four
-   configurations through `SPARK_GROUPED_CONFIG` on the bf16 and fp8 rows.
-3. `scripts/bench_grouped.py` for the torch loop.
-4. If DeepSeek at 512 tokens sits above its byte floor by more than the other shapes, ncu on
-   it for tensor-pipe utilization: that is the padded-rows question above.
+DeepSeek V3-like in fp8, in both benches, and DeepSeek at 2048 tokens in the C++ bench and
+8192 in the torch one: with about 14 GB free on the shared card they ran out of memory (the
+bf16 weight, its e4m3 copy and the reference outputs together). They need the card to
+themselves.
