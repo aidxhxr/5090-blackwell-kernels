@@ -33,10 +33,10 @@
 // block's share of the (tile, k-step) space is at least kMinShare k-steps; rows past M are
 // zero-filled by the copy engine (an out-of-range box row) and skipped by the epilogue.
 // Decode shapes (M <= 64) go to hgemm_decode.cu and everything else to variant 4's 64-row
-// tiles, the same routing variant 4 does itself. That is the default route. The kernel is
-// templated on the block tile (hgemm_tma_tile.cuh), and a second route (hgemm_v6_set_route,
-// HGEMM_V6_ROUTE_AUTO) picks per shape among 128x256, 128x128, 128x64 and 64x128 TMA tiles
-// and keeps every M > 64 on this kernel: the rule is route_auto below, the reasoning
+// tiles, the same routing variant 4 does itself. That was the route until the model-shape
+// sweep (HGEMM_V6_ROUTE_LEGACY now). The kernel is templated on the block tile
+// (hgemm_tma_tile.cuh), and the default route picks per shape among 128x128, 128x64 and
+// 64x128 TMA tiles and variant 4: route_rule below, the measurements in
 // docs/design/hgemm.md, "Model shapes".
 //
 // The fused epilogue (hgemm_epilogue.cuh) is applied by whichever piece stores a tile: a
@@ -469,27 +469,41 @@ struct Route {
     int min_share;  // the static schedule's least k-steps per block
 };
 
-// The per-shape rule (HGEMM_V6_ROUTE_AUTO). Three steps, each from the arithmetic in
-// docs/design/hgemm.md, "Model shapes", not from a table of shapes:
-//   1. The largest tile whose every block gets kMinShare k-steps: 128x256 (N % 256 == 0),
-//      then 128x128, then the 8 K-element tile of step 2. A bigger tile reads fewer bytes
-//      from L2 per mma.sync (BM BN / (BM + BN) FLOP per byte: 85, 64, 43), and the share
-//      bound keeps the fixup a small part of each block's work; the bound is the same for
-//      every tile because the slot bytes and the work per k-step both scale with BM BN.
-//   2. Between 128x64 and 64x128 (the same work per k-step), the one with fewer zero-filled
-//      rows past M; a tie goes to 128 rows, which reads B from L2 half as many times. N %
-//      128 != 0 leaves 128x64.
-//   3. If no tile reaches kMinShare, the tile from step 2 with a floor of kMinShareSmall
-//      k-steps instead: the problem is too small to amortize a fixup either way, and a grid
-//      that covers the card matters more than the chain links.
-// Everything with M > 64 stays on the TMA kernel; variant 4's tiles are not used.
-Route route_auto(int M, int N, int K) {
+// The per-shape rule, the default route since the model-shape sweep (docs/design/hgemm.md,
+// "Model shapes"). One quantity decides it besides the share: how many tiles there are
+// against the blocks in flight. With fewer tiles than a quarter of the resident blocks
+// every tile is cut four or more ways, and the chain of fixups costs more than the bigger
+// tile saves.
+//   1. 128x128 when every block gets kMinShare k-steps and there are at least resident / 4
+//      tiles (the old route, minus the shapes with too few tiles: 128x4096x14336 is 32 tiles
+//      and ran 104.5% of cuBLAS on 128x128, 114.6% on 128x64).
+//   2. Otherwise the 64-wide tile with fewer zero-filled rows past M (128x64 on a tie, or
+//      when N % 128 != 0), when it has at least resident / 4 tiles: with kMinShare if its
+//      blocks get that many k-steps, else with a floor of kMinShareSmall so the grid covers
+//      the card (512x1024x4096: 117% of cuBLAS at a floor of 8, 102% at 32).
+//   3. Fewer tiles than that even at 64 wide (128x1024x4096 is 16): variant 4's 64x64
+//      cp.async tiles, two blocks per SM and four times the tiles (80.8% of cuBLAS there,
+//      69.1% on 128x64).
+// 128x256 is not in the rule: at 168 registers it spills and lost to 128x128 on every
+// shape it took but the largest lm_head ones (within 0.5%). It stays as a forced tile.
+Route route_rule(int M, int N, int K) {
     const Env& e = env();
+    const int quarter = TILES[kTile128].resident() / 4;
+    auto tiles = [&](const Config& c) { return cdiv(M, c.bm) * (N / c.bn); };
+    const Config& big = CONFIGS[CONFIG_DEFAULT];
+    if (N % big.bn == 0 && tiles(big) >= quarter && share_of(big, M, N, K) >= e.knobs.min_share)
+        return {Route::CONFIG, CONFIG_DEFAULT, e.knobs.min_share};
     const int small = (N % 128 != 0 || cdiv(M, 128) * 128 <= cdiv(M, 64) * 64) ? kTile128x64
                                                                                  : kTile64x128;
-    for (int t : {kTile128x256, kTile128, small})
-        if (share_of(TILES[t], M, N, K) >= e.knobs.min_share)
-            return {Route::TILE, t, e.knobs.min_share};
+    if (tiles(TILES[small]) < quarter) return {Route::V4, 0, 0};
+    if (share_of(TILES[small], M, N, K) >= e.knobs.min_share)
+        return {Route::TILE, small, e.knobs.min_share};
+    // The floor only helps when K can be cut: with fewer than two floors of k-steps per tile
+    // and fewer tiles than blocks, a piece is most of a tile plus a fixup, and variant 4's
+    // whole 64x64 tiles fill the card instead (256x2048x768: 125.5% of cuBLAS on variant 4,
+    // 102.3% on 128x64 at a floor of 8).
+    if (K / TILES[small].bk < 2 * e.min_share_small && tiles(TILES[small]) < 4 * quarter)
+        return {Route::V4, 0, 0};
     return {Route::TILE, small, e.min_share_small};
 }
 
@@ -500,10 +514,10 @@ Route choose(int M, int N, int K) {
     const int r = route_slot().load(std::memory_order_relaxed);
     if (r >= 0 && r < NUM_TILES && N % TILES[r].bn == 0)
         return {Route::TILE, r, e.knobs.min_share};
-    if (r >= 0 || r == HGEMM_V6_ROUTE_AUTO) return route_auto(M, N, K);
-    // The default: the 128x128 tile when each block's share of the (tile, k-step) space is
-    // at least kMinShare k-steps; below that the fixup outweighs the mma work and variant
-    // 4's smaller tiles take the shape.
+    if (r != HGEMM_V6_ROUTE_LEGACY && e.cfg < 0) return route_rule(M, N, K);
+    // The route before the model-shape sweep (and the one SPARK_HGEMM_V6_CONFIG sweeps):
+    // the 128x128 tile when each block's share of the (tile, k-step) space is at least
+    // kMinShare k-steps, variant 4's smaller tiles below that.
     int cfg = e.cfg;
     if (cfg < 0 || cfg >= NUM_CONFIGS) cfg = CONFIG_DEFAULT;
     if (share_of(CONFIGS[cfg], M, N, K) < e.knobs.min_share) return {Route::V4, 0, 0};

@@ -194,14 +194,14 @@ int hgemm_num_variants();
 // Lets a caller pick the fastest variant that fits instead of catching the exception.
 bool hgemm_supports(int M, int N, int K, int variant);
 // Variant 6's tile route for M > 64, for the sweeps (bench_hgemm --models). DEFAULT is the
-// 128x128 TMA tile when every block gets 32 k-steps and variant 4's tiles below that. AUTO is
-// the per-shape rule of docs/design/hgemm.md, "Model shapes": the largest of 128x256,
-// 128x128 and a 128x64 or 64x128 TMA tile that gives every block 32 k-steps, else the small
-// one with a lower floor. n in [0, hgemm_v6_num_tiles()) forces TMA tile n where N tiles,
-// AUTO elsewhere. Process-wide, initial value from SPARK_HGEMM_V6_ROUTE; M <= 64 always runs
-// the decode kernel. hgemm_v6_route_name says what variant 6 runs for a shape under the
-// current route.
-enum HgemmV6Route { HGEMM_V6_ROUTE_DEFAULT = -1, HGEMM_V6_ROUTE_AUTO = -2 };
+// per-shape rule of docs/design/hgemm.md, "Model shapes": 128x128 TMA tiles when there are
+// enough of them and every block gets 32 k-steps, else a 128x64 or 64x128 TMA tile, else
+// variant 4's 64x64 tiles. LEGACY is the route before it: 128x128 when every block gets 32
+// k-steps, variant 4 below. n in [0, hgemm_v6_num_tiles()) forces TMA tile n where N tiles
+// (1 is 128x256, which no route picks), DEFAULT elsewhere. Process-wide, initial value from
+// SPARK_HGEMM_V6_ROUTE; M <= 64 always runs the decode kernel. hgemm_v6_route_name says
+// what variant 6 runs for a shape under the current route.
+enum HgemmV6Route { HGEMM_V6_ROUTE_DEFAULT = -1, HGEMM_V6_ROUTE_LEGACY = -2 };
 void hgemm_v6_set_route(int route);
 int hgemm_v6_route();
 int hgemm_v6_num_tiles();

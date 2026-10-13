@@ -504,8 +504,8 @@ const FusedRow fused_rows[] = {
 // weight is generated on the device once per shape (a 128256-column lm_head is 1 GB), the
 // output is checked on the device against cuBLAS with the tolerance run_one uses, and B is
 // rotated over copies that exceed L2 whenever one copy would fit, as a real forward pass
-// sees each layer's weight once. Rows are "MxNxK@label" with label v3, v4, v5, v6 (the
-// default route), v6auto (the per-shape rule) and, with --tiles, v6t<n> (TMA tile n forced).
+// sees each layer's weight once. Rows are "MxNxK@label" with label v3, v4, v5, v6old
+// (variant 6's route before this sweep), v6 (the default, the per-shape rule) and, with --tiles, v6t<n> (TMA tile n forced).
 
 struct Weight {
     const char* model;
@@ -635,8 +635,8 @@ bool run_models_weight(cublasHandle_t handle, cudaStream_t stream, const Weight&
     std::vector<Cand> cands = {{"v3", 3, spark::HGEMM_V6_ROUTE_DEFAULT},
                                {"v4", 4, spark::HGEMM_V6_ROUTE_DEFAULT},
                                {"v5", 5, spark::HGEMM_V6_ROUTE_DEFAULT},
-                               {"v6", 6, spark::HGEMM_V6_ROUTE_DEFAULT},
-                               {"v6auto", 6, spark::HGEMM_V6_ROUTE_AUTO}};
+                               {"v6old", 6, spark::HGEMM_V6_ROUTE_LEGACY},
+                               {"v6", 6, spark::HGEMM_V6_ROUTE_DEFAULT}};
     if (tiles)
         for (int t = 0; t < spark::hgemm_v6_num_tiles(); ++t)
             cands.push_back({"v6t" + std::to_string(t), 6, t});
@@ -661,8 +661,8 @@ bool run_models_weight(cublasHandle_t handle, cudaStream_t stream, const Weight&
             if (!spark::hgemm_supports(M, N, K, c.variant)) continue;
             if (c.route >= 0) {
                 // A forced tile that does not divide N falls back to the rule, and a forced
-                // tile the rule picks anyway is the v6auto row: skip both duplicates.
-                spark::hgemm_v6_set_route(spark::HGEMM_V6_ROUTE_AUTO);
+                // tile the rule picks anyway is the v6 row: skip both duplicates.
+                spark::hgemm_v6_set_route(spark::HGEMM_V6_ROUTE_DEFAULT);
                 const std::string by_rule = spark::hgemm_v6_route_name(M, N, K);
                 spark::hgemm_v6_set_route(c.route);
                 if (by_rule == spark::hgemm_v6_route_name(M, N, K)) continue;
