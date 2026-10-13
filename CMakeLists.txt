@@ -40,7 +40,8 @@ endforeach()
 file(GLOB SPARK_KERNEL_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/kernels/*.cu)
 file(GLOB SPARK_FP8_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/kernels/fp8gemm*.cu
      ${CMAKE_SOURCE_DIR}/src/kernels/attention_fp8*.cu
-     ${CMAKE_SOURCE_DIR}/src/kernels/fp4*.cu)
+     ${CMAKE_SOURCE_DIR}/src/kernels/fp4*.cu
+     ${CMAKE_SOURCE_DIR}/src/kernels/grouped_gemm*.cu)
 list(REMOVE_ITEM SPARK_KERNEL_SOURCES ${SPARK_FP8_SOURCES})
 add_library(spark_kernels_fp8 STATIC ${SPARK_FP8_SOURCES})
 add_library(spark_kernels STATIC ${SPARK_KERNEL_SOURCES})

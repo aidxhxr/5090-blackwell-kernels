@@ -399,6 +399,26 @@ void w1gemm_moe_bf16(const __nv_bfloat16* A, const uint32_t* packed,
                      const __nv_bfloat16* scales, const int32_t* offsets, __nv_bfloat16* C,
                      int E, int N, int K, int bits, int variant, cudaStream_t stream);
 
+// ---- Grouped GEMM for MoE prefill (src/kernels/grouped_gemm.cu) --------------------------
+// Every expert's GEMM in one persistent launch:
+//   C[r, :] = scale_a * scale_b[e] * A[r, :] * W[e]^T   for r in offsets[e] .. offsets[e+1]-1
+// A [T, K] has its rows sorted by expert (offsets int32 [E + 1] on the device, offsets[0] ==
+// 0, offsets[E] == T, empty experts allowed, the w1gemm_moe convention), W is [E, N, K] (K
+// contiguous, nn.Linear's layout per expert), C [T, N] bf16, fp32 accumulate. The tile list
+// is built on the device from offsets (no host sync), the last wave is balanced Stream-K
+// style, and every tile is fed by TMA. fp8: A and W e4m3, scale_a [1] and scale_b [E] fp32
+// on the device (either may be null: 1), through the block-scaled mma with unit block
+// scales; needs an sm_120a / sm_121a build. Requires 1 <= E <= 512, N % 128 == 0, K % 64 ==
+// 0 (bf16) or K % 128 == 0 (fp8), 16-byte aligned A and W. Stream-K tiles are summed in a
+// fixed order, so the output is the same bits every run. Not safe to run concurrently on
+// two streams (one workspace per configuration).
+void grouped_gemm_bf16(const __nv_bfloat16* A, const __nv_bfloat16* W, const int32_t* offsets,
+                       __nv_bfloat16* C, int T, int E, int N, int K, cudaStream_t stream);
+void grouped_gemm_fp8(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* W, const int32_t* offsets,
+                      __nv_bfloat16* C, int T, int E, int N, int K, const float* scale_a,
+                      const float* scale_b, cudaStream_t stream);
+bool grouped_gemm_supports(int E, int N, int K, bool fp8);
+
 // ---- RoPE + K/V cache append -------------------------------------------------------------
 // From qkv = [B, S, (H_q + 2 H_kv) * D] bf16 (a fused q|k|v projection) and rotary tables
 // cos, sin = [>= pos0 + S, D] fp32 in the rotate-half layout (column d pairs with d + D/2;
