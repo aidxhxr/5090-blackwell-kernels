@@ -482,6 +482,72 @@ over the tensor; neither shows up in a Gaussian test. `tests/test_fp8gemm.py` pi
 ceil mode to within 3% of per-tensor and the floor mode between 1x and 1.6x of it, on
 Gaussian and on the x2000 input.
 
+## Clusters, multicast and a wider tile (written, not measured)
+
+The 8192³ gap is the clock, and the clock is joules: same cycles as cuBLASLt, 341 M
+instructions against 233 M, and at 600 W the kernel that does less per FLOP runs faster.
+Two kinds of joules are in reach without touching the tensor work: instructions issued per
+mma, and bytes moved from L2 into shared memory per FLOP. `fp8gemm_cl_kernel` in
+`src/kernels/fp8gemm_tma.cu` is a second per-tensor kernel next to variant 2 that attacks
+both, behind `SPARK_FP8GEMM_V2_CONFIG=11..19`, so nothing changes by default. None of it has
+been compiled with nvcc or run: the box was down for the whole session it was written in.
+
+| config | tile, BK, stages, warps | cluster | what it tests |
+|---|---|---|---|
+| 11 | 128x128, 128, 3, 2x4 | 1x1 | config 1 with fp4gemm v2's consumer loop: unrolled by the ring depth, no `fence.proxy.async` before the release |
+| 12 | same | 2x1 | Bt panel multicast to the two blocks that share it |
+| 13 | same | 1x2 | A panel multicast |
+| 14 | same | 2x2 | both, each block copies a quarter of the stage |
+| 15 | same | 4x1 | Bt multicast four ways |
+| 16 | 128x256, 128, 2, 2x4 of 64x64 | 1x1 | 8 `ldmatrix` per 32 mma and a quarter less L2 traffic per FLOP |
+| 17 | 128x256, 64, 4, 2x4 of 64x64 | 1x1 | the same with four shallow stages |
+| 18, 19 | 16, 17 | 2x1 | half of config 1's L2 traffic per FLOP |
+
+**The loop.** fp4gemm v2 measured the change at 8192³: 229 M executed instructions down to
+180 M, 3.3% fewer cycles at a fixed clock. Variant 2 still has the loop it was ported from,
+with the stage address and parity recomputed from kt every stage and a `MEMBAR.ALL.CTA` per
+stage per warp from the fence. Config 11 isolates that.
+
+**Multicast.** A CLM x CLN cluster takes a (CLM x 128) x (CLN x BN) tile; block (ci, cj),
+cluster rank ci + CLM cj, computes tile (ci, cj). The CLN blocks of a cluster row need the
+same 128 rows of A for every stage, so each copies 128 / CLN of them with one box and
+`.multicast::cluster` writes it into all of them at the same offset; the CLM blocks of a
+column split the Bt panel the same way. Every block still receives the whole stage and its
+full barrier still expects the whole stage's bytes; only the copies out of L2 are shared.
+The slices are whole swizzle spans (8 KB of a 16 KB box for a 2-way split), so the swizzle
+the consumers read is unchanged. The release is where it gets harder: a block's stage is
+written by the producers of its whole row and column, so each consumer warp arrives on the
+empty barrier of all CLM + CLN - 1 of them (lane i does `mapa` and a cluster-scope
+`mbarrier.arrive`), each empty barrier counts 8 x (CLM + CLN - 1) arrivals, and the producer
+waits on it with cluster-scope acquire. A peer's bytes can land on a full barrier before
+that block's own producer has posted `expect_tx` for the phase; the transaction count goes
+negative and the phase cannot complete until the local arrive, which is how CUTLASS's
+multicast pipelines run too. A cluster barrier after the barrier init and another after the
+main loop keep any block from exiting while a peer can still arrive on it. The split-K
+tail runs on cluster tiles (every block of a cluster takes the same K slice), with fp4 v2's
+self-cleaning workspace and its cap of 8 slices.
+
+L2 -> SM bytes per stage per block, against config 1's 32 KB: 24 KB for 2x1 and 1x2, 16 KB
+for 2x2 and for the 128x256 tile in a 2x1 cluster. Nsight put v2's L2 throughput at 81%
+(277 M sectors at 8192³), so the bytes are not a bottleneck at a fixed clock; the bet is
+only on the power they cost.
+
+Unknowns the first run answers: whether this card launches clusters at all (this repo's
+RTX5090.md and hgemm.md say sm_120 has none, and I found no measurement behind that in the notes; the launcher
+asks `cudaDevAttrClusterLaunch` and `cudaOccupancyMaxActiveClusters` and falls back to config 1 if
+either says no, and `SPARK_FP8GEMM_VERBOSE=1` prints the resident count); whether
+multicast is a fast path here (the PTX ISA lists it as optimized for the sm_90a/sm_100a
+families, not sm_120); how many SMs a cluster shape leaves idle (170 SMs over the GPCs);
+and whether the 64x64 warp tile at 2 warps per scheduler hides the `ldmatrix` latency, which
+1.25 warps per scheduler (configs 5, 6) and fp4's 128x256 configs (2 to 4% under its
+default) did not.
+
+To run, per config, under the GPU lock:
+`SPARK_FP8GEMM_VERBOSE=1 SPARK_FP8GEMM_V2_CONFIG=<n> ./build/bench_fp8gemm --m=8192 --n=8192 --k=8192 --variant=2 --iters=50`,
+then the same for 4096³ and 4096x11008x4096, then the 1,500-iteration power loop and ncu's
+`inst_executed`, `lts__t_sectors_srcunit_tex_op_read`, `sm__pipe_tensor_cycles_active` on
+the winner against config 1. A config becomes the default only if it is faster there.
+
 ## What was done and what remains
 
 Done: the fragment layout and the b16-pair `ldmatrix` for both operands with no transposing
@@ -495,6 +561,7 @@ warps.
 Open:
 
 - **8192³ at 92 to 94%.** Same cycles as cuBLASLt at a fixed clock, 7% less clock at 600 W.
+  Configs 11 to 19 (the section above) are written and waiting for the box.
   The instruction count per mma is the lever: a 64x64 warp tile at one block per SM needs the
   fragment loads for step k+1 issued before step k's mma from a second register set, so that
   1.25 warps per scheduler can keep the pipe fed; the compiler does not do that on its own for
