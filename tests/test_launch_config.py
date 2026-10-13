@@ -100,8 +100,10 @@ def test_wave_clause_only_past_one_wave_of_the_bandwidth_rule() -> None:
     assert _C.need_ctas(1024, "gb10") == 214
     assert _C.split_k_for(0, 50, 64, 1024, 48, "gb10") == 6
     assert _C.split_k_for(0, 50, 64, 1024, 1000, "gb10") == 5
-    # On the 5090 the bandwidth rule never exceeds one wave at the kernels' in-flight sizes.
-    for per_cta in (HGEMM_CTA, W4_BLOCK, W1_BLOCK):
+    # On the 5090 the bandwidth rule never exceeds one wave for the two kernels that call it
+    # (hgemm_decode and w4gemm). w1gemm's 8 KB block would ask for 192, but its grid is N / 16
+    # blocks and never goes through split_k_for (src/kernels/w1gemm.cu).
+    for per_cta in (HGEMM_CTA, W4_BLOCK):
         assert _C.need_ctas(per_cta, "rtx5090") <= 170
 
 
