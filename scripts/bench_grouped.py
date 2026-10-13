@@ -61,7 +61,7 @@ def bench_shape(sk, ref, args, name, m, w, T):
     ids = ref.moe_route(T, E, k, seed=T)
     order, offsets = sk.moe_offsets(ids, E)
     rows_n = T * k
-    a = (torch.rand(rows_n, K, device="cuda") * 2 - 1).to(torch.bfloat16)
+    a = torch.empty(rows_n, K, device="cuda", dtype=torch.bfloat16).uniform_(-1, 1)
     offs = offsets.tolist()
     flops = 2.0 * rows_n * N * K
     shape = f"{name} t={T}"
@@ -150,7 +150,7 @@ def main() -> None:
     for name in args.model:
         m = MODELS[name]
         E, K, N = m["E"], m["K"], m["N"]
-        w = (torch.rand(E, N, K, device="cuda") * 2 - 1).to(torch.bfloat16)
+        w = torch.empty(E, N, K, device="cuda", dtype=torch.bfloat16).uniform_(-1, 1)
         for T in args.tokens:
             rows += bench_shape(sk, ref, args, name, m, w, T)
         del w
