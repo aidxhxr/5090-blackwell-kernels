@@ -234,10 +234,14 @@ def _ops():
 
 def quantize_weight(w: torch.Tensor, bits: int = 1):
     """A [K, N] bf16 weight as a `W1Weight` (the extension's quantizer), or as a `_Packed`
-    built by the torch quantizer when the extension is not importable."""
+    built by the torch quantizer when the extension is not importable. The extension's
+    quantizer is a CUDA kernel, so a CPU weight goes through the torch quantizer (the same
+    codes and scales, bit for bit) and is still wrapped as a `W1Weight`."""
     sk = _ops()
     if sk is not None and hasattr(sk, "W1Weight"):
-        return sk.W1Weight.quantize(w, bits)
+        if w.is_cuda:
+            return sk.W1Weight.quantize(w, bits)
+        return sk.W1Weight(*_quantize_ref(w, bits), bits)
     return _Packed(*_quantize_ref(w, bits), bits)
 
 
@@ -245,7 +249,9 @@ def quantize_experts(w: torch.Tensor, bits: int = 1):
     """[E, K, N] bf16 experts as a `W1ExpertWeights`, or a `_Packed` without the extension."""
     sk = _ops()
     if sk is not None and hasattr(sk, "W1ExpertWeights"):
-        return sk.W1ExpertWeights.quantize(w, bits)
+        if w.is_cuda:
+            return sk.W1ExpertWeights.quantize(w, bits)
+        return sk.W1ExpertWeights(*_quantize_experts_ref(w, bits), bits)
     return _Packed(*_quantize_experts_ref(w, bits), bits)
 
 

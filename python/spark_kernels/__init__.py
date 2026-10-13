@@ -169,3 +169,14 @@ from .ops import (  # noqa: E402
 )
 
 __all__ += ["unified_device_caps", "unified_gemv", "unified_num_variants", "unified_read_sum"]
+
+# The CPU-side ops (include/spark/cpu.h, docs/design/grace.md): NEON on the GB10's Arm cores,
+# the scalar rungs everywhere else.
+from .ops import (  # noqa: E402
+    cpu_bandwidth_probe,
+    cpu_route,
+    cpu_sample,
+    cpu_w1gemv,
+)
+
+__all__ += ["cpu_bandwidth_probe", "cpu_route", "cpu_sample", "cpu_w1gemv"]
