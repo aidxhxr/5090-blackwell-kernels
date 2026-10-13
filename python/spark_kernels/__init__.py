@@ -53,6 +53,9 @@ Ops (all run on the current CUDA stream, all accept float32 or bfloat16 unless n
                                              caches with k_scale=, v_scale= per kv head;
                                              quantize_kv_cache is the same rounding in
                                              torch, dequantize_kv_cache its values)
+    grouped_gemm(a, w, offsets, scale_a=None, scale_b=None)
+                                             every expert of an MoE layer in one launch, a
+                                             sorted by expert (moe_offsets), bf16 or e4m3
     num_variants(name)                       how many implementations exist for `name`
 
 `variant` selects a rung on the optimization ladder described in docs/DESIGN.md; -1 picks
@@ -83,9 +86,11 @@ from .ops import (
     fp4gemm,
     fp8_quantize,
     fp8gemm,
+    grouped_gemm,
     hgemm,
     hgemm_swiglu,
     interleave_gate_up,
+    moe_offsets,
     num_variants,
     paged_decode,
     quantize_fp8,
@@ -123,10 +128,12 @@ __all__ = [
     "fp8_quantize",
     "fp4gemm",
     "fp8gemm",
+    "grouped_gemm",
     "hgemm",
     "hgemm_swiglu",
     "interleave_gate_up",
     "layer",
+    "moe_offsets",
     "num_variants",
     "paged_decode",
     "quantize_fp8",

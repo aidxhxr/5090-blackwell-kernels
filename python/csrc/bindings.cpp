@@ -742,6 +742,74 @@ Tensor w1gemm_moe(const Tensor& a, const Tensor& packed, const Tensor& scales,
     return c;
 }
 
+// Grouped GEMM over E experts for MoE prefill: a [T, K] with its rows sorted by expert
+// (offsets int32 [E + 1] on the device, the w1gemm_moe convention), w [E, N, K] (each
+// expert's weight as nn.Linear stores it) -> [T, N] bf16, row t = a[t] @ w[e].T. bf16 a and
+// w, or float8_e4m3fn a and w with scale_a (one element) and scale_b (one per expert, or
+// one for all) float32 on the device, either optional (1.0).
+Tensor grouped_gemm(const Tensor& a, const Tensor& w, const Tensor& offsets,
+                    const std::optional<Tensor>& scale_a, const std::optional<Tensor>& scale_b) {
+    check_cuda_contig(a, "a");
+    check_cuda_contig(w, "w");
+    check_cuda_contig(offsets, "offsets");
+    const bool fp8 = a.scalar_type() == at::kFloat8_e4m3fn;
+    TORCH_CHECK((fp8 && w.scalar_type() == at::kFloat8_e4m3fn) ||
+                    (a.scalar_type() == at::kBFloat16 && w.scalar_type() == at::kBFloat16),
+                "grouped_gemm expects a and w both bfloat16 or both float8_e4m3fn, got ",
+                a.scalar_type(), " and ", w.scalar_type());
+    TORCH_CHECK(a.dim() == 2 && w.dim() == 3, "grouped_gemm expects a [T, K] and w [E, N, K]");
+    const int64_t T = a.size(0), K = a.size(1), E = w.size(0), N = w.size(1);
+    TORCH_CHECK(w.size(2) == K, "w is ", w.sizes(), ", expected [E, N, ", K, "]");
+    TORCH_CHECK(offsets.scalar_type() == at::kInt && offsets.dim() == 1 && offsets.size(0) == E + 1,
+                "offsets must be int32 [E + 1] = [", E + 1, "], got ", offsets.scalar_type(), " ",
+                offsets.sizes());
+    TORCH_CHECK(w.device() == a.device() && offsets.device() == a.device(),
+                "w and offsets must be on a's device");
+    TORCH_CHECK(T <= INT32_MAX && K <= INT32_MAX && N <= INT32_MAX && E <= INT32_MAX,
+                "grouped_gemm dims too large");
+    TORCH_CHECK(spark::grouped_gemm_supports(static_cast<int>(E), static_cast<int>(N),
+                                             static_cast<int>(K), fp8),
+                "grouped_gemm needs 1 <= E <= 512, N a multiple of 128 and K a multiple of ",
+                fp8 ? 128 : 64, ", got E = ", E, ", N = ", N, ", K = ", K);
+    TORCH_CHECK(aligned16(a) && aligned16(w), "grouped_gemm needs 16-byte aligned a and w");
+    const float* sa = nullptr;
+    const float* sb = nullptr;
+    Tensor sb_full;
+    if (fp8) {
+        if (scale_a.has_value()) {
+            TORCH_CHECK(scale_a->is_cuda() && scale_a->scalar_type() == at::kFloat &&
+                            scale_a->numel() == 1 && scale_a->device() == a.device(),
+                        "scale_a must be a float32 tensor with one element on a's device");
+            sa = scale_a->data_ptr<float>();
+        }
+        if (scale_b.has_value()) {
+            TORCH_CHECK(scale_b->is_cuda() && scale_b->scalar_type() == at::kFloat &&
+                            (scale_b->numel() == 1 || scale_b->numel() == E) &&
+                            scale_b->device() == a.device(),
+                        "scale_b must be float32 with 1 or E elements on a's device");
+            sb_full = scale_b->reshape({-1}).expand({E}).contiguous();
+            sb = sb_full.data_ptr<float>();
+        }
+    } else {
+        TORCH_CHECK(!scale_a.has_value() && !scale_b.has_value(),
+                    "grouped_gemm: scales are for float8_e4m3fn inputs only");
+    }
+    const c10::cuda::CUDAGuard guard(a.device());
+    Tensor c = at::empty({T, N}, a.options().dtype(at::kBFloat16));
+    if (fp8) {
+        spark::grouped_gemm_fp8(reinterpret_cast<const __nv_fp8_e4m3*>(a.data_ptr()),
+                                reinterpret_cast<const __nv_fp8_e4m3*>(w.data_ptr()),
+                                offsets.data_ptr<int32_t>(), bf16_ptr_mut(c), static_cast<int>(T),
+                                static_cast<int>(E), static_cast<int>(N), static_cast<int>(K), sa,
+                                sb, current_stream(a));
+    } else {
+        spark::grouped_gemm_bf16(bf16_ptr(a), bf16_ptr(w), offsets.data_ptr<int32_t>(),
+                                 bf16_ptr_mut(c), static_cast<int>(T), static_cast<int>(E),
+                                 static_cast<int>(N), static_cast<int>(K), current_stream(a));
+    }
+    return c;
+}
+
 // The rows each K/V head is allocated when k and v are the leading S_kv rows of every head of
 // a [B, H_kv, cap, D] cache (`cache[:, :, :length]`, the filled part of a cache with spare
 // capacity), which the forward reads in place; 0 for packed k and v. Anything else is not a
@@ -1345,6 +1413,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "packed [E, N, K * bits / 32], scales [E, K/128, N] -> [T, N] bf16",
           py::arg("a"), py::arg("packed"), py::arg("scales"), py::arg("offsets"),
           py::arg("bits") = 1, py::arg("variant") = -1);
+    m.def("grouped_gemm", &grouped_gemm,
+          "grouped GEMM for MoE prefill: a [T, K] sorted by expert with offsets int32 [E + 1], "
+          "w [E, N, K] -> [T, N] bf16, one launch; bf16, or e4m3 with scale_a [1] and scale_b "
+          "[E] or [1]",
+          py::arg("a"), py::arg("w"), py::arg("offsets"), py::arg("scale_a") = py::none(),
+          py::arg("scale_b") = py::none());
     m.def("attention", &attention,
           "softmax(q k^T / sqrt(D)) v over [B, H, S, D] bf16 tensors (k, v may have fewer heads)",
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("causal") = false,

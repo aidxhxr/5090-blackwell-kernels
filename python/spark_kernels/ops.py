@@ -459,6 +459,38 @@ def w1gemm_moe(a: torch.Tensor, w: W1ExpertWeights, offsets: torch.Tensor,
     return _C.w1gemm_moe(a, w.packed, w.scales, offsets, w.bits, variant)
 
 
+def grouped_gemm(a: torch.Tensor, w: torch.Tensor, offsets: torch.Tensor,
+                 scale_a: torch.Tensor | None = None,
+                 scale_b: torch.Tensor | None = None) -> torch.Tensor:
+    """Every expert's GEMM of an MoE layer in one launch: a [T, K] with its rows sorted by
+    expert, expert e owning rows offsets[e]..offsets[e+1]-1, times w [E, N, K] (each expert's
+    weight as nn.Linear stores it) -> [T, N] bfloat16, row t = a[t] @ w[e].T, fp32 accumulate.
+
+    `offsets` is int32 [E + 1] on a's device with offsets[0] == 0 and offsets[E] == T, empty
+    experts allowed; the host never reads it, so the call does not synchronize. a and w are
+    both bfloat16, or both float8_e4m3fn with optional float32 scales: scale_a (one element)
+    and scale_b (one per expert, or one), row t then being scale_a * scale_b[e] * (a[t] @
+    w[e].T). Needs E <= 512, N a multiple of 128, K a multiple of 64 (bf16) or 128 (fp8).
+    """
+    return _C.grouped_gemm(a, w, offsets, scale_a, scale_b)
+
+
+def moe_offsets(expert_ids: torch.Tensor, num_experts: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sort the (token, slot) pairs of a top-k routing by expert for `grouped_gemm`.
+
+    expert_ids is [T, k] integer. Returns (order, offsets): order [T * k] int64 is the
+    flattened (token * k + slot) index of each sorted row (stable, so a token's rows keep
+    their slot order within an expert), offsets [E + 1] int32. Everything stays on the
+    device: a[order // k] is the sorted activation.
+    """
+    flat = expert_ids.reshape(-1)
+    order = torch.argsort(flat, stable=True)
+    counts = torch.bincount(flat, minlength=num_experts)
+    offsets = torch.zeros(num_experts + 1, dtype=torch.int32, device=flat.device)
+    offsets[1:] = torch.cumsum(counts, 0).to(torch.int32)
+    return order, offsets
+
+
 def rope_append_(
     qkv: torch.Tensor,
     cos: torch.Tensor,

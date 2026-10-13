@@ -431,3 +431,35 @@ def w1gemm_ref(a: torch.Tensor, packed: torch.Tensor, scales: torch.Tensor, bits
                ) -> torch.Tensor:
     """a @ the dequantized weight, fp32 sum, one bf16 rounding."""
     return (a.float() @ w1_dequantize(packed, scales, bits).float()).to(torch.bfloat16)
+
+
+def grouped_gemm(a: torch.Tensor, w: torch.Tensor, offsets: torch.Tensor,
+                 scale_a: torch.Tensor | None = None,
+                 scale_b: torch.Tensor | None = None) -> torch.Tensor:
+    """The loop over experts most MoE code runs: rows offsets[e]..offsets[e+1]-1 of a times
+    w[e].T, fp32 sum (exact e4m3 or bf16 products), scales in fp32, one bf16 rounding."""
+    E = w.shape[0]
+    offs = offsets.tolist()
+    out = torch.zeros(a.shape[0], w.shape[1], dtype=torch.float32, device=a.device)
+    sa = 1.0 if scale_a is None else scale_a.float().reshape(())
+    sb = None if scale_b is None else scale_b.float().reshape(-1).expand(E)
+    for e in range(E):
+        lo, hi = offs[e], offs[e + 1]
+        if hi == lo:
+            continue
+        y = a[lo:hi].float() @ w[e].float().t()
+        if sb is not None:
+            y = y * sb[e]
+        out[lo:hi] = y * sa
+    return out.to(torch.bfloat16)
+
+
+def moe_route(T: int, E: int, top_k: int, seed: int = 0, skew: float = 1.0,
+              device: str = "cuda") -> torch.Tensor:
+    """A seeded random top-k router with uneven load: logits N(0, 1) per (token, expert) plus
+    a per-expert bias N(0, skew), so some experts are popular and some get few tokens, as a
+    trained router's are. Returns expert ids [T, top_k] int64."""
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    bias = torch.randn(E, generator=g) * skew
+    logits = torch.randn(T, E, generator=g) + bias
+    return torch.topk(logits, top_k, dim=-1).indices.to(device)
