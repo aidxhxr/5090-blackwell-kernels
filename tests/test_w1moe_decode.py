@@ -9,8 +9,9 @@ has run yet: the kernel was written on a machine without nvcc."""
 import pytest
 import torch
 
-from spark_kernels import moe
-from spark_kernels import reference as ref
+pytest.importorskip("spark_kernels")
+from spark_kernels import moe  # noqa: E402
+from spark_kernels import reference as ref  # noqa: E402
 
 H, N_I = 5120, 2304  # DeepSeek V4.1 Flash's hidden and intermediate
 E, TOPK = 8, 6

@@ -152,7 +152,7 @@ MX_TOL = dict(atol=1e-2, rtol=3e-2)
 
 def _mx_inputs(M, N, K, seed=0):
     torch.manual_seed(seed)
-    ref = __import__("spark_kernels").reference
+    ref = pytest.importorskip("spark_kernels").reference
     a, sfa = ref.quantize_mx(torch.randn(M, K, device="cuda", dtype=torch.bfloat16))
     b_t, sfb = ref.quantize_mx(torch.randn(N, K, device="cuda", dtype=torch.bfloat16))
     return a, sfa, b_t, sfb
@@ -295,7 +295,7 @@ def test_fp8gemm_mx_rejects_bad_inputs(sk):
 
 
 def test_quantize_mx_reference():
-    ref = __import__("spark_kernels").reference
+    ref = pytest.importorskip("spark_kernels").reference
     torch.manual_seed(1)
     x = torch.randn(64, 1024, device="cuda", dtype=torch.bfloat16) * 8
     x[3, 40] = 3000.0  # an outlier: its block scales up, the others do not
@@ -337,7 +337,7 @@ def test_mx_against_per_tensor_on_outliers():
     # outliers inside e4m3's 2^14.8 of dynamic range, and the outlier channels dominate the
     # outputs in both schemes); the OCP floor recipe costs more, since a block maximum in
     # the top eighth of its binade saturates at 448.
-    ref = __import__("spark_kernels").reference
+    ref = pytest.importorskip("spark_kernels").reference
     torch.manual_seed(2)
     b = torch.randn(512, 2048, device="cuda")
 

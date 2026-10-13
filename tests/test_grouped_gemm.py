@@ -7,7 +7,8 @@ one wave so that both the whole tiles and the Stream-K chains run."""
 import pytest
 import torch
 
-from spark_kernels import reference as ref
+pytest.importorskip("spark_kernels")
+from spark_kernels import reference as ref  # noqa: E402
 
 TOL = dict(atol=3e-2, rtol=3e-2)
 

@@ -4,7 +4,8 @@ repack, against the plain-PyTorch versions in spark_kernels.reference."""
 import pytest
 import torch
 
-from spark_kernels import reference as ref
+pytest.importorskip("spark_kernels")
+from spark_kernels import reference as ref  # noqa: E402
 
 # (K, N) weight shapes: the smallest legal one, one with a single 16-column strip, the
 # Llama-3-8B o projection, and shapes whose K is not a multiple of the four-group stage of

@@ -261,7 +261,7 @@ def test_fp4_quantize_matches_reference_bytes(sk, rows, K):
 
 
 def test_e2m1_rounding_reference():
-    ref = __import__("spark_kernels").reference
+    ref = pytest.importorskip("spark_kernels").reference
     v = torch.tensor([0.0, 0.25, 0.26, 0.74, 0.75, 1.25, 1.26, 1.75, 2.5, 2.51, 3.49, 3.5, 5.0,
                       5.01, 100.0, -0.75, -6.0])
     want = [0.0, 0.0, 0.5, 0.5, 1.0, 1.0, 1.5, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 6.0, 6.0, -1.0, -6.0]
@@ -281,7 +281,7 @@ def test_fp4_accuracy_against_bf16():
     # Gaussian data, and its per-16 e4m3 scales follow outlier channels that a coarser scale
     # cannot; MXFP4's power-of-two per-32 scale costs more (scripts/fp4_accuracy.py has the
     # table, docs/design/fp4gemm.md the numbers).
-    ref = __import__("spark_kernels").reference
+    ref = pytest.importorskip("spark_kernels").reference
     torch.manual_seed(2)
     b = torch.randn(512, 2048, device="cuda")
 
