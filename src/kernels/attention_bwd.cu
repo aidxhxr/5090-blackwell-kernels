@@ -850,7 +850,7 @@ __device__ __forceinline__ void bulk_load(void* smem_dst, const void* src, unsig
         : "memory");
 }
 
-template <int D, int BQ, bool DQ, bool SKIP>
+template <int D, int BQ, bool DQ, bool SKIP, bool EARLY>
 __global__ void __launch_bounds__(THREADS, 1)
     bwd_kv_tma_kernel(const __grid_constant__ CUtensorMap tmQ,
                       const __grid_constant__ CUtensorMap tmO, const bf16* __restrict__ K,
@@ -1022,11 +1022,11 @@ __global__ void __launch_bounds__(THREADS, 1)
 
         const bool dead = SKIP && causal && q0 + BQ - 1 < kw0;
         if (!dead) {
-            float s[NQ][4];
+            float s[NQ][4], dp_[NQ][4];
 #pragma unroll
             for (int n = 0; n < NQ; ++n)
 #pragma unroll
-                for (int e = 0; e < 4; ++e) s[n][e] = 0.f;
+                for (int e = 0; e < 4; ++e) s[n][e] = dp_[n][e] = 0.f;
 #pragma unroll
             for (int kk = 0; kk < KT; ++kk) {
                 unsigned a[4];
@@ -1041,9 +1041,10 @@ __global__ void __launch_bounds__(THREADS, 1)
                     mma_bf16_16816(s[n + 1], a, b1);
                 }
             }
+            // P^T of n8 tile n in place, and the tile's Dv. Lane (g, c) holds keys g (e = 0, 1)
+            // and g + 8 (e = 2, 3) against rows 8n + 2c (e even) and 8n + 2c + 1 (e odd).
             float dvec[NQ][2];
-#pragma unroll
-            for (int n = 0; n < NQ; ++n) {
+            auto expo = [&](int n) {
                 const float4 l4 = *reinterpret_cast<const float4*>(lds + 2 * (n * 8 + c2));
                 s[n][0] = ex2(fmaf(s[n][0], scale_log2, -l4.x));
                 s[n][1] = ex2(fmaf(s[n][1], scale_log2, -l4.z));
@@ -1051,22 +1052,35 @@ __global__ void __launch_bounds__(THREADS, 1)
                 s[n][3] = ex2(fmaf(s[n][3], scale_log2, -l4.z));
                 dvec[n][0] = l4.y;
                 dvec[n][1] = l4.w;
+            };
+            auto mask = [&]() {
+                if ((causal && q0 < kw0 + 15) || kv_tail) {
+#pragma unroll
+                    for (int n = 0; n < NQ; ++n)
+#pragma unroll
+                        for (int e = 0; e < 4; ++e) {
+                            const int key = kw0 + g + (e >> 1) * 8;
+                            const int q = q0 + n * 8 + c2 + (e & 1);
+                            if ((causal && key > q) || key >= S_kv) s[n][e] = 0.f;
+                        }
+                }
+            };
+            auto dsform = [&](int n) {
+                s[n][0] *= dp_[n][0] - dvec[n][0];
+                s[n][1] *= dp_[n][1] - dvec[n][1];
+                s[n][2] *= dp_[n][2] - dvec[n][0];
+                s[n][3] *= dp_[n][3] - dvec[n][1];
+            };
+            if constexpr (!EARLY) {
+#pragma unroll
+                for (int n = 0; n < NQ; ++n) expo(n);
+                mask();
             }
-            if ((causal && q0 < kw0 + 15) || kv_tail) {
-#pragma unroll
-                for (int n = 0; n < NQ; ++n)
-#pragma unroll
-                    for (int e = 0; e < 4; ++e) {
-                        const int key = kw0 + g + (e >> 1) * 8;
-                        const int q = q0 + n * 8 + c2 + (e & 1);
-                        if ((causal && key > q) || key >= S_kv) s[n][e] = 0.f;
-                    }
-            }
-            float dp[NQ][4];
-#pragma unroll
-            for (int n = 0; n < NQ; ++n)
-#pragma unroll
-                for (int e = 0; e < 4; ++e) dp[n][e] = 0.f;
+            // dP^T = V_w dO^T. With EARLY it is issued straight after S^T and the exponentials
+            // of P^T are spread between its mma (n8 tile n after k step n * KT / NQ), all in
+            // one basic block, so the scheduler can fill the warp's gaps between mma issues with
+            // MUFU work instead of the warp running its exponentials with the pipe idle; the
+            // mask (a warp-uniform branch, which would end the block) comes after.
 #pragma unroll
             for (int kk = 0; kk < KT; ++kk) {
 #pragma unroll
@@ -1075,10 +1089,16 @@ __global__ void __launch_bounds__(THREADS, 1)
                     ldmatrix_x4(r, dos + box_off<BQ>(n * 8 + (lane & 15), 2 * kk + (lane >> 4)));
                     const unsigned b0[2] = {r[0], r[2]};
                     const unsigned b1[2] = {r[1], r[3]};
-                    mma_bf16_16816(dp[n], vf[kk], b0);
-                    mma_bf16_16816(dp[n + 1], vf[kk], b1);
+                    mma_bf16_16816(dp_[n], vf[kk], b0);
+                    mma_bf16_16816(dp_[n + 1], vf[kk], b1);
+                }
+                if constexpr (EARLY) {
+#pragma unroll
+                    for (int n = 0; n < NQ; ++n)
+                        if (n * KT / NQ == kk) expo(n);
                 }
             }
+            if constexpr (EARLY) mask();
 #pragma unroll
             for (int kq = 0; kq < QK; ++kq) {
                 pa[kq][0] = pack_bf16x2(s[2 * kq][0], s[2 * kq][1]);
@@ -1086,6 +1106,9 @@ __global__ void __launch_bounds__(THREADS, 1)
                 pa[kq][2] = pack_bf16x2(s[2 * kq + 1][0], s[2 * kq + 1][1]);
                 pa[kq][3] = pack_bf16x2(s[2 * kq + 1][2], s[2 * kq + 1][3]);
             }
+            // dV += P^T dO; with EARLY, dS^T = P^T (dP^T - Dv) of n8 tile n is formed after
+            // step n * STEPS / NQ of it (P^T is already packed in pa).
+            constexpr int STEPS = QK * (DT / 2);
 #pragma unroll
             for (int kq = 0; kq < QK; ++kq) {
 #pragma unroll
@@ -1097,14 +1120,17 @@ __global__ void __launch_bounds__(THREADS, 1)
                     const unsigned b1[2] = {r[2], r[3]};
                     mma_bf16_16816(dv[dj], pa[kq], b0);
                     mma_bf16_16816(dv[dj + 1], pa[kq], b1);
+                    if constexpr (EARLY) {
+                        const int step = kq * (DT / 2) + dj / 2;
+#pragma unroll
+                        for (int n = 0; n < NQ; ++n)
+                            if (n * STEPS / NQ == step) dsform(n);
+                    }
                 }
             }
+            if constexpr (!EARLY) {
 #pragma unroll
-            for (int n = 0; n < NQ; ++n) {
-                s[n][0] *= dp[n][0] - dvec[n][0];
-                s[n][1] *= dp[n][1] - dvec[n][1];
-                s[n][2] *= dp[n][2] - dvec[n][0];
-                s[n][3] *= dp[n][3] - dvec[n][1];
+                for (int n = 0; n < NQ; ++n) dsform(n);
             }
 #pragma unroll
             for (int kq = 0; kq < QK; ++kq) {
@@ -1403,6 +1429,16 @@ int env_chunk() {
     return v;
 }
 
+// SPARK_ATTN_BWD_EARLY = 1: variant 3 issues dP^T before the exponentials (see the kernel).
+bool env_early() {
+    static int v = -1;
+    if (v == -1) {
+        const char* e = std::getenv("SPARK_ATTN_BWD_EARLY");
+        v = e != nullptr && std::atoi(e) != 0;
+    }
+    return v != 0;
+}
+
 int env_split() {
     static int v = -2;
     if (v == -2) {
@@ -1575,10 +1611,10 @@ void launch_kv(const Args& a, bool split_tail, cudaStream_t stream) {
     launch_split_convert<D, C::BN>(a, s, ws_tiles, stream);
 }
 
-template <int D, int BQ, bool DQ>
+template <int D, int BQ, bool DQ, bool EARLY>
 void launch_kv_tma(const Args& a, bool split_tail, cudaStream_t stream) {
     using C = kvt::Cfg<D, BQ, DQ>;
-    auto kernel = kvt::bwd_kv_tma_kernel<D, BQ, DQ, true>;
+    auto kernel = kvt::bwd_kv_tma_kernel<D, BQ, DQ, true, EARLY>;
     static bool opted = false;
     if (!opted) {
         SPARK_CUDA_CHECK(
@@ -1712,11 +1748,18 @@ void attention_bwd_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __
                 break;
             case 3: {
                 constexpr int BQ = DD == 128 ? 32 : 64;
+                const bool early = env_early();
                 if (atomic_dq) {
-                    launch_kv_tma<DD, BQ, true>(a, true, stream);
+                    if (early)
+                        launch_kv_tma<DD, BQ, true, true>(a, true, stream);
+                    else
+                        launch_kv_tma<DD, BQ, true, false>(a, true, stream);
                 } else {
                     launch_dq_pass<DD>(a, stream);
-                    launch_kv_tma<DD, BQ, false>(a, false, stream);
+                    if (early)
+                        launch_kv_tma<DD, BQ, false, true>(a, false, stream);
+                    else
+                        launch_kv_tma<DD, BQ, false, false>(a, false, stream);
                 }
                 break;
             }
