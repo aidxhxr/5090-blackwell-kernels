@@ -401,26 +401,51 @@ GQA groups of 4 and 8), the forward's L against `torch.logsumexp` for every forw
 including the decode shapes, the autograd Function end to end, GQA against the same inputs
 with K and V repeated, and repeated calls on two streams.
 
-## Written, not yet measured
+## Three changes against variant 3, measured 2026-10-13
 
-Three changes against variant 3, each behind an environment knob that is off by default.
-The GPU box was down the whole session they were written in, so none of them has been
-compiled, checked or timed; the default stays variant 3 as measured above until each one
-beats it in `bench_attention_bwd` (which checks every run against the CPU reference, so
-running the sweep with a knob set is the test).
+Each sits behind an environment knob. `bench_attention_bwd --variant=3` checked every run
+against the CPU reference (all rows pass, the deterministic mode included), medians of 30 to
+50, the card at 2,565 MHz idle with other tenants holding 18 GB of its memory.
 
-| knob | change | what it is after |
+| knob | change | verdict |
 |---|---|---|
-| `SPARK_ATTN_BWD_EARLY=1` | dP^T issued right after S^T, the exponentials of n8 tile n placed after k step `n · KT / NQ` of it, dS^T formed during the dV product | the tiles where both warps of a scheduler are in their exponentials at once |
-| `SPARK_ATTN_BWD_PERSIST=1` | variant 3 on 170 resident blocks taking variant 3's blocks as items from a counter, rings that keep counting across items, V from global memory into fragments, the next item's K and V prefetched into L2 | the per-block start: barrier setup, 64 KB of K and V, the first Q/dO wait |
-| `SPARK_ATTN_BWD_ZERO4=1` | the preprocess zeroes the dQ buffer with one float4 store per lane | four masked 4-byte writes per sector in the 46 µs preprocess |
+| `SPARK_ATTN_BWD_EARLY` | dP^T issued right after S^T, the exponentials of n8 tile n placed after k step `n · KT / NQ` of it, dS^T formed during the dV product | kept, on from `S_q = 2048` |
+| `SPARK_ATTN_BWD_PERSIST=1` | variant 3 on 170 resident blocks taking variant 3's blocks as items from a counter, rings that keep counting across items, V from global memory into fragments, the next item's K and V prefetched into L2 | lost everywhere, off |
+| `SPARK_ATTN_BWD_ZERO4=1` | the preprocess zeroes the dQ buffer with one float4 store per lane | no difference, off |
+
+TFLOPS, the same session. The first two columns are the first of two alternating runs of 50
+iterations (the second pair agreed with it to 0.5%), the last two one run of 30 each:
+
+| shape | v3 | v3 + EARLY | v3 + PERSIST | v3 + ZERO4 |
+|---|---|---|---|---|
+| b1 h32 s1024 d128 | 163.8 | 163.9 | 158.5 | 164.0 |
+| b1 h32 s1024 d128 causal | **156.3** | 152.3 | 115.4 | 156.9 |
+| b1 h32 s2048 d128 | 222.7 | 222.6 | 214.4 | 223.3 |
+| b1 h32 s2048 d128 causal | 184.9 | 184.9 | 172.8 | 185.3 |
+| b1 h32 s4096 d128 | 225.6 | **229.6** | 216.0 | 227.0 |
+| b1 h32 s4096 d128 causal | 209.8 | **211.2** | 198.3 | 210.3 |
+| b1 h32 s8192 d128 | 221.4 | **226.5** | 213.8 | 223.2 |
+| b1 h32 s8192 d128 causal | 217.3 | **219.9** | 209.8 | 218.7 |
+| b4 h32 s2048 d128 causal | 158.6 | 158.8 | 149.9 | 158.7 |
+| b1 h32 s4096 d64 causal | 215.5 | **219.6** | 204.0 | 216.6 |
+| b1 hq32 hkv8 s4096 d128 | 221.5 | **224.3** | 211.1 | 221.9 |
+| b1 hq32 hkv8 s4096 d128 causal | 203.0 | **204.9** | 192.2 | 203.6 |
+| b1 hq32 hkv8 s8192 d128 causal | 216.2 | **218.2** | 203.1 | 217.2 |
+
+Registers (`cuobjdump --dump-resource-usage`): the shipped variant 3 kernel at `D = 128` is
+252 as before; with EARLY 254; the persistent kernel 255, and 255 with 32 bytes of stack
+when EARLY is on too. EARLY loses only at 1,024 tokens under the mask (156.3 to 152.3), where
+a key tile sees 32 query tiles or fewer, so the rule turns it on from 2,048 query rows,
+where it is level, and up. `SPARK_ATTN_BWD_EARLY=0` or `1` forces it either way. With the
+rule in place the default sweep gave 211.4 TFLOPS causal at 4096 tokens, 220.1 causal at
+8192 and 229.3 without the mask at 4096.
 
 **EARLY.** In variant 3 the exponentials sit between S^T and the mask, and the mask is a
 warp-uniform branch, so they form a basic block with no `mma` in it: the scheduler cannot
 move them in between `HMMA` issues, and a warp spends that stretch with nothing for the
 tensor pipe. dP^T does not depend on P, so it can go first, with the exponentials
-interleaved in the same block and the mask after it. The instruction count is the same;
-whether `ptxas` actually interleaves them is the first thing to check in the SASS.
+interleaved in the same block and the mask after it. The instruction count is the same.
+I have not read the SASS to see how much of the gain is the interleave.
 
 **PERSIST.** The forward measured its per-block start at 3.0 µs (variant 5's section of the
 forward note). Here a block also loads 64 KB of K and V before its first `mma`, against the
@@ -432,12 +457,17 @@ threads no registers. V cannot be staged through the stage region as variant 3 d
 because by the time a new item starts that region holds the item's first Q/dO tiles, so
 each lane loads its fragments from global memory with 32 4-byte loads, which the L2 prefetch
 issued a whole item earlier should turn into hits. K is reloaded with `cp.async` after one
-block-wide barrier per item.
+block-wide barrier per item. It came out 4 to 6% slower on every large shape and 26% slower
+at 1,024 tokens causal. I have not profiled it. Two suspects: the per-item barrier, which
+waits for the slowest warp's last dQ product and epilogue, where variant 3's blocks end
+independently; and the 255 registers, at the limit where variant 3 had three to spare.
 
-**ZERO4.** The loop `dq_acc[r · D + lane · 4 + e] = 0` compiles to four `STG.32` per lane:
-the compiler cannot see that the buffer is 16-byte aligned. Each warp instruction then writes
+**ZERO4.** The loop `dq_acc[r · D + lane · 4 + e] = 0` should compile to four `STG.32` per
+lane (I did not check the SASS): the compiler cannot see that the buffer is 16-byte aligned. Each warp instruction then writes
 4 bytes into each of 32 places 16 bytes apart, so every sector is written four times with a
 byte mask. One `float4` store per lane writes each sector once.
+The whole backward moved by under 0.5% either way, which is noise here: either L2 merges
+those partial writes for free or they were not what the preprocess waits on.
 
 ### Not built: dQ through a TMA reduce
 
@@ -467,7 +497,7 @@ full 32-byte sectors. So I did not build it.
   across all heads is still the best order measured; splitting the launch per batch element,
   or accumulating dQ for a group of heads at a time, has not been tried.
 - **A persistent grid**, the forward's variant 5: 1,024 blocks each load their K and V tile,
-  read V's fragments and initialize their barriers before the first `mma`. Written
-  (`SPARK_ATTN_BWD_PERSIST`, above), not measured.
+  read V's fragments and initialize their barriers before the first `mma`. The version above
+  (`SPARK_ATTN_BWD_PERSIST`) lost 4 to 6%; a profile of why is the next step.
 - **Scope.** `D` in {64, 128}, no dropout, no attention bias, no sliding window, and sm_120
   only as measured (the GB10 build compiles the same source and is untested).

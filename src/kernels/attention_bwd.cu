@@ -1777,14 +1777,16 @@ int env_chunk() {
     return v;
 }
 
-// SPARK_ATTN_BWD_EARLY = 1: variant 3 issues dP^T before the exponentials (see the kernel).
-bool env_early() {
-    static int v = -1;
-    if (v == -1) {
+// Whether variant 3 issues dP^T before the exponentials (see the kernel). Measured: 0.7 to
+// 2.6% faster from 4096 tokens up, even at 2048, 2.4% slower at 1024 causal, so it is on
+// from S_q = 2048. SPARK_ATTN_BWD_EARLY = 0 or 1 forces it.
+bool use_early(int S_q) {
+    static int v = -2;
+    if (v == -2) {
         const char* e = std::getenv("SPARK_ATTN_BWD_EARLY");
-        v = e != nullptr && std::atoi(e) != 0;
+        v = e != nullptr ? (std::atoi(e) != 0) : -1;
     }
-    return v != 0;
+    return v >= 0 ? v != 0 : S_q >= 2048;
 }
 
 // SPARK_ATTN_BWD_PERSIST = 1: variant 3 with atomic dQ runs on the persistent grid.
@@ -2147,7 +2149,7 @@ void attention_bwd_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __
                 break;
             case 3: {
                 constexpr int BQ = DD == 128 ? 32 : 64;
-                const bool early = env_early();
+                const bool early = use_early(S_q);
                 if (persist) {
                     if (early)
                         launch_kv_persist<DD, BQ, true>(a, stream);

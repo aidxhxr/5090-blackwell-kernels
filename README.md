@@ -595,7 +595,10 @@ to an fp32 buffer with atomics. What made it fast on this card:
 TFLOPS with the backward counted as 2.5 times the forward's FLOPs, halved under the mask. The
 split mattered most for GQA: 256 key tiles on 170 SMs is two waves with the second half
 empty, 159 TFLOPS before the split and 208 after. Taking the barrier out bought the same thing
-it bought the forward: the tensor pipe went from 85% to 90% busy. The atomics make the last
+it bought the forward: the tensor pipe went from 85% to 90% busy. Issuing dP^T before the
+exponentials, so they share a basic block with `mma` work, added 0.7 to 2.6% from 4096 tokens
+up (209.8 to 211.2 TFLOPS causal at 4096, 217.3 to 219.9 at 8192, 225.6 to 229.6 without the
+mask, measured 2026-10-13; the table above is the earlier sweep). The atomics make the last
 bits of dQ run-to-run dependent; `deterministic=True` computes dQ in a separate pass instead,
 1.4x the time under the causal mask. The numbers, the profiles and the experiments that lost
 are in [the design note](docs/design/attention_bwd.md).
