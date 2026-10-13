@@ -42,7 +42,7 @@ PyTorch" column is eager PyTorch on the same shapes through the extension.
 | bf16 GEMM | 8192 x 8192 x 8192 | v6 | 4.51 ms | 244 TFLOPS | 104.8% of cuBLAS | 1.07x |
 | bf16 GEMM, decode | 16 x 4096 x 4096 | v6 | 23.4 us | 1,446 GB/s | 123% of cuBLAS | 1.21x |
 | fp8 GEMM | 4096 x 4096 x 4096 | v2 | 0.189 ms | 729 TFLOPS | 104.0% of cuBLASLt | 1.35x |
-| fp8 GEMM | 8192 x 8192 x 8192 | v2 | 1.45 ms | 757 TFLOPS | 100.8% of cuBLASLt | 1.03x |
+| fp8 GEMM | 8192 x 8192 x 8192 | v2 | 1.45 ms | 757 TFLOPS | 100.8% of cuBLASLt | 1.13x |
 | fp8 GEMM, decode | 16 x 4096 x 4096 | v1 | 13.2 us | 1,291 GB/s | 126% of cuBLASLt | 1.62x |
 | fp4 GEMM, NVFP4 | 8192 x 8192 x 8192 | v2 | 0.803 ms | 1,369 TFLOPS | 96.2% of cuBLASLt | 1.10x |
 | fp4 GEMM, NVFP4 decode | 16 x 4096 x 4096 | v1 | 9.1 us | 1,061 GB/s | 228% of cuBLASLt | 3.78x |
