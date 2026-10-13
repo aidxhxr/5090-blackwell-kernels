@@ -223,16 +223,14 @@ overrides it). Measured on v2, % of cuBLASLt:
 (The memsets themselves were worth about 3 points at 4096³: 91% with them and 94.3% without,
 both at the uncapped split, in back-to-back sessions.)
 
-### Clusters (written, not measured)
+### Clusters
 
 Configs 10 to 13 run config 1 in a 2x1, 1x2, 2x2 and 4x1 thread block cluster with the
 operand boxes multicast, the scheme of the fp8 cluster kernel (docs/design/fp8gemm.md,
-"Clusters, multicast and a wider tile"): each block copies its share of the A and Bt panels
-its cluster row and column have in common, consumer warps release a stage to every block
-that writes into it, and the schedule runs on cluster tiles. The scale runs stay per block
-(2 KB of an 18 KB stage). They take a cluster shape as two template parameters of the v2
-kernel that default to 1 x 1. Not compiled or run yet; the target is the 2.15 against 2.21
-GHz clock gap at 8192³, not cycles, since v2 already takes 1.4% fewer cycles than cuBLASLt.
+"Clusters, multicast and a wider tile"); the scale runs stay per block. They are correct
+(100% of outputs bit-identical to cuBLASLt) and unusable for the same reason as the fp8 ones:
+the multicast TMA load is a slow path on sm_120, 973 ms for a 4096x4096x1024 NVFP4 launch.
+The default is unchanged.
 
 ## Measured
 

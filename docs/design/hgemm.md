@@ -16,7 +16,8 @@ Both targets are the consumer/workstation Blackwell lineage: the RTX 5090 is com
 12.0 (sm_120, primary target) and the GB10 is 12.1 (sm_121, secondary). They have
 fifth-generation tensor cores driven by the classic `mma.sync` warp-level instruction, which is
 what the WMMA C++ API compiles to. The datacenter Blackwell parts (sm_100, B200/GB200) add
-`tcgen05` instructions and thread-block clusters; those do not exist on either machine. TMA
+`tcgen05` instructions; those do not exist on either machine (thread-block clusters launch on
+the 5090, but their multicast TMA load is a slow path there, docs/design/fp8gemm.md). TMA
 (`cp.async.bulk.tensor`) and mbarriers do exist on sm_120, and variant 5 uses them to feed the
 same `mma.sync` k-loop. So `mma.sync` is not a compromise, it is the native path, and the same
 source builds for both.

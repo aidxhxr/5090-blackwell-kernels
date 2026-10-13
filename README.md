@@ -10,7 +10,7 @@ PyTorch on the same shapes in the same timing loop, and gets profiled in Nsight 
 the ladder says what each change bought.
 
 Where it ended up: the bf16 GEMM is ahead of cuBLAS on every shape from 2048 cubed up and at
-the memory floor on decode shapes. The fp8 GEMM is level with cuBLASLt at 4096 cubed, and the
+the memory floor on decode shapes. The fp8 GEMM is level with or ahead of cuBLASLt from 4096 cubed up, and the
 fp4 GEMM gives cuBLASLt's NVFP4 bits at 96% of its speed on the big squares. The
 attention kernel is 18 to 38% ahead of PyTorch's FlashAttention-2 on prefill and streams a
 128K-token cache faster than `cudaMemcpy` copies it, and its backward pass is 1 to 40% ahead
@@ -41,8 +41,8 @@ PyTorch" column is eager PyTorch on the same shapes through the extension.
 | bf16 GEMM | 4096 x 4096 x 4096 | v6 | 0.549 ms | 250 TFLOPS | 111.0% of cuBLAS | 1.12x |
 | bf16 GEMM | 8192 x 8192 x 8192 | v6 | 4.51 ms | 244 TFLOPS | 104.8% of cuBLAS | 1.07x |
 | bf16 GEMM, decode | 16 x 4096 x 4096 | v6 | 23.4 us | 1,446 GB/s | 123% of cuBLAS | 1.21x |
-| fp8 GEMM | 4096 x 4096 x 4096 | v2 | 0.195 ms | 703 TFLOPS | 99.6% of cuBLASLt | 1.35x |
-| fp8 GEMM | 8192 x 8192 x 8192 | v2 | 1.59 ms | 693 TFLOPS | 93.9% of cuBLASLt | 1.03x |
+| fp8 GEMM | 4096 x 4096 x 4096 | v2 | 0.189 ms | 729 TFLOPS | 104.0% of cuBLASLt | 1.35x |
+| fp8 GEMM | 8192 x 8192 x 8192 | v2 | 1.45 ms | 757 TFLOPS | 100.8% of cuBLASLt | 1.03x |
 | fp8 GEMM, decode | 16 x 4096 x 4096 | v1 | 13.2 us | 1,291 GB/s | 126% of cuBLASLt | 1.62x |
 | fp4 GEMM, NVFP4 | 8192 x 8192 x 8192 | v2 | 0.803 ms | 1,369 TFLOPS | 96.2% of cuBLASLt | 1.10x |
 | fp4 GEMM, NVFP4 decode | 16 x 4096 x 4096 | v1 | 9.1 us | 1,061 GB/s | 228% of cuBLASLt | 3.78x |
@@ -260,16 +260,20 @@ block-scaled instruction from the section above.
 |---|---|---|---|---|---|---|
 | 1024 x 1024 x 1024 | 63 | 234 |  | 205 | 114.1% | 1.54x |
 | 2048 x 2048 x 2048 | 73 | 410 | 582 | 410 | 142.0% | 1.25x |
-| 4096 x 4096 x 4096 | 65 | 638 | 703 | 706 | 99.6% | 1.35x |
-| 8192 x 8192 x 8192 | 63 | 639 | 693 | 738 | 93.9% | 1.03x |
-| 4096 x 4096 x 11008 | 49 | 665 | 738 | 580 | 127.2% | 1.29x |
-| 4096 x 11008 x 4096 | 64 | 653 | 698 | 672 | 103.9% | 1.21x |
+| 4096 x 4096 x 4096 | 65 | 638 | 729 | 701 | 104.0% | 1.35x |
+| 8192 x 8192 x 8192 | 63 | 639 | 757 | 751 | 100.8% | 1.03x |
+| 4096 x 4096 x 11008 | 49 | 665 | 780 | 578 | 135.0% | 1.29x |
+| 4096 x 11008 x 4096 | 64 | 653 | 738 | 666 | 110.8% | 1.21x |
 
 TFLOPS. Every row is bit-identical to cuBLASLt: e4m3 products are multiples of 2^-18 and the
-fp32 partial sums stay exact. At 8192 cubed Nsight has variant 2 and cuBLASLt at the same
-cycle count and the same 89% tensor-pipe activity, and the gap is clock: both at 600 W,
-cuBLASLt at 2.3 GHz and variant 2 at 2.15, because it issues 341 M instructions to cuBLASLt's
-233 M for the same 134 M `QMMA`. The "vs torch" column is `torch._scaled_mm`, whose own call
+fp32 partial sums stay exact. At 8192 cubed the old 128 x 128 tile took the same cycles as
+cuBLASLt but ran at 2.11 GHz against 2.29 under the 600 W cap, issuing 324 M instructions to
+cuBLASLt's 233 M. The default is now a 128 x 256 tile with eight 64 x 64 warp tiles: 240 M
+instructions and a quarter fewer L2 sectors for the same 134 M `QMMA`, and it holds
+cuBLASLt's clock. The v2 column is that tile (a later run than the other columns, cuBLASLt
+re-timed next to it). Thread block clusters with multicast TMA loads launch on this card and
+compute the right bits, but the multicast copy is a slow path on sm_120, thousands of times
+slower than a plain one (docs/design/fp8gemm.md). The "vs torch" column is `torch._scaled_mm`, whose own call
 path lands well under a direct cuBLASLt call.
 
 | M x N x K | time | ours | ours / cuBLASLt | vs torch |
