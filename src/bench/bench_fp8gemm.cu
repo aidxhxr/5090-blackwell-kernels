@@ -3,6 +3,7 @@
 //   ./bench_fp8gemm                       # default shape sweep (bench_hgemm's), all variants,
 //                                         # per-tensor scales (dtype e4m3) then MX (dtype mxfp8)
 //   ./bench_fp8gemm --m=4096 --n=4096 --k=4096 --variant=1 --iters=50 --mode=mx
+//   ./bench_fp8gemm --models[=llama3-8b] [--ms=128,512] [--mode=mx]   # real projection shapes
 //
 // C = scale_a * scale_b * A[M,K] * Bt[N,K]^T, e4m3 in, bf16 out. cuBLASLt's fp8 path only takes
 // this layout (A row-major, B column-major, both K-contiguous), so the reference is timed on
@@ -32,6 +33,7 @@
 #include <vector>
 
 #include "bench_common.hpp"
+#include "model_shapes.hpp"
 #include "spark/kernels.h"
 
 #define CUBLAS_CHECK(expr)                                                                        \
@@ -393,6 +395,180 @@ bool run_one(cudaStream_t stream, const Shape& s, int variant, int iters, bool m
     return ok;
 }
 
+// ---- model shapes (--models) ----------------------------------------------------------------
+//
+// bench_hgemm --models' twenty weights (model_shapes.hpp) at M = 128 to 4096 tokens, Bt as
+// nn.Linear stores it. Per weight the operands are generated on the device once (a
+// 128256-row lm_head is 525 MB of e4m3), every row runs cuBLASLt and each applicable
+// variant on the same buffers, the output is checked on the device against cuBLASLt with
+// run_one's tolerance, and Bt is rotated over copies past L2 whenever one copy would fit. In
+// MX mode the scales are random powers of two in [2^-2, 2^2] (cuBLASLt gets them in its
+// tiled layout) and the reference is cuBLASLt's MXFP8 kernel. Rows are "MxNxK@label".
+
+// Uniform [-1, 1) rounded to e4m3, from a hash of the index.
+__global__ void fill_e4m3_kernel(__nv_fp8_e4m3* p, size_t n, unsigned seed) {
+    for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        unsigned x = static_cast<unsigned>(i) * 0x9E3779B1u ^ static_cast<unsigned>(i >> 32) ^ seed;
+        x ^= x >> 16;
+        x *= 0x7FEB352Du;
+        x ^= x >> 15;
+        x *= 0x846CA68Bu;
+        x ^= x >> 16;
+        p[i] = __nv_fp8_e4m3(static_cast<float>(x >> 8) * (2.0f / 16777216.0f) - 1.0f);
+    }
+}
+
+void fill_e4m3_dev(__nv_fp8_e4m3* p, size_t n, unsigned seed) {
+    fill_e4m3_kernel<<<1024, 256>>>(p, n, seed);
+    SPARK_CUDA_CHECK(cudaGetLastError());
+}
+
+std::vector<unsigned char> random_ue8m0(size_t n, uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::vector<unsigned char> v(n);
+    for (auto& x : v) x = static_cast<unsigned char>(125 + rng() % 5);
+    return v;
+}
+
+// A candidate row: label and variant.
+struct ModelCand {
+    std::string label;
+    int variant;
+};
+
+// One weight at every M of `ms`. Returns false on a correctness failure.
+bool run_models_weight(cudaStream_t stream, const spark::bench::ModelWeight& w,
+                       const std::vector<int>& ms, bool mx, int iters) {
+    const int N = w.N, K = w.K, KB = K / 32;
+    const int max_m = *std::max_element(ms.begin(), ms.end());
+    const size_t nB = static_cast<size_t>(N) * K;  // bytes
+    const int copies =
+        nB >= (size_t{256} << 20) ? 1 : static_cast<int>((size_t{256} << 20) / nB) + 1;
+    const size_t nA = static_cast<size_t>(max_m) * K, nC = static_cast<size_t>(max_m) * N;
+    __nv_fp8_e4m3 *dA = nullptr, *dB = nullptr;
+    __nv_bfloat16 *dC = nullptr, *dRef = nullptr;
+    float* dScale = nullptr;
+    unsigned* scratch = nullptr;
+    SPARK_CUDA_CHECK(cudaMalloc(&dA, nA));
+    SPARK_CUDA_CHECK(cudaMalloc(&dB, copies * nB));
+    SPARK_CUDA_CHECK(cudaMalloc(&dC, nC * sizeof(__nv_bfloat16)));
+    SPARK_CUDA_CHECK(cudaMalloc(&dRef, nC * sizeof(__nv_bfloat16)));
+    SPARK_CUDA_CHECK(cudaMalloc(&dScale, 2 * sizeof(float)));
+    SPARK_CUDA_CHECK(cudaMalloc(&scratch, 2 * sizeof(unsigned)));
+    const float scales[2] = {mx ? 1.0f : kScaleA, mx ? 1.0f : kScaleB};
+    SPARK_CUDA_CHECK(cudaMemcpy(dScale, scales, sizeof(scales), cudaMemcpyHostToDevice));
+    fill_e4m3_dev(dA, nA, 1234u);
+    fill_e4m3_dev(dB, nB, 5678u);
+    for (int c = 1; c < copies; ++c)
+        SPARK_CUDA_CHECK(cudaMemcpy(dB + c * nB, dB, nB, cudaMemcpyDeviceToDevice));
+    // MX scales, row-major for us and tiled for cuBLASLt. The first M rows of the max_m-row
+    // tensors are the M-row tensors in both layouts (the tiled one is row tiles outermost).
+    unsigned char *dSfa = nullptr, *dSfb = nullptr, *dSfaBlk = nullptr, *dSfbBlk = nullptr;
+    size_t sfb_bytes = 0, sfb_blk_bytes = 0;
+    if (mx) {
+        const auto sfa = random_ue8m0(static_cast<size_t>(max_m) * KB, 11);
+        const auto sfb = random_ue8m0(static_cast<size_t>(N) * KB, 12);
+        const auto blkA = to_blocked(sfa, max_m, KB);
+        const auto blkB = to_blocked(sfb, N, KB);
+        sfb_bytes = sfb.size();
+        sfb_blk_bytes = blkB.size();
+        SPARK_CUDA_CHECK(cudaMalloc(&dSfa, sfa.size()));
+        SPARK_CUDA_CHECK(cudaMalloc(&dSfaBlk, blkA.size()));
+        SPARK_CUDA_CHECK(cudaMalloc(&dSfb, copies * sfb_bytes));
+        SPARK_CUDA_CHECK(cudaMalloc(&dSfbBlk, copies * sfb_blk_bytes));
+        SPARK_CUDA_CHECK(cudaMemcpy(dSfa, sfa.data(), sfa.size(), cudaMemcpyHostToDevice));
+        SPARK_CUDA_CHECK(cudaMemcpy(dSfaBlk, blkA.data(), blkA.size(), cudaMemcpyHostToDevice));
+        for (int c = 0; c < copies; ++c) {
+            SPARK_CUDA_CHECK(
+                cudaMemcpy(dSfb + c * sfb_bytes, sfb.data(), sfb_bytes, cudaMemcpyHostToDevice));
+            SPARK_CUDA_CHECK(cudaMemcpy(dSfbBlk + c * sfb_blk_bytes, blkB.data(), sfb_blk_bytes,
+                                        cudaMemcpyHostToDevice));
+        }
+    }
+    SPARK_CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<ModelCand> cands;
+    for (int v = 1; v < spark::fp8gemm_num_variants(); ++v)
+        cands.push_back({"v" + std::to_string(v), v});
+
+    bool all_ok = true;
+    for (int M : ms) {
+        const size_t nc = static_cast<size_t>(M) * N;
+        const std::string shape =
+            std::to_string(M) + "x" + std::to_string(N) + "x" + std::to_string(K);
+        std::fprintf(stderr, "  %s %s, M = %d (Bt %.1f MB%s)%s\n", w.model, w.name, M, nB / 1e6,
+                     copies > 1 ? ", rotated over copies past L2" : "", mx ? ", MX" : "");
+        if (mx && K % 256 != 0) continue;
+        LtGemm lt(M, N, K, mx ? static_cast<const void*>(dSfaBlk) : dScale,
+                  mx ? static_cast<const void*>(dSfbBlk) : dScale + 1, mx);
+        if (!lt.available) {
+            std::fprintf(stderr, "    cuBLASLt has no MXFP8 kernel for this shape: skipped\n");
+            continue;
+        }
+        lt.run(dA, dB, dRef, stream);
+        int turn = 0;
+        const auto t_ref = spark::bench::time_kernel(
+            [&] {
+                const int c = turn++ % copies;
+                if (mx) lt.set_a_scale(dSfbBlk + c * sfb_blk_bytes);
+                lt.run(dA, dB + static_cast<size_t>(c) * nB, dC, stream);
+            },
+            stream, 5, iters);
+        if (mx) lt.set_a_scale(dSfbBlk);
+        const double flops = 2.0 * M * N * static_cast<double>(K);
+        std::fprintf(stderr, "    cuBLASLt%s %.4f ms, %.1f TFLOPS\n", mx ? " MXFP8" : "",
+                     t_ref.median_ms, flops / (t_ref.median_ms * 1e-3) / 1e12);
+        for (const auto& c : cands) {
+            const bool sup = mx ? spark::fp8gemm_mx_supports(M, N, K, c.variant)
+                                : spark::fp8gemm_supports(M, N, K, c.variant);
+            if (!sup) continue;
+            auto run_ours = [&](int copy) {
+                const __nv_fp8_e4m3* b = dB + static_cast<size_t>(copy) * nB;
+                if (mx)
+                    spark::fp8gemm_mx(dA, b, dC, M, N, K, nullptr, nullptr, dSfa,
+                                      dSfb + copy * sfb_bytes, c.variant, stream);
+                else
+                    spark::fp8gemm(dA, b, dC, M, N, K, dScale, dScale + 1, c.variant, stream);
+            };
+            SPARK_CUDA_CHECK(cudaMemsetAsync(dC, 0, nc * sizeof(__nv_bfloat16), stream));
+            run_ours(0);
+            const auto err = spark::bench::max_err_dev(dC, dRef, nc, scratch, stream);
+            const double tol = 2e-2 * err.second + 1e-3;
+            const bool ok = err.first <= tol;
+            if (!ok)
+                std::fprintf(stderr, "  FAIL %s %s: max_abs=%.4e tol=%.4e\n", shape.c_str(),
+                             c.label.c_str(), err.first, tol);
+            all_ok = all_ok && ok;
+            turn = 0;
+            const auto t =
+                spark::bench::time_kernel([&] { run_ours(turn++ % copies); }, stream, 5, iters);
+            spark::bench::Row row;
+            row.kernel = "fp8gemm_models";
+            row.dtype = mx ? "mxfp8" : "e4m3";
+            row.variant = c.variant;
+            row.shape = shape + "@" + c.label;
+            row.median_ms = t.median_ms;
+            row.min_ms = t.min_ms;
+            row.tflops = flops / (t.median_ms * 1e-3) / 1e12;
+            row.gbps = (static_cast<double>(M) * K + nB + 2.0 * nc) / (t.median_ms * 1e-3) / 1e9;
+            row.ref_ms = t_ref.median_ms;
+            row.max_abs_err = err.first;
+            row.max_rel_err = err.second > 0 ? err.first / err.second : 0.0;
+            row.ok = ok;
+            spark::bench::print_row(row);
+            std::fprintf(stderr, "    %-8s %.1f%% of cuBLASLt\n", c.label.c_str(),
+                         100.0 * t_ref.median_ms / t.median_ms);
+        }
+    }
+    for (void* d : {static_cast<void*>(dA), static_cast<void*>(dB), static_cast<void*>(dC),
+                    static_cast<void*>(dRef), static_cast<void*>(dScale),
+                    static_cast<void*>(scratch), static_cast<void*>(dSfa), static_cast<void*>(dSfb),
+                    static_cast<void*>(dSfaBlk), static_cast<void*>(dSfbBlk)})
+        if (d) SPARK_CUDA_CHECK(cudaFree(d));
+    return all_ok;
+}
+
 }  // namespace
 
 int run(int argc, char** argv) {
@@ -417,8 +593,9 @@ int run(int argc, char** argv) {
     } else {
         for (int v = 0; v < spark::fp8gemm_num_variants(); ++v) variants.push_back(v);
     }
-    // --mode=tensor (per-tensor scales), mx (per-32-k ue8m0 scales) or both (the default).
-    const std::string mode = args.get("mode", "both");
+    // --mode=tensor (per-tensor scales), mx (per-32-k ue8m0 scales) or both (the default;
+    // tensor with --models).
+    const std::string mode = args.get("mode", args.has("models") ? "tensor" : "both");
     SPARK_REQUIRE(mode == "tensor" || mode == "mx" || mode == "both",
                   "--mode must be tensor, mx or both");
     std::vector<bool> modes;
@@ -433,9 +610,24 @@ int run(int argc, char** argv) {
     cudaStream_t stream = nullptr;  // legacy default stream, as bench_hgemm
     spark::bench::print_header();
     bool all_ok = true;
-    for (bool mx : modes) {
-        for (const auto& s : shapes) {
-            for (int v : variants) all_ok = run_one(stream, s, v, iters, mx) && all_ok;
+    if (args.has("models")) {
+        // --models[=<model substring>] [--ms=128,256,...] [--mode=tensor|mx|both]
+        const std::string filter = args.get("models", "1");
+        const std::vector<int> ms =
+            spark::bench::parse_int_list(args.get("ms", "128,256,512,1024,2048,4096"));
+        SPARK_REQUIRE(!ms.empty(), "--ms: expected a comma-separated list of M");
+        for (bool mx : modes) {
+            for (const auto& w : spark::bench::model_weights()) {
+                if (filter != "1" && std::string(w.model).find(filter) == std::string::npos)
+                    continue;
+                all_ok = run_models_weight(stream, w, ms, mx, iters) && all_ok;
+            }
+        }
+    } else {
+        for (bool mx : modes) {
+            for (const auto& s : shapes) {
+                for (int v : variants) all_ok = run_one(stream, s, v, iters, mx) && all_ok;
+            }
         }
     }
     if (!all_ok) {
