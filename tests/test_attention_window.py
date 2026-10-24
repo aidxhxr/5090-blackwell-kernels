@@ -282,9 +282,9 @@ def test_paged_window_default_is_not_the_invariant_rung(sk):
     got = sk.paged_decode(q, kc, vc, bt, sl, window=300, sinks=sinks)
     assert torch.equal(got, want)
     if sk.num_variants("paged_decode") > 2:
-        with pytest.raises(RuntimeError):
+        with pytest.raises(ValueError):
             sk.paged_decode(q, kc, vc, bt, sl, variant=2, window=300)
-        with pytest.raises(RuntimeError):
+        with pytest.raises(ValueError):
             sk.paged_decode(q, kc, vc, bt, sl, variant=2, sinks=sinks)
     tq = torch.randn(sum(lens[:3]), hq, d, device="cuda", dtype=torch.bfloat16)
     cu = torch.tensor([0, lens[0], lens[0] + lens[1], sum(lens[:3])], dtype=torch.int32,
@@ -294,7 +294,7 @@ def test_paged_window_default_is_not_the_invariant_rung(sk):
     got = sk.attention_varlen(tq, kc, vc, cu, sl3, bt3, window=300, sinks=sinks)
     assert torch.equal(got, want)
     if sk.num_variants("attention_varlen") > 2:
-        with pytest.raises(RuntimeError):
+        with pytest.raises(ValueError):
             sk.attention_varlen(tq, kc, vc, cu, sl3, bt3, variant=2, window=300)
 
 
