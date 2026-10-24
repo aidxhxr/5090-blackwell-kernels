@@ -448,6 +448,18 @@ void grouped_gemm_fp8(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* W, const int3
                       __nv_bfloat16* C, int T, int E, int N, int K, const float* scale_a,
                       const float* scale_b, cudaStream_t stream);
 bool grouped_gemm_supports(int E, int N, int K, bool fp8);
+// Both grouped GEMMs pick a tile of 16, 64 or 128 rows from the average rows per expert, T / E,
+// in bf16; fp8 keeps 128 (SPARK_GROUPED_BM=16|64|128 forces one for either). grouped_gemm_swiglu is
+// the same with the SwiGLU of an MoE expert in the epilogue: W [E, N, K] has its rows alternating
+// gate and up (row 2j gate_j, row 2j + 1 up_j), C is [T, N / 2] with C[r, j] = silu(G) * U formed
+// in fp32 from the two unrounded sums (scaled first, for fp8) and rounded once. Same rules; the
+// default pipeline of each type (SPARK_GROUPED_CONFIG does not apply).
+void grouped_gemm_swiglu_bf16(const __nv_bfloat16* A, const __nv_bfloat16* W,
+                              const int32_t* offsets, __nv_bfloat16* C, int T, int E, int N, int K,
+                              cudaStream_t stream);
+void grouped_gemm_swiglu_fp8(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* W, const int32_t* offsets,
+                             __nv_bfloat16* C, int T, int E, int N, int K, const float* scale_a,
+                             const float* scale_b, cudaStream_t stream);
 
 // ---- Linear cross-entropy (src/kernels/cross_entropy.cu) ---------------------------------
 // The pieces of CE(h w^T, y) for a large vocabulary without torch's [T, V] logits; the
