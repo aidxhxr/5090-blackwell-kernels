@@ -378,7 +378,8 @@ A = 1.1 on open chat would be close to a wash. These are the numbers to fill in.
 - Same tokens up to near ties. The verify forward computes a row through `attention_varlen`
   and GEMMs of a different M than the plain decode step, and the engine is not batch invariant
   (llm_parity.md), so at a near tie in bf16 a token can flip, the same kind of split the mixed
-  step can make.
+  step can make. With `batch_invariant=True` the verify rows get the decode steps' bits and
+  speculation gives exactly greedy's tokens (batch_invariant.md).
 
 **Tests.** `tests/test_spec.py` runs on the CPU: the indexed drafter against a plain scan on
 growing random contexts, the acceptance rule, the stop cut, and whole speculative decodes on a

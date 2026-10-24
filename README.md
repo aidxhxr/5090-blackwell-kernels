@@ -910,6 +910,30 @@ faster, and the same bytes hold twice the tokens. That figure is arithmetic: the
 their tests (against a reference on the same e4m3 bytes) are written but have not run on the
 card yet (the fp8 section of serving.md).
 
+### batch invariance
+
+The engine was deterministic but not batch invariant: hgemm picks its kernel and K split from
+M, and the paged decode kernel splits the keys of the whole batch over the SMs, so a
+request's logits moved with whatever else was in its steps. `Engine(batch_invariant=True)`
+(or `SPARK_BATCH_INVARIANT=1`) swaps in three opt-in rungs: hgemm variant 7, which never
+splits K, and variant 2 of `paged_decode` and `attention_varlen`, which cut a sequence's keys
+into 256-key chunks at fixed offsets and fold them in order, with the same arithmetic in both
+ops. A request's logits are then `torch.equal` alone or in a batch, in any slot or graph
+bucket, with its prompt chunked or its prefix cached, after a preemption, and under
+speculative decoding. On 8 of the 32 layers:
+
+| batch | decode ms/step, default | invariant | prefill tok/s, default | invariant |
+|---|---|---|---|---|
+| 1 | 2.894 | 2.942 | 60,990 | 55,462 |
+| 8 | 3.040 | 3.014 | 65,477 | 62,982 |
+| 32 | 3.302 | 3.355 | 65,089 | 63,138 |
+| 64 | 3.934 | 3.970 | 64,172 | 63,467 |
+
+Decode costs under 2%: the decode GEMMs are the same kernels, and the invariant attention is
+0 to 8% slower on its own. Prefill pays for the waves Stream-K used to fill, 1 to 9% here and
+up to 1.6x on a 128-token GEMM. Quantized weights and the fp8 cache are not covered. Details
+in [docs/design/batch_invariant.md](docs/design/batch_invariant.md).
+
 ## real models
 
 Everything above ran on random weights. So I loaded real checkpoints into the engine
@@ -938,9 +962,10 @@ the residual adds and SwiGLU happen in the fp32 GEMM epilogue.
 
 Greedy outputs still split from transformers', in 12 of 16 replies within 256 tokens. Every
 split I looked at was a tie or one bf16 step between the top two logits, and the fp32
-reference sided with each implementation six times. The engine is also not batch invariant:
-hgemm picks its schedule by M, so the same prompt can take a different near-tie at a
-different batch size. Details in [docs/design/llm_parity.md](docs/design/llm_parity.md).
+reference sided with each implementation six times. The engine is also not batch invariant by
+default: hgemm picks its schedule by M, so the same prompt can take a different near-tie at a
+different batch size (`batch_invariant=True` fixes that, above). Details in
+[docs/design/llm_parity.md](docs/design/llm_parity.md).
 
 **Is it fast.** I ran the same token ids through vLLM 0.30 and transformers 5.18, all bf16,
 greedy, no early stop.

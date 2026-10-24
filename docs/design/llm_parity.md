@@ -227,7 +227,10 @@ ran it with batch 1, so I have not measured it.
 If someone needs reproducible greedy output across batch sizes, two changes would do it: a
 fixed reduction order in the GEMMs regardless of M, and fp32 logits out of the last GEMM, so
 the argmax stops seeing exact ties at 2% of positions. Neither would make the model more
-accurate.
+accurate. The first now exists: `Engine(batch_invariant=True)` (batch_invariant.md) fixes the
+reduction order of every GEMM and of attention, so the logits are the same bits at any batch
+size; the exact ties are still broken by token id, the same way every time. Not rerun on the
+checkpoint yet.
 
 ## Perplexity, all of wikitext-2
 
