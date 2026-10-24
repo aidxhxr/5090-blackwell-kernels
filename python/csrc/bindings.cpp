@@ -316,7 +316,8 @@ Tensor hgemm(const Tensor& a, const Tensor& b, int variant, const std::optional<
     } else {
         c = at::empty({s.M, n_out}, a.options());
     }
-    int v = resolve_variant(variant, spark::hgemm_num_variants());
+    int v = variant < 0 ? spark::hgemm_default_variant()
+                        : resolve_variant(variant, spark::hgemm_num_variants());
     while (variant < 0 && v > 0 && !spark::hgemm_supports(s.M, s.N, s.K, v)) --v;
     spark::hgemm_bf16(bf16_ptr(a), bf16_ptr(b), bf16_ptr_mut(c), s.M, s.N, s.K, v,
                       current_stream(a), ep);

@@ -145,14 +145,19 @@ def hgemm(
     multiple of 16, and variant 2 M, N multiples of 128 and K a multiple of 32. The default
     steps down to the highest variant that accepts the shape.
 
+    Variant 7 is batch invariant and opt-in (-1 never picks it): row i of the result has the
+    same bits whatever M is, because no route splits K (the decode kernel with K unsplit for
+    M <= 64, whole TMA tiles above). Same shape rules and epilogue as variant 6;
+    docs/design/batch_invariant.md has what it costs.
+
     Args:
         bias: [N] bfloat16, added to every row before the activation.
         act: None, "silu", "gelu" (the tanh form, as F.gelu(approximate="tanh")) or "relu".
         residual: [M, N] bfloat16, added after the activation.
         out: [M, N] bfloat16 to write into instead of allocating; `out=residual` is the
             in-place accumulate `residual += act(a @ b + bias)`.
-    The fused options run on variants 4 and 6 only (N and K multiples of 64); asking for one
-    on another variant, or on a shape those two refuse, raises ValueError.
+    The fused options run on variants 4, 6 and 7 only (N and K multiples of 64); asking for
+    one on another variant, or on a shape those refuse, raises ValueError.
     """
     return _C.hgemm(a, b, variant, bias, act, residual, False, out)
 

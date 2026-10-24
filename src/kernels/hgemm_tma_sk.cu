@@ -758,6 +758,52 @@ void launch_auto(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* 
         c.launch_fused(A, B, C, M, N, K, stream, ep, knobs);
 }
 
+// Variant 7, batch invariant: no route that splits K. M <= 64 runs the decode kernel with K
+// unsplit; above that one TMA tile, each output tile computed whole by one block, k-steps 0
+// to K in order. Every route runs the same mma.sync.m16n8k16 chain per output element (a
+// zero accumulator, then the k16 steps in K order) and the same fp32 epilogue, and the tile
+// shape only decides which block computes which elements, so a row's bits are the same at
+// every M. The tile is the one that finishes first by a simple count: waves of whole tiles
+// times the tile's area, a 64-wide tile taken as 0.9 of the 128 x 128 tile's rate.
+int invariant_tile(int M, int N) {
+    struct Cand {
+        const Config* c;
+        double rate;
+    };
+    const Cand cands[] = {
+        {&CONFIGS[CONFIG_DEFAULT], 1.0}, {&TILES[kTile128x64], 0.9}, {&TILES[kTile64x128], 0.9}};
+    int best = -1;
+    double best_t = 0.0;
+    for (int i = 0; i < 3; ++i) {
+        const Config& c = *cands[i].c;
+        if (N % c.bn != 0) continue;
+        const long long tiles = static_cast<long long>(cdiv(M, c.bm)) * (N / c.bn);
+        const long long waves = (tiles + c.resident() - 1) / c.resident();
+        const double t = static_cast<double>(waves) * c.bm * c.bn / cands[i].rate;
+        if (best < 0 || t < best_t) {
+            best = i;
+            best_t = t;
+        }
+    }
+    return best;
+}
+
+void launch_invariant(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M,
+                      int N, int K, cudaStream_t stream, const HgemmEpilogue& ep) {
+    if (M <= 64) {
+        hgemm_decode::launch_unsplit(A, B, C, M, N, K, stream, ep);
+        return;
+    }
+    const int t = invariant_tile(M, N);
+    const Config& c = t == 0 ? CONFIGS[CONFIG_DEFAULT] : TILES[t == 1 ? kTile128x64 : kTile64x128];
+    hgemm_sk::Knobs knobs = env().knobs;
+    knobs.whole_tiles = true;
+    if (hgemm_epi::is_plain(ep))
+        c.launch(A, B, C, M, N, K, stream, ep, knobs);
+    else
+        c.launch_fused(A, B, C, M, N, K, stream, ep, knobs);
+}
+
 const char* route_name(int M, int N, int K) {
     const Route r = choose(M, N, K);
     switch (r.kind) {
@@ -795,6 +841,23 @@ void hgemm_tma_sk(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16*
     SPARK_REQUIRE(is_aligned16(A) && is_aligned16(B),
                   "hgemm variant 6: A and B must be 16-byte aligned");
     v6::launch_auto(A, B, C, M, N, K, stream, ep);
+}
+
+void hgemm_tma_sk_invariant(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M,
+                            int N, int K, cudaStream_t stream, const HgemmEpilogue& ep) {
+    SPARK_REQUIRE(hgemm_tma_sk_supports(M, N, K),
+                  "hgemm variant 7: requires N % 64 == 0 and K % 64 == 0");
+    SPARK_REQUIRE(is_aligned16(A) && is_aligned16(B),
+                  "hgemm variant 7: A and B must be 16-byte aligned");
+    v6::launch_invariant(A, B, C, M, N, K, stream, ep);
+}
+
+const char* hgemm_v7_tile_name(int M, int N, int K) {
+    if (!hgemm_tma_sk_supports(M, N, K)) return "unsupported";
+    if (M <= 64) return "decode, K unsplit";
+    const int t = v6::invariant_tile(M, N);
+    return t == 0 ? "tma 128x128 s2, whole tiles"
+                  : (t == 1 ? "tma 128x64 s4, whole tiles" : "tma 64x128 s4, whole tiles");
 }
 
 void hgemm_v6_set_route(int route) {

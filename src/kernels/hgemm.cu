@@ -17,6 +17,8 @@
 //              mbarrier pipeline (src/kernels/hgemm_tma.cu).
 //   variant 6: variant 5's TMA mainloop on variant 4's Stream-K schedule
 //              (src/kernels/hgemm_tma_sk.cu).
+//   variant 7: variant 6 with every K split taken out, batch invariant and opt-in
+//              (src/kernels/hgemm_tma_sk.cu, docs/design/batch_invariant.md).
 //
 // Tile sizes come from the GB10 analysis (48 SMs, 273 GB/s, 24 MB L2) in
 // docs/design/hgemm.md; re-tune on the RTX 5090 (170 SMs, 1,792 GB/s GDDR7).
@@ -544,9 +546,15 @@ void hgemm_tma(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C,
 bool hgemm_tma_sk_supports(int M, int N, int K);
 void hgemm_tma_sk(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N,
                   int K, cudaStream_t stream, const HgemmEpilogue& ep);
+void hgemm_tma_sk_invariant(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M,
+                            int N, int K, cudaStream_t stream, const HgemmEpilogue& ep);
 
 int hgemm_num_variants() {
-    return 7;
+    return 8;
+}
+
+int hgemm_default_variant() {
+    return 6;  // 7 is batch invariant and opt-in, as sgemm's TF32 rungs are
 }
 
 bool hgemm_supports(int M, int N, int K, int variant) {
@@ -557,7 +565,7 @@ bool hgemm_supports(int M, int N, int K, int variant) {
     if (variant == 2) return M % BM == 0 && N % BN == 0 && K % BK == 0;
     if (variant == 3 || variant == 4) return N % 64 == 0 && K % 64 == 0;  // any M >= 1
     if (variant == 5) return hgemm_tma_supports(M, N, K);
-    if (variant == 6) return hgemm_tma_sk_supports(M, N, K);
+    if (variant == 6 || variant == 7) return hgemm_tma_sk_supports(M, N, K);
     return true;
 }
 
@@ -566,13 +574,13 @@ void hgemm_bf16(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C
     SPARK_REQUIRE(A != nullptr && B != nullptr && C != nullptr, "hgemm: null pointer");
     SPARK_REQUIRE(M > 0 && N > 0 && K > 0, "hgemm: M, N, K must be positive");
     SPARK_REQUIRE(N % WMMA_N == 0 && K % WMMA_K == 0, "hgemm: N, K must be multiples of 16");
-    SPARK_REQUIRE(M % WMMA_M == 0 || variant == 3 || variant == 4 || variant == 6,
+    SPARK_REQUIRE(M % WMMA_M == 0 || variant == 3 || variant == 4 || variant >= 6,
                   "hgemm: M must be a multiple of 16");
     SPARK_REQUIRE(variant >= 0 && variant < hgemm_num_variants(), "hgemm: unknown variant");
     if (!hgemm_epi::is_plain(ep)) {
-        SPARK_REQUIRE(variant == 4 || variant == 6,
+        SPARK_REQUIRE(variant == 4 || variant >= 6,
                       "hgemm: the fused epilogue (bias, act, residual, swiglu) is only supported "
-                      "by variants 4 and 6, which need N % 64 == 0 and K % 64 == 0");
+                      "by variants 4, 6 and 7, which need N % 64 == 0 and K % 64 == 0");
         SPARK_REQUIRE(ep.act >= HGEMM_ACT_NONE && ep.act <= HGEMM_ACT_RELU,
                       "hgemm: unknown activation");
         SPARK_REQUIRE(!ep.swiglu || N % 2 == 0, "hgemm: swiglu needs an even N");
@@ -617,6 +625,9 @@ void hgemm_bf16(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C
             break;
         case 6:
             hgemm_tma_sk(A, B, C, M, N, K, stream, ep);
+            break;
+        case 7:
+            hgemm_tma_sk_invariant(A, B, C, M, N, K, stream, ep);
             break;
         default:
             break;

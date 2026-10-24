@@ -167,6 +167,13 @@ int sgemm_default_variant();
 //            across pieces. Same shape rules as variant 4 (N % 64 == 0, K % 64 == 0, any
 //            M >= 1); shapes the 128x128 TMA tile cannot fill run variant 4's tiles, and
 //            M <= 64 the decode kernel
+// variant 7: batch invariant (docs/design/batch_invariant.md): row i of C has the same bits
+//            whatever M is. Variant 6 with no K split anywhere: M <= 64 runs the decode
+//            kernel with K unsplit, larger M one TMA tile (128x128, 128x64 or 64x128) with
+//            every output tile computed whole by one block. Each output element is then the
+//            same chain of k16 mma steps from k = 0 to K on every route, and the epilogue is
+//            the same. Opt-in: variant -1 is still 6 (hgemm_default_variant). Same shape
+//            rules and fused epilogue as variant 6
 //
 // Fused epilogue (variants 4 and 6 only, every route inside them: the TMA tile, the Stream-K
 // finishing piece, variant 4's tiles and the decode kernel). Applied in fp32 before the one
@@ -190,6 +197,10 @@ void hgemm_bf16(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C
                 int K, int variant, cudaStream_t stream,
                 const HgemmEpilogue& epilogue = HgemmEpilogue());
 int hgemm_num_variants();
+// The variant -1 runs: 6. Variant 7 trades the K split for batch invariance and is opt-in.
+int hgemm_default_variant();
+// What variant 7 runs for a shape: the decode kernel or the whole-tile TMA tile it picks.
+const char* hgemm_v7_tile_name(int M, int N, int K);
 // True if `variant` accepts this shape (the rules above); hgemm_bf16 throws when it is false.
 // Lets a caller pick the fastest variant that fits instead of catching the exception.
 bool hgemm_supports(int M, int N, int K, int variant);

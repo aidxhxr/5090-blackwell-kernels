@@ -312,7 +312,7 @@ static_assert(kDecodeCtaInFlight == 24576, "");
 
 template <int BM, int BN, int BK, int STAGES, int WM, int WN, bool FUSED>
 void launch_cfg(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N,
-                int K, cudaStream_t stream, const HgemmEpilogue& ep) {
+                int K, cudaStream_t stream, const HgemmEpilogue& ep, bool unsplit) {
     constexpr int bytes = smem_bytes<BM, BN, BK, STAGES>();
     (void)slots<BM, BN, BK, STAGES, WM, WN, FUSED>();  // the smem opt-in, if not done by fits()
     Params p;
@@ -327,9 +327,13 @@ void launch_cfg(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C
     // Old: p.split = std::min(K / BK, std::max(1, cdiv(kMinCtas, strips))) with kMinCtas = 64.
     // New: the same number on 170 SMs (see kDecodeCtaInFlight), the device's number elsewhere,
     // a forced split (decode_force_split_k) for the sweeps.
-    p.split = launch::split_k_for(
-        static_cast<int64_t>(K) * N * sizeof(__nv_bfloat16), strips, K / BK, kDecodeCtaInFlight,
-        slots<BM, BN, BK, STAGES, WM, WN, FUSED>(), launch::device_shape());
+    // `unsplit` (launch_unsplit, hgemm variant 7): every CTA runs its strip over the whole of
+    // K, so an output element is one chain of k16 mma steps from k = 0, whatever M is.
+    p.split = unsplit ? 1
+                      : launch::split_k_for(static_cast<int64_t>(K) * N * sizeof(__nv_bfloat16),
+                                            strips, K / BK, kDecodeCtaInFlight,
+                                            slots<BM, BN, BK, STAGES, WM, WN, FUSED>(),
+                                            launch::device_shape());
     p.ws = nullptr;
     p.counters = nullptr;
     if (p.split > 1) {
@@ -353,26 +357,26 @@ bool fits(int N, int K) {
 
 template <bool FUSED>
 void launch_impl(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N,
-                 int K, cudaStream_t stream, const HgemmEpilogue& ep) {
+                 int K, cudaStream_t stream, const HgemmEpilogue& ep, bool unsplit) {
     if (M <= 16) {
         // 16x64x64, 4 stages, 4 warps along N, 40 KB: 2 CTAs per SM, 340 slots (96 on the GB10).
         if (fits<16, 64, 64, 4, 1, 4, FUSED>(N, K))
-            launch_cfg<16, 64, 64, 4, 1, 4, FUSED>(A, B, C, M, N, K, stream, ep);
+            launch_cfg<16, 64, 64, 4, 1, 4, FUSED>(A, B, C, M, N, K, stream, ep, unsplit);
         else  // 16x32x64, 24 KB: 4 per SM, 680 slots (192 on the GB10)
-            launch_cfg<16, 32, 64, 4, 1, 2, FUSED>(A, B, C, M, N, K, stream, ep);
+            launch_cfg<16, 32, 64, 4, 1, 2, FUSED>(A, B, C, M, N, K, stream, ep, unsplit);
     } else if (M <= 32) {
         // 32x32x64, 4 stages, 2x2 warps, 32 KB: 3 per SM, 510 slots (144 on the GB10).
         if (fits<32, 32, 64, 4, 2, 2, FUSED>(N, K))
-            launch_cfg<32, 32, 64, 4, 2, 2, FUSED>(A, B, C, M, N, K, stream, ep);
+            launch_cfg<32, 32, 64, 4, 2, 2, FUSED>(A, B, C, M, N, K, stream, ep, unsplit);
         else  // 32x64x64, 2x4 warps, 40 KB: 2 per SM, 340 slots (96), half the strips
-            launch_cfg<32, 64, 64, 4, 2, 4, FUSED>(A, B, C, M, N, K, stream, ep);
+            launch_cfg<32, 64, 64, 4, 2, 4, FUSED>(A, B, C, M, N, K, stream, ep, unsplit);
     } else {
         // 64x32x128, 4 stages, 4x2 warps, 96 KB: 1 per SM, 170 slots (48). The tensor work of a
         // 64-row strip is what limits the CTA, so the tile is narrow and the warps many.
         if (fits<64, 32, 128, 4, 4, 2, FUSED>(N, K))
-            launch_cfg<64, 32, 128, 4, 4, 2, FUSED>(A, B, C, M, N, K, stream, ep);
+            launch_cfg<64, 32, 128, 4, 4, 2, FUSED>(A, B, C, M, N, K, stream, ep, unsplit);
         else  // 64x64x64, 3 stages, 2x4 warps, 48 KB: 2 per SM, 340 slots (96)
-            launch_cfg<64, 64, 64, 3, 2, 4, FUSED>(A, B, C, M, N, K, stream, ep);
+            launch_cfg<64, 64, 64, 3, 2, 4, FUSED>(A, B, C, M, N, K, stream, ep, unsplit);
     }
 }
 
@@ -385,9 +389,17 @@ bool supports(int M, int N, int K) {
 void launch(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N, int K,
             cudaStream_t stream, const HgemmEpilogue& ep) {
     if (hgemm_epi::is_plain(ep))
-        launch_impl<false>(A, B, C, M, N, K, stream, ep);
+        launch_impl<false>(A, B, C, M, N, K, stream, ep, false);
     else
-        launch_impl<true>(A, B, C, M, N, K, stream, ep);
+        launch_impl<true>(A, B, C, M, N, K, stream, ep, false);
+}
+
+void launch_unsplit(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N,
+                    int K, cudaStream_t stream, const HgemmEpilogue& ep) {
+    if (hgemm_epi::is_plain(ep))
+        launch_impl<false>(A, B, C, M, N, K, stream, ep, true);
+    else
+        launch_impl<true>(A, B, C, M, N, K, stream, ep, true);
 }
 
 }  // namespace spark::hgemm_decode

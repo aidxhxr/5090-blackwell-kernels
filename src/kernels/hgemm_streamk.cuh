@@ -100,6 +100,11 @@ struct Knobs {
     int group = 0;  // > 0: fixed; 0: about the square root of the blocks in flight (variant
                     // 4); -1: the largest group whose A rows fit in L2 next to the B columns
                     // in flight (variant 6, see raster_group below)
+    // Every tile whole, never a K split (hgemm variant 7, batch invariant): one block per
+    // tile when they fit in one wave, else whole tiles from the queue. An output element is
+    // then one chain of k16 steps from k = 0 to K whatever the shape, at the price of the
+    // last partial wave Stream-K exists to fill.
+    bool whole_tiles = false;
 };
 
 inline size_t l2_bytes() {
@@ -165,7 +170,13 @@ inline void plan(Params& p, Workspace& w, int M, int N, int K, int BM, int BN, i
                             p.tiles <= static_cast<long long>(resident) * static_waves;
 
     int sk_tiles;
-    if (use_static) {
+    if (k.whole_tiles) {
+        p.dp_tiles = p.tiles <= resident ? 0 : p.tiles;
+        p.passes = p.tiles <= resident ? 0 : 1;  // static: block c owns [c KT, (c + 1) KT)
+        p.grid = std::min(resident, p.tiles);
+        p.sk_iters = p.tiles <= resident ? p.tiles * p.KT : 0;
+        sk_tiles = 0;
+    } else if (use_static) {
         // Static ranges. Never more blocks than there are pieces of min_share k-steps (a
         // shorter piece costs more in fixup traffic than it does in mma work), but never
         // fewer than there are tiles: with one block per tile there are no partials at all.

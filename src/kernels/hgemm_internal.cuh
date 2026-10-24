@@ -19,4 +19,10 @@ bool supports(int M, int N, int K);
 void launch(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N, int K,
             cudaStream_t stream, const HgemmEpilogue& ep = HgemmEpilogue());
 
+// The same with K never split, whatever the shape: each CTA runs its strip over the whole of
+// K, so a row's bits do not depend on M (hgemm variant 7). On a narrow N that leaves fewer
+// CTAs than the bandwidth rule wants, which is the cost.
+void launch_unsplit(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N,
+                    int K, cudaStream_t stream, const HgemmEpilogue& ep = HgemmEpilogue());
+
 }  // namespace spark::hgemm_decode

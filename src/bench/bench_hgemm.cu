@@ -610,6 +610,7 @@ bool run_models_weight(cublasHandle_t handle, cudaStream_t stream, const ModelWe
                  {"v6old", 6, spark::HGEMM_V6_ROUTE_LEGACY}};
     cands.push_back({"v6nosplit", 6, spark::HGEMM_V6_ROUTE_DEFAULT, spark::HGEMM_V6_SPLIT_OFF});
     cands.push_back({"v6", 6, spark::HGEMM_V6_ROUTE_DEFAULT});
+    if (!v6only) cands.push_back({"v7", 7, spark::HGEMM_V6_ROUTE_DEFAULT});
     if (tiles)
         for (int t = 0; t < spark::hgemm_v6_num_tiles(); ++t)
             cands.push_back({"v6t" + std::to_string(t), 6, t, spark::HGEMM_V6_SPLIT_OFF});
@@ -687,7 +688,9 @@ bool run_models_weight(cublasHandle_t handle, cudaStream_t stream, const ModelWe
             row.ok = ok;
             spark::bench::print_row(row);
             std::fprintf(stderr, "    %-7s %-30s %.1f%% of cuBLAS\n", c.label.c_str(),
-                         c.variant == 6 ? spark::hgemm_v6_route_name(M, N, K) : "",
+                         c.variant == 6   ? spark::hgemm_v6_route_name(M, N, K)
+                         : c.variant == 7 ? spark::hgemm_v7_tile_name(M, N, K)
+                                          : "",
                          100.0 * t_ref.median_ms / t.median_ms);
         }
     }
