@@ -1148,7 +1148,8 @@ What the numbers say:
 
 Source: the tiles in `src/kernels/hgemm_tma_tile.cuh`, the route in `src/kernels/hgemm_tma_sk.cu`
 (`route_rule`), the sweep in `bench_hgemm --models`, the rows in `results/hgemm_models.json`
-(measured 2026-10-13, `--iters=20`).
+(measured 2026-10-13, `--iters=20`; the file now holds the 2026-10-23 run of the split-K
+subsection at the end, and the rows behind this section's tables are in its git history).
 
 Every number above is a big square or a decode shape. A prefill or a batched decode step
 lives in between: M = 128 to 4096 tokens against the projections of a real checkpoint. That
@@ -1273,7 +1274,8 @@ split-K tail does better than either Stream-K kernel:
 
 The first five are 0.4 to 3 GFLOP and 12 to 24 µs, and cuBLAS takes them with split-K. Variant
 3's tail is fp32 atomics, not the same bits every run, so it is not a route variant 6 can
-take as it is; a deterministic split-K for problems this small is the open item. Variant 5
+take as it is; a deterministic split-K for problems this small was the open item (it is
+the next subsection). Variant 5
 wins a handful of the larger rows by 1 to 2% (2048×4096×14336 118.3% against 116.9%,
 1024×8192×8192 115.4% against 113.0%).
 
@@ -1287,6 +1289,145 @@ up to a near tie instead of bit for bit, and all three pass bit for bit with
 
 fp8gemm's mid-M shapes were not touched: its TMA kernel has variant 5's split-K tail, not
 Stream-K, so the same work there starts with porting the schedule.
+
+#### Split-K for the grids that do not fill the card
+
+Source: the `SPLIT` instantiation of `hgemm_v6_kernel` and `split_rule` in
+`src/kernels/hgemm_tma_sk.cu`, the sweep in `bench_hgemm --models --split=<S,...> --tiles
+--queued=20`, the rows in `results/hgemm_models.json` and `results/hgemm_split.json`
+(measured 2026-10-23, `--iters=50`).
+
+The five shapes cuBLAS still won are a fraction of a wave even in 64×64 tiles, and the route
+above gave them to variant 4, whose minimum share puts 32 k-steps on every block:
+
+| shape | 64×64 tiles | k-steps | old route | blocks | k-steps per block |
+|---|---|---|---|---|---|
+| 128×768×2048 | 24 | 32 | v4 64×64 | 24 | 32 |
+| 256×768×2048 | 48 | 32 | v4 64×64 | 48 | 32 |
+| 128×1024×4096 | 32 | 64 | v4 64×64 | 64 | 32 |
+| 256×1024×4096 | 64 | 64 | v4 64×64 | 128 | 32 |
+| 128×2304×5120 | 72 | 80 | v4 64×64 | 180 | 32 |
+
+A 64×64×64 k-step is 262 K multiply-adds, 0.35 µs of one SM's tensor pipe at peak, so 32 of
+them back to back is 11 µs per block before any memory latency, and on three of the five
+most of the 170 SMs have no block at all. cuBLAS cuts K there. The question was whether that can be done with the same bits every run, and
+cheaply enough for a kernel of 7 to 20 µs.
+
+**The kernel.** It is variant 6's, with a `SPLIT` template flag. Block b runs slice
+j = b % S of tile b / S, k-steps [j KT / S, (j + 1) KT / S), on the TMA mainloop as it is.
+At the end every slice writes its fp32 accumulators to its own slot (tiles × S slots of
+BM×BN, the fragment order of the Stream-K slot), `__threadfence`s, and each of the eight
+consumer warps does an `atomicAdd` on a counter for its own region of the tile. The warp
+that reads S − 1 is the last of the S slices at that region. It puts the counter back to
+zero, reads the S slots in order 0, 1, ..., S − 1 (its own read back from L2 like the
+others) and runs the usual epilogue, fused or plain. So the sum is the same left fold
+s0 + s1 + ... + s(S−1) whichever block got there last: the bits differ from the unsplit
+kernel, which sums in another order, but never between runs. The counter is an integer and
+nothing spins on anything, so there is no residency argument to make either. Counting per
+warp rather than per block means no block barrier at the end, and the eight regions of a
+tile can finish in eight different blocks. The last warp's loads go out four slices at a
+time (64 registers) before the adds; the 64×64 split kernel takes 137 registers plain and
+128 fused, no spills.
+
+**The sweep.** Single launches between events fall on a grid of about 2 µs on this box
+(the decode notes above saw the same), which hides most of what a sweep is after, so the
+sweep times 20 launches back to back per sample (`--queued=20`). Those read lower than
+single launches, cuBLAS too; the results files' model rows are single launches. µs, 64×64
+tile, S slices, an asterisk where tiles × S is more than 170 blocks:
+
+| shape | cuBLAS | no split | S = 2 | 3 | 4 | 5 | 6 | 7 |
+|---|---|---|---|---|---|---|---|---|
+| 128×768×2048 | 6.91 | 16.84 | 8.99 | 7.37 | **6.66** | 6.70 | 6.73 | 6.75 |
+| 256×768×2048 | 9.16 | 17.04 | 9.20 | **7.79** | 11.78* | 11.07* | 11.47* | 12.15* |
+| 128×1024×4096 | 10.34 | 18.25 | 14.53 | 11.24 | 9.71 | **9.55** | 13.91* | 13.85* |
+| 256×1024×4096 | 14.46 | 18.57 | **15.03** | 21.01* | 18.20* | 18.00* | 19.75* | 20.07* |
+| 128×2048×768 | 7.93 | 7.63 | **6.01** | 8.86* | 8.74* | 9.42* | 10.22* | 11.04* |
+| 128×2304×5120 | 19.70 | 31.78 | **19.07** | 26.45* | 22.54* | 26.21* | 24.80* | 25.29* |
+
+Up to one wave, more slices is better or flat; one block past it, every shape loses 30 to
+50%, since the last slices start when the first wave is done. So the count is the one wave:
+S = ⌊170 / tiles⌋.
+
+What lost, same method:
+
+* **Other tiles.** 64×128 and 128×64 at their best S trail 64×64 on every shape at 128
+  tokens (64×128 8.89 and 128×64 9.0 against 6.66 µs at 128×768×2048, 12.21 and 12.46
+  against 9.55 at 128×1024×4096) and tie at 256×1024×4096 (15.01 to 15.17 against 15.03):
+  the same block count with twice the work per k-step and twice the slot traffic per slice.
+  Two runs of one configuration in one sweep differed by up to 5% here, so read the ties as
+  ties. 128×128 split was 2 to 3 times
+  slower (13.49 µs at its best on 128×768×2048) and its fused form spilled, so it has no
+  split form now.
+* **Six stages** of the 64×64 tile instead of four (96 KB, a whole slice in flight at once):
+  within 1 to 3% either way, so four stay.
+* **Static ranges over all 170 blocks** with the same slice-order sum, so the work is
+  balanced exactly and a block's range can cross a tile boundary: slower on every shape but
+  one tie (8.12 against 6.97 µs at 128×768×2048, 12.26 against 9.92 at 128×1024×4096, 15.45
+  against 15.39 at 256×1024×4096). I did not chase why; the even split is simpler anyway.
+* **Stream-K's own chain with more pieces per tile** (the 64×64 tile with a share of 8 or 16
+  k-steps): 9.15 and 9.81 µs at 128×768×2048, 15.18 and 12.40 at 128×1024×4096, against
+  6.97 and 9.92 for the split in the same session. The chain sums the pieces one after
+  another; the split has one link whatever S is.
+
+**The rule.** S = min(⌊170 / tiles⌋, k-steps / 4, 16) on the 64×64 tile, and the split runs
+wherever S ≥ 2, before the rule above is asked. From the shape and the SM count only, never
+from run-time state. On the 120 model shapes that is six: the five above and 128×2048×768,
+the shapes with N ≤ 2304 at 128 tokens and N ≤ 1024 at 256. `SPARK_HGEMM_V6_SPLIT=0` (or
+`hgemm_v6_set_split(0)`) turns it off, n ≥ 2 forces n slices for a sweep, and
+`SPARK_HGEMM_V6_ROUTE=-2` still gives the route from before this whole section, which never
+splits. `tests/test_gemm.py` checks nine split shapes against the fp32 reference and with
+`torch.equal` across six calls, forced counts past one wave, the fused epilogue on two of
+them, and both switches.
+
+**Measured**, single launches, % of cuBLAS, the split off and on in the same run:
+
+| shape | what it is | cuBLAS µs | no split | split | S |
+|---|---|---|---|---|---|
+| 128×768×2048 | Qwen 3 30B-A3B expert gate/up | 11.3 | 58.7% | 126.2% | 7 |
+| 256×768×2048 | same, 256 tokens | 13.4 | 70.0% | 149.5% | 3 |
+| 128×1024×4096 | Llama 3 8B k/v proj | 15.5 | 79.8% | 140.0% | 5 |
+| 256×1024×4096 | same, 256 tokens | 19.6 | 91.9% | 113.8% | 2 |
+| 128×2304×5120 | DeepSeek expert up | 23.6 | 70.3% | 111.2% | 2 |
+| 128×2048×768 | Qwen 3 30B-A3B expert down | 13.3 | 147.5% | 167.1% | 2 |
+
+Over the 120 shapes the geometric mean goes from 109.3% (the split off, same run) to 111.9%
+of cuBLAS; at 128 tokens from 103.1% to 113.4%, at 256 from 109.2% to 114.6%. No shape at
+512 tokens or more splits, and the other 114 shapes run the same kernel as before (the
+previous build, measured the same day, had the geometric mean at 109.4%). The squares and the decode rows run the same kernels too, and measured the
+same before and after within 0.6% (2048³ 224.5 / 224.4 TFLOPS, 4096³ 249.2 / 249.2, 8192³
+241.7 / 242.1, 23.3 µs at 1×4096² both ways, 25.3 / 25.2 at 64×4096²).
+
+Two shapes stay under cuBLAS, both by under 2% and both at the DRAM floor rather than short
+of SMs: 128×10240×8192 (98.4%; B is 168 MB, 110 µs at 1,532 GB/s, cuBLAS takes 111.3) and
+128×5120×25600 (99.5%; 262 MB, 171 µs, cuBLAS 175.7). A split cannot help a shape that is
+already streaming B at the copy rate, and forced it lost there (128×128 split in two 113.1
+against 110.9 µs queued at 128×10240×8192), so it is not routed.
+
+Shapes outside the model list that the rule now splits, the split off and on, single
+launches (B resident in L2, `--m/--n/--k`): 272×128×4096 19.2 → 8.9 µs, 100×1024×1024
+11.0 → 6.9, 128×64×16384 25.5 → 11.0, 96×1024×4096 19.3 → 11.0.
+
+**M = 65 to 127.** Between the decode kernel (M ≤ 64) and the tiles there is no gap. The
+same weights at 64, 80, 96, 112 and 128 tokens, B rotated, % of cuBLAS:
+
+| weight | 64 | 80 | 96 | 112 | 128 |
+|---|---|---|---|---|---|
+| Llama 3 8B q/o 4096×4096 | 118.1% | 108.9% | 115.6% | 115.1% | 111.6% |
+| Llama 3 8B k/v 4096→1024 | 110.8% | 139.7% | 137.4% | 140.0% | 137.9% |
+| Llama 3 70B q/o 8192×8192 | 106.1% | 106.8% | 106.8% | 106.3% | 106.5% |
+| Qwen 3 32B o_proj 8192→5120 | 107.7% | 104.1% | 105.5% | 103.6% | 103.5% |
+| Qwen 3 30B-A3B expert 2048→768 | 131.8% | 116.8% | 129.0% | 123.1% | 126.8% |
+| Qwen 3 30B-A3B expert 768→2048 | 163.6% | 192.6% | 163.6% | 189.9% | 159.5% |
+| DeepSeek expert 5120→2304 | 100.3% | 134.8% | 114.0% | 110.4% | 114.3% |
+| DeepSeek expert 2304→5120 | 144.1% | 101.4% | 99.6% | 103.4% | 101.1% |
+
+Our time is flat from 80 to 128 rows (the tiles do not change), and the step from 64 to 80
+is the decode kernel handing over (25.3 to 29.3 µs on 4096×4096, where cuBLAS goes 29.9 to
+32.0). 96×5120×2304 at 99.6% is the one cell under 100%, within run-to-run noise of 128 rows
+at 101.1%. One thing the table shows that I did not follow up: on the narrow weights the
+split at 80 rows is faster than the decode kernel at 64 (11.0 against 13.1 µs on the k/v
+projection, 19.6 against 23.4 on the DeepSeek expert up). The decode kernel's own split-K
+has float atomics; whether this split should take M ≤ 64 on narrow N is unmeasured.
 
 ## Correctness
 
@@ -1428,7 +1569,12 @@ Still open:
   `cp.async` tiles; the TMA tile forced onto 1024³ measured 111 TFLOPS against 124, because a
   6 k-step share per block is all fixup. Done ("Model shapes"): 128×64 and 64×128 TMA tiles
   on the same ring, routed per shape, 16 of 120 model shapes faster by 3 to 37 points of
-  cuBLAS. The smallest shapes (under about 3 GFLOP) still want a deterministic split-K.
+  cuBLAS. The smallest shapes (under about 3 GFLOP) wanted a deterministic split-K, next.
+- **A deterministic split-K for the smallest shapes.** Done ("Model shapes", "Split-K for the
+  grids that do not fill the card"): the 64×64 tile in ⌊170 / tiles⌋ K-slices, summed in slice
+  order by the last warp to arrive, the five shapes cuBLAS won from 59 to 92% of it to 111 to
+  150%. Open: whether the same split beats the decode kernel at M ≤ 64 on narrow N, where 80
+  rows on the split already run faster than 64 on the decode kernel.
 - **The 64×64 warp tile.** Tried as 128×256: 168 registers, spills, behind 128×128 by 3 to
   20 points except on the largest lm_head shapes.
 - **The 2 µs of launch and ramp** that a single decode launch pays over the back-to-back

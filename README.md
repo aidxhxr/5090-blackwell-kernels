@@ -215,11 +215,31 @@ of the SMs' worth of tiles and enough k-steps per block, variant 4 only when eve
 
 % of cuBLAS. Over all 120 shapes the geometric mean goes from 107.1% to 109.4%, and at 128
 tokens from 98.7% to 103.8%; 16 shapes move by more than 3%, all up, and the rest run the
-same kernel as before. Six are still below cuBLAS, all under 3 GFLOP except one (128 x 1024
-x 4096 at 78.7%, an expert at 128 tokens at 63.6%), where cuBLAS's split-K wins and ours would
-have to give up the same bits every run to follow it. A 128 x 256 tile with a 64 x 64 warp
-tile spilled at 168 registers and lost; it is not routed. Details in
-[hgemm.md, "Model shapes"](docs/design/hgemm.md), rows in `results/hgemm_models.json`.
+same kernel as before. A 128 x 256 tile with a 64 x 64 warp tile spilled at 168 registers
+and lost; it is not routed.
+
+That left six shapes below cuBLAS. Five are the smallest, where cuBLAS splits K. Ours now
+does too, and keeps the same bits every run. When a grid of 64 x 64 tiles is under half a wave, K
+is cut into floor(170 / tiles) slices, one block each. Every slice writes its fp32 partial to
+its own slot, and the last warp to arrive at each region of a tile sums the slots in slice
+order and stores. No float atomics, nothing waits, no memset. It runs on those five and one
+more:
+
+| M x N x K | what it is | cuBLAS | no split | split |
+|---|---|---|---|---|
+| 128 x 768 x 2048 | Qwen 3 30B-A3B expert, 128 tokens | 11.3 us | 58.7% | 126.2% |
+| 256 x 768 x 2048 | same, 256 tokens | 13.4 us | 70.0% | 149.5% |
+| 128 x 1024 x 4096 | Llama 3 8B k/v proj | 15.5 us | 79.8% | 140.0% |
+| 256 x 1024 x 4096 | same, 256 tokens | 19.6 us | 91.9% | 113.8% |
+| 128 x 2304 x 5120 | DeepSeek expert up | 23.6 us | 70.3% | 111.2% |
+| 128 x 2048 x 768 | Qwen 3 30B-A3B expert down | 13.3 us | 147.5% | 167.1% |
+
+The geometric mean over the 120 goes to 111.9%, 113.4% at 128 tokens. Two shapes stay just
+under cuBLAS, 128 x 10240 x 8192 at 98.4% and 128 x 5120 x 25600 at 99.5%, and both already
+stream B at the DRAM rate, where a split does not help, so it is not routed there.
+`SPARK_HGEMM_V6_SPLIT=0` turns it off. From 65 to 127 tokens there is no gap between the
+decode kernel and the tiles. Details in [hgemm.md, "Model shapes"](docs/design/hgemm.md), rows
+in `results/hgemm_models.json` and `results/hgemm_split.json`.
 
 ### decode
 
