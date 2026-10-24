@@ -3,6 +3,7 @@
 `C[M,N] = scale_a · scale_b · A[M,K] · Bt[N,K]^T`, A and Bt e4m3 with K contiguous, scales
 per-tensor fp32 on the device, C bf16, fp32 accumulation on `mma.sync.m16n8k32`.
 Source: `src/kernels/fp8gemm.cu` (variants 0 and 1), `src/kernels/fp8gemm_tma.cu` (variant 2),
+`src/kernels/fp8gemm_tma_sk.cu` (variant 3, the "Model shapes" section),
 the block tile they share in `src/kernels/fp8gemm_tile.cuh`, the two mma helpers in
 `include/spark/common.cuh`. Bench: `bench_fp8gemm` (validates every variant against cuBLASLt
 and a CPU sample). Python: `sk.fp8gemm(a, b_t, scale_a, scale_b)`, parity test against
@@ -72,6 +73,7 @@ sums unscaled partials in the workspace and scales at the conversion.
 | 0 | one warp per 16x8 tile, fragment words loaded straight from global memory: lane (g, c) reads bytes 4c..4c+3 of rows g and g+8 of A and row g of Bt, one aligned 4-byte load per register | baseline: the fragment layout, checked against cuBLASLt |
 | 1 | 128x128x64 block tile (64 bytes of K per stage), `ldmatrix` + `mma.sync` out of XOR-swizzled shared memory, 3-stage `cp.async` pipeline, register epilogue with the scale, split-K on the last partial wave, 64x128 and 64x64 tiles for small grids, one CTA per 16/32/64-row strip of Bt for M ≤ 64 (hgemm variant 3 and its decode kernel, on 8-bit rows) | reuse through smem and L2, DRAM latency, wave quantization, decode shapes at the memory floor |
 | 2 | the 128x128 tile fed by TMA (`cp.async.bulk.tensor`) through a warp-specialized mbarrier pipeline: a producer warp issues two box loads per stage (128 rows by BK bytes of A and of Bt), the consumer warps run the tensor cores, no `__syncthreads` in the k-loop (hgemm variant 5) | the block barrier and the copy instructions in the consumer warps; at twice the mma rate they cost twice as much per byte |
+| 3 | variant 2's mainloop on hgemm's Stream-K schedule (persistent grid, grouped raster, K-ordered fixup), with a tile per shape from 128x256 down to 128x64 and 64x128 (hgemm variant 6) | grids of a fraction of a wave at M = 128 to 1024, the partial last wave, and the row-major raster that read the lm_head's Bt from DRAM once per tile row |
 
 ### The tile
 
@@ -571,6 +573,208 @@ config 1 when N % 256 != 0). The full default run after the switch: 2048³ 546 (
 path), 4096³ 729 / 104.0%, 8192³ 757 / 100.8% (cuBLASLt 751 in that run), 4096x4096x11008
 780 / 135.0%, 4096x11008x4096 738 / 110.8%. MX mode keeps config 4.
 
+## Model shapes: M = 128 to 4096 against real weights
+
+Source: variant 3 in `src/kernels/fp8gemm_tma_sk.cu` (the kernel, the tiles, the plan and
+`route_rule`), the sweep in `bench_fp8gemm --models`, the rows in
+`results/fp8gemm_models.json` (measured 2026-10-23, `--iters=20`).
+
+Everything above is a big square or a decode shape. A prefill or a batched decode step is
+M = 128 to 4096 tokens against the projections of a real checkpoint, and the default (variant
+2 where it takes the shape, variant 1 elsewhere) had never been run there.
+
+### The sweep
+
+`bench_fp8gemm --models[=<model>] [--ms=...] [--tiles] [--mode=mx]` runs the twenty weights
+of `bench_hgemm --models` at M = 128, 256, 512, 1024, 2048 and 4096: Llama 3 8B and 70B,
+Qwen 3 8B and 32B, a Qwen 3 30B-A3B expert and a DeepSeek expert, Bt as `nn.Linear` stores
+it. The list lives in `src/bench/model_shapes.hpp` now, shared by both benches. cuBLASLt is
+the per-tensor call of the rest of this note, timed once per shape; Bt is rotated over copies
+past the 96 MB L2 whenever one copy would fit; every row is checked on the device against
+cuBLASLt with the 2% tolerance, and all 995 rows of the results file pass. Labels: `v1`, `v2`,
+`v3old` (variant 3 on the route before it, which is the old default), `v3` (the default now)
+and, with `--tiles`, `v3t<n>` (tile n forced; a forced tile the rule picks anyway is not
+repeated).
+
+The old default, % of cuBLASLt (cuBLASLt time over ours), geometric mean per M:
+
+| M | shapes | old default | below cuBLASLt |
+|---|---|---|---|
+| 128 | 20 | 104.0% | 5 |
+| 256 | 20 | 100.0% | 7 |
+| 512 | 20 | 104.3% | 9 |
+| 1024 | 20 | 109.9% | 6 |
+| 2048 | 20 | 101.9% | 7 |
+| 4096 | 20 | 103.0% | 7 |
+
+Level with cuBLASLt on average, and 41 of the 120 shapes lost. The worst were not the small
+grids but the widest weights: the lm_head (4096 in, 128256 out) ran 49 to 55% at every M
+from 256 up, the 70B gate/up (8192 in, 28672 out) 61 to 66% at 2048 and 4096 tokens, the
+Qwen 3 32B gate/up (5120 in, 25600 out) 82 to 88% from 1024 tokens up. Variant 2 walks its tiles row-major, so a wave of 170 128x256 tiles
+is one tile row of A against 170 different 1 MB column blocks of Bt, and each of the 32 tile
+rows of a 4096-token lm_head reads all 525 MB of Bt from DRAM again: 16.8 GB, 11 ms at the
+copy roof, where cuBLASLt takes 6 ms. The small grids lost the way they did for the bf16
+GEMM: 128 tokens on a 4096-wide weight is 32 128x128 tiles, under a fifth of a wave, and
+variant 1's 64x64 tiles with an atomic split-K tail were what ran there.
+
+### Variant 3
+
+Variant 3 is hgemm variant 6 on 8-bit operands: variant 2's mainloop (one producer warp, eight
+consumer warps, two TMA boxes per stage, `fp8gemm_tile::mma_stage` on the stage) on the
+Stream-K schedule of `hgemm_streamk.cuh`. A persistent grid walks static (tile, k-step) ranges
+when A and Bt fit in L2 or the grid is at most two waves, and whole tiles from a queue plus
+K-passes of shrinking length above that, in the grouped raster, with the group sized for
+one-byte operands: the largest power of two whose rows of A fit in L2 next to the Bt columns
+in flight. The pieces of a tile are summed in K order through one fp32 slot and one
+epoch-tagged flag per tile, unscaled, and the piece that stores applies the scale. No memset,
+no atomics on data, the same bits every run, which variants 1 and 2 do not promise once their
+split-K tail adds partials with atomics. The producer lane owns the schedule and publishes
+each piece through a two-deep ring in shared memory, and the stage counters run on across
+pieces, so the next piece's loads overlap this one's fixup and epilogue. The schedule knobs
+count k-steps of 128 bytes, twice hgemm's, so they are half of hgemm's: at least 16 k-steps
+per block in the static ranges, no K-pass shorter than 4.
+
+The tiles, all 288 threads, registers and stack from `cuobjdump -res-usage`:
+
+| tile | warp tile | BK, stages | smem | blocks per SM | registers | stack |
+|---|---|---|---|---|---|---|
+| 0: 128x256 | 64x64 | 128, 2 | 97 KB | 1 | 168 | 16 |
+| 1: 128x128 | 64x32 | 128, 3 | 97 KB | 1 | 164 | 8 |
+| 2: 128x128 | 64x32 | 64, 2 | 33 KB | 2 | 96 | 8 |
+| 3: 128x64 | 32x32 | 128, 4 | 97 KB | 1 | 96 | 8 |
+| 4: 64x128 | 32x32 | 128, 4 | 97 KB | 1 | 96 | 8 |
+
+0, 1 and 2 are variant 2's configurations 16, 1 and 3; the 64-wide tiles are new, the fp8 form
+of hgemm's 128x64 and 64x128.
+
+The first version kept the piece (tile, k range) and its tile coordinates live across the
+k-loop, and the 128x256 tile, already at the 168 registers a 288-thread block gets, spilled
+80 bytes into the loop (`LDL` in front of the `QMMA`s). A consumer warp now holds its ring
+slot until the piece is stored and reads the piece from it again after the loop, so only the
+accumulators and the stage counter are live, and the loop is unrolled by the ring depth, so a
+stage's address and barriers are immediates whenever a piece is aligned to the ring. That is
+16 bytes of stack, the same as variant 2's 128x256 kernel. Between those two sessions the
+tile went from 712 to 765 TFLOPS at 4096³, 648 to 702 on the 4096-token lm_head and 700 to
+738 at 4096 x 8192 x 8192.
+
+### The rule
+
+From the forced-tile sweep over the 120 shapes, with W = 170 the blocks of a wave:
+
+1. 128x256 when M >= 512 and it has at least 3/4 W tiles. With fewer tiles it lost to 128x128
+   on every shape, by up to 17% (512x4096x4096: 161% of cuBLASLt against 193%), and at M =
+   256 it lost even with more (256x28672x8192: 168% against 182%).
+2. 128x128 when M > 128, it has at least W / 4 tiles, and each block gets 9 k-steps or there
+   are 3/4 W tiles. The share catches short K: 256x5120x2304 (80 tiles, 8.5 k-steps a block)
+   ran 99% on 128x128 and 123% on a 64-wide tile; 2048x768x2048 (96 tiles, 9 a block) 157%
+   against 151%.
+3. Otherwise the 64-wide tile with fewer zero-filled rows past M, 128x64 on a tie. At M = 128
+   it beat 128x128 on all twenty weights, and even with few tiles it beats the old route
+   (128x1024x4096, 16 tiles: 117% against 101% on variant 1).
+
+Decode shapes (M <= 64), K % 128 != 0 and MX mode keep the old route. Two more rules came out
+of the same sweep, both for grids under one wave in the static plan:
+
+- When the grid would leave more than half the card idle, every tile is split two ways,
+  evenly, if the halves are 8 k-steps or more: 128x768x2048 is 12 tiles of 16 k-steps and ran
+  93% on 12 blocks, 116% on 24, 95% on 48.
+- When a split would add under a quarter more blocks on a tile of at most 32 k-steps, there
+  is no split: 128x5120x2304 is 80 tiles of 18 k-steps, and 90 blocks cut most of them in two
+  uneven pieces with a fixup each. 102% on 90 blocks, 117% on 80.
+
+`SPARK_FP8GEMM_V3_ROUTE=-2` (`fp8gemm_v3_set_route(FP8GEMM_V3_ROUTE_LEGACY)`,
+`sk._C.fp8gemm_v3_set_route(-2)` from Python) gives every shape the old route back, and a
+tile index forces that tile. The knobs have their own variables
+(`SPARK_FP8GEMM_V3_MIN_SHARE`, `_MIN_SHARE_128`, `_MIN_PASS`, `_STATIC_WAVES`, `_GROUP`), and
+`SPARK_FP8GEMM_V1_CONFIG` / `SPARK_FP8GEMM_V2_CONFIG` still sweep variants 1 and 2, which
+variant 3 runs on the old route.
+
+### Measured
+
+One session, % of cuBLASLt, geometric mean per M; "before" is the old default (the `v3old`
+rows), "after" the default now:
+
+| M | shapes | before | after | below cuBLASLt before | after |
+|---|---|---|---|---|---|
+| 128 | 20 | 104.0% | 123.9% | 5 | 0 |
+| 256 | 20 | 100.0% | 146.1% | 7 | 2 |
+| 512 | 20 | 104.3% | 146.5% | 9 | 2 |
+| 1024 | 20 | 109.9% | 131.3% | 6 | 2 |
+| 2048 | 20 | 101.9% | 117.1% | 7 | 4 |
+| 4096 | 20 | 103.0% | 113.3% | 7 | 5 |
+| all | 120 | 103.8% | 129.1% | 41 | 15 |
+
+96 shapes move up by more than 3%, 2 move down. The best forced tile per shape (the oracle of
+this sweep) would be 129.7%; the rule's pick is the fastest row on 93 of the 120 shapes.
+Selected rows:
+
+| M x N x K | what it is | cuBLASLt | before | after |
+|---|---|---|---|---|
+| 128 x 4096 x 4096 | Llama 3 8B q_proj, 128 tokens | 20.7 us | 95.8% | 120.7% |
+| 256 x 4096 x 4096 | same, 256 tokens | 28.8 us | 113.8% | 150.4% |
+| 128 x 1024 x 4096 | k/v proj | 15.4 us | 100.8% | 117.3% |
+| 512 x 1024 x 4096 | k/v proj | 18.6 us | 86.2% | 122.9% |
+| 128 x 6144 x 4096 | fused qkv | 28.8 us | 123.0% | 135.1% |
+| 4096 x 4096 x 4096 | | 198.5 us | 105.0% | 111.0% |
+| 4096 x 128256 x 4096 | Llama 3 8B lm_head | 5.99 ms | 49.4% | 97.0% |
+| 2048 x 28672 x 8192 | Llama 3 70B gate/up | 1.35 ms | 65.9% | 96.6% |
+| 4096 x 25600 x 5120 | Qwen 3 32B gate/up | 1.47 ms | 82.5% | 94.9% |
+| 128 x 8192 x 28672 | Llama 3 70B down | 194.9 us | 103.8% | 121.5% |
+| 512 x 768 x 2048 | Qwen 3 30B-A3B expert | 12.4 us | 77.0% | 137.9% |
+| 128 x 5120 x 2304 | DeepSeek expert down | 16.5 us | 85.1% | 126.2% |
+
+4096³ on variant 3 is 769 TFLOPS, against 727 for variant 2 in the same session (729 in the
+full run of the "Clusters" section). Some of the largest percentages are cuBLASLt's heuristic
+more than our kernel: 512x8192x8192 is 205% of a cuBLASLt that runs it at 353 TFLOPS, where
+it runs 1024 tokens of the same weight at 529.
+
+### What lost
+
+- **The 128x256 tile with the piece live across the k-loop** (above): 80 bytes of spills, 4
+  to 8% on the five shapes I compared.
+- **Tile 2, 128x128 at two blocks per SM.** The fastest row on one shape of 120 (1024 x 2048
+  x 768). It stays as a forced tile.
+- **hgemm's floor for small shares.** hgemm's rule cuts the smallest problems into pieces of 8
+  of its k-steps; the fp8 equivalent, 4, lost: 128x4096x4096 ran 108% at a floor of 4 and
+  121% at 16. The least share itself, swept over the 42 Llama 3 8B and expert shapes at M <=
+  512: 118.5% of cuBLASLt at 4 k-steps, 124.4% at 8, 126.4% at 16, 121.7% at 32. 16 it is,
+  with the two grid rules above for what 8 and 32 did better.
+- **The queue instead of static ranges for operands past L2**
+  (`SPARK_FP8GEMM_V3_STATIC_WAVES=0`), on the Qwen 3 32B weights: no better (25600 x 5120
+  went 164 -> 149% at 256 tokens, 94 -> 96% at 4096), and with fewer tiles than blocks it
+  hung, because the plan put a tail and a whole wave into the Stream-K region of a problem
+  smaller than one. The plan caps that region at the tile count now.
+- **Two shapes run slower than before**: 2048 x 5120 x 25600 (115.0% against variant 2's
+  132.9%) and 4096 x 4096 x 14336 (138.2% against 142.7%, 3%, close to this sweep's noise).
+  My guess for the first, not profiled: it is 320 128x256 tiles with K = 25600 and operands
+  past L2, on static ranges; variant 2's data-parallel waves have every tile of a wave at the
+  same k, sharing A rows and Bt columns in L2, where the static ranges start every block at a
+  different k.
+- **Still below cuBLASLt, 15 shapes.** The lm_head at 256 tokens (85.9%) and the other lm_head
+  rows (97 to 98%), the 70B and Qwen 3 32B gate/up from 512 tokens up (95 to 98%), and five
+  rows at 98 to 99.6%. Not profiled yet.
+
+### MX mode
+
+MX mode keeps the old route: a Stream-K piece can start at any k-step, and the MX k-loop runs
+whole groups of scale chunks, so the pieces would have to be cut on group boundaries first.
+`--mode=mx` on the Llama 3 8B and DeepSeek weights at 128, 512 and 2048 tokens (24 shapes,
+against cuBLASLt's VEC32_UE8M0 kernel): 60 to 147% of cuBLASLt MXFP8, and the old route's
+problems are all there. The lm_head at 512 and 2048 tokens runs 60 and 64% (the raster
+again), and 512 x 4096 x 14336 runs 62% (183.5 us against 113.3) on variant 1's small tiles.
+Against variant 3's per-tensor rows of the same session the MX rows take 1.0x to 2.1x as
+long, 1.0x to 1.6x at 128 tokens.
+MX on the Stream-K kernel is the open item below.
+
+### The engine
+
+`quant.FP8Linear` (the engine's `fp8` and `fp8-tok` weights) calls `sk.fp8gemm` with the
+default variant, so every prefill step of more than 64 tokens now runs variant 3; decode steps
+(M <= 64) still run variant 1's decode kernels and `mxfp8` weights the old route. Not
+measured end to end. A row's bits now depend on M through the tile and the split, as they
+did before through variant 1's tile choice and atomic tail; for M > 64 they no longer depend
+on the run. `tests/test_quant.py` passes on the new default.
+
 ## What was done and what remains
 
 Done: the fragment layout and the b16-pair `ldmatrix` for both operands with no transposing
@@ -586,8 +790,10 @@ Open:
 - **8192³.** Done for now: the 128x256 tile (config 16) runs 754 to 757 TFLOPS, 101 to 105%
   of cuBLASLt, at cuBLASLt's clock. Multicast would halve the L2 bytes again but is a slow
   path on sm_120.
-- **Stream-K.** Variant 1 has v3's tail split, not v4's persistent schedule; 4096x11008x4096
-  (2,752 tiles, 8.1 waves) and the grouped tile order are the shapes it would help.
+- **Stream-K.** Done in per-tensor mode: variant 3 ("Model shapes"), 129.1% of cuBLASLt over
+  the 120 model shapes against 103.8% for the old default. Open there: MX mode on it (pieces
+  cut on scale-chunk groups), the lm_head at 256 tokens (85.9%), and the two deep-K shapes
+  where variant 2's data-parallel waves still win.
 - **MX at 90%.** The MX mode costs 8 to 10% on the large shapes against the per-tensor
   kernel where cuBLASLt's MXFP8 kernel costs it 3%: eight shuffles per stage on the MIO
   queue the `ldmatrix` traffic already fills, and the chunk loads. cuBLASLt takes its scales

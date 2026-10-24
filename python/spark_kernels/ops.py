@@ -203,10 +203,12 @@ def fp8gemm(
     as nn.Linear stores it ([out_features, in_features]), and the same layout torch._scaled_mm
     wants for its second operand as b_t.t(). scale_a and scale_b are per-tensor float32 CUDA
     scalars (0-dim or one element), applied in fp32 before the single rounding to bf16.
-    Requires N and K multiples of 64 and 16-byte aligned storage. Variant 1 (the default for
-    most shapes) takes any M >= 1; variant 0 needs M a multiple of 16; variant 2 (TMA) needs
-    M, N multiples of 128, K a multiple of 128 and at least one 128x128 tile per SM. The default
-    steps down to the highest variant that accepts the shape.
+    Requires N and K multiples of 64 and 16-byte aligned storage. Variant 1 takes any M >= 1;
+    variant 0 needs M a multiple of 16; variant 2 (TMA) needs M, N multiples of 128, K a
+    multiple of 128 and at least one 128x128 tile per SM. Variant 3 (the default) takes any
+    shape variant 1 does: a TMA tile picked per shape on a Stream-K schedule, the same bits
+    every run, and for decode shapes (M <= 64), K % 128 != 0 and MX mode what the default ran
+    before it, variant 2 where it takes the shape and variant 1 elsewhere.
 
     MX mode (MXFP8): `sfa` [M, K // 32] and `sfb` [N, K // 32] are uint8 E8M0 block scales
     (exponent + 127, one per 32 consecutive k of a row, as `reference.quantize_mx` produces

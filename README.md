@@ -315,6 +315,38 @@ more instructions at the same 600 W. On the outlier inputs where MX is supposed 
 GEMM error of both schemes is the 3-bit mantissa, 3.7 to 3.8% relative; the table and the
 reasons are in the design note.
 
+### model shapes
+
+The bf16 GEMM's twenty weights at M = 128 to 4096, `bench_fp8gemm --models`, against
+cuBLASLt with per-tensor scales, Bt rotated past L2. The old default (variant 2 where it takes
+the shape, variant 1 elsewhere) was level with cuBLASLt on average and lost 41 of the 120
+shapes. The worst were the widest weights: variant 2 walked its tiles row-major, so each tile
+row of a 4096-token lm_head read all 525 MB of Bt from DRAM again, and it ran at 49% of
+cuBLASLt. Variant 3 is the bf16 variant 6 on 8-bit operands: variant 2's mainloop on the
+Stream-K schedule, the grouped raster, the K-ordered fixup (the same bits every run), and a
+tile per shape: 128x256 or 128x128 when there are enough tiles, new 128x64 and 64x128 TMA
+tiles when there are not. It is the default now, and `SPARK_FP8GEMM_V3_ROUTE=-2` gives the
+old route back.
+
+| M x N x K | what it is | cuBLASLt | before | after |
+|---|---|---|---|---|
+| 128 x 4096 x 4096 | Llama 3 8B q_proj, 128 tokens | 20.7 us | 95.8% | 120.7% |
+| 256 x 4096 x 4096 | same, 256 tokens | 28.8 us | 113.8% | 150.4% |
+| 512 x 1024 x 4096 | k/v proj | 18.6 us | 86.2% | 122.9% |
+| 4096 x 128256 x 4096 | Llama 3 8B lm_head | 5.99 ms | 49.4% | 97.0% |
+| 2048 x 28672 x 8192 | Llama 3 70B gate/up | 1.35 ms | 65.9% | 96.6% |
+| 512 x 768 x 2048 | Qwen 3 30B-A3B expert | 12.4 us | 77.0% | 137.9% |
+| 128 x 5120 x 2304 | DeepSeek expert down | 16.5 us | 85.1% | 126.2% |
+| 4096 x 4096 x 4096 | | 198.5 us | 105.0% | 111.0% |
+
+% of cuBLASLt, one session. Over all 120 shapes the geometric mean goes from 103.8% to
+129.1%, and from 104.0% to 123.9% at 128 tokens. 15 shapes are still below cuBLASLt: the
+lm_head at 256 tokens (85.9%), the other lm_head rows and the widest gate/up weights from 512
+tokens up at 95 to 98%, and a few at 98 to 99.6%. Two got slower, 2048 x 5120 x 25600 from
+132.9% to 115.0% and one by 3%. 4096³ runs 769 TFLOPS on variant 3. MX mode keeps the old
+route for now; on 24 of these shapes it runs 60 to 147% of cuBLASLt's MXFP8 kernel. Details in
+[fp8gemm.md, "Model shapes"](docs/design/fp8gemm.md), rows in `results/fp8gemm_models.json`.
+
 ## the fp4 GEMM
 
 fp4 is the densest format the tensor cores here take, and NVFP4 is the one Blackwell inference
@@ -917,7 +949,7 @@ default stays on the CUDA cores.
 | `softmax` | three pass, warp online softmax, block online softmax, row in registers | `torch.softmax` |
 | `sgemm` fp32 | naive, smem tile, 8x8 register tile, cp.async, register prefetch with swizzle, 256x128 tile; TF32 and 3xTF32 on the tensor cores (opt-in) | cuBLAS SGEMM, in fp32 and in TF32 math mode |
 | `hgemm` bf16 | WMMA, smem tile, cp.async, `mma.sync` + `ldmatrix` with swizzle and split-K, Stream-K, TMA, TMA on Stream-K; a weight-streaming kernel for decode; fused bias / activation / residual / SwiGLU epilogues | cuBLAS GemmEx; eager `addmm`, `F.gelu`, `F.silu * up` |
-| `fp8gemm` e4m3 | naive `mma.sync.m16n8k32`, the swizzled cp.async tile with a 64x64 warp tile and decode configs, TMA; all on the block-scaled instruction, with per-tensor scales or MXFP8 block scales | cuBLASLt, `torch._scaled_mm`, `F.scaled_mm` |
+| `fp8gemm` e4m3 | naive `mma.sync.m16n8k32`, the swizzled cp.async tile with a 64x64 warp tile and decode configs, TMA, TMA on a Stream-K schedule with a tile per shape; all on the block-scaled instruction, with per-tensor scales or MXFP8 block scales | cuBLASLt, `torch._scaled_mm`, `F.scaled_mm` |
 | `fp4gemm` NVFP4, MXFP4 | naive `mma.sync.m16n8k64.kind::mxf4nvf4`, the swizzled cp.async tile with the block scales staged beside it, TMA with bulk-copied scales; a bf16 -> fp4 quantizer | cuBLASLt NVFP4 (bit-identical), `F.scaled_mm` |
 | `w4gemm` W4A16 | thread per output; a warp per 16 columns with the repacked int4 fragments and the activations straight into registers; warps along K on a cp.async pipeline for M <= 8 and independent warps for M <= 16, Stream-K tiles above; round-to-nearest quantizer and the offline repack | the bf16 `hgemm` on the dequantized weights, cuBLAS |
 | `w1gemm`, `w1gemm_moe` W1A16 | thread per output; a warp per 16 columns with the sign bits XORed into bf16x2 fragments and the activations straight into registers; warps along K for M <= 16; the grouped form over experts from sorted rows and offsets; the absmean quantizer at 1 and 2 bits | the bf16 `hgemm` on the dequantized weights, cuBLAS; unmeasured |
