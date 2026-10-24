@@ -578,6 +578,38 @@ experts, where both already read the weights at the copy rate: DeepSeek at 512 t
 its 167 used experts' 4.9 GB in 3.18 ms, 1.54 TB/s. fp8 is 1.9x to 3.0x faster than cuBLAS
 grouped in bf16. The 15 tests in `tests/test_grouped_gemm.py` pass.
 
+### a whole MoE layer
+
+`spark_kernels.moe_layer.MoELayer` is the rest of the layer around the grouped GEMM, in six
+launches with no host sync: the router GEMM, a routing kernel (softmax top-k with
+renormalization, the per-expert offsets and each assignment's row in expert order, one
+launch), a permute, the gate/up grouped GEMM with the SwiGLU in its epilogue, the down GEMM,
+and a combine that sums each token's k rows in a fixed order. The bf16 grouped GEMM also got
+16- and 64-row tiles, picked from the rows per expert: at 8 rows per expert the 128-row tile
+was 16 times the MMA work, and at one token that capped the weight stream (fp8 keeps 128
+rows; the 64-row tile lost there). ms per layer, bf16,
+against vLLM 0.30's `fused_moe` (its default config, as no tuned file ships for these shapes
+on the 5090) and the transformers experts loop:
+
+| tokens | Mixtral: ours | vLLM | loop | Qwen3-30B-A3B: ours | vLLM | loop |
+|---|---|---|---|---|---|---|
+| 1 | 0.440 | 0.440 | 0.624 | 0.064 | 0.199 | 1.236 |
+| 16 | 1.716 | 1.725 | 2.455 | 0.480 | 0.474 | 10.92 |
+| 128 | 1.747 | 1.766 | 2.459 | 0.750 | 0.759 | 17.42 |
+| 1024 | 3.852 | 4.413 | 4.583 | 0.820 | 0.886 | 18.53 |
+| 4096 | 13.01 | 14.14 | 14.85 | 1.794 | 1.971 | 18.31 |
+| 16384 | 49.12 | 53.61 | 55.78 | 6.394 | 6.907 | 18.81 |
+
+Up to 128 tokens a layer is a read of the experts the batch touched, and we and vLLM both do
+it at 1.6 to 1.7 TB/s: level within about 1%, with vLLM 1.1% ahead on Qwen3 at 16 tokens,
+where our four small kernels around the GEMMs cost 16 us and vLLM has no permute. From 1024
+tokens up the layer is compute and ours is 1.08x to 1.15x faster than vLLM's Triton GEMMs
+(235 against 215 TFLOPS on Mixtral at 16384). At one token on Qwen3 we are 3.1x faster: our
+call is 64 us, vLLM's 199. The transformers loop is 19x to 23x slower on Qwen3 up to 1024
+tokens (a sync per expert hit). The breakdown per kernel, the tile sweep and what is left
+are in [docs/design/moe_layer.md](docs/design/moe_layer.md); `scripts/bench_moe_layer.py`,
+`results/moe_layer.json`, 47 tests in `tests/test_moe_layer.py`.
+
 ## attention
 
 Fused scaled-dot-product attention, forward, bf16 in and out, fp32 math. Head sizes 64 and
@@ -1062,6 +1094,7 @@ default stays on the CUDA cores.
 | `w4gemm` W4A16 | thread per output; a warp per 16 columns with the repacked int4 fragments and the activations straight into registers; warps along K on a cp.async pipeline for M <= 8 and independent warps for M <= 16, Stream-K tiles above; round-to-nearest quantizer and the offline repack | the bf16 `hgemm` on the dequantized weights, cuBLAS |
 | `w1gemm`, `w1gemm_moe` W1A16 | thread per output; a warp per 16 columns with the sign bits XORed into bf16x2 fragments and the activations straight into registers; warps along K for M <= 16; one word of a row per lane with deeper rings and the warps from the SM count; the grouped form over experts from sorted rows and offsets, sized by the row count; the absmean quantizer at 1 and 2 bits | the bf16 `hgemm` on the dequantized weights, `w4gemm`, the CPU; 4.3 us at 1 x 2304 x 5120 |
 | `grouped_gemm` bf16, e4m3 | every MoE expert in one persistent launch: the tile list scanned from device offsets, Stream-K over the last waves, fp8gemm's TMA stage with W through one 3-D map | cuBLAS grouped GEMM, the per-expert cuBLAS loop, the torch loop |
+| `moe_route`, `moe_dispatch`, `moe_combine`, `MoELayer` | a whole MoE layer: softmax top-k routing with the offsets and expert order in one launch, a permute, `grouped_gemm_swiglu` (the SwiGLU in the epilogue) and 16- and 64-row tiles for small experts, a fixed-order combine | transformers' experts loop, `torch._grouped_mm`, vLLM's `fused_moe` |
 | `w1moe_decode` | three passes through global memory; one persistent kernel per (expert, 128 columns) with the intermediate in shared memory and fp32 atomics into y; the routing weight folded into the down epilogue with the next expert's words in flight; the same item on the tensor cores with 16 warps | the sorted `w1gemm_moe` path and a dense torch reference; 43 us a DeepSeek layer at T = 1 |
 | `unified_read`, `unified_gemv` | scalar, 16-byte, four 16-byte loads in flight; a warp per row, a warp per 4 rows, a persistent grid from the SM count; over `cudaMalloc`, managed, host-mapped and system memory | CPU double sum, cuBLAS on device copies; measured on the 5090 only |
 | `cpu_w1gemv`, `cpu_route`, `cpu_sample` | the 1-bit GEMV on the Arm cores: scalar, NEON sign masks in fp32, NEON int8 dot products; sigmoid top-k routing and top-k / top-p sampling, no CUDA | the scalar path, `reference.w1_dequantize`, `moe.route`; runs on any Arm machine |

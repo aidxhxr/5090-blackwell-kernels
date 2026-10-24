@@ -199,3 +199,15 @@ DeepSeek V3-like in fp8, in both benches, and DeepSeek at 2048 tokens in the C++
 8192 in the torch one: with about 14 GB free on the shared card they ran out of memory (the
 bf16 weight, its e4m3 copy and the reference outputs together). They need the card to
 themselves.
+
+## Later: smaller tiles
+
+The whole-layer work ([moe_layer.md](moe_layer.md)) made the tile height a template
+parameter and added 16- and 64-row tiles, which bf16 now picks from the average rows per
+expert (16 up to 24 rows, 64 up to 512). Every table above was measured with the 128-row
+tile. Rerun through `scripts/bench_grouped.py`, the 64-row tile is 3 to 5% faster in bf16 on
+four of the five shapes it takes (Qwen3 at 2048 tokens: 0.342 against 0.360 ms) and lost in
+fp8, which keeps 128. The line above about a 64-row tile not being worth it held for DeepSeek
+at 512 tokens, which runs at the copy rate; it did not hold at 32 to 512 rows per expert.
+`bench_grouped_gemm` (the C++ bench against cuBLAS grouped) was not rerun.
+
