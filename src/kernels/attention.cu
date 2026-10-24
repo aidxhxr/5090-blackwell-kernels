@@ -2009,8 +2009,8 @@ int resident_blocks() {
 // `split_mode`: 0 / 1 forces the tail split off / on, -1 picks it: on for the non-causal
 // shapes and for any shape with fewer tiles than resident blocks (the slices are the only way
 // to give the idle SMs work); off under the causal mask once the queue has a full wave to
-// balance. A window makes the tiles nearly equal again, as without a mask, so it counts as
-// non-causal here (docs/design/attention.md, "Sliding window and sinks").
+// balance. A window takes the causal rule: its tiles are nearly equal, but the queue evens
+// them out as well as the split does (docs/design/attention.md, "Sliding window and sinks").
 template <int D, bool PWARP, bool EXT>
 void launch_cfg(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv,
                 int S_q, int S_kv, int kv_cap, float scale_log2, bool causal, int split_mode,
@@ -2031,8 +2031,7 @@ void launch_cfg(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int
     s.lse = lse;
     s.kv_cap = kv_cap;
     v2::set_local(s, loc);
-    const bool split_tail =
-        split_mode < 0 ? !causal || loc.window > 0 || s.dp_tiles < resident : split_mode != 0;
+    const bool split_tail = split_mode < 0 ? !causal || s.dp_tiles < resident : split_mode != 0;
     if (split_tail) v2::split_tail_tiles<D, CONSUMER_WARPS>(s, resident, S_kv, causal);
     const int n_items = v2::grid_blocks(s);
     const int grid = std::min(resident, n_items);
