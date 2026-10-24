@@ -131,6 +131,81 @@ def test_fp8gemm_num_variants(sk):
     assert sk.num_variants("fp8gemm") == 4
 
 
+# ---- variant 3: the TMA tiles on the Stream-K schedule, routed per shape ------------------
+# Shapes the default rule sends to each tile (128x64 at M = 128 and ragged M under 128, 64x128
+# for ragged M with fewer zero-filled rows, 128x128, 128x256), a K too short for the share
+# rule, and the shapes it leaves to the old route (decode, K % 128 != 0).
+FP8_SHAPES_V3 = [(128, 4096, 4096), (100, 1024, 768), (320, 1024, 1024), (256, 4096, 4096),
+                 (1000, 2048, 1024), (512, 8192, 2048), (256, 5120, 2304), (16, 4096, 4096),
+                 (256, 1024, 192)]
+V3_ROUTES = {(128, 4096, 4096): "tma 128x64 bk128 s4", (100, 1024, 768): "tma 128x64 bk128 s4",
+             (320, 1024, 1024): "tma 64x128 bk128 s4", (256, 4096, 4096): "tma 128x128 bk128 s3",
+             (1000, 2048, 1024): "tma 128x128 bk128 s3", (512, 8192, 2048): "tma 128x256 bk128 s2",
+             (256, 5120, 2304): "tma 128x64 bk128 s4", (16, 4096, 4096): "v1 decode",
+             (256, 1024, 192): "v1"}
+# Every tile forced on shapes that exercise its schedule: one piece per tile, Stream-K
+# splits of a tile over several blocks (static ranges), rows past M, and the queue with
+# K-passes (A and Bt beyond L2, more than two waves).
+FP8_SHAPES_V3_FORCED = [(128, 2048, 512), (200, 1024, 4096), (777, 2560, 2048),
+                        (256, 81920, 1024)]
+
+
+@pytest.fixture
+def v3_route(sk):
+    """Sets fp8gemm variant 3's route for one test and puts the old one back."""
+    if 3 not in _variants("fp8gemm"):
+        pytest.skip("variant 3 not built")
+    prev = sk._C.fp8gemm_v3_set_route(-1)
+    yield sk._C.fp8gemm_v3_set_route
+    sk._C.fp8gemm_v3_set_route(prev)
+
+
+@pytest.mark.parametrize("shape", FP8_SHAPES_V3, ids=lambda s: f"M{s[0]}_N{s[1]}_K{s[2]}")
+def test_fp8gemm_variant3_routes(sk, v3_route, shape):
+    assert sk._C.fp8gemm_v3_route_name(*shape) == V3_ROUTES[shape]
+    _case(sk, shape, 3)
+    _case(sk, shape, 3)  # the Stream-K workspace and the queue are reused between calls
+
+
+@pytest.mark.parametrize("shape", FP8_SHAPES_V3_FORCED, ids=lambda s: f"M{s[0]}_N{s[1]}_K{s[2]}")
+def test_fp8gemm_variant3_forced_tiles(sk, v3_route, shape):
+    for tile in range(sk._C.fp8gemm_v3_num_tiles()):
+        v3_route(tile)
+        assert sk._C.fp8gemm_v3_route_name(*shape).startswith("tma")
+        _case(sk, shape, 3)
+
+
+def test_fp8gemm_variant3_same_bits_every_run(sk, v3_route):
+    # Gaussian e4m3 inputs at K = 8192: the fp32 partial sums are not exact, so the bits
+    # depend on the order the pieces of a tile are added in. The fixup adds them in K order
+    # whichever block computed them, so every run gives the same bits, on every tile.
+    a, b_t, sa, sb = _inputs(384, 2048, 8192, seed=5)
+    for tile in [-1] + list(range(sk._C.fp8gemm_v3_num_tiles())):
+        v3_route(tile)
+        first = sk.fp8gemm(a, b_t, sa, sb, 3)
+        for _ in range(3):
+            assert torch.equal(sk.fp8gemm(a, b_t, sa, sb, 3), first), tile
+
+
+def test_fp8gemm_variant3_legacy_route_is_the_old_default(sk, v3_route):
+    # Route -2 runs what the default ran before variant 3: variant 2 where it takes the
+    # shape, variant 1 elsewhere. Neither has a split-K tail on these two shapes, so the bits
+    # are comparable on Gaussian inputs.
+    v3_route(-2)
+    for shape, old, name in [((2048, 2048, 2048), 2, "v2"), ((16, 4096, 4096), 1, "v1 decode")]:
+        a, b_t, sa, sb = _inputs(*shape, seed=7)
+        assert sk._C.fp8gemm_v3_route_name(*shape) == name
+        assert torch.equal(sk.fp8gemm(a, b_t, sa, sb, 3), sk.fp8gemm(a, b_t, sa, sb, old))
+    assert sk._C.fp8gemm_v3_route_name(256, 4096, 4096) == "v1"
+
+
+def test_fp8gemm_variant3_rejects_bad_routes(sk, v3_route):
+    with pytest.raises(RuntimeError):
+        v3_route(sk._C.fp8gemm_v3_num_tiles())
+    with pytest.raises(RuntimeError):
+        v3_route(-3)
+
+
 # ---- MX mode: sfa [M, K/32] and sfb [N, K/32] ue8m0 block scales -------------------------
 # The same rungs and tile paths as above, on K a multiple of 256 (the MX requirement): both
 # scale chunk widths (K % 512 == 0 takes 16-byte chunks, K = 11008 or 256 + 512n the 8-byte
@@ -202,6 +277,16 @@ def test_fp8gemm_mx_variant2(sk, shape):
     _mx_supported(sk)
     _mx_case(sk, shape, 2)
     _mx_case(sk, shape, 2)
+
+
+@pytest.mark.parametrize("shape", [(256, 4096, 4096), (2048, 2048, 2048), (33, 1024, 768)],
+                         ids=lambda s: f"M{s[0]}_N{s[1]}_K{s[2]}")
+def test_fp8gemm_mx_variant3(sk, shape):
+    # MX mode on variant 3 runs variant 2 where it takes the shape and variant 1 elsewhere.
+    if 3 not in _variants("fp8gemm"):
+        pytest.skip("variant 3 not built")
+    _mx_supported(sk)
+    _mx_case(sk, shape, 3)
 
 
 def test_fp8gemm_mx_default_steps_down(sk):

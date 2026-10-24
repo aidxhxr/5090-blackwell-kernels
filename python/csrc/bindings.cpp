@@ -397,6 +397,18 @@ Tensor fp8gemm(const Tensor& a, const Tensor& b_t, const std::optional<Tensor>& 
     return c;
 }
 
+// fp8gemm variant 3's tile route (spark::fp8gemm_v3_set_route): -1 the per-shape rule, -2 the
+// route before variant 3, n >= 0 TMA tile n forced. Returns the previous route, so a test can
+// put it back. Process-wide, like the environment variable it overrides.
+int fp8gemm_v3_set_route(int route) {
+    const int prev = spark::fp8gemm_v3_route();
+    TORCH_CHECK(route >= -2 && route < spark::fp8gemm_v3_num_tiles(),
+                "fp8gemm_v3_set_route: ", route, " is not -1, -2 or a tile in [0, ",
+                spark::fp8gemm_v3_num_tiles(), ")");
+    spark::fp8gemm_v3_set_route(route);
+    return prev;
+}
+
 // ---- fp4 (e2m1): NVFP4 and MXFP4 -------------------------------------------------------
 int fp4_format(const std::string& fmt) {
     if (fmt == "nvfp4") return spark::FP4_NVFP4;
@@ -1379,6 +1391,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("a"), py::arg("b_t"), py::arg("scale_a") = py::none(),
           py::arg("scale_b") = py::none(), py::arg("variant") = -1, py::arg("sfa") = py::none(),
           py::arg("sfb") = py::none());
+    m.def("fp8gemm_v3_set_route", &fp8gemm_v3_set_route,
+          "fp8gemm variant 3's route: -1 the per-shape rule, -2 the route before it, n a forced "
+          "TMA tile; returns the previous one",
+          py::arg("route"));
+    m.def(
+        "fp8gemm_v3_route_name",
+        [](int M, int N, int K) { return std::string(spark::fp8gemm_v3_route_name(M, N, K)); },
+        "what fp8gemm variant 3 runs for an M x N x K problem under the current route",
+        py::arg("M"), py::arg("N"), py::arg("K"));
+    m.def("fp8gemm_v3_num_tiles", &spark::fp8gemm_v3_num_tiles,
+          "number of TMA tiles fp8gemm variant 3 can be forced to");
     m.def("fp4gemm", &fp4gemm,
           "fp4 (e2m1) block-scaled GEMM, NVFP4 or MXFP4: scale_a * scale_b * a @ b_t^T with a "
           "[M, K/2] and b_t [N, K/2] packed e2m1 and block scales in the blocked layout, bf16 out",
