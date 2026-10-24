@@ -3,16 +3,25 @@
 // fp32 copies (docs/design/cross_entropy.md). This file holds the pieces; the ladder that
 // puts them together is linear_cross_entropy in python/spark_kernels/ops.py.
 //
-// The row kernel is the step after the logits of one chunk of rows: it reads a logits row
-// and writes the row's loss and, in place, its gradient row (softmax minus one-hot, times
-// the reduction scale). The transpose turns a slab of that gradient into the K-contiguous
-// operand of dw += g^T h.
+//   v1  Liger's recipe on these kernels: a chunk of rows at a time, the logits by ce_gemm
+//       (LOGITS), one row kernel that reads a logits row and writes its loss and, in place,
+//       its gradient row (softmax minus one-hot, times the reduction scale), then dh and dw
+//       by hgemm, dw from a transposed slab of the gradient.
+//
+// ce_gemm is grouped_gemm's bf16 kernel with one expert: logits = h w^T with both operands
+// K-contiguous, a persistent grid of one 288-thread block per SM, one producer lane issuing
+// two TMA boxes per stage, eight consumer warps on mma.sync.m16n8k16, the last partial wave
+// plus one wave split along K Stream-K style and summed through hgemm's deterministic
+// chain fixup. The epilogue runs once per tile, on the finished fp32 sums (the piece that
+// ends a tile's K chain), so the output is the same bits every run.
 
 #include <cuda_bf16.h>
 
 #include <algorithm>
 #include <cmath>
 
+#include "fp8gemm_tile.cuh"
+#include "hgemm_streamk.cuh"
 #include "spark/common.cuh"
 #include "spark/kernels.h"
 
@@ -173,6 +182,327 @@ __global__ void __launch_bounds__(256)
     }
 }
 
+// ---- the lm_head GEMM ------------------------------------------------------------------
+
+using hgemm_sk::ld_acquire_gpu;
+using hgemm_sk::slot_idx;
+using hgemm_sk::st_release_gpu;
+
+constexpr int BM = 128, BN = 128;
+constexpr int WARPS_M = 2, WARPS_N = 4;
+constexpr int CONSUMER_WARPS = WARPS_M * WARPS_N;
+constexpr int CONSUMERS = CONSUMER_WARPS * 32;
+constexpr int THREADS = CONSUMERS + 32;
+constexpr int ITEM_DEPTH = 2;     // pieces the producer may publish ahead of the consumers
+constexpr int FIXUP_BARRIER = 1;  // named barrier for the 256 consumer threads
+constexpr int MIN_SHARE = 32;     // least k-steps per Stream-K block (hgemm_sk::kMinShare)
+constexpr int BKB = 128;          // bytes of K per stage: 64 bf16
+constexpr int STAGES = 2;         // grouped_gemm's and hgemm v6's bf16 choice
+
+using C = fp8gemm_tile::Cfg<BM, BN, BKB, STAGES, WARPS_M, WARPS_N>;
+using Acc = C::Acc;
+
+constexpr int smem_bytes() {
+    return (STAGES * C::STAGE + ITEM_DEPTH * 16 + (2 * STAGES + 2 * ITEM_DEPTH) * 8 + 1023) / 1024 *
+           1024;
+}
+static_assert(smem_bytes() <= 101376, "two 32 KB stages fit");
+
+struct Params {
+    int M, N;      // T rows of h, V rows of w
+    int tiles_m;   // cdiv(M, BM)
+    int tiles_n;   // N / BN
+    int KT;        // k-steps per tile
+    int grid;      // resident blocks
+    float* slots;  // 2 * grid Stream-K tiles of BM x BN fp32
+    unsigned long long* flags;
+    unsigned epoch;
+    __nv_bfloat16* out;  // LOGITS: the logits, [M][N]
+};
+
+struct Split {
+    int dp, sk, ranges;
+};
+__device__ __forceinline__ Split split_work(int tiles, int grid, int KT) {
+    Split s;
+    const int rem = tiles % grid;
+    s.sk = rem == 0 ? 0 : rem + (tiles >= grid ? grid : 0);
+    s.dp = tiles - s.sk;
+    const long long iters = static_cast<long long>(s.sk) * KT;
+    s.ranges = static_cast<int>(
+        min(static_cast<long long>(grid), max(static_cast<long long>(s.sk), iters / MIN_SHARE)));
+    return s;
+}
+__device__ __forceinline__ int range_start(int sk_iters, int ranges, int c) {
+    return static_cast<int>(static_cast<long long>(c) * sk_iters / ranges);
+}
+
+// One 32-byte k-step of a bf16 stage (grouped_gemm.cu's bf16_step).
+template <int KK>
+__device__ __forceinline__ void bf16_step(const unsigned char* as, const unsigned char* bs, int wm,
+                                          int wn, int lane, Acc& acc) {
+    constexpr int BK = C::BK, MT = C::MT, NT = C::NT, WROWS = C::WROWS, WCOLS = C::WCOLS;
+    unsigned afrag[MT][4];
+    unsigned bfrag[NT][2];
+    const int a_row = lane & 15;
+    const int a_ch = KK / 16 + (lane >> 4);
+#pragma unroll
+    for (int mi = 0; mi < MT; ++mi) {
+        const int row = wm * WROWS + mi * 16 + a_row;
+        ldmatrix_x4(afrag[mi], as + row * BK + fp8gemm_tile::swz<BK>(row, a_ch) * 16);
+    }
+    const int b_row = (lane & 7) + ((lane >> 4) & 1) * 8;
+    const int b_ch = KK / 16 + ((lane >> 3) & 1);
+#pragma unroll
+    for (int nj = 0; nj < NT; nj += 2) {
+        const int row = wn * WCOLS + nj * 8 + b_row;
+        unsigned r[4];
+        ldmatrix_x4(r, bs + row * BK + fp8gemm_tile::swz<BK>(row, b_ch) * 16);
+        bfrag[nj][0] = r[0];
+        bfrag[nj][1] = r[1];
+        bfrag[nj + 1][0] = r[2];
+        bfrag[nj + 1][1] = r[3];
+    }
+#pragma unroll
+    for (int mi = 0; mi < MT; ++mi)
+#pragma unroll
+        for (int nj = 0; nj < NT; ++nj) mma_bf16_16816(acc[mi][nj], afrag[mi], bfrag[nj]);
+}
+__device__ __forceinline__ void bf16_stage(const unsigned char* as, const unsigned char* bs, int wm,
+                                           int wn, int lane, Acc& acc) {
+    bf16_step<0>(as, bs, wm, wn, lane, acc);
+    bf16_step<32>(as, bs, wm, wn, lane, acc);
+    bf16_step<64>(as, bs, wm, wn, lane, acc);
+    bf16_step<96>(as, bs, wm, wn, lane, acc);
+}
+
+template <int MODE>
+__global__ void __launch_bounds__(THREADS, 1)
+    ce_gemm_kernel(const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMap tmB,
+                   Params p) {
+    constexpr int A_STAGE = C::A_STAGE, STAGE_BYTES = C::STAGE;
+    constexpr int MT = C::MT, NT = C::NT, WROWS = C::WROWS;
+
+    extern __shared__ __align__(1024) unsigned char smem[];
+    int4* items = reinterpret_cast<int4*>(smem + STAGES * STAGE_BYTES);
+    uint64_t* full_bar = reinterpret_cast<uint64_t*>(items + ITEM_DEPTH);
+    uint64_t* empty_bar = full_bar + STAGES;
+    uint64_t* item_full = empty_bar + STAGES;
+    uint64_t* item_empty = item_full + ITEM_DEPTH;
+    if (smem_u32(smem) % 1024 != 0) __trap();
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+
+    if (tid == 0) {
+#pragma unroll
+        for (int s = 0; s < STAGES; ++s) {
+            mbar_init(&full_bar[s], 1);
+            mbar_init(&empty_bar[s], CONSUMER_WARPS);
+        }
+#pragma unroll
+        for (int i = 0; i < ITEM_DEPTH; ++i) {
+            mbar_init(&item_full[i], 1);
+            mbar_init(&item_empty[i], CONSUMER_WARPS);
+        }
+        fence_mbar_init();
+    }
+    __syncthreads();  // the only block-wide barrier in the kernel
+
+    const int tiles = p.tiles_m * p.tiles_n;
+    const Split sp = split_work(tiles, p.grid, p.KT);
+    const int sk_iters = sp.sk * p.KT;
+
+    if (warp == CONSUMER_WARPS) {
+        if (lane == 0) {
+            prefetch_tensormap(&tmA);
+            prefetch_tensormap(&tmB);
+            unsigned g_kt = 0;
+            unsigned n_pub = 0;
+            auto piece = [&](int tile, int kb, int ke) {
+                const int r = n_pub % ITEM_DEPTH;
+                const unsigned use = n_pub / ITEM_DEPTH;
+                if (n_pub >= ITEM_DEPTH) mbar_wait(&item_empty[r], (use - 1) & 1);
+                items[r] = make_int4(tile, kb, ke, 0);
+                mbar_arrive(&item_full[r]);
+                ++n_pub;
+                if (tile < 0) return;
+                // m-tile fastest: the tiles in flight share w's rows (the vocabulary slice)
+                // and walk h, which is the smaller operand and stays in L2.
+                const int row0 = (tile % p.tiles_m) * BM;
+                const int bn = (tile / p.tiles_m) * BN;
+                for (int kt = kb; kt < ke; ++kt, ++g_kt) {
+                    const int s = g_kt % STAGES;
+                    const unsigned use_s = g_kt / STAGES;
+                    if (g_kt >= STAGES) mbar_wait(&empty_bar[s], (use_s - 1) & 1);
+                    mbar_arrive_expect_tx(&full_bar[s], STAGE_BYTES);
+                    unsigned char* as = smem + s * STAGE_BYTES;
+                    tma_load_2d(as, &tmA, &full_bar[s], kt * BKB, row0);
+                    tma_load_2d(as + A_STAGE, &tmB, &full_bar[s], kt * BKB, bn);
+                }
+            };
+            for (int t = blockIdx.x; t < sp.dp; t += p.grid) piece(t, 0, p.KT);
+            if (static_cast<int>(blockIdx.x) < sp.ranges) {
+                const int it_begin = range_start(sk_iters, sp.ranges, blockIdx.x);
+                int it = range_start(sk_iters, sp.ranges, blockIdx.x + 1);
+                while (it > it_begin) {
+                    const int t = (it - 1) / p.KT;
+                    const int k0 = t * p.KT;
+                    const int s = max(it_begin, k0);
+                    piece(sp.dp + t, s - k0, it - k0);
+                    it = s;
+                }
+            }
+            piece(-1, 0, 0);
+        }
+        return;
+    }
+
+    const int wm = warp / WARPS_N;
+    const int wn = warp % WARPS_N;
+    unsigned g_kt = 0;
+    unsigned n_item = 0;
+    Acc acc;
+
+    for (;;) {
+        const int r = n_item % ITEM_DEPTH;
+        mbar_wait(&item_full[r], (n_item / ITEM_DEPTH) & 1);
+        const int4 itm = items[r];
+        __syncwarp();
+        if (lane == 0) mbar_arrive(&item_empty[r]);
+        ++n_item;
+        if (itm.x < 0) break;
+        const int tile = itm.x, kb = itm.y, ke = itm.z;
+        const int row0 = (tile % p.tiles_m) * BM;
+        const int nt = tile / p.tiles_m;
+        const int bn = nt * BN;
+        const int m_valid = p.M - row0;
+
+#pragma unroll
+        for (int i = 0; i < MT; ++i)
+#pragma unroll
+            for (int j = 0; j < NT; ++j)
+#pragma unroll
+                for (int q = 0; q < 4; ++q) acc[i][j][q] = 0.f;
+
+        for (int kt = kb; kt < ke; ++kt, ++g_kt) {
+            const int s = g_kt % STAGES;
+            mbar_wait(&full_bar[s], (g_kt / STAGES) & 1);
+            const unsigned char* as = smem + s * STAGE_BYTES;
+            bf16_stage(as, as + A_STAGE, wm, wn, lane, acc);
+            fence_proxy_async_smem();
+            __syncwarp();
+            if (lane == 0) mbar_arrive(&empty_bar[s]);
+        }
+
+        bool finish = true;
+        if (kb > 0 || ke < p.KT) {
+            const int tile_r = tile - sp.dp;
+            float4* slot =
+                reinterpret_cast<float4*>(p.slots + static_cast<size_t>(tile_r) * (BM * BN));
+            unsigned long long* flag = p.flags + tile_r;
+            const unsigned long long tag = static_cast<unsigned long long>(p.epoch) << 32;
+            if (kb > 0) {
+                if (tid == 0) {
+                    while (ld_acquire_gpu(flag) != (tag | static_cast<unsigned>(kb))) {
+                    }
+                }
+                named_barrier_sync(FIXUP_BARRIER, CONSUMERS);
+#pragma unroll
+                for (int mi = 0; mi < MT; ++mi) {
+                    if (wm * WROWS + mi * 16 >= m_valid) continue;
+#pragma unroll
+                    for (int nj = 0; nj < NT; ++nj) {
+                        const float4 v = __ldcg(slot + slot_idx<MT, NT>(warp, lane, mi, nj));
+                        acc[mi][nj][0] += v.x;
+                        acc[mi][nj][1] += v.y;
+                        acc[mi][nj][2] += v.z;
+                        acc[mi][nj][3] += v.w;
+                    }
+                }
+            }
+            if (ke < p.KT) {
+#pragma unroll
+                for (int mi = 0; mi < MT; ++mi) {
+                    if (wm * WROWS + mi * 16 >= m_valid) continue;
+#pragma unroll
+                    for (int nj = 0; nj < NT; ++nj)
+                        slot[slot_idx<MT, NT>(warp, lane, mi, nj)] = make_float4(
+                            acc[mi][nj][0], acc[mi][nj][1], acc[mi][nj][2], acc[mi][nj][3]);
+                }
+                __threadfence();
+                named_barrier_sync(FIXUP_BARRIER, CONSUMERS);
+                if (tid == 0) st_release_gpu(flag, tag | static_cast<unsigned>(ke));
+                finish = false;
+            }
+        }
+        if (!finish) continue;
+        if constexpr (MODE == CE_GEMM_LOGITS)
+            fp8gemm_tile::store_bf16<C>(acc, 1.f, p.out, p.M, p.N, row0, bn);
+    }
+}
+
+// ---- host side of ce_gemm ---------------------------------------------------------------
+
+struct Workspace {
+    float* slots = nullptr;
+    unsigned long long* flags = nullptr;
+    size_t tiles = 0;
+    unsigned epoch = 0;
+};
+
+template <int MODE>
+int resident_blocks() {
+    constexpr int bytes = smem_bytes();
+    static int resident = 0;
+    if (resident == 0) {
+        SPARK_CUDA_CHECK(cudaFuncSetAttribute(ce_gemm_kernel<MODE>,
+                                              cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+        int per_sm = 0;
+        SPARK_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &per_sm, ce_gemm_kernel<MODE>, THREADS, bytes));
+        resident = (per_sm > 0 ? per_sm : 1) * num_sms();
+    }
+    return resident;
+}
+
+template <int MODE>
+void launch(const __nv_bfloat16* h, const __nv_bfloat16* w, int M, int N, int K, Params p,
+            cudaStream_t stream) {
+    constexpr int bytes = smem_bytes();
+    const int grid = resident_blocks<MODE>();
+    const int kbytes = K * 2;
+    const CUtensorMap tmA =
+        make_tensor_map_2d_u8(h, M, kbytes, BM, BKB, CU_TENSOR_MAP_SWIZZLE_128B);
+    const CUtensorMap tmB =
+        make_tensor_map_2d_u8(w, N, kbytes, BN, BKB, CU_TENSOR_MAP_SWIZZLE_128B);
+
+    static Workspace ws;
+    const size_t need = 2 * static_cast<size_t>(grid);
+    if (ws.tiles < need) {
+        if (ws.slots) SPARK_CUDA_CHECK(cudaFree(ws.slots));
+        if (ws.flags) SPARK_CUDA_CHECK(cudaFree(ws.flags));
+        ws.tiles = need;
+        SPARK_CUDA_CHECK(cudaMalloc(&ws.slots, ws.tiles * BM * BN * sizeof(float)));
+        SPARK_CUDA_CHECK(cudaMalloc(&ws.flags, ws.tiles * sizeof(unsigned long long)));
+        SPARK_CUDA_CHECK(cudaMemset(ws.flags, 0, ws.tiles * sizeof(unsigned long long)));
+    }
+    if (++ws.epoch == 0) ws.epoch = 1;
+
+    p.M = M;
+    p.N = N;
+    p.tiles_m = cdiv(M, BM);
+    p.tiles_n = N / BN;
+    p.KT = kbytes / BKB;
+    p.grid = grid;
+    p.slots = ws.slots;
+    p.flags = ws.flags;
+    p.epoch = ws.epoch;
+    ce_gemm_kernel<MODE><<<grid, THREADS, bytes, stream>>>(tmA, tmB, p);
+    SPARK_CHECK_LAUNCH();
+}
+
 }  // namespace ce
 
 }  // namespace
@@ -196,6 +526,29 @@ void transpose_pad_bf16(const __nv_bfloat16* x, int rows, int ldx, __nv_bfloat16
     const dim3 grid(cdiv(ncols, ce::TP), cdiv(ld, ce::TP));
     ce::transpose_pad_kernel<<<grid, 256, 0, stream>>>(x, rows, ldx, out, ncols, ld);
     SPARK_CHECK_LAUNCH();
+}
+
+bool ce_gemm_supports(int V, int D) {
+    return V >= ce::BN && V % ce::BN == 0 && D > 0 && D % 64 == 0;
+}
+
+void ce_gemm_bf16(const __nv_bfloat16* h, const __nv_bfloat16* w, int T, int V, int D, int mode,
+                  const CeGemmEpilogue& ep, cudaStream_t stream) {
+    SPARK_REQUIRE(ce_gemm_supports(V, D),
+                  "ce_gemm: requires V a multiple of 128 and D a multiple of 64");
+    SPARK_REQUIRE(h && w, "ce_gemm: null pointer");
+    SPARK_REQUIRE(is_aligned16(h) && is_aligned16(w), "ce_gemm: h and w must be 16-byte aligned");
+    if (T <= 0) return;
+    ce::Params p{};
+    p.out = ep.out;
+    switch (mode) {
+        case CE_GEMM_LOGITS:
+            SPARK_REQUIRE(ep.out, "ce_gemm (logits): needs out");
+            ce::launch<CE_GEMM_LOGITS>(h, w, T, V, D, p, stream);
+            break;
+        default:
+            SPARK_REQUIRE(false, "ce_gemm: unknown mode");
+    }
 }
 
 }  // namespace spark

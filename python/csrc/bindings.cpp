@@ -822,6 +822,115 @@ Tensor grouped_gemm(const Tensor& a, const Tensor& w, const Tensor& offsets,
     return c;
 }
 
+// ---- Linear cross-entropy pieces (src/kernels/cross_entropy.cu) ---------------------------
+// h [T, D] and w [V, D] bf16, targets int64 [T]. The ladder that puts them together is
+// linear_cross_entropy in python/spark_kernels/ops.py.
+struct CeShape {
+    int T, V, D;
+};
+CeShape ce_check(const Tensor& h, const Tensor& w, const Tensor* targets, const char* who) {
+    check_cuda_contig(h, "h");
+    check_cuda_contig(w, "w");
+    TORCH_CHECK(h.scalar_type() == at::kBFloat16 && w.scalar_type() == at::kBFloat16, who,
+                " expects bfloat16 h and w");
+    TORCH_CHECK(h.dim() == 2 && w.dim() == 2 && h.size(1) == w.size(1), who,
+                " expects h [T, D] and w [V, D], got ", h.sizes(), " and ", w.sizes());
+    TORCH_CHECK(w.device() == h.device(), who, ": w must be on h's device");
+    TORCH_CHECK(h.size(0) <= INT32_MAX && w.size(0) <= INT32_MAX && h.size(1) <= INT32_MAX, who,
+                ": dims too large");
+    const CeShape s{static_cast<int>(h.size(0)), static_cast<int>(w.size(0)),
+                    static_cast<int>(h.size(1))};
+    TORCH_CHECK(spark::ce_gemm_supports(s.V, s.D), who,
+                " needs V a multiple of 128 and D a multiple of 64, got V = ", s.V, ", D = ", s.D);
+    TORCH_CHECK(aligned16(h) && aligned16(w), who, " needs 16-byte aligned h and w");
+    if (targets) {
+        check_cuda_contig(*targets, "targets");
+        TORCH_CHECK(
+            targets->scalar_type() == at::kLong && targets->dim() == 1 && targets->size(0) == s.T,
+            who, " expects int64 targets [", s.T, "], got ", targets->scalar_type(), " ",
+            targets->sizes());
+        TORCH_CHECK(targets->device() == h.device(), who, ": targets must be on h's device");
+    }
+    return s;
+}
+Tensor ce_out(const std::optional<Tensor>& out, const Tensor& h, int T, int V) {
+    if (!out) return at::empty({T, V}, h.options());
+    check_cuda_contig(*out, "out");
+    TORCH_CHECK(out->scalar_type() == at::kBFloat16 && out->dim() == 2 && out->size(0) == T &&
+                    out->size(1) == V && out->device() == h.device(),
+                "out must be bfloat16 [", T, ", ", V, "] on h's device, got ", out->sizes());
+    TORCH_CHECK(aligned16(*out), "out must be 16-byte aligned");
+    return *out;
+}
+const float* ce_f32(const Tensor& t, int64_t n, const Tensor& h, const char* name) {
+    check_cuda_contig(t, name);
+    TORCH_CHECK(t.scalar_type() == at::kFloat && t.numel() == n && t.device() == h.device(), name,
+                " must be float32 with ", n, " elements on h's device");
+    return t.data_ptr<float>();
+}
+
+// logits = h @ w.T, bf16 [T, V], into `out` when given.
+Tensor ce_logits(const Tensor& h, const Tensor& w, const std::optional<Tensor>& out) {
+    const CeShape s = ce_check(h, w, nullptr, "ce_logits");
+    const c10::cuda::CUDAGuard guard(h.device());
+    Tensor c = ce_out(out, h, s.T, s.V);
+    spark::CeGemmEpilogue ep;
+    ep.out = bf16_ptr_mut(c);
+    spark::ce_gemm_bf16(bf16_ptr(h), bf16_ptr(w), s.T, s.V, s.D, spark::CE_GEMM_LOGITS, ep,
+                        current_stream(h));
+    return c;
+}
+
+// The fused row kernel on bf16 logits [rows, V]: (loss, lse) float32 [rows]; with `scale`
+// (float32 [1] on the device) the logits are overwritten by the gradient rows.
+std::tuple<Tensor, Tensor> ce_rows(const Tensor& logits_in, const Tensor& targets,
+                                   int64_t ignore_index, const std::optional<Tensor>& scale) {
+    Tensor logits = logits_in;
+    check_cuda_contig(logits, "logits");
+    check_cuda_contig(targets, "targets");
+    TORCH_CHECK(logits.scalar_type() == at::kBFloat16 && logits.dim() == 2,
+                "ce_rows expects bfloat16 logits [rows, V]");
+    const int64_t rows = logits.size(0), V = logits.size(1);
+    TORCH_CHECK(rows <= INT32_MAX && V <= INT32_MAX, "ce_rows: dims too large");
+    TORCH_CHECK(V % 8 == 0 && aligned16(logits), "ce_rows needs V % 8 == 0 and aligned logits");
+    TORCH_CHECK(targets.scalar_type() == at::kLong && targets.dim() == 1 &&
+                    targets.size(0) == rows && targets.device() == logits.device(),
+                "ce_rows expects int64 targets [", rows, "] on the logits' device");
+    const c10::cuda::CUDAGuard guard(logits.device());
+    const auto f32 = logits.options().dtype(at::kFloat);
+    Tensor loss = at::empty({rows}, f32);
+    Tensor lse = at::empty({rows}, f32);
+    const float* sc = scale ? ce_f32(*scale, 1, logits, "scale") : nullptr;
+    spark::cross_entropy_rows_bf16(bf16_ptr_mut(logits), targets.data_ptr<int64_t>(),
+                                   static_cast<int>(rows), static_cast<int>(V),
+                                   static_cast<int>(ignore_index), sc, loss.data_ptr<float>(),
+                                   lse.data_ptr<float>(), current_stream(logits));
+    return {loss, lse};
+}
+
+// out[c - c0][r] = x[r][c] for c in [c0, c1), r < rows, and 0 for rows <= r < ld: a column
+// slab of x [rows, cols] transposed into out [c1 - c0, ld].
+Tensor ce_transpose(const Tensor& x, int64_t c0, int64_t c1, int64_t ld, const Tensor& out_in) {
+    Tensor out = out_in;
+    check_cuda_contig(x, "x");
+    check_cuda_contig(out, "out");
+    TORCH_CHECK(x.scalar_type() == at::kBFloat16 && out.scalar_type() == at::kBFloat16 &&
+                    x.dim() == 2 && out.dim() == 2,
+                "ce_transpose expects bfloat16 matrices");
+    TORCH_CHECK(0 <= c0 && c0 < c1 && c1 <= x.size(1) && ld >= x.size(0),
+                "ce_transpose: bad column range or ld");
+    TORCH_CHECK(out.size(0) == c1 - c0 && out.size(1) == ld && out.device() == x.device(),
+                "ce_transpose: out must be [", c1 - c0, ", ", ld, "] on x's device");
+    TORCH_CHECK(x.numel() <= INT64_MAX / 2 && x.size(0) <= INT32_MAX && x.size(1) <= INT32_MAX &&
+                    ld <= INT32_MAX,
+                "ce_transpose: dims too large");
+    const c10::cuda::CUDAGuard guard(x.device());
+    spark::transpose_pad_bf16(bf16_ptr(x) + c0, static_cast<int>(x.size(0)),
+                              static_cast<int>(x.size(1)), bf16_ptr_mut(out),
+                              static_cast<int>(c1 - c0), static_cast<int>(ld), current_stream(x));
+    return out;
+}
+
 // The rows each K/V head is allocated when k and v are the leading S_kv rows of every head of
 // a [B, H_kv, cap, D] cache (`cache[:, :, :length]`, the filled part of a cache with spare
 // capacity), which the forward reads in place; 0 for packed k and v. Anything else is not a
@@ -1571,6 +1680,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "[E] or [1]",
           py::arg("a"), py::arg("w"), py::arg("offsets"), py::arg("scale_a") = py::none(),
           py::arg("scale_b") = py::none());
+    m.def("ce_logits", &ce_logits, "logits = h @ w.T, h [T, D] and w [V, D] bf16 -> [T, V] bf16",
+          py::arg("h"), py::arg("w"), py::arg("out") = py::none());
+    m.def("ce_rows", &ce_rows,
+          "cross-entropy rows of bf16 logits: (loss, lse) float32; with scale the logits are "
+          "overwritten by (softmax - one_hot) * scale",
+          py::arg("logits"), py::arg("targets"), py::arg("ignore_index") = -100,
+          py::arg("scale") = py::none());
+    m.def("ce_transpose", &ce_transpose,
+          "columns [c0, c1) of x [rows, cols] bf16 transposed into out [c1 - c0, ld], zero "
+          "past rows",
+          py::arg("x"), py::arg("c0"), py::arg("c1"), py::arg("ld"), py::arg("out"));
     m.def("attention", &attention,
           "softmax(q k^T / sqrt(D)) v over [B, H, S, D] bf16 tensors (k, v may have fewer heads)",
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("causal") = false,

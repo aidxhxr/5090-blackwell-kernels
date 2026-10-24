@@ -41,6 +41,9 @@ Ops (all run on the current CUDA stream, all accept float32 or bfloat16 unless n
     attention_bwd(q, k, v, out, d_out, lse, causal=False, deterministic=False)
                                              (dq, dk, dv), the backward pass
     attention_with_grad(q, k, v, causal=False)  attention as a torch.autograd.Function
+    linear_cross_entropy(h, w, targets, ignore_index=-100, reduction="mean", variant=-1)
+                                             F.cross_entropy(h @ w.T, targets) for an lm_head
+                                             without the [T, V] logits, differentiable
     rope_append_(qkv, cos, sin, k_cache, v_cache, pos0, H_q, H_kv)
                                              RoPE on q and k, k and v into the caches; returns q
     rope_append_paged_(qkv, cos, sin, positions, slots, k_cache, v_cache, H_q, H_kv)
@@ -71,6 +74,7 @@ from importlib.metadata import PackageNotFoundError, version
 from . import engine, layer, reference
 from .ops import (
     AttentionFunction,
+    LinearCrossEntropyChunked,
     W1ExpertWeights,
     W1Weight,
     W4Weight,
@@ -90,6 +94,7 @@ from .ops import (
     hgemm,
     hgemm_swiglu,
     interleave_gate_up,
+    linear_cross_entropy,
     moe_offsets,
     num_variants,
     paged_decode,
@@ -112,6 +117,7 @@ from .ops import (
 
 __all__ = [
     "AttentionFunction",
+    "LinearCrossEntropyChunked",
     "W1ExpertWeights",
     "W1Weight",
     "W4Weight",
@@ -133,6 +139,7 @@ __all__ = [
     "hgemm_swiglu",
     "interleave_gate_up",
     "layer",
+    "linear_cross_entropy",
     "moe_offsets",
     "num_variants",
     "paged_decode",

@@ -453,6 +453,18 @@ void cross_entropy_rows_bf16(__nv_bfloat16* logits, const int64_t* targets, int 
 // [ncols][ld]. The K-contiguous A operand of dw += g^T h from a slab of the gradient.
 void transpose_pad_bf16(const __nv_bfloat16* x, int rows, int ldx, __nv_bfloat16* out, int ncols,
                         int ld, cudaStream_t stream);
+// ce_gemm_bf16: x = h w^T in fp32 on a persistent TMA kernel (grouped_gemm's bf16 mainloop
+// and Stream-K schedule, one expert), then the epilogue on each finished 128x128 tile:
+//   CE_GEMM_LOGITS  out [T][V] = bf16(x)
+// Requires V % 128 == 0, D % 64 == 0, 16-byte aligned h and w; any T >= 1. Deterministic.
+// Not safe to run concurrently on two streams (one Stream-K workspace).
+enum CeGemmMode { CE_GEMM_LOGITS = 0 };
+struct CeGemmEpilogue {
+    __nv_bfloat16* out = nullptr;  // LOGITS: [T][V]
+};
+void ce_gemm_bf16(const __nv_bfloat16* h, const __nv_bfloat16* w, int T, int V, int D, int mode,
+                  const CeGemmEpilogue& ep, cudaStream_t stream);
+bool ce_gemm_supports(int V, int D);
 
 // ---- RoPE + K/V cache append -------------------------------------------------------------
 // From qkv = [B, S, (H_q + 2 H_kv) * D] bf16 (a fused q|k|v projection) and rotary tables

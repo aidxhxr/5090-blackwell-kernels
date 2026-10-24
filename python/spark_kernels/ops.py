@@ -799,6 +799,152 @@ def attention_with_grad(
 
 
 # ---------------------------------------------------------------------------
+# Linear cross-entropy (src/kernels/cross_entropy.cu, docs/design/cross_entropy.md)
+# ---------------------------------------------------------------------------
+CE_CHUNK = 2048  # rows of logits held at once by variant 1
+CE_SLAB = 16384  # vocabulary rows per transposed slab of the gradient for dw += g^T h
+
+
+def _ce_reference(h, w, targets, ignore_index, reduction):
+    """Variant 0, torch's spelling: the bf16 logits, then cross-entropy in fp32."""
+    logits = h @ w.t()
+    return torch.nn.functional.cross_entropy(logits.float(), targets, ignore_index=ignore_index,
+                                             reduction=reduction)
+
+
+def _ce_counts(targets, ignore_index):
+    return (targets != ignore_index).sum()
+
+
+def _ce_scale(targets, ignore_index, reduction):
+    """d loss / d loss_row for a row that counts, float32 [1] on the device: 1 / rows that
+    count for "mean" (1 when none does, so the gradient is zero), 1 for "sum"."""
+    if reduction == "sum":
+        return torch.ones(1, device=targets.device, dtype=torch.float32)
+    return (1.0 / _ce_counts(targets, ignore_index).clamp(min=1).float()).reshape(1)
+
+
+def _ce_reduce(loss_rows, targets, ignore_index, reduction):
+    total = loss_rows.sum()
+    if reduction == "sum":
+        return total
+    return total / _ce_counts(targets, ignore_index)  # nan when no row counts, as torch
+
+
+def _ce_backprop_chunk(g, h_c, w, dh_c, dw, first, slab_buf):
+    """dh_c = g @ w and dw (+)= g^T @ h_c for one chunk's logit gradient g [C, V] bf16, both
+    by hgemm. hgemm takes its A operand K-contiguous, so g^T goes through `slab_buf` (flat,
+    CE_SLAB x the chunk rounded up to 64) one vocabulary slab at a time, its columns padded
+    to a multiple of 64 with zeros, and h_c gets zero rows to match. dw accumulates in bf16
+    across chunks, as Liger's does."""
+    C, V = g.shape
+    hgemm(g, w, out=dh_c)
+    c_pad = (C + 63) // 64 * 64
+    if c_pad != C:
+        h_c = torch.nn.functional.pad(h_c, (0, 0, 0, c_pad - C))
+    slab = slab_buf.numel() // c_pad
+    for v0 in range(0, V, slab):
+        v1 = min(V, v0 + slab)
+        gt = _C.ce_transpose(g, v0, v1, c_pad, slab_buf[: (v1 - v0) * c_pad].view(v1 - v0, c_pad))
+        hgemm(gt, h_c, residual=None if first else dw[v0:v1], out=dw[v0:v1])
+
+
+def _ce_chunks(T, chunk):
+    return [(t0, min(T, t0 + chunk)) for t0 in range(0, T, chunk)]
+
+
+def _ce_buffers(h, V, T, chunk, need_grad=True):
+    """The one chunk of logits (or gradient) and, for a backward, the transposed slab."""
+    rows = min(chunk, T)
+    g = torch.empty(rows, V, device=h.device, dtype=h.dtype)
+    if not need_grad:
+        return g, None
+    slab_buf = torch.empty(min(CE_SLAB, V) * ((rows + 63) // 64 * 64), device=h.device,
+                           dtype=h.dtype)
+    return g, slab_buf
+
+
+class LinearCrossEntropyChunked(torch.autograd.Function):
+    """Variant 1, Liger's recipe: the gradients are computed in the forward, a chunk of rows
+    at a time (the logits by `ce_logits`, loss and gradient rows in place by `ce_rows`, dh
+    and dw by `hgemm`), and the backward only scales them by the upstream gradient."""
+
+    @staticmethod
+    def forward(ctx, h, w, targets, ignore_index, reduction, chunk, need_grad):
+        T, V = h.shape[0], w.shape[0]
+        scale = _ce_scale(targets, ignore_index, reduction) if need_grad else None
+        logits, slab_buf = _ce_buffers(h, V, T, chunk, need_grad)
+        losses = []
+        dh = dw = None
+        if need_grad:
+            dh = torch.empty_like(h)
+            dw = torch.empty_like(w)
+        for t0, t1 in _ce_chunks(T, chunk):
+            lg = logits[: t1 - t0]
+            _C.ce_logits(h[t0:t1], w, lg)
+            loss_c, _ = _C.ce_rows(lg, targets[t0:t1], ignore_index, scale)
+            losses.append(loss_c)
+            if need_grad:
+                _ce_backprop_chunk(lg, h[t0:t1], w, dh[t0:t1], dw, t0 == 0, slab_buf)
+        del logits, slab_buf
+        loss = _ce_reduce(torch.cat(losses), targets, ignore_index, reduction)
+        ctx.save_for_backward(dh, dw)
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad):
+        dh, dw = ctx.saved_tensors
+        if grad.item() != 1.0:  # one sync, as Liger's check
+            dh = dh * grad.to(dh.dtype)
+            dw = dw * grad.to(dw.dtype)
+        return dh, dw, None, None, None, None, None
+
+
+def linear_cross_entropy(
+    h: torch.Tensor,
+    w: torch.Tensor,
+    targets: torch.Tensor,
+    ignore_index: int = -100,
+    reduction: str = "mean",
+    variant: int = -1,
+    chunk: int | None = None,
+) -> torch.Tensor:
+    """`F.cross_entropy(h @ w.T, targets)` for an lm_head without the [T, V] logits.
+
+    h [T, D] and w [V, D] (nn.Linear's layout) bfloat16, targets int64 [T]; rows whose
+    target is `ignore_index` do not count. reduction "mean" (over the rows that count) or
+    "sum". Differentiable in h and w. Variants (docs/design/cross_entropy.md):
+
+      0  torch's spelling: the bf16 logits, F.cross_entropy on them in fp32
+      1  chunked over T, Liger's recipe on these kernels: per chunk of `chunk` rows the
+         logits, a fused row kernel for the loss and the gradient in place, dh and dw by
+         hgemm, all inside the forward; holds one chunk of logits
+
+    -1 picks 1. Variant 1 needs V a multiple of 128 and D a multiple of 64; -1 falls back to
+    0 otherwise. dw is accumulated in bf16 across chunks (one rounding per chunk).
+    """
+    if reduction not in ("mean", "sum"):
+        raise ValueError(f"reduction must be 'mean' or 'sum', got {reduction!r}")
+    V, D = w.shape
+    fits = V % 128 == 0 and D % 64 == 0
+    need_grad = torch.is_grad_enabled() and (h.requires_grad or w.requires_grad)
+    if variant == -1:
+        variant = 1 if fits else 0
+    if variant == 0:
+        return _ce_reference(h, w, targets, ignore_index, reduction)
+    if variant != 1:
+        raise ValueError(f"linear_cross_entropy: variant must be -1, 0 or 1, got {variant}")
+    if not fits:
+        raise ValueError(f"linear_cross_entropy variant {variant} needs V % 128 == 0 and "
+                         f"D % 64 == 0, got V = {V}, D = {D}")
+    chunk = CE_CHUNK if chunk is None else int(chunk)
+    if chunk < 1:
+        raise ValueError(f"chunk must be positive, got {chunk}")
+    return LinearCrossEntropyChunked.apply(h, w, targets, ignore_index, reduction, chunk,
+                                           need_grad)
+
+
+# ---------------------------------------------------------------------------
 # CPU-side ops: the GB10's Arm cores (include/spark/cpu.h, docs/design/grace.md)
 # ---------------------------------------------------------------------------
 def cpu_w1gemv(a: torch.Tensor, w: W1Weight, threads: int = 1, variant: int = -1) -> torch.Tensor:
