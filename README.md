@@ -759,6 +759,36 @@ take the K/V head stride now, so a cache with spare capacity is read where it is
 of being copied out before every step (19 us at 4K tokens, 0.68 ms at 128K, measured
 before the stride).
 
+## the loss without the logits
+
+Training with a 128K vocabulary spends a surprising share of memory on one tensor: the
+logits of the last layer. `F.cross_entropy(h @ w.T, y)` for Llama 3 (V = 128256) at 8192
+tokens makes 2.1 GB of bf16 logits and fp32 copies of twice that, and in a 10 GB budget it
+does not fit even without a backward. `sk.linear_cross_entropy(h, w, y)` never holds
+more than a chunk. Variant 1 is Liger's recipe on these kernels: per 2048-row chunk the
+lm_head GEMM (grouped_gemm's kernel with one expert, since w is K-contiguous), one row kernel
+that writes the loss and the gradient row in place, and dh, dw by `hgemm`, all in the
+forward. Variant 2 never writes the logits in the forward: the GEMM's epilogue reduces each
+128 x 128 tile to a per-row max and sum of exponentials, and the backward recomputes a chunk
+with softmax minus one-hot folded into the epilogue.
+
+| D = 4096, forward + backward | torch | torch.compile | v1 | v2 |
+|---|---|---|---|---|
+| V = 128256, T = 2048 | 35.1 ms, 3.15 GB | 29.2 ms, 1.59 GB | **28.3 ms**, 1.66 GB | 36.7 ms, 1.66 GB |
+| V = 128256, T = 8192 | does not fit in 10 GB | 115.4 ms, 3.22 GB | **113.5 ms**, 1.71 GB | 146.9 ms, 1.71 GB |
+| V = 128256, T = 16384 | does not fit | 228.6 ms, 5.39 GB | **228.0 ms**, 1.78 GB | 295.4 ms, 1.78 GB |
+| V = 151936, T = 16384 | does not fit | does not fit | **269.8 ms**, 2.07 GB | 349.3 ms, 2.07 GB |
+| forward only, V = 128256, T = 8192 | does not fit | 37.9 ms, 2.10 GB | 36.7 ms, 0.53 GB | **35.8 ms**, 0.07 GB |
+
+Peak memory above the inputs, gradients included (dw alone is 1.05 GB). The win is memory:
+ours stays flat in T, `torch.compile` grows with the logits it keeps. On time it is a tie
+with `torch.compile` (0.3% to 3% ahead, 0.1% behind at one shape), since all of them spend
+the step in the same three GEMMs. Variant 2's forward is the fastest one and holds almost
+nothing, which is what an eval loss wants, but its backward lost: four GEMMs to variant
+1's three, 1.29 to 1.30x slower at every shape. A backward with no chunk at all, the way Cut
+Cross-Entropy does it, is not built; [docs/design/cross_entropy.md](docs/design/cross_entropy.md)
+has why, the per-kernel numbers and the chunk sweep.
+
 ## serving a batch
 
 The same kernels on a paged K/V cache run the whole 32-layer model for a batch of sequences of
@@ -992,6 +1022,7 @@ default stays on the CUDA cores.
 | `attention_bwd` bf16 | warp per row, FlashAttention-2's key-tile loop on `mma.sync`, V in registers with a double-buffered Q/dO tile and a simulated split, TMA and mbarriers with no block barrier; GQA, a deterministic dQ pass, an autograd Function | torch autograd through `F.scaled_dot_product_attention` (flash and cuDNN) |
 | `rope_append` bf16 | RoPE on q and k plus the K/V cache append from a fused q\|k\|v projection, one launch | the torch spelling, ten kernels |
 | `layer` | one Llama-3-8B decoder layer from the kernels above, prefill and decode with a K/V cache, our decode step as a CUDA graph | the same layer in PyTorch, eager and `torch.compile` |
+| `linear_cross_entropy` | torch's bf16 logits and fp32 loss; chunked over T with a fused row kernel for the loss and the gradient in place (Liger's recipe); the forward with no logits from a GEMM epilogue of per-tile row max and sum, the backward with softmax minus one-hot in the recompute's epilogue | `F.cross_entropy(h @ w.T)`, eager and `torch.compile` |
 | `engine` | the 32-layer model on a paged cache: packed and chunked prefill, mixed prefill and decode steps, CUDA-graph decode, stop ids; bf16, fp8, MXFP8, int4 (with AWQ scales), NVFP4 and MXFP4 weights; Hugging Face checkpoints through `spark_kernels.hf` | vLLM 0.30, transformers 5.18, the same model in PyTorch |
 | `bench_peak` | | the card's real `mma.sync` (bf16, fp8 plain and block-scaled, fp4, tf32) and FMA peaks and the clock they ran at |
 

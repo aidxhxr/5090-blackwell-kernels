@@ -50,6 +50,9 @@ LAYER_FILE = "layer.json"
 # Written by scripts/bench_serve.py: the whole model served by spark_kernels.engine against the
 # same model in PyTorch; rows of their own shape, not bench rows.
 SERVE_FILE = "serve.json"
+# Written by scripts/bench_cross_entropy.py: the lm_head loss against torch eager and compiled,
+# time and peak memory per (V, T, method); rows of their own shape, not bench rows.
+CROSS_ENTROPY_FILE = "cross_entropy.json"
 
 # The C++ benches name some rows after the entry point they time rather than the kernel family
 # everything here keys on (tables, peaks, traffic, FLOPs, the torch comparison).
@@ -157,7 +160,8 @@ def load_bench_rows(results_dir: Path) -> list[dict]:
     """Every row written by the C++ benches (results/*.json minus the torch comparison)."""
     rows: list[dict] = []
     for p in sorted(results_dir.glob("*.json")):
-        if p.name not in (TORCH_COMPARISON, PEAK_FILE, LAYER_FILE, SERVE_FILE):
+        if p.name not in (TORCH_COMPARISON, PEAK_FILE, LAYER_FILE, SERVE_FILE,
+                          CROSS_ENTROPY_FILE):
             rows.extend(normalize_row(r) for r in load_jsonl(p))
     return rows
 
