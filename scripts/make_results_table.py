@@ -39,6 +39,8 @@ KERNEL_ORDER = ["bandwidth", "rmsnorm", "add_rmsnorm", "swiglu", "softmax", "sge
 REFERENCE_NAME = {"sgemm": "cuBLAS", "hgemm": "cuBLAS", "fp8gemm": "cuBLASLt",
                   "fp4gemm": "cuBLASLt", "attention_varlen": "dense attention per sequence",
                   "attention_fp8": "bf16 attention v5"}
+# bench_attention --sweep=window times the full causal kernel next to every windowed row.
+REFERENCE_NAME["attention_window"] = "full causal v5"
 
 
 def on_device(r: dict, device: str) -> bool:

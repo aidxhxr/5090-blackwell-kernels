@@ -366,14 +366,14 @@ def arithmetic_intensity(kernel: str, dtype: str, shape: str) -> float:
 
 def is_compute_bound_kernel(kernel: str) -> bool:
     return kernel.lower() in (GEMM_KERNELS + ATTENTION_KERNELS
-                              + ("attention_varlen", "attention_bwd"))
+                              + ("attention_varlen", "attention_bwd", "attention_window"))
 
 
 def uses_tensor_cores(kernel: str, dtype: str = "") -> bool:
     """Kernels judged against a tensor-core peak (bf16, fp8, fp4 or tf32) rather than the fp32
     one. sgemm is the CUDA-core ladder except for its tf32 / 3xtf32 rows."""
-    return (kernel.lower() in ("hgemm", "fp8gemm", "fp4gemm", "attention_varlen", "attention_bwd")
-            + ATTENTION_KERNELS or dtype in TF32_DTYPES)
+    return (kernel.lower() in ("hgemm", "fp8gemm", "fp4gemm", "attention_varlen", "attention_bwd",
+                               "attention_window") + ATTENTION_KERNELS or dtype in TF32_DTYPES)
 
 
 def compute_peak_key(kernel: str, dtype: str = "") -> str:

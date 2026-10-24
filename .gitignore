@@ -36,6 +36,9 @@ parity_work/
 # a downloaded checkpoint to regenerate, so its rows are kept
 !results/llm_serve.json
 !results/llm_quant.json
+# the sliding-window sweep (docs/design/attention.md, "Sliding window and sinks") is quoted in
+# the docs; its torch side, results/attention_window_torch.jsonl, is not matched above
+!results/attention_window.json
 
 # editors / OS
 .vscode/

@@ -6,6 +6,10 @@
 //   ./bench_attention --hq=32 --hkv=8 --sq=1 --skv=131072   # grouped-query attention
 //   ./bench_attention --sq=1 --skv=4096 --kvcap=4352       # K/V as the first 4096 rows of
 //                                                          # heads allocated 4352 (a cache)
+//   ./bench_attention --hq=32 --hkv=8 --s=16384 --causal=1 --window=1024 --sinks=1
+//                                                       # a sliding window and sink logits
+//   ./bench_attention --sweep=window                    # the window sweep (attention_window
+//                                                       # rows, results/attention_window.json)
 //
 // Correctness: a CPU double-precision reference on every output row for the small shapes,
 // and on 64 sampled (b, h, row) triples for the large ones (the full reference at S = 4096
@@ -36,7 +40,10 @@ namespace {
 struct Shape {
     int B, Hq, Hkv, Sq, Skv, D;
     int causal;
-    int kvcap = 0;  // rows each K/V head is allocated (0: Skv, packed); the kernel's kv_cap
+    int kvcap = 0;   // rows each K/V head is allocated (0: Skv, packed); the kernel's kv_cap
+    int window = 0;  // keys each query sees, its own included (0: no window); causal, the
+                     // query at key position i + Skv - Sq (attention_window_bf16)
+    int sinks = 0;   // a sink logit per query head
 };
 
 // "b1_h32_s4096_d128_causal", or "b1_h32_sq1_skv4096_d128" when S_q != S_kv, and
@@ -55,7 +62,17 @@ std::string shape_str(const Shape& s) {
     r += "_d" + std::to_string(s.D);
     if (s.causal) r += "_causal";
     if (s.kvcap) r += "_cap" + std::to_string(s.kvcap);
+    if (s.window) r += "_w" + std::to_string(s.window);
+    if (s.sinks) r += "_sink";
     return r;
+}
+
+// Keys [lo, hi) query row i sees: the causal bound (top-left, or at key position
+// i + Skv - Sq under a window) and the window's left edge.
+void key_range(const Shape& s, int i, int& lo, int& hi) {
+    const int pos = s.window ? i + s.Skv - s.Sq : i;
+    hi = s.causal || s.window ? std::min(s.Skv, pos + 1) : s.Skv;
+    lo = s.window ? std::max(0, pos - s.window + 1) : 0;
 }
 
 std::vector<float> to_host_f32(const __nv_bfloat16* d, size_t n) {
@@ -68,21 +85,23 @@ std::vector<float> to_host_f32(const __nv_bfloat16* d, size_t n) {
 
 // One output row in double precision from the bf16-rounded inputs (hq/hk/hv are those values
 // as floats). Softmax as exp(s - max) / sum, all D columns of the row. Query head h of batch
-// b reads K/V head h / (H_q / H_kv).
+// b reads K/V head h / (H_q / H_kv). `hs`, when not empty, holds a sink logit per query head,
+// one more term of the denominator.
 void reference_row(const std::vector<float>& hq, const std::vector<float>& hk,
-                   const std::vector<float>& hv, const Shape& s, int bh, int i,
-                   std::vector<double>& out) {
+                   const std::vector<float>& hv, const std::vector<float>& hs, const Shape& s,
+                   int bh, int i, std::vector<double>& out) {
     const int D = s.D;
     const int b = bh / s.Hq, h = bh % s.Hq;
     const int bkv = b * s.Hkv + h / (s.Hq / s.Hkv);
     const float* q = hq.data() + (static_cast<size_t>(bh) * s.Sq + i) * D;
     const float* k = hk.data() + static_cast<size_t>(bkv) * s.Skv * D;
     const float* v = hv.data() + static_cast<size_t>(bkv) * s.Skv * D;
-    const int n = s.causal ? std::min(s.Skv, i + 1) : s.Skv;
+    int lo, n;
+    key_range(s, i, lo, n);
     const double scale = 1.0 / std::sqrt(static_cast<double>(D));
     std::vector<double> sc(n);
-    double mx = -INFINITY;
-    for (int j = 0; j < n; ++j) {
+    double mx = hs.empty() ? -INFINITY : static_cast<double>(hs[h]);
+    for (int j = lo; j < n; ++j) {
         double acc = 0.0;
         for (int d = 0; d < D; ++d)
             acc += static_cast<double>(q[d]) * k[static_cast<size_t>(j) * D + d];
@@ -90,8 +109,8 @@ void reference_row(const std::vector<float>& hq, const std::vector<float>& hk,
         mx = std::max(mx, sc[j]);
     }
     out.assign(D, 0.0);
-    double sum = 0.0;
-    for (int j = 0; j < n; ++j) {
+    double sum = hs.empty() ? 0.0 : std::exp(static_cast<double>(hs[h]) - mx);
+    for (int j = lo; j < n; ++j) {
         const double p = std::exp(sc[j] - mx);
         sum += p;
         for (int d = 0; d < D; ++d) out[d] += p * v[static_cast<size_t>(j) * D + d];
@@ -99,8 +118,12 @@ void reference_row(const std::vector<float>& hq, const std::vector<float>& hk,
     for (int d = 0; d < D; ++d) out[d] /= sum;
 }
 
-// Runs one shape for one variant. Returns false on a correctness failure.
-bool run_one(cudaStream_t stream, const Shape& s, int variant, int iters) {
+// Runs one shape for one variant. Returns false on a correctness failure. The median time goes
+// to `median_ms` when given; `ref_ms` is printed as the row's reference (the window sweep
+// passes the full causal time of the same shape), and `kernel` names the row when given (the
+// sweep's full causal rows are "attention_window" rows too, apart from the default sweep's).
+bool run_one(cudaStream_t stream, const Shape& s, int variant, int iters,
+             double* median_ms = nullptr, double ref_ms = 0.0, const char* kernel = nullptr) {
     if (!spark::attention_supports(s.Sq, s.Skv, s.D, variant)) {
         std::fprintf(stderr, "  skip variant %d shape %s: not supported\n", variant,
                      shape_str(s).c_str());
@@ -138,13 +161,40 @@ bool run_one(cudaStream_t stream, const Shape& s, int variant, int iters) {
     // timing loop rotates through enough copies of K and V to exceed L2 (256 MB+), as
     // bench_hgemm does with the weights of a decode GEMM. A 128K-token cache is past L2 on
     // its own (512 MB at 8 heads, 2 GB at 32) and gets one copy.
-    const size_t kv_bytes = nKd * sizeof(__nv_bfloat16);
-    const int copies = s.Sq <= 64 ? static_cast<int>((size_t{256} << 20) / (2 * kv_bytes)) + 1 : 1;
+    //
+    // A windowed decode step reads only the last rows of each head (4096 of a 128K cache is
+    // 16.8 MB at 8 heads), which L2 would hold between launches, and whole copies of the
+    // cache to rotate through would not fit the card. So the copies are shifts along each
+    // head instead: one [B * H_kv, cap + (copies - 1) * rows, D] allocation, copy c is the
+    // tensor starting c * rows rows in, with the head stride of the allocation as its kv_cap,
+    // and the rows of its window hold the window's data. Each launch reads its own rows.
+    int lo_first, hi_first;
+    key_range(s, 0, lo_first, hi_first);
+    const int rows_read = s.window ? s.Skv - lo_first : s.Skv;  // per K/V head
+    const bool shifted = s.window > 0 && s.Sq <= 64;
+    int copies;
+    int cap_alloc = cap;  // rows per head of the allocation
+    size_t copy_stride;   // elements between copies
+    size_t alloc_elems;
+    if (shifted) {
+        const size_t win_bytes = BHkv * rows_read * s.D * sizeof(__nv_bfloat16);
+        copies = static_cast<int>((size_t{256} << 20) / (2 * win_bytes)) + 1;
+        cap_alloc = cap + (copies - 1) * rows_read;
+        copy_stride = static_cast<size_t>(rows_read) * s.D;
+        alloc_elems = BHkv * cap_alloc * s.D;
+    } else {
+        const size_t kv_bytes = nKd * sizeof(__nv_bfloat16);
+        copies = s.Sq <= 64 ? static_cast<int>((size_t{256} << 20) / (2 * kv_bytes)) + 1 : 1;
+        copy_stride = nKd;
+        alloc_elems = copies * nKd;
+    }
+    const int kv_cap_arg = shifted ? cap_alloc : s.kvcap;
+    const size_t kv_bytes = BHkv * cap_alloc * s.D * sizeof(__nv_bfloat16);  // one copy's span
 
     __nv_bfloat16 *dQ = nullptr, *dK = nullptr, *dV = nullptr, *dO = nullptr;
     SPARK_CUDA_CHECK(cudaMalloc(&dQ, nQ * sizeof(__nv_bfloat16)));
-    SPARK_CUDA_CHECK(cudaMalloc(&dK, copies * kv_bytes));
-    SPARK_CUDA_CHECK(cudaMalloc(&dV, copies * kv_bytes));
+    SPARK_CUDA_CHECK(cudaMalloc(&dK, alloc_elems * sizeof(__nv_bfloat16)));
+    SPARK_CUDA_CHECK(cudaMalloc(&dV, alloc_elems * sizeof(__nv_bfloat16)));
     SPARK_CUDA_CHECK(cudaMalloc(&dO, nQ * sizeof(__nv_bfloat16)));
     SPARK_CUDA_CHECK(cudaMemcpy(dQ, bq.data(), nQ * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
     // the rows past Skv of every head hold garbage the kernel must not read
@@ -152,19 +202,49 @@ bool run_one(cudaStream_t stream, const Shape& s, int variant, int iters) {
     SPARK_CUDA_CHECK(cudaMemset(dV, 0xff, kv_bytes));
     for (size_t h = 0; h < BHkv; ++h) {
         const size_t rows = static_cast<size_t>(s.Skv) * s.D;
-        SPARK_CUDA_CHECK(cudaMemcpy(dK + h * cap * s.D, bk.data() + h * rows,
+        SPARK_CUDA_CHECK(cudaMemcpy(dK + h * cap_alloc * s.D, bk.data() + h * rows,
                                     rows * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
-        SPARK_CUDA_CHECK(cudaMemcpy(dV + h * cap * s.D, bv.data() + h * rows,
+        SPARK_CUDA_CHECK(cudaMemcpy(dV + h * cap_alloc * s.D, bv.data() + h * rows,
                                     rows * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
     }
     for (int c = 1; c < copies; ++c) {
+        if (shifted) {  // the window's rows of every head, c * rows_read rows further on
+            const size_t win = static_cast<size_t>(rows_read) * s.D;
+            for (size_t h = 0; h < BHkv; ++h) {
+                const size_t src = h * cap_alloc * s.D + static_cast<size_t>(lo_first) * s.D;
+                SPARK_CUDA_CHECK(cudaMemcpy(dK + src + c * copy_stride, dK + src,
+                                            win * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice));
+                SPARK_CUDA_CHECK(cudaMemcpy(dV + src + c * copy_stride, dV + src,
+                                            win * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice));
+            }
+            continue;
+        }
         SPARK_CUDA_CHECK(cudaMemcpy(dK + c * nKd, dK, kv_bytes, cudaMemcpyDeviceToDevice));
         SPARK_CUDA_CHECK(cudaMemcpy(dV + c * nKd, dV, kv_bytes, cudaMemcpyDeviceToDevice));
     }
     SPARK_CUDA_CHECK(cudaMemset(dO, 0, nQ * sizeof(__nv_bfloat16)));
 
-    spark::attention_bf16(dQ, dK, dV, dO, s.B, s.Hq, s.Hkv, s.Sq, s.Skv, s.D, s.causal != 0,
-                          variant, stream, nullptr, s.kvcap);
+    // Sink logits in [0, 3]: the scores spread over a few units, so a sink takes a visible
+    // share of the denominator without swamping it.
+    std::vector<float> hs;
+    float* dS = nullptr;
+    if (s.sinks) {
+        hs.resize(s.Hq);
+        spark::bench::fill_uniform(hs, 0.0f, 3.0f, 3456);
+        SPARK_CUDA_CHECK(cudaMalloc(&dS, s.Hq * sizeof(float)));
+        SPARK_CUDA_CHECK(cudaMemcpy(dS, hs.data(), s.Hq * sizeof(float), cudaMemcpyHostToDevice));
+    }
+    const bool local = s.window > 0 || s.sinks;
+    auto launch = [&](const __nv_bfloat16* k, const __nv_bfloat16* v) {
+        if (local)
+            spark::attention_window_bf16(dQ, k, v, dO, s.B, s.Hq, s.Hkv, s.Sq, s.Skv, s.D,
+                                         s.causal != 0, s.window, dS, variant, stream, nullptr,
+                                         kv_cap_arg);
+        else
+            spark::attention_bf16(dQ, k, v, dO, s.B, s.Hq, s.Hkv, s.Sq, s.Skv, s.D, s.causal != 0,
+                                  variant, stream, nullptr, kv_cap_arg);
+    };
+    launch(dK, dV);
     SPARK_CUDA_CHECK(cudaStreamSynchronize(stream));
     const auto got = to_host_f32(dO, nQ);
 
@@ -189,7 +269,7 @@ bool run_one(cudaStream_t stream, const Shape& s, int variant, int iters) {
     double max_abs = 0.0, max_rel = 0.0, max_ref = 0.0;
     std::vector<double> ref;
     for (const auto& [bh, i] : rows) {
-        reference_row(hq, hk, hv, s, bh, i, ref);
+        reference_row(hq, hk, hv, hs, s, bh, i, ref);
         const float* o = got.data() + (static_cast<size_t>(bh) * s.Sq + i) * s.D;
         for (int d = 0; d < s.D; ++d) {
             const double diff = std::fabs(static_cast<double>(o[d]) - ref[d]);
@@ -210,20 +290,33 @@ bool run_one(cudaStream_t stream, const Shape& s, int variant, int iters) {
     int turn = 0;
     const auto t = spark::bench::time_kernel(
         [&] {
-            const size_t off = static_cast<size_t>(turn++ % copies) * nKd;
-            spark::attention_bf16(dQ, dK + off, dV + off, dO, s.B, s.Hq, s.Hkv, s.Sq, s.Skv, s.D,
-                                  s.causal != 0, variant, stream, nullptr, s.kvcap);
+            const size_t off = static_cast<size_t>(turn++ % copies) * copy_stride;
+            launch(dK + off, dV + off);
         },
         stream, 5, iters);
 
     // 4 * B * H_q * S_q * S_kv * D, halved under the causal mask (the FlashAttention
-    // convention: only the tiles at or below the diagonal are computed).
+    // convention: only the tiles at or below the diagonal are computed). Under a window,
+    // 4 * D per (query, visible key) pair, counted exactly.
     double flops = 4.0 * BH * s.Sq * static_cast<double>(s.Skv) * s.D;
     if (s.causal) flops *= 0.5;
-    // Q and O once (H_q heads), K and V once (H_kv heads): the GQA traffic floor.
-    const double bytes = 2.0 * (2.0 * nQ + 2.0 * nK);
+    // Q and O once (H_q heads), K and V once (H_kv heads): the GQA traffic floor. Under a
+    // window only the keys some query's window holds.
+    double bytes = 2.0 * (2.0 * nQ + 2.0 * nK);
+    if (s.window) {
+        double pairs = 0.0;
+        int lo0, hi0, lo1, hi1;
+        for (int i = 0; i < s.Sq; ++i) {
+            key_range(s, i, lo0, hi0);
+            pairs += hi0 - lo0;
+        }
+        flops = 4.0 * BH * pairs * s.D;
+        key_range(s, 0, lo0, hi0);
+        key_range(s, s.Sq - 1, lo1, hi1);
+        bytes = 2.0 * (2.0 * nQ + 2.0 * BHkv * static_cast<double>(hi1 - lo0) * s.D);
+    }
     spark::bench::Row row;
-    row.kernel = "attention";
+    row.kernel = kernel ? kernel : local ? "attention_window" : "attention";
     row.dtype = "bf16";
     row.variant = variant;
     row.shape = shape_str(s);
@@ -231,7 +324,7 @@ bool run_one(cudaStream_t stream, const Shape& s, int variant, int iters) {
     row.min_ms = t.min_ms;
     row.tflops = flops / (t.median_ms * 1e-3) / 1e12;
     row.gbps = bytes / (t.median_ms * 1e-3) / 1e9;
-    row.ref_ms = 0.0;
+    row.ref_ms = ref_ms;
     row.max_abs_err = max_abs;
     row.max_rel_err = max_rel;
     row.ok = ok;
@@ -244,6 +337,37 @@ bool run_one(cudaStream_t stream, const Shape& s, int variant, int iters) {
     SPARK_CUDA_CHECK(cudaFree(dK));
     SPARK_CUDA_CHECK(cudaFree(dV));
     SPARK_CUDA_CHECK(cudaFree(dO));
+    if (dS) SPARK_CUDA_CHECK(cudaFree(dS));
+    if (median_ms) *median_ms = t.median_ms;
+    return ok;
+}
+
+// --sweep=window: sliding windows against the full causal kernel on the same shapes, every
+// windowed row with the full row's time as its ref_ms. Llama-3-8B heads (32 query, 8 K/V,
+// D = 128) at 4K, 16K and 32K tokens with windows of 128 (gpt-oss), 1024 and 4096 (Mistral,
+// Gemma); the sink logits on top at 4K and 16K; gpt-oss's own heads (64 query, 8 K/V, D = 64,
+// window 128, sinks); and decode steps against 128K cached keys with a 4096-key window and
+// gpt-oss's 128.
+bool window_sweep(cudaStream_t stream, int variant, int iters) {
+    bool ok = true;
+    auto pair = [&](Shape full, const std::vector<std::pair<int, int>>& wins) {
+        double full_ms = 0.0;
+        ok = run_one(stream, full, variant, iters, &full_ms, 0.0, "attention_window") && ok;
+        for (const auto& [w, sk] : wins) {
+            Shape s = full;
+            s.window = w;
+            s.sinks = sk;
+            ok = run_one(stream, s, variant, iters, nullptr, full_ms, "attention_window") && ok;
+        }
+    };
+    for (int S : {4096, 16384, 32768}) {
+        std::vector<std::pair<int, int>> wins = {{128, 0}, {1024, 0}, {4096, 0}};
+        if (S <= 16384) wins.insert(wins.end(), {{128, 1}, {1024, 1}});
+        pair({1, 32, 8, S, S, 128, 1}, wins);
+    }
+    for (int S : {4096, 16384}) pair({1, 64, 8, S, S, 64, 1}, {{128, 1}});
+    pair({1, 32, 8, 1, 131072, 128, 0}, {{4096, 0}, {128, 0}});
+    pair({1, 64, 8, 1, 131072, 64, 0}, {{128, 1}});
     return ok;
 }
 
@@ -253,17 +377,26 @@ int run(int argc, char** argv) {
     spark::bench::Args args(argc, argv);
     spark::bench::print_device_banner();
 
+    if (args.get("sweep", "") == "window") {
+        spark::bench::print_header();
+        const int variant = args.geti("variant", spark::attention_num_variants() - 1);
+        if (!window_sweep(nullptr, variant, args.geti("iters", 50))) {
+            std::fprintf(stderr, "CORRECTNESS FAILURE\n");
+            return 1;
+        }
+        return 0;
+    }
     std::vector<Shape> shapes;
     if (args.has("b") || args.has("h") || args.has("hq") || args.has("hkv") || args.has("s") ||
         args.has("sq") || args.has("skv") || args.has("d") || args.has("causal") ||
-        args.has("kvcap")) {
+        args.has("kvcap") || args.has("window") || args.has("sinks")) {
         // --h sets both head counts; --hq / --hkv set them apart (GQA).
         const int s = args.geti("s", 4096);
         const int h = args.geti("h", 32);
         const int hq = args.geti("hq", h);
         shapes.push_back({args.geti("b", 1), hq, args.geti("hkv", hq), args.geti("sq", s),
                           args.geti("skv", s), args.geti("d", 128), args.geti("causal", 0),
-                          args.geti("kvcap", 0)});
+                          args.geti("kvcap", 0), args.geti("window", 0), args.geti("sinks", 0)});
     } else {
         // Small shapes, checked on every row: both head sizes, both masks, a sequence that is
         // not a multiple of the 128 x 64 tile, and a GQA group of 4. Then Llama-7B-sized
