@@ -518,6 +518,16 @@ MoeRoutePlan moe_route(const void* logits, bool logits_fp32, int T, int E, int k
                        cudaStream_t stream);
 void moe_positions(const int32_t* ids, int32_t* pos, const MoeRoutePlan& plan, int T, int E, int k,
                    cudaStream_t stream);
+// moe_permute: pos (in: the rank from moe_route, out: the row in expert order) and xs [T * k,
+// D] with xs[pos[t, s]] = x[t]. moe_combine: out [T, D] = sum over s of weights[t, s] *
+// y[pos[t, s]], fp32 in slot order, one rounding, no atomics. bf16, D % 8 == 0, D <= 8192,
+// k <= 16, 16-byte aligned rows.
+bool moe_permute_supports(int D, int k);
+void moe_permute_bf16(const __nv_bfloat16* x, const int32_t* ids, int32_t* pos,
+                      const MoeRoutePlan& plan, __nv_bfloat16* xs, int T, int E, int k, int D,
+                      cudaStream_t stream);
+void moe_combine_bf16(const __nv_bfloat16* y, const int32_t* pos, const float* weights,
+                      __nv_bfloat16* out, int T, int k, int D, cudaStream_t stream);
 
 // ---- RoPE + K/V cache append -------------------------------------------------------------
 // From qkv = [B, S, (H_q + 2 H_kv) * D] bf16 (a fused q|k|v projection) and rotary tables
