@@ -496,6 +496,29 @@ bool ce_gemm_supports(int V, int D);
 void ce_combine(const float* partials, const float* target_logit, const int64_t* targets, int T,
                 int V, int ignore_index, float* lse, float* loss, cudaStream_t stream);
 
+// ---- MoE layer: routing, permute, combine (src/kernels/moe_route.cu, moe_permute.cu) ------
+// moe_route: logits [T, E] (fp32 or bf16) -> ids [T, k] int32 (the top k experts of each
+// token, largest first, ties to the lower id), weights [T, k] fp32 (the softmax over all E
+// at those experts, divided by their sum when `renorm`), offsets [E + 1] int32 (rows per
+// expert in expert order, offsets[E] == T * k) and rank [T, k] int32, the (token, slot)'s
+// index among its route block's assignments to the same expert. One launch. A (token, slot)'s
+// row in expert order is plan.base[(t / plan.tb) * E + e] + rank; rows are sorted by expert,
+// then token, then slot (the stable sort of the flat ids). moe_positions adds that base in
+// place (rank -> pos); moe_permute does it while moving the rows. The plan points into a
+// per-process workspace that the next moe_route call overwrites, and like grouped_gemm the
+// routing is not safe on two streams at once. Requires 1 <= k <= min(E, 16), E <= 512.
+struct MoeRoutePlan {
+    const int32_t* base;  // [nb, E]
+    int tb;               // tokens per route block
+    int nb;               // route blocks
+};
+bool moe_route_supports(int E, int k);
+MoeRoutePlan moe_route(const void* logits, bool logits_fp32, int T, int E, int k, bool renorm,
+                       int32_t* ids, float* weights, int32_t* rank, int32_t* offsets,
+                       cudaStream_t stream);
+void moe_positions(const int32_t* ids, int32_t* pos, const MoeRoutePlan& plan, int T, int E, int k,
+                   cudaStream_t stream);
+
 // ---- RoPE + K/V cache append -------------------------------------------------------------
 // From qkv = [B, S, (H_q + 2 H_kv) * D] bf16 (a fused q|k|v projection) and rotary tables
 // cos, sin = [>= pos0 + S, D] fp32 in the rotate-half layout (column d pairs with d + D/2;
