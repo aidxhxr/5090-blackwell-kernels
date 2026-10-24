@@ -40,6 +40,15 @@
 //              and K/V stages as the next loads of one running sequence, so the block prologue
 //              is paid once per SM and the next item's Q is in flight during the current one's
 //              last tiles. Tail split kept for the non-causal shapes; the same decode paths.
+//
+// Local attention (attention_window_bf16): a sliding window of W keys, causal and aligned to
+// the last key (query i at key position i + S_kv - S_q sees keys p - W < j <= p), and sink
+// logits, one per query head, added to the softmax denominator with no value. Every variant
+// takes them. The tile ranges start at the first KV tile a row's window reaches, the mask
+// code also masks the window's edge, and the sink joins the denominator in the epilogue (in
+// the combine for split rows). Variants 2, 4 and 5 and the flash-decoding kernel do this in
+// an EXT instantiation of their template, so the plain kernels are the code they were.
+// docs/design/attention.md, "Sliding window and sinks".
 
 #include <algorithm>
 #include <cstdlib>
@@ -59,8 +68,11 @@ using attn::bf16;
 using attn::ex2;
 using attn::kLog2e;
 using attn::kv_index;
+using attn::Local;
 using attn::pack_bf16x2;
+using attn::sink_norm;
 using attn::swz;
+using attn::window_lo;
 
 constexpr float kLn2 = 0.6931471805599453f;
 
@@ -69,6 +81,12 @@ constexpr float kLn2 = 0.6931471805599453f;
 // log(sum_j exp(s_j / sqrt(D))) = (m + log2 l) ln 2. The backward pass recomputes P from it.
 __device__ __forceinline__ float row_lse(float m, float l) {
     return (m + __log2f(l)) * kLn2;
+}
+
+// The same with a sink logit s (log2 domain) in the denominator: log(sum_j exp(.) + exp(sink)).
+__device__ __forceinline__ float row_lse_sink(float m, float l, float s) {
+    const float mx = fmaxf(m, s);
+    return (mx + __log2f(fmaf(l, ex2(m - mx), ex2(s - mx)))) * kLn2;
 }
 
 // 8 bf16 (one 16-byte chunk) to 8 floats.
@@ -118,7 +136,7 @@ __global__ void __launch_bounds__(THREADS)
     attention_v0_kernel(const bf16* __restrict__ Q, const bf16* __restrict__ K,
                         const bf16* __restrict__ V, bf16* __restrict__ O, float* __restrict__ lse,
                         int H_q, int H_kv, int S_q, int S_kv, int kv_cap, float scale_log2,
-                        int causal) {
+                        int causal, int window, int off, const float* __restrict__ sinks) {
     constexpr int VEC = D / 32;
     const int lane = threadIdx.x & 31;
     const int row = blockIdx.x * (THREADS / 32) + (threadIdx.x >> 5);
@@ -139,9 +157,12 @@ __global__ void __launch_bounds__(THREADS)
     for (int i = 0; i < VEC; ++i) o[i] = 0.f;
     float m = -INFINITY, l = 0.f;
 
-    const int n = causal ? min(S_kv, row + 1) : S_kv;
+    // Keys [j0, n): the causal bound at the row's position, and the window's left edge.
+    const int pos = row + off;
+    const int n = causal ? min(S_kv, pos + 1) : S_kv;
+    const int j0 = window_lo(pos, window);
 #pragma unroll 4
-    for (int j = 0; j < n; ++j) {
+    for (int j = j0; j < n; ++j) {
         float kr[VEC], vr[VEC];
         load_vec<VEC>(k + static_cast<size_t>(j) * D, kr);
         load_vec<VEC>(v + static_cast<size_t>(j) * D, vr);
@@ -158,14 +179,18 @@ __global__ void __launch_bounds__(THREADS)
         m = m_new;
     }
 
-    const float inv = 1.f / l;
+    float inv = 1.f / l;
+    const float sk = sinks != nullptr ? sinks[bh % H_q] * kLog2e : 0.f;
+    if (sinks != nullptr) inv = sink_norm(m, l, sk);
     bf16* out = O + (static_cast<size_t>(bh) * S_q + row) * D + lane * VEC;
     Vec<VEC> ov;
 #pragma unroll
     for (int i = 0; i < VEC / 2; ++i)
         ov.h[i] = __floats2bfloat162_rn(o[2 * i] * inv, o[2 * i + 1] * inv);
     *reinterpret_cast<Vec<VEC>*>(out) = ov;
-    if (lse != nullptr && lane == 0) lse[static_cast<size_t>(bh) * S_q + row] = row_lse(m, l);
+    if (lse != nullptr && lane == 0)
+        lse[static_cast<size_t>(bh) * S_q + row] =
+            sinks != nullptr ? row_lse_sink(m, l, sk) : row_lse(m, l);
 }
 
 }  // namespace v0
@@ -198,7 +223,7 @@ __global__ void __launch_bounds__(THREADS, 1)
     attention_v1_kernel(const bf16* __restrict__ Q, const bf16* __restrict__ K,
                         const bf16* __restrict__ V, bf16* __restrict__ O, float* __restrict__ lse,
                         int H_q, int H_kv, int S_q, int S_kv, int kv_cap, float scale_log2,
-                        int causal) {
+                        int causal, int window, int off, const float* __restrict__ sinks) {
     constexpr int CH = D / 8;                    // 16-byte chunks per bf16 row
     constexpr int DD = D / 32;                   // float4 chunks of O per lane
     constexpr int Q_ITERS = BM * CH / THREADS;   // 8 (D = 128), 4 (D = 64)
@@ -234,8 +259,11 @@ __global__ void __launch_bounds__(THREADS, 1)
         *reinterpret_cast<uint4*>(Qs + row * D + swz(row, ch) * 8) = u;
     }
 
-    const int kv_end = causal ? min(S_kv, q0 + BM) : S_kv;
+    // KV tiles [t0, T): up to the causal bound of the last row, from the window's left edge
+    // for the first row.
+    const int kv_end = causal ? min(S_kv, q0 + BM + off) : S_kv;
     const int T = cdiv(kv_end, BN);
+    const int t0 = window_lo(q0 + off, window) / BN;
 
     uint4 pre[2 * KV_ITERS];
     auto prefetch = [&](int t) {
@@ -292,8 +320,8 @@ __global__ void __launch_bounds__(THREADS, 1)
         l[rr] = 0.f;
     }
 
-    prefetch(0);
-    for (int t = 0; t < T; ++t) {
+    prefetch(t0);
+    for (int t = t0; t < T; ++t) {
         __syncthreads();  // every warp is done with the previous tile's Ks / Vs
         stage();
         __syncthreads();
@@ -336,14 +364,17 @@ __global__ void __launch_bounds__(THREADS, 1)
         }
 
         const int kv0 = t * BN;
-        if (kv0 + BN > S_kv || (causal && kv0 + BN - 1 > q0)) {  // warp-uniform
+        // The window's edge: the last row of the tile sees keys from q0 + BM + off - window.
+        if (kv0 + BN > S_kv || (causal && kv0 + BN - 1 > q0 + off) ||
+            (window > 0 && kv0 < q0 + BM + off - window)) {  // warp-uniform
 #pragma unroll
             for (int rr = 0; rr < 4; ++rr) {
-                const int i = q0 + warp * 16 + rg + 4 * rr;
+                const int i = q0 + warp * 16 + rg + 4 * rr + off;  // the row's key position
 #pragma unroll
                 for (int kk = 0; kk < 8; ++kk) {
                     const int j = kv0 + kl + 8 * kk;
-                    if (j >= S_kv || (causal && j > i)) s[rr][kk] = -INFINITY;
+                    if (j >= S_kv || (causal && j > i) || (window > 0 && j <= i - window))
+                        s[rr][kk] = -INFINITY;
                 }
             }
         }
@@ -403,11 +434,14 @@ __global__ void __launch_bounds__(THREADS, 1)
         ls += __shfl_xor_sync(kFullMask, ls, 1);
         ls += __shfl_xor_sync(kFullMask, ls, 2);
         ls += __shfl_xor_sync(kFullMask, ls, 4);
-        const float inv = 1.f / ls;
+        float inv = 1.f / ls;
+        const float sk = sinks != nullptr ? sinks[bh % H_q] * kLog2e : 0.f;
+        if (sinks != nullptr) inv = sink_norm(m[rr], ls, sk);
         const int row = q0 + warp * 16 + rg + 4 * rr;
         if (row >= S_q) continue;
         if (lse != nullptr && kl == 0)
-            lse[static_cast<size_t>(bh) * S_q + row] = row_lse(m[rr], ls);
+            lse[static_cast<size_t>(bh) * S_q + row] =
+                sinks != nullptr ? row_lse_sink(m[rr], ls, sk) : row_lse(m[rr], ls);
 #pragma unroll
         for (int dd = 0; dd < DD; ++dd) {
             uint2 u;
@@ -452,7 +486,22 @@ struct Sched {
     int split;
     float* ws;   // (tiles - dp_tiles) * split partials of BM * (D + 2) floats each
     float* lse;  // optional [bh][S_q] fp32 log-sum-exp output (natural log), or nullptr
+    // Local attention (attn::Local), read only by the EXT instantiations and the combine:
+    // a window of `window` keys (0: none), the causal diagonal shifted by `off`, sink logits.
+    int window;
+    int off;
+    const float* sinks;
 };
+
+// KV tiles [t0, t1) of the Q tile at rows q0 .. q0 + BM - 1: up to the causal bound of its
+// last row, from the window's left edge for its first row (tile 0 without a window).
+template <int BM>
+__host__ __device__ __forceinline__ void kv_tiles(int q0, int S_kv, bool causal, int off,
+                                                  int window, int& t0, int& t1) {
+    const int last = q0 + BM + off;  // past the last row's causal bound
+    t1 = cdiv(causal && last < S_kv ? last : S_kv, BN);
+    t0 = attn::window_lo(q0 + off, window) / BN;
+}
 
 template <int D>
 constexpr int stage_elems() {
@@ -467,7 +516,9 @@ constexpr int partial_floats() {
     return 16 * WARPS * (D + 2);  // O rows, then m, then l
 }
 
-template <int D, int WARPS, int STAGES>
+// EXT: the local-attention instantiation (a window, a shifted causal diagonal, sinks). The
+// plain one compiles to the kernel as it was before those options.
+template <int D, int WARPS, int STAGES, bool EXT>
 __global__ void __launch_bounds__(WARPS * 32, 1)
     attention_v2_kernel(const bf16* __restrict__ Q, const bf16* __restrict__ K,
                         const bf16* __restrict__ V, bf16* __restrict__ O, int S_q, int S_kv,
@@ -532,10 +583,17 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
     __syncthreads();  // stage 0 is free again
 
     // KV tiles [tb, te) of the T this Q tile needs (all of them unless the tile is split).
-    const int kv_end = causal ? min(S_kv, q0 + BM) : S_kv;
-    const int T = cdiv(kv_end, BN);
-    const int tb = slice * T / split;
-    const int te = (slice + 1) * T / split;
+    const int off = EXT ? sched.off : 0;
+    int t0 = 0, t1;
+    if constexpr (EXT) {
+        kv_tiles<BM>(q0, S_kv, causal, off, sched.window, t0, t1);
+    } else {
+        const int kv_end = causal ? min(S_kv, q0 + BM) : S_kv;
+        t1 = cdiv(kv_end, BN);
+    }
+    const int T = t1 - t0;
+    const int tb = t0 + slice * T / split;
+    const int te = t0 + (slice + 1) * T / split;
 
     auto load_kv = [&](int stage, int t) {
         bf16* ks = smem + stage * stage_elems<D>();
@@ -596,14 +654,20 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
         }
 
         const int kv0 = t * BN;
-        if (kv0 + BN > S_kv || (causal && kv0 + BN - 1 > q0)) {  // warp-uniform
+        bool edge = kv0 + BN > S_kv || (causal && kv0 + BN - 1 > q0 + off);
+        // The window's edge: the tile's last row sees keys from q0 + BM + off - window.
+        if constexpr (EXT) edge = edge || (sched.window > 0 && kv0 < q0 + BM + off - sched.window);
+        if (edge) {  // warp-uniform
 #pragma unroll
             for (int nj = 0; nj < NT; ++nj)
 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
-                    const int i = q0 + warp * 16 + g + (e >> 1) * 8;
+                    const int i = q0 + warp * 16 + g + (e >> 1) * 8 + off;  // key position
                     const int j = kv0 + nj * 8 + c2 + (e & 1);
-                    if (j >= S_kv || (causal && j > i)) s[nj][e] = -INFINITY;
+                    bool masked = j >= S_kv || (causal && j > i);
+                    if constexpr (EXT)
+                        masked = masked || (sched.window > 0 && j <= i - sched.window);
+                    if (masked) s[nj][e] = -INFINITY;
                 }
         }
 
@@ -674,14 +738,22 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
         if (split == 1) {
             const int row = q0 + lrow;
             if (row >= S_q) continue;
-            const float inv = 1.f / ls;
+            float inv = 1.f / ls;
+            float sk = 0.f;
+            if constexpr (EXT) {
+                if (sched.sinks != nullptr) {
+                    sk = __ldg(sched.sinks + bh % sched.H_q) * kLog2e;
+                    inv = sink_norm(m[r], ls, sk);
+                }
+            }
             bf16* out = Og + static_cast<size_t>(row) * D + c2;
 #pragma unroll
             for (int dj = 0; dj < DT; ++dj)
                 *reinterpret_cast<__nv_bfloat162*>(out + dj * 8) =
                     __floats2bfloat162_rn(o[dj][2 * r] * inv, o[dj][2 * r + 1] * inv);
             if (sched.lse != nullptr && (lane & 3) == 0)
-                sched.lse[static_cast<size_t>(bh) * S_q + row] = row_lse(m[r], ls);
+                sched.lse[static_cast<size_t>(bh) * S_q + row] =
+                    EXT && sched.sinks != nullptr ? row_lse_sink(m[r], ls, sk) : row_lse(m[r], ls);
         } else {
             float* part = sched.ws + (static_cast<size_t>(tile - sched.dp_tiles) * split + slice) *
                                          partial_floats<D, WARPS>();
@@ -738,9 +810,13 @@ __global__ void attention_combine_kernel(bf16* __restrict__ O, int S_q, int caus
         acc[6] = fmaf(b.z, w, acc[6]);
         acc[7] = fmaf(b.w, w, acc[7]);
     }
-    const float inv = 1.f / L;
+    // The sink, if any, joins the denominator once, here, and not in the slices' partials.
+    float inv = 1.f / L;
+    const float sk = sched.sinks != nullptr ? __ldg(sched.sinks + bh % sched.H_q) * kLog2e : 0.f;
+    if (sched.sinks != nullptr) inv = sink_norm(M, L, sk);
     if (sched.lse != nullptr && ch == 0)
-        sched.lse[static_cast<size_t>(bh) * S_q + row] = row_lse(M, L);
+        sched.lse[static_cast<size_t>(bh) * S_q + row] =
+            sched.sinks != nullptr ? row_lse_sink(M, L, sk) : row_lse(M, L);
     uint4 u;
     u.x = pack_bf16x2(acc[0] * inv, acc[1] * inv);
     u.y = pack_bf16x2(acc[2] * inv, acc[3] * inv);
@@ -751,16 +827,16 @@ __global__ void attention_combine_kernel(bf16* __restrict__ O, int S_q, int caus
 
 constexpr int STAGES = 3;
 
-template <int D, int WARPS>
+template <int D, int WARPS, bool EXT = false>
 int resident_blocks() {
     constexpr int bytes = smem_bytes<D, STAGES>();
     static int resident = 0;  // blocks resident per GPU; also the > 48 KB smem opt-in
     if (resident == 0) {
-        SPARK_CUDA_CHECK(cudaFuncSetAttribute(attention_v2_kernel<D, WARPS, STAGES>,
+        SPARK_CUDA_CHECK(cudaFuncSetAttribute(attention_v2_kernel<D, WARPS, STAGES, EXT>,
                                               cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
         int per_sm = 0;
         SPARK_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &per_sm, attention_v2_kernel<D, WARPS, STAGES>, WARPS * 32, bytes));
+            &per_sm, attention_v2_kernel<D, WARPS, STAGES, EXT>, WARPS * 32, bytes));
         resident = (per_sm > 0 ? per_sm : 1) * num_sms();
     }
     return resident;
@@ -785,7 +861,17 @@ Sched whole_tiles(int B, int H_q, int H_kv, int S_q) {
     s.split = 1;
     s.ws = nullptr;
     s.lse = nullptr;
+    s.window = 0;
+    s.off = 0;
+    s.sinks = nullptr;
     return s;
+}
+
+// The schedule's local-attention fields (the EXT kernels read them).
+inline void set_local(Sched& s, const Local& loc) {
+    s.window = loc.window;
+    s.off = loc.off;
+    s.sinks = loc.sinks;
 }
 
 // Splits the tiles of the last partial wave (variants 3 and 4). The tail tiles are the last in
@@ -797,7 +883,10 @@ void split_tail_tiles(Sched& s, int resident, int S_kv, bool causal) {
     const int tiles = s.bh_count * s.q_tiles;
     const int tail = tiles % resident;
     const int q_last = causal ? 0 : s.q_tiles - 1;  // rank tiles - 1
-    const int T_last = cdiv(causal ? std::min(S_kv, q_last * BM + BM) : S_kv, BN);
+    // Its KV tiles; under a window too, the Q tiles that see fewer come last.
+    int t0, t1;
+    kv_tiles<BM>(q_last * BM, S_kv, causal, s.off, s.window, t0, t1);
+    const int T_last = t1 - t0;
     const int split = tail > 0 ? std::min(T_last, resident / tail) : 1;
     if (split <= 1) return;
     s.dp_tiles = tiles - tail;
@@ -824,21 +913,29 @@ void launch_combine(bf16* O, int S_q, bool causal, const Sched& s, cudaStream_t 
     attention_combine_kernel<D, WARPS><<<cgrid, 256, 0, stream>>>(O, S_q, causal ? 1 : 0, s);
 }
 
-// `split_tail`: variant 3. Variant 2 runs every tile whole on the 8-warp tile.
+// `split_tail`: variant 3. Variant 2 runs every tile whole on the 8-warp tile. `loc` active
+// runs the local-attention instantiation.
 template <int D, int WARPS>
 void launch(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv, int S_q,
             int S_kv, int kv_cap, float scale_log2, bool causal, bool split_tail, float* lse,
-            cudaStream_t stream) {
+            cudaStream_t stream, const Local& loc = Local{}) {
     constexpr int bytes = smem_bytes<D, STAGES>();
     const int resident = resident_blocks<D, WARPS>();
 
     Sched s = whole_tiles<WARPS>(B, H_q, H_kv, S_q);
     s.lse = lse;
     s.kv_cap = kv_cap;
+    set_local(s, loc);
     if (split_tail) split_tail_tiles<D, WARPS>(s, resident, S_kv, causal);
     const int grid = grid_blocks(s);
-    attention_v2_kernel<D, WARPS, STAGES>
-        <<<grid, WARPS * 32, bytes, stream>>>(Q, K, V, O, S_q, S_kv, scale_log2, causal ? 1 : 0, s);
+    if (loc.active()) {
+        resident_blocks<D, WARPS, true>();  // the smem opt-in of that instantiation
+        attention_v2_kernel<D, WARPS, STAGES, true><<<grid, WARPS * 32, bytes, stream>>>(
+            Q, K, V, O, S_q, S_kv, scale_log2, causal ? 1 : 0, s);
+    } else {
+        attention_v2_kernel<D, WARPS, STAGES, false><<<grid, WARPS * 32, bytes, stream>>>(
+            Q, K, V, O, S_q, S_kv, scale_log2, causal ? 1 : 0, s);
+    }
     if (s.split > 1) launch_combine<D, WARPS>(O, S_q, causal, s, stream);
 }
 
@@ -906,7 +1003,7 @@ __device__ __forceinline__ int box_off(int row, int ch) {
 // scheduler), 1 = even and odd warps. OPT bits: 1 = a warp skips a causal tile whose keys all
 // follow its 16 rows (the fully masked half of the second diagonal tile), 2 = the O rescale is
 // skipped when no row max in the warp moved (warp-uniform branch).
-template <int D, int STAGES, int MODE, int PAIR, int OPT>
+template <int D, int STAGES, int MODE, int PAIR, int OPT, bool EXT>
 __global__ void __launch_bounds__(THREADS, 1)
     attention_v4_kernel(const __grid_constant__ CUtensorMap tmQ,
                         const __grid_constant__ CUtensorMap tmK,
@@ -949,10 +1046,18 @@ __global__ void __launch_bounds__(THREADS, 1)
     const int q0 = q_tile * BM;
     bf16* Og = O + static_cast<size_t>(bh) * S_q * D;
 
-    const int kv_end = causal ? min(S_kv, q0 + BM) : S_kv;
-    const int T = cdiv(kv_end, BN);
-    const int tb = slice * T / split;
-    const int te = (slice + 1) * T / split;
+    // EXT (local attention): the causal diagonal shifted by sched.off, a window's left edge.
+    const int off = EXT ? sched.off : 0;
+    int t0 = 0, t1;
+    if constexpr (EXT) {
+        v2::kv_tiles<BM>(q0, S_kv, causal, off, sched.window, t0, t1);
+    } else {
+        const int kv_end = causal ? min(S_kv, q0 + BM) : S_kv;
+        t1 = cdiv(kv_end, BN);
+    }
+    const int T = t1 - t0;
+    const int tb = t0 + slice * T / split;
+    const int te = t0 + (slice + 1) * T / split;
     const int n = te - tb;    // KV tiles of this block
     const int loads = n + 1;  // plus the Q tile
 
@@ -1055,14 +1160,19 @@ __global__ void __launch_bounds__(THREADS, 1)
     // P packed as the A fragments of P V: variant 2's code.
     auto softmax = [&](int t) {
         const int kv0 = t * BN;
-        if (kv0 + BN > S_kv || (causal && kv0 + BN - 1 > q0)) {  // warp-uniform
+        bool edge = kv0 + BN > S_kv || (causal && kv0 + BN - 1 > q0 + off);
+        if constexpr (EXT) edge = edge || (sched.window > 0 && kv0 < q0 + BM + off - sched.window);
+        if (edge) {  // warp-uniform
 #pragma unroll
             for (int nj = 0; nj < NT; ++nj)
 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
-                    const int i = q0 + warp * 16 + g + (e >> 1) * 8;
+                    const int i = q0 + warp * 16 + g + (e >> 1) * 8 + off;  // key position
                     const int j = kv0 + nj * 8 + c2 + (e & 1);
-                    if (j >= S_kv || (causal && j > i)) sacc[nj][e] = -INFINITY;
+                    bool masked = j >= S_kv || (causal && j > i);
+                    if constexpr (EXT)
+                        masked = masked || (sched.window > 0 && j <= i - sched.window);
+                    if (masked) sacc[nj][e] = -INFINITY;
                 }
         }
         float alpha[2];
@@ -1162,7 +1272,7 @@ __global__ void __launch_bounds__(THREADS, 1)
             // (rows q0 + 16 warp .. + 15 against keys from (tb + it) BN): every score is masked,
             // every p is 0, and the tile is a no-op for the warp.
             const bool dead =
-                (OPT & 1) && MODE == 0 && causal && (tb + it) * BN > q0 + warp * 16 + 15;
+                (OPT & 1) && MODE == 0 && causal && (tb + it) * BN > q0 + off + warp * 16 + 15;
             take_turn();
             if (tid == 0 && it + STAGES < loads) produce(it + STAGES);
             if (!dead) qk(stage_of(it));
@@ -1185,14 +1295,22 @@ __global__ void __launch_bounds__(THREADS, 1)
         if (split == 1) {
             const int row = q0 + lrow;
             if (row >= S_q) continue;
-            const float inv = 1.f / ls;
+            float inv = 1.f / ls;
+            float sk = 0.f;
+            if constexpr (EXT) {
+                if (sched.sinks != nullptr) {
+                    sk = __ldg(sched.sinks + bh % sched.H_q) * kLog2e;
+                    inv = sink_norm(m[r], ls, sk);
+                }
+            }
             bf16* out = Og + static_cast<size_t>(row) * D + c2;
 #pragma unroll
             for (int dj = 0; dj < DT; ++dj)
                 *reinterpret_cast<__nv_bfloat162*>(out + dj * 8) =
                     __floats2bfloat162_rn(o[dj][2 * r] * inv, o[dj][2 * r + 1] * inv);
             if (sched.lse != nullptr && (lane & 3) == 0)
-                sched.lse[static_cast<size_t>(bh) * S_q + row] = row_lse(m[r], ls);
+                sched.lse[static_cast<size_t>(bh) * S_q + row] =
+                    EXT && sched.sinks != nullptr ? row_lse_sink(m[r], ls, sk) : row_lse(m[r], ls);
         } else {
             float* part = sched.ws + (static_cast<size_t>(tile - sched.dp_tiles) * split + slice) *
                                          v2::partial_floats<D, WARPS>();
@@ -1211,27 +1329,27 @@ __global__ void __launch_bounds__(THREADS, 1)
 
 constexpr int STAGES = 3;
 
-template <int D, int MODE, int PAIR, int OPT>
+template <int D, int MODE, int PAIR, int OPT, bool EXT>
 int resident_blocks() {
     constexpr int bytes = smem_bytes<D, STAGES>();
     static int resident = 0;
     if (resident == 0) {
-        SPARK_CUDA_CHECK(cudaFuncSetAttribute(attention_v4_kernel<D, STAGES, MODE, PAIR, OPT>,
+        SPARK_CUDA_CHECK(cudaFuncSetAttribute(attention_v4_kernel<D, STAGES, MODE, PAIR, OPT, EXT>,
                                               cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
         int per_sm = 0;
         SPARK_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &per_sm, attention_v4_kernel<D, STAGES, MODE, PAIR, OPT>, THREADS, bytes));
+            &per_sm, attention_v4_kernel<D, STAGES, MODE, PAIR, OPT, EXT>, THREADS, bytes));
         resident = (per_sm > 0 ? per_sm : 1) * num_sms();
     }
     return resident;
 }
 
-template <int D, int MODE, int PAIR, int OPT>
+template <int D, int MODE, int PAIR, int OPT, bool EXT = false>
 void launch_mode(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv,
                  int S_q, int S_kv, int kv_cap, float scale_log2, bool causal, float* lse,
-                 cudaStream_t stream) {
+                 cudaStream_t stream, const Local& loc = Local{}) {
     constexpr int bytes = smem_bytes<D, STAGES>();
-    const int resident = resident_blocks<D, MODE, PAIR, OPT>();
+    const int resident = resident_blocks<D, MODE, PAIR, OPT, EXT>();
     // [B*H][S][D] maps with boxes of 64 columns (one 128-byte swizzle span): 128 rows for Q,
     // 64 for K and V. Rows past S_q / S_kv are zero-filled by the copy engine; a K/V head
     // is kv_cap rows apart from the next (the cache's capacity, S_kv when packed).
@@ -1247,15 +1365,23 @@ void launch_mode(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, in
     Sched s = v2::whole_tiles<WARPS>(B, H_q, H_kv, S_q);
     s.lse = lse;
     s.kv_cap = kv_cap;
+    v2::set_local(s, loc);
     v2::split_tail_tiles<D, WARPS>(s, resident, S_kv, causal);
-    attention_v4_kernel<D, STAGES, MODE, PAIR, OPT><<<v2::grid_blocks(s), THREADS, bytes, stream>>>(
-        tmQ, tmK, tmV, O, S_q, S_kv, scale_log2, causal ? 1 : 0, s);
+    attention_v4_kernel<D, STAGES, MODE, PAIR, OPT, EXT>
+        <<<v2::grid_blocks(s), THREADS, bytes, stream>>>(tmQ, tmK, tmV, O, S_q, S_kv, scale_log2,
+                                                         causal ? 1 : 0, s);
     if (s.split > 1) v2::launch_combine<D, WARPS>(O, S_q, causal, s, stream);
 }
 
 template <int D>
 void launch(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv, int S_q,
-            int S_kv, int kv_cap, float scale_log2, bool causal, float* lse, cudaStream_t stream) {
+            int S_kv, int kv_cap, float scale_log2, bool causal, float* lse, cudaStream_t stream,
+            const Local& loc = Local{}) {
+    if (loc.active()) {  // the shipped schedule, local-attention instantiation
+        launch_mode<D, 0, 0, 0, true>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2,
+                                      causal, lse, stream, loc);
+        return;
+    }
 #ifdef SPARK_ATTN_V4_EXPERIMENTS
     // SPARK_ATTN_V4_MODE = MODE + 10 * PAIR + 100 * OPT (see the kernel).
     static int mode = -1;
@@ -1370,7 +1496,7 @@ __device__ __forceinline__ void decode_item(int w, const Sched& sched, int& tile
     }
 }
 
-template <int D, bool PWARP>
+template <int D, bool PWARP, bool EXT>
 __global__ void __launch_bounds__(CONSUMERS + (PWARP ? 32 : 0), 1)
     attention_v5_kernel(const __grid_constant__ CUtensorMap tmQ,
                         const __grid_constant__ CUtensorMap tmK,
@@ -1412,6 +1538,9 @@ __global__ void __launch_bounds__(CONSUMERS + (PWARP ? 32 : 0), 1)
     }
     __syncthreads();  // the only block-wide barrier in the kernel
 
+    // EXT (local attention): row i sits at key position i + off, and a window bounds it.
+    const int off = EXT ? sched.off : 0;
+
     // The rows and keys of an item: Q rows q0 .. q0+BM-1 of head bh, KV tiles [tb, te) of the
     // T its rows see (all of them unless the tile is split), from K/V head bkv.
     auto geometry = [&](int tile, int slice, int split, int& bh, int& bkv, int& q0, int& tb,
@@ -1421,10 +1550,18 @@ __global__ void __launch_bounds__(CONSUMERS + (PWARP ? 32 : 0), 1)
         const int q_rank = tile / sched.bh_count;
         const int q_tile = causal ? sched.q_tiles - 1 - q_rank : q_rank;
         q0 = q_tile * BM;
-        const int kv_end = causal ? min(S_kv, q0 + BM) : S_kv;
-        const int T = cdiv(kv_end, BN);
-        tb = slice * T / split;
-        te = (slice + 1) * T / split;
+        if constexpr (EXT) {
+            int t0, t1;
+            v2::kv_tiles<BM>(q0, S_kv, causal, off, sched.window, t0, t1);
+            const int T = t1 - t0;
+            tb = t0 + slice * T / split;
+            te = t0 + (slice + 1) * T / split;
+        } else {
+            const int kv_end = causal ? min(S_kv, q0 + BM) : S_kv;
+            const int T = cdiv(kv_end, BN);
+            tb = slice * T / split;
+            te = (slice + 1) * T / split;
+        }
     };
 
     // ---- producer state: lives on the producing lane, the rest of the block never reads it.
@@ -1564,14 +1701,19 @@ __global__ void __launch_bounds__(CONSUMERS + (PWARP ? 32 : 0), 1)
     // P packed as the A fragments of P V: variant 4's code.
     auto softmax = [&](int t) {
         const int kv0 = t * BN;
-        if (kv0 + BN > S_kv || (causal && kv0 + BN - 1 > q0)) {  // warp-uniform
+        bool edge = kv0 + BN > S_kv || (causal && kv0 + BN - 1 > q0 + off);
+        if constexpr (EXT) edge = edge || (sched.window > 0 && kv0 < q0 + BM + off - sched.window);
+        if (edge) {  // warp-uniform
 #pragma unroll
             for (int nj = 0; nj < NT; ++nj)
 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
-                    const int i = q0 + warp * 16 + g + (e >> 1) * 8;
+                    const int i = q0 + warp * 16 + g + (e >> 1) * 8 + off;  // key position
                     const int j = kv0 + nj * 8 + c2 + (e & 1);
-                    if (j >= S_kv || (causal && j > i)) sacc[nj][e] = -INFINITY;
+                    bool masked = j >= S_kv || (causal && j > i);
+                    if constexpr (EXT)
+                        masked = masked || (sched.window > 0 && j <= i - sched.window);
+                    if (masked) sacc[nj][e] = -INFINITY;
                 }
         }
         float alpha[2];
@@ -1674,12 +1816,74 @@ __global__ void __launch_bounds__(CONSUMERS + (PWARP ? 32 : 0), 1)
             // Under the causal mask the keys of a tile may all follow every row of this warp
             // (the second diagonal tile for warps 0-3): every p is 0 and the tile is a no-op
             // for the warp, which then starts the next item while the other warps finish.
-            const bool dead = skip_dead && causal && t * BN > q0 + warp * 16 + 15;
+            // Under a window the same holds for a tile whose keys all precede the window of
+            // the warp's first row.
+            bool dead;
+            if constexpr (EXT) {
+                const int wpos = q0 + off + warp * 16;  // key position of the warp's first row
+                dead = skip_dead && ((causal && t * BN > wpos + 15) ||
+                                     (sched.window > 0 && t * BN + BN <= wpos - sched.window + 1));
+            } else {
+                dead = skip_dead && causal && t * BN > q0 + warp * 16 + 15;
+            }
             wait_load(g_cons);
-            if (!dead) {
-                qk(stage_of(g_cons));
-                softmax(t);
-                pv(stage_of(g_cons) + BN * D);
+            if constexpr (EXT) {
+                // With bit 2 of skip_dead the warp also skips the 16-key blocks of a live tile
+                // that lie outside all of its rows' windows: both products of those keys, whose
+                // scores the mask sets to -inf and whose p are 0 (SPARK_ATTN_V5_WSKIP).
+                const int wpos = q0 + off + warp * 16;
+                const int kv0 = t * BN;
+                const int lo = sched.window > 0 ? wpos - sched.window + 1 : 0;
+                const int hi = causal ? wpos + 15 : kv0 + BN - 1;
+                const int b0 = (skip_dead & 2) && lo > kv0 ? (lo - kv0) >> 4 : 0;
+                const int b1 = (skip_dead & 2) && hi < kv0 + BN - 1 ? (hi - kv0) >> 4 : PT - 1;
+                if (!dead && (b0 > 0 || b1 < PT - 1)) {
+                    const bf16* ks = stage_of(g_cons);
+                    const bf16* vs = ks + BN * D;
+#pragma unroll
+                    for (int nj = 0; nj < NT; ++nj)
+#pragma unroll
+                        for (int e = 0; e < 4; ++e) sacc[nj][e] = 0.f;
+#pragma unroll
+                    for (int kk = 0; kk < KT; ++kk) {
+#pragma unroll
+                        for (int nj = 0; nj < NT; nj += 2) {
+                            if (nj / 2 < b0 || nj / 2 > b1) continue;  // warp-uniform
+                            const int row = nj * 8 + (lane & 15);
+                            unsigned r4[4];
+                            ldmatrix_x4(r4, ks + box_off<BN>(row, 2 * kk + (lane >> 4)));
+                            const unsigned k0[2] = {r4[0], r4[2]};
+                            const unsigned k1[2] = {r4[1], r4[3]};
+                            mma_bf16_16816(sacc[nj], qf[kk], k0);
+                            mma_bf16_16816(sacc[nj + 1], qf[kk], k1);
+                        }
+                    }
+                    softmax(t);
+#pragma unroll
+                    for (int kt = 0; kt < PT; ++kt) {
+                        if (kt < b0 || kt > b1) continue;
+#pragma unroll
+                        for (int dj = 0; dj < DT; dj += 2) {
+                            const int row = kt * 16 + (lane & 15);
+                            unsigned r4[4];
+                            ldmatrix_x4_trans(r4, vs + box_off<BN>(row, dj + (lane >> 4)));
+                            const unsigned v0[2] = {r4[0], r4[1]};
+                            const unsigned v1[2] = {r4[2], r4[3]};
+                            mma_bf16_16816(o[dj], pa[kt], v0);
+                            mma_bf16_16816(o[dj + 1], pa[kt], v1);
+                        }
+                    }
+                } else if (!dead) {
+                    qk(stage_of(g_cons));
+                    softmax(t);
+                    pv(stage_of(g_cons) + BN * D);
+                }
+            } else {
+                if (!dead) {
+                    qk(stage_of(g_cons));
+                    softmax(t);
+                    pv(stage_of(g_cons) + BN * D);
+                }
             }
             release_load(g_cons);
         }
@@ -1695,6 +1899,24 @@ __global__ void __launch_bounds__(CONSUMERS + (PWARP ? 32 : 0), 1)
             if (split == 1) {
                 const int row = q0 + lrow;
                 if (row >= S_q) continue;
+                if constexpr (EXT) {
+                    float inv = 1.f / ls;
+                    float sk = 0.f;
+                    if (sched.sinks != nullptr) {
+                        sk = __ldg(sched.sinks + bh % sched.H_q) * kLog2e;
+                        inv = sink_norm(m[rr], ls, sk);
+                    }
+                    bf16* out = Og + static_cast<size_t>(row) * D + c2;
+#pragma unroll
+                    for (int dj = 0; dj < DT; ++dj)
+                        *reinterpret_cast<__nv_bfloat162*>(out + dj * 8) =
+                            __floats2bfloat162_rn(o[dj][2 * rr] * inv, o[dj][2 * rr + 1] * inv);
+                    if (sched.lse != nullptr && (lane & 3) == 0)
+                        sched.lse[static_cast<size_t>(bh) * S_q + row] =
+                            sched.sinks != nullptr ? row_lse_sink(m[rr], ls, sk)
+                                                   : row_lse(m[rr], ls);
+                    continue;
+                }
                 const float inv = 1.f / ls;
                 bf16* out = Og + static_cast<size_t>(row) * D + c2;
 #pragma unroll
@@ -1732,6 +1954,7 @@ struct Env {
     int split = -1;
     int pwarp = 1;
     int skip_dead = 1;
+    int wskip = 1;  // SPARK_ATTN_V5_WSKIP: the 16-key block skip of the local-attention kernel
 };
 const Env& env() {
     static Env e;
@@ -1741,6 +1964,7 @@ const Env& env() {
         if (const char* s = std::getenv("SPARK_ATTN_V5_SPLIT")) e.split = std::atoi(s);
         if (const char* s = std::getenv("SPARK_ATTN_V5_PWARP")) e.pwarp = std::atoi(s);
         if (const char* s = std::getenv("SPARK_ATTN_V5_SKIP")) e.skip_dead = std::atoi(s);
+        if (const char* s = std::getenv("SPARK_ATTN_V5_WSKIP")) e.wskip = std::atoi(s);
     }
     return e;
 }
@@ -1766,17 +1990,17 @@ unsigned* queue_for(cudaStream_t stream) {
     return base + 2 * it->second;
 }
 
-template <int D, bool PWARP>
+template <int D, bool PWARP, bool EXT>
 int resident_blocks() {
     constexpr int bytes = smem_bytes<D>();
     constexpr int threads = CONSUMERS + (PWARP ? 32 : 0);
     static int resident = 0;
     if (resident == 0) {
-        SPARK_CUDA_CHECK(cudaFuncSetAttribute(attention_v5_kernel<D, PWARP>,
+        SPARK_CUDA_CHECK(cudaFuncSetAttribute(attention_v5_kernel<D, PWARP, EXT>,
                                               cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
         int per_sm = 0;
         SPARK_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &per_sm, attention_v5_kernel<D, PWARP>, threads, bytes));
+            &per_sm, attention_v5_kernel<D, PWARP, EXT>, threads, bytes));
         resident = (per_sm > 0 ? per_sm : 1) * num_sms();
     }
     return resident;
@@ -1785,14 +2009,15 @@ int resident_blocks() {
 // `split_mode`: 0 / 1 forces the tail split off / on, -1 picks it: on for the non-causal
 // shapes and for any shape with fewer tiles than resident blocks (the slices are the only way
 // to give the idle SMs work); off under the causal mask once the queue has a full wave to
-// balance.
-template <int D, bool PWARP>
+// balance. A window makes the tiles nearly equal again, as without a mask, so it counts as
+// non-causal here (docs/design/attention.md, "Sliding window and sinks").
+template <int D, bool PWARP, bool EXT>
 void launch_cfg(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv,
                 int S_q, int S_kv, int kv_cap, float scale_log2, bool causal, int split_mode,
-                float* lse, cudaStream_t stream) {
+                float* lse, cudaStream_t stream, const Local& loc) {
     constexpr int bytes = smem_bytes<D>();
     constexpr int threads = CONSUMERS + (PWARP ? 32 : 0);
-    const int resident = resident_blocks<D, PWARP>();
+    const int resident = resident_blocks<D, PWARP, EXT>();
     const uint64_t BHq = static_cast<uint64_t>(B) * H_q;
     const uint64_t BHkv = static_cast<uint64_t>(B) * H_kv;
     const CUtensorMap tmQ =
@@ -1805,25 +2030,33 @@ void launch_cfg(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int
     Sched s = v2::whole_tiles<CONSUMER_WARPS>(B, H_q, H_kv, S_q);
     s.lse = lse;
     s.kv_cap = kv_cap;
-    const bool split_tail = split_mode < 0 ? !causal || s.dp_tiles < resident : split_mode != 0;
+    v2::set_local(s, loc);
+    const bool split_tail =
+        split_mode < 0 ? !causal || loc.window > 0 || s.dp_tiles < resident : split_mode != 0;
     if (split_tail) v2::split_tail_tiles<D, CONSUMER_WARPS>(s, resident, S_kv, causal);
     const int n_items = v2::grid_blocks(s);
     const int grid = std::min(resident, n_items);
-    attention_v5_kernel<D, PWARP>
+    // EXT reads bit 2 of skip_dead as the 16-key block skip.
+    const int skip = EXT && env().skip_dead && env().wskip ? 3 : env().skip_dead;
+    attention_v5_kernel<D, PWARP, EXT>
         <<<grid, threads, bytes, stream>>>(tmQ, tmK, tmV, O, S_q, S_kv, scale_log2, causal ? 1 : 0,
-                                           s, n_items, queue_for(stream), env().skip_dead);
+                                           s, n_items, queue_for(stream), skip);
     if (s.split > 1) v2::launch_combine<D, CONSUMER_WARPS>(O, S_q, causal, s, stream);
 }
 
 template <int D>
 void launch(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv, int S_q,
-            int S_kv, int kv_cap, float scale_log2, bool causal, float* lse, cudaStream_t stream) {
-    if (env().pwarp)
-        launch_cfg<D, true>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal,
-                            env().split, lse, stream);
+            int S_kv, int kv_cap, float scale_log2, bool causal, float* lse, cudaStream_t stream,
+            const Local& loc = Local{}) {
+    if (loc.active())  // the producer-warp configuration, local-attention instantiation
+        launch_cfg<D, true, true>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal,
+                                  env().split, lse, stream, loc);
+    else if (env().pwarp)
+        launch_cfg<D, true, false>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal,
+                                   env().split, lse, stream, loc);
     else
-        launch_cfg<D, false>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal,
-                             env().split, lse, stream);
+        launch_cfg<D, false, false>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal,
+                                    env().split, lse, stream, loc);
 }
 
 }  // namespace v5
@@ -1831,7 +2064,7 @@ void launch(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q
 template <int D>
 void launch_v1(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv,
                int S_q, int S_kv, int kv_cap, float scale_log2, bool causal, float* lse,
-               cudaStream_t stream) {
+               cudaStream_t stream, const Local& loc) {
     constexpr int bytes = v1::smem_bytes<D>();
     static bool opted_in = false;
     if (!opted_in) {
@@ -1841,16 +2074,18 @@ void launch_v1(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int 
     }
     const dim3 grid(B * H_q, cdiv(S_q, v1::BM));
     v1::attention_v1_kernel<D><<<grid, v1::THREADS, bytes, stream>>>(
-        Q, K, V, O, lse, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal ? 1 : 0);
+        Q, K, V, O, lse, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal ? 1 : 0, loc.window,
+        loc.off, loc.sinks);
 }
 
 template <int D>
 void launch_v0(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv,
                int S_q, int S_kv, int kv_cap, float scale_log2, bool causal, float* lse,
-               cudaStream_t stream) {
+               cudaStream_t stream, const Local& loc) {
     const dim3 grid(cdiv(S_q, v0::THREADS / 32), B * H_q);
     v0::attention_v0_kernel<D><<<grid, v0::THREADS, 0, stream>>>(
-        Q, K, V, O, lse, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal ? 1 : 0);
+        Q, K, V, O, lse, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal ? 1 : 0, loc.window,
+        loc.off, loc.sinks);
 }
 
 // SPARK_ATTENTION_DECODE=0 keeps decode shapes on the 64-row tile of variant 3 (the path
@@ -1870,16 +2105,16 @@ bool use_decode_kernel() {
 template <int D>
 void launch_v3(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv,
                int S_q, int S_kv, int kv_cap, float scale_log2, bool causal, float* lse,
-               cudaStream_t stream) {
+               cudaStream_t stream, const Local& loc) {
     if (lse == nullptr && use_decode_kernel() && attn::decode_fits(H_q, H_kv, S_q)) {
         attn::decode_launch(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, D, scale_log2, causal, 0,
-                            stream);
+                            stream, loc);
     } else if (S_q <= 64) {
         v2::launch<D, 4>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal, true, lse,
-                         stream);
+                         stream, loc);
     } else {
         v2::launch<D, 8>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal, true, lse,
-                         stream);
+                         stream, loc);
     }
 }
 
@@ -1895,9 +2130,14 @@ bool attention_supports(int S_q, int S_kv, int D, int variant) {
     return D == 64 || D == 128;
 }
 
-void attention_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_bfloat16* V,
+namespace {
+
+// Both entry points. `window` and `sinks` are attention_window_bf16's; with neither every
+// launcher runs exactly what it ran before they existed.
+void attention_impl(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_bfloat16* V,
                     __nv_bfloat16* O, int B, int H_q, int H_kv, int S_q, int S_kv, int D,
-                    bool causal, int variant, cudaStream_t stream, float* lse, int kv_cap) {
+                    bool causal, int window, const float* sinks, int variant, cudaStream_t stream,
+                    float* lse, int kv_cap) {
     SPARK_REQUIRE(Q != nullptr && K != nullptr && V != nullptr && O != nullptr,
                   "attention: null pointer");
     SPARK_REQUIRE(B > 0 && H_q > 0 && H_kv > 0 && S_q > 0 && S_kv > 0,
@@ -1911,6 +2151,20 @@ void attention_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_b
     SPARK_REQUIRE(kv_cap >= S_kv, "attention: kv_cap must be at least S_kv");
     SPARK_REQUIRE(static_cast<int64_t>(B) * H_q * std::max(S_q, kv_cap) * D < (int64_t{1} << 40),
                   "attention: tensor too large");
+    SPARK_REQUIRE(window >= 0, "attention: window must be >= 0");
+
+    // A window is causal and aligned to the last key: query i sits at key position
+    // i + S_kv - S_q, which is torch's top-left mask when S_q == S_kv. A window that holds
+    // every key a row can see is no window; with S_q == S_kv and no sinks that leaves plain
+    // causal attention, which runs the plain kernels.
+    Local loc;
+    if (window > 0) {
+        SPARK_REQUIRE(S_q <= S_kv, "attention: a window needs S_q <= S_kv");
+        causal = true;
+        loc.off = S_kv - S_q;
+        loc.window = window < S_kv ? window : 0;
+    }
+    loc.sinks = sinks;
 
     const float scale_log2 = kLog2e / std::sqrt(static_cast<float>(D));
     auto run = [&](auto d) {
@@ -1918,38 +2172,38 @@ void attention_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_b
         switch (variant) {
             case 0:
                 launch_v0<DD>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal, lse,
-                              stream);
+                              stream, loc);
                 break;
             case 1:
                 launch_v1<DD>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal, lse,
-                              stream);
+                              stream, loc);
                 break;
             case 2:
                 v2::launch<DD, 8>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal,
-                                  false, lse, stream);
+                                  false, lse, stream, loc);
                 break;
             case 3:
                 launch_v3<DD>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal, lse,
-                              stream);
+                              stream, loc);
                 break;
             case 4:
                 // Short queries take variant 3's paths (the flash-decoding kernel or the 64-row
                 // tile); the TMA kernel takes every 128-row tile.
                 if (S_q <= 64)
                     launch_v3<DD>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal,
-                                  lse, stream);
+                                  lse, stream, loc);
                 else
                     v4::launch<DD>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal,
-                                   lse, stream);
+                                   lse, stream, loc);
                 break;
             case 5:
                 // Variant 4's routing for short queries; the persistent kernel for the rest.
                 if (S_q <= 64)
                     launch_v3<DD>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal,
-                                  lse, stream);
+                                  lse, stream, loc);
                 else
                     v5::launch<DD>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal,
-                                   lse, stream);
+                                   lse, stream, loc);
                 break;
             default:
                 break;
@@ -1960,6 +2214,23 @@ void attention_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_b
     else
         run(std::integral_constant<int, 128>{});
     SPARK_CHECK_LAUNCH();
+}
+
+}  // namespace
+
+void attention_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_bfloat16* V,
+                    __nv_bfloat16* O, int B, int H_q, int H_kv, int S_q, int S_kv, int D,
+                    bool causal, int variant, cudaStream_t stream, float* lse, int kv_cap) {
+    attention_impl(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, D, causal, 0, nullptr, variant, stream, lse,
+                   kv_cap);
+}
+
+void attention_window_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_bfloat16* V,
+                           __nv_bfloat16* O, int B, int H_q, int H_kv, int S_q, int S_kv, int D,
+                           bool causal, int window, const float* sinks, int variant,
+                           cudaStream_t stream, float* lse, int kv_cap) {
+    attention_impl(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, D, causal, window, sinks, variant, stream,
+                   lse, kv_cap);
 }
 
 }  // namespace spark

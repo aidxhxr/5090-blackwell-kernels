@@ -21,6 +21,9 @@
 //     (b, kv head) to arrive (a per-head counter, the pattern of hgemm_decode.cu), so a call
 //     is one launch with no combine kernel and no memset. The merge rule is the online
 //     softmax's own: M = max m_i, L = sum l_i 2^(m_i - M), O = sum O_i 2^(m_i - M) / L.
+// Under a sliding window (the EXT instantiation) the slabs before the first key any row's
+// window holds are not part of the split at all: a step at 128K cached keys with a 4096-key
+// window streams 4096 keys. Sinks join the denominator where a row is normalized.
 #include <algorithm>
 #include <cstdlib>
 
@@ -69,11 +72,15 @@ struct Params {
     int split;   // blocks per (b, kv head); block = bkv * split + slice
     int causal;
     float scale_log2;
-    float* ws;      // B * H_kv * split partials of partial_floats<D>() each (split > 1 only)
-    int* counters;  // one per (b, kv head), zero between launches
+    // Local attention (EXT): token t sits at key position t + off; keys before a row's
+    // window are masked, and the slabs before slab0 (the first row's window edge) skipped.
+    int off, window, slab0;
+    const float* sinks;  // [H_q] logits, or null
+    float* ws;           // B * H_kv * split partials of partial_floats<D>() each (split > 1 only)
+    int* counters;       // one per (b, kv head), zero between launches
 };
 
-template <int D>
+template <int D, bool EXT>
 __global__ void __launch_bounds__(THREADS, 1) attention_decode_kernel(Params p) {
     constexpr int BN = slab_keys<D>();
     constexpr int CH = D / 8;                // 16-byte chunks per row
@@ -110,8 +117,9 @@ __global__ void __launch_bounds__(THREADS, 1) attention_decode_kernel(Params p) 
 
     // Slabs [sb, se) of this warp: the block's share of the (b, kv head)'s slabs, then this
     // warp's share of the block's. Contiguous ranges, so each warp streams whole rows of K/V.
-    const int nslab = cdiv(p.kv_end, BN);
-    const int bb = slice * nslab / p.split, be = (slice + 1) * nslab / p.split;
+    const int s0 = EXT ? p.slab0 : 0;
+    const int nslab = cdiv(p.kv_end, BN) - s0;
+    const int bb = s0 + slice * nslab / p.split, be = s0 + (slice + 1) * nslab / p.split;
     const int sb = bb + warp * (be - bb) / WARPS, se = bb + (warp + 1) * (be - bb) / WARPS;
 
     auto load = [&](int stage, int s) {
@@ -197,15 +205,29 @@ __global__ void __launch_bounds__(THREADS, 1) attention_decode_kernel(Params p) 
         }
 
         // Keys past S_kv (zero-filled) and, under the causal mask, keys past the row's token.
+        // EXT: the token's position is t + off, and a window's edge masks the keys before
+        // position - window + 1 (the last token's edge is the highest).
         const int kv0 = s * BN;
-        if (kv0 + BN > p.S_kv || p.causal) {  // warp-uniform
+        bool edge;
+        if constexpr (EXT)
+            edge = kv0 + BN > p.S_kv || (p.causal && kv0 + BN - 1 > p.off) ||
+                   (p.window > 0 && kv0 < p.S_q + p.off - p.window);
+        else
+            edge = kv0 + BN > p.S_kv || p.causal;
+        if (edge) {  // warp-uniform
 #pragma unroll
             for (int nj = 0; nj < NT; ++nj)
 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
                     const int t = (g + (e >> 1) * 8) % p.S_q;  // row hg * S_q + t
                     const int j = kv0 + nj * 8 + c2 + (e & 1);
-                    if (j >= p.S_kv || (p.causal && j > t)) sc[nj][e] = -INFINITY;
+                    bool masked;
+                    if constexpr (EXT)
+                        masked = j >= p.S_kv || (p.causal && j > t + p.off) ||
+                                 (p.window > 0 && j <= t + p.off - p.window);
+                    else
+                        masked = j >= p.S_kv || (p.causal && j > t);
+                    if (masked) sc[nj][e] = -INFINITY;
                 }
         }
 
@@ -318,7 +340,10 @@ __global__ void __launch_bounds__(THREADS, 1) attention_decode_kernel(Params p) 
             acc[7] = fmaf(c.w, wt, acc[7]);
         }
         if (p.split == 1) {
-            const float inv = 1.f / L;
+            float inv = 1.f / L;
+            if constexpr (EXT)  // row hg * S_q + t is query head kv * group + hg
+                if (p.sinks != nullptr)
+                    inv = sink_norm(M, L, __ldg(p.sinks + kv * group + row / p.S_q) * kLog2e);
             uint4 u;
             u.x = pack_bf16x2(acc[0] * inv, acc[1] * inv);
             u.y = pack_bf16x2(acc[2] * inv, acc[3] * inv);
@@ -373,6 +398,13 @@ __global__ void __launch_bounds__(THREADS, 1) attention_decode_kernel(Params p) 
             L = fmaf(sl[k * ROWS + tid], wt, L);
         }
         sL[tid] = L;
+        // EXT: the normalization factor itself, with the row's sink in the denominator.
+        if constexpr (EXT) {
+            float f = 1.f / L;
+            if (p.sinks != nullptr && tid < p.rows)
+                f = sink_norm(M, L, __ldg(p.sinks + kv * group + tid / p.S_q) * kLog2e);
+            sL[tid] = f;
+        }
     }
     __syncthreads();
     for (int i = tid; i < ROWS * CH; i += THREADS) {
@@ -396,7 +428,7 @@ __global__ void __launch_bounds__(THREADS, 1) attention_decode_kernel(Params p) 
             acc[6] = fmaf(c.z, wt, acc[6]);
             acc[7] = fmaf(c.w, wt, acc[7]);
         }
-        const float inv = 1.f / sL[row];
+        const float inv = EXT ? sL[row] : 1.f / sL[row];
         uint4 u;
         u.x = pack_bf16x2(acc[0] * inv, acc[1] * inv);
         u.y = pack_bf16x2(acc[2] * inv, acc[3] * inv);
@@ -436,16 +468,16 @@ Workspace& workspace(size_t floats, size_t heads) {
 }
 
 // Resident blocks per GPU (one per SM at 96 KB of shared memory); also the > 48 KB opt-in.
-template <int D>
+template <int D, bool EXT = false>
 int resident_blocks() {
     constexpr int bytes = smem_bytes<D>();
     static int resident = 0;
     if (resident == 0) {
-        SPARK_CUDA_CHECK(cudaFuncSetAttribute(attention_decode_kernel<D>,
+        SPARK_CUDA_CHECK(cudaFuncSetAttribute(attention_decode_kernel<D, EXT>,
                                               cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
         int per_sm = 0;
         SPARK_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &per_sm, attention_decode_kernel<D>, THREADS, bytes));
+            &per_sm, attention_decode_kernel<D, EXT>, THREADS, bytes));
         resident = (per_sm > 0 ? per_sm : 1) * num_sms();
     }
     return resident;
@@ -463,7 +495,8 @@ int env_split() {
 
 template <int D>
 void launch(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv, int S_q,
-            int S_kv, int kv_cap, float scale_log2, bool causal, int split, cudaStream_t stream) {
+            int S_kv, int kv_cap, float scale_log2, bool causal, int split, cudaStream_t stream,
+            const Local& loc) {
     constexpr int bytes = smem_bytes<D>();
     const int resident = resident_blocks<D>();
     Params p;
@@ -477,11 +510,16 @@ void launch(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q
     p.S_kv = S_kv;
     p.kv_cap = kv_cap;
     p.rows = (H_q / H_kv) * S_q;
-    p.kv_end = causal ? std::min(S_kv, S_q) : S_kv;
+    p.kv_end = causal ? std::min(S_kv, S_q + loc.off) : S_kv;
     p.causal = causal ? 1 : 0;
     p.scale_log2 = scale_log2;
+    p.off = loc.off;
+    p.window = loc.window;
+    p.sinks = loc.sinks;
+    // Under a window the union of the rows' windows starts at the first token's edge.
+    p.slab0 = window_lo(loc.off, loc.window) / slab_keys<D>();
     const int heads = B * H_kv;
-    const int nslab = cdiv(p.kv_end, slab_keys<D>());
+    const int nslab = cdiv(p.kv_end, slab_keys<D>()) - p.slab0;
     if (split <= 0) split = env_split();
     if (split <= 0) {
         // About 128 blocks over the (b, kv head) pairs, each with at least two slabs per warp.
@@ -500,7 +538,12 @@ void launch(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q
         p.ws = w.ws;
         p.counters = w.counters;
     }
-    attention_decode_kernel<D><<<heads * split, THREADS, bytes, stream>>>(p);
+    if (loc.active()) {
+        resident_blocks<D, true>();  // the smem opt-in of that instantiation
+        attention_decode_kernel<D, true><<<heads * split, THREADS, bytes, stream>>>(p);
+    } else {
+        attention_decode_kernel<D, false><<<heads * split, THREADS, bytes, stream>>>(p);
+    }
 }
 
 }  // namespace
@@ -511,13 +554,15 @@ bool decode_fits(int H_q, int H_kv, int S_q) {
 
 void decode_launch(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q, int H_kv,
                    int S_q, int S_kv, int kv_cap, int D, float scale_log2, bool causal, int split,
-                   cudaStream_t stream) {
+                   cudaStream_t stream, const Local& loc) {
     SPARK_REQUIRE(decode_fits(H_q, H_kv, S_q), "attention decode: query rows exceed the tile");
     SPARK_REQUIRE(kv_cap >= S_kv, "attention decode: kv_cap must be at least S_kv");
     if (D == 64)
-        launch<64>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal, split, stream);
+        launch<64>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal, split, stream,
+                   loc);
     else
-        launch<128>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal, split, stream);
+        launch<128>(Q, K, V, O, B, H_q, H_kv, S_q, S_kv, kv_cap, scale_log2, causal, split, stream,
+                    loc);
 }
 
 }  // namespace spark::attn

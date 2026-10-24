@@ -613,6 +613,29 @@ void attention_varlen_fp8(const __nv_bfloat16* Q, const __nv_fp8_e4m3* k_cache,
                           __nv_bfloat16* O, int B, int T, int H_q, int H_kv, int D, int page,
                           int max_pages, bool causal, int variant, cudaStream_t stream);
 
+// ---- Sliding-window attention and attention sinks ----------------------------------------
+// The forward above with the two options local attention needs (docs/design/attention.md,
+// "Sliding window and sinks"): the same layouts, variants and rules as attention_bf16, which
+// this is when window = 0 and sinks is null. Mistral 7B and Gemma 2 use 4096-key windows,
+// Gemma 3 1024, gpt-oss 128 on every other layer and a sink logit per head on every layer.
+//
+// `window` > 0: each query sees at most the last `window` keys up to its own position, its
+// own included. The window is causal and aligned to the last key: query i sits at key
+// position p_i = i + S_kv - S_q (S_q <= S_kv) and sees keys p_i - window < j <= p_i,
+// whatever `causal` says (with S_q == S_kv that is torch's top-left causal mask with a left
+// edge; a decode step sees the last `window` keys of the cache). The kernels skip the K/V
+// tiles that lie wholly outside every row's window: a decode step at 128K cached keys with a
+// 4096-key window streams 4096 keys.
+// `sinks`, when not null, is fp32 [H_q] in device memory: one learned logit per query head
+// added to every softmax denominator with no value vector (gpt-oss):
+//   O_i = sum_j exp(s_ij - m) v_j / (exp(sink_h - m) + sum_j exp(s_ij - m)),
+// with s_ij = q_i . k_j / sqrt(D) and m the max over the row's scores and the sink. A
+// forward `lse` then includes the sink: log(exp(sink_h) + sum_j exp(s_ij)).
+void attention_window_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_bfloat16* V,
+                           __nv_bfloat16* O, int B, int H_q, int H_kv, int S_q, int S_kv, int D,
+                           bool causal, int window, const float* sinks, int variant,
+                           cudaStream_t stream, float* lse = nullptr, int kv_cap = 0);
+
 // ---- FP8 attention (e4m3 in, bf16 out, forward) ------------------------------------------
 // O = softmax(sq sk Q K^T / sqrt(D)) sv V per (b, h), for Q = [B, H_q, S_q, D] and
 // K, V = [B, H_kv, S_kv, D] e4m3 (the same layout, heads and mask as attention_bf16), O bf16.
