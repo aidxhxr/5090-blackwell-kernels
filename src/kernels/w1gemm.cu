@@ -7,8 +7,14 @@
 //   2  M <= 16: variant 1's step with the block's four warps splitting K, the next groups'
 //      weights in flight in registers, the partial sums added through shared memory;
 //      M > 16: variant 1's kernel over 8-token chunks (see launch_v2)
+//   3  M <= 16: variant 2 with one word of a row per lane (a k order inside the group that
+//      gives lane c k 32c..32c+31), 8 groups of words and 3 of activations in flight per
+//      warp (4 and 1 at 16 tokens), no predicated loads, 1 to 16 warps along K from the
+//      strip and SM counts, 8-token tiles for M <= 8; M > 16: variant 2. The grouped form
+//      takes the j-th non-empty expert per block row.
 // The packed layout, the k order inside a group and the dequant: w1gemm_internal.cuh.
 #include <algorithm>
+#include <cstdlib>
 
 #include "spark/common.cuh"
 #include "spark/kernels.h"
@@ -300,6 +306,198 @@ __global__ void __launch_bounds__(kSplitWarps * 32)
     }
 }
 
+// ---- variant 3, M <= 16: every load of the next groups in flight -------------------------
+
+// Variant 2 measured on the 5090 at 7 to 35 us for weights whose bytes take 1 to 5 us at the
+// copy roof: a block keeps 2 KB of distinct weight bytes in flight, the four lanes of a quad
+// each holding the same 16 bytes of a row and using 4 of them, the activations are loaded
+// in front of the mma that needs them, and a 144-strip expert leaves 26 SMs empty. This rung
+// keeps the arithmetic and changes what is in flight:
+//   * the k order inside a group (any order works if both operands follow it): lane c takes
+//     k 32c .. 32c + 31, step pair i the byte i of that, so a lane loads only word c of its
+//     two rows (two at 2 bits) and the quad's four lanes together read the group's 16 bytes
+//     once; its activations for step pair i are the 16 bytes at k 32c + 8i;
+//   * a ring of the next D groups per warp (8 at 8 tokens, 4 at 16), 2 registers a slot,
+//     and the activations AD - 1 groups ahead (3 at 8 tokens, 1 at 16): they come from L2
+//     (a warp reads 1 / WK of them, so L1 rarely has them) and a load one group ahead
+//     left every group waiting on it;
+//   * WK = 1 to 16 warps along K, picked from the strip and SM counts (stream_warps);
+//   * 8 tokens per tile for M <= 8.
+// The partial sums are added in shared memory in a fixed order, as in variant 2: no atomics.
+
+// One block: WK warps on the 16 columns n0.. of one weight and the tokens m0..m_end (at
+// most 8 NT of them), the whole K. `red` holds WK * NT * 4 * 32 floats. Ends on a barrier,
+// so the caller can run it again on the same `red`.
+template <int BITS, int NT, int WK>
+__device__ __forceinline__ void stream_strip(const __nv_bfloat16* __restrict__ A,
+                                             const uint32_t* __restrict__ packed,
+                                             const __nv_bfloat16* __restrict__ scales,
+                                             __nv_bfloat16* __restrict__ C, int m0, int m_end,
+                                             int N, int K, int n0, float* red) {
+    constexpr int D = NT == 1 ? 8 : 4, AD = NT == 1 ? 4 : 2, E = NT * 4;
+    static_assert(D % AD == 0, "the activation ring follows the weight ring's slot");
+    const int lane = threadIdx.x & 31, wk = threadIdx.x >> 5;
+    const int g = lane >> 2, c = lane & 3;
+    const int G = K / kG;
+    const int ng = G > wk ? (G - wk + WK - 1) / WK : 0;
+    const int wpr = w1::words_per_row(K, BITS);
+    const unsigned short* sbase = reinterpret_cast<const unsigned short*>(scales) + n0 + g;
+    // Token columns of the mma are independent, so a lane past the last row reads the last
+    // row and its sums go to outputs that are never stored. No predicate and no zeroing: a
+    // predicated load whose other lanes write zeros into the same registers makes the warp
+    // wait for the load right there (one scoreboard per warp), and every group waited on
+    // its activations, about 0.6 us each, whatever the ring depth.
+    const uint4* abase[NT];
+#pragma unroll
+    for (int nt = 0; nt < NT; ++nt) {
+        const int row = min(m0 + nt * 8 + g, m_end - 1);
+        abase[nt] = reinterpret_cast<const uint4*>(A + static_cast<size_t>(row) * K) + 4 * c;
+    }
+
+    w1::LaneWords<BITS> wr[D][2];
+    unsigned sr[D];  // the two rows' scales, row g in the low half
+    uint4 act[AD][NT][4];
+    auto load_w = [&](int slot, int grp) {
+        wr[slot][0].load(packed, n0 + g, grp, wpr, c);
+        wr[slot][1].load(packed, n0 + g + 8, grp, wpr, c);
+        const size_t srow = static_cast<size_t>(grp) * N;
+        sr[slot] = static_cast<unsigned>(__ldg(sbase + srow)) |
+                   (static_cast<unsigned>(__ldg(sbase + srow + 8)) << 16);
+    };
+    auto load_a = [&](int buf, int grp) {
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+            for (int q = 0; q < 4; ++q) act[buf][nt][q] = __ldg(abase[nt] + grp * 16 + q);
+    };
+
+    float acc[NT][4];
+#pragma unroll
+    for (int j = 0; j < NT; ++j)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) acc[j][e] = 0.f;
+
+#pragma unroll
+    for (int d = 0; d < D; ++d)
+        if (d < ng) load_w(d, wk + d * WK);
+#pragma unroll
+    for (int d = 0; d < AD - 1; ++d)
+        if (d < ng) load_a(d, wk + d * WK);
+
+    for (int i0 = 0; i0 < ng; i0 += D) {
+#pragma unroll
+        for (int d = 0; d < D; ++d) {
+            const int i = i0 + d;
+            if (i < ng) {
+                if (i + AD - 1 < ng) load_a((d + AD - 1) % AD, wk + (i + AD - 1) * WK);
+                const unsigned s2 = sr[d];
+                w1::lane_group_mma<BITS, NT>(acc, wr[d][0], wr[d][1], w1::splat(s2 & 0xFFFFu),
+                                             w1::splat(s2 >> 16), act[d % AD]);
+                if (i + D < ng) load_w(d, wk + (i + D) * WK);
+            }
+        }
+    }
+
+    if constexpr (WK == 1) {
+        // One warp owns the strip: the accumulators are the sums.
+        const int m = m0 + 2 * c;
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt) {
+            const int mm = m + nt * 8;
+            if (mm < m_end) {
+                C[static_cast<size_t>(mm) * N + n0 + g] = __float2bfloat16(acc[nt][0]);
+                C[static_cast<size_t>(mm) * N + n0 + g + 8] = __float2bfloat16(acc[nt][2]);
+            }
+            if (mm + 1 < m_end) {
+                C[static_cast<size_t>(mm + 1) * N + n0 + g] = __float2bfloat16(acc[nt][1]);
+                C[static_cast<size_t>(mm + 1) * N + n0 + g + 8] = __float2bfloat16(acc[nt][3]);
+            }
+        }
+        return;
+    } else {
+#pragma unroll
+        for (int nt = 0; nt < NT; ++nt)
+#pragma unroll
+            for (int q = 0; q < 4; ++q) red[(wk * E + nt * 4 + q) * 32 + lane] = acc[nt][q];
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < E * 32; idx += WK * 32) {
+            const int e = idx / 32, ln = idx % 32;
+            float v = 0.f;
+#pragma unroll
+            for (int w = 0; w < WK; ++w) v += red[(w * E + e) * 32 + ln];
+            const int nt = e / 4, q = e % 4;
+            const int dn = (ln >> 2) + (q >> 1) * 8;
+            const int dm = nt * 8 + 2 * (ln & 3) + (q & 1);
+            const int m = m0 + dm;
+            if (m < m_end) C[static_cast<size_t>(m) * N + n0 + dn] = __float2bfloat16(v);
+        }
+        __syncthreads();
+    }
+}
+
+template <int BITS, int NT, int WK>
+__global__ void __launch_bounds__(WK * 32)
+    w1_stream_kernel(const __nv_bfloat16* __restrict__ A, const uint32_t* __restrict__ packed,
+                     const __nv_bfloat16* __restrict__ scales, __nv_bfloat16* __restrict__ C, int M,
+                     int N, int K) {
+    __shared__ float red[WK > 1 ? WK * NT * 4 * 32 : 1];
+    stream_strip<BITS, NT, WK>(A, packed, scales, C, blockIdx.y * 8 * NT, M, N, K, blockIdx.x * 16,
+                               red);
+}
+
+// Warps along K for variant 3, from a sweep of 1, 2, 4, 8 and 16 at M = 1 and 16 on the
+// Llama-3-8B and DeepSeek expert shapes on the 5090, 20 launches back to back
+// (docs/design/w1gemm.md): fewer strips than SMs (a 2304-wide expert, 144 blocks) wants 16
+// warps a block, everything else 4, doubled until a warp has at most 16 groups (K = 14336
+// takes 8). At most one warp per two groups. A function of N and K only, so the grouped form
+// can pick the same split for an expert. SPARK_W1_WARPS=1|2|4|8|16 forces it.
+int stream_warps(int N, int K) {
+    static const int forced = [] {
+        const char* s = std::getenv("SPARK_W1_WARPS");
+        const int v = s ? std::atoi(s) : 0;
+        return v == 1 || v == 2 || v == 4 || v == 8 || v == 16 ? v : 0;
+    }();
+    if (forced) return forced;
+    const int strips = N / 16, G = K / kG;
+    int wk = 16;
+    if (strips >= num_sms()) {
+        wk = 4;
+        while (wk < 16 && G > 16 * wk) wk *= 2;
+    }
+    while (wk > 1 && wk > G / 2) wk /= 2;
+    return wk;
+}
+
+template <int BITS, int NT, int WK>
+void launch_stream_wk(const __nv_bfloat16* A, const uint32_t* packed, const __nv_bfloat16* scales,
+                      __nv_bfloat16* C, int M, int N, int K, cudaStream_t stream) {
+    const dim3 grid(N / 16, cdiv(M, 8 * NT));
+    w1_stream_kernel<BITS, NT, WK><<<grid, WK * 32, 0, stream>>>(A, packed, scales, C, M, N, K);
+    SPARK_CHECK_LAUNCH();
+}
+
+template <int BITS, int NT>
+void launch_stream(const __nv_bfloat16* A, const uint32_t* packed, const __nv_bfloat16* scales,
+                   __nv_bfloat16* C, int M, int N, int K, cudaStream_t stream) {
+    switch (stream_warps(N, K)) {
+        case 1:
+            launch_stream_wk<BITS, NT, 1>(A, packed, scales, C, M, N, K, stream);
+            break;
+        case 2:
+            launch_stream_wk<BITS, NT, 2>(A, packed, scales, C, M, N, K, stream);
+            break;
+        case 4:
+            launch_stream_wk<BITS, NT, 4>(A, packed, scales, C, M, N, K, stream);
+            break;
+        case 8:
+            launch_stream_wk<BITS, NT, 8>(A, packed, scales, C, M, N, K, stream);
+            break;
+        default:
+            launch_stream_wk<BITS, NT, 16>(A, packed, scales, C, M, N, K, stream);
+            break;
+    }
+}
+
 // ---- grouped form over the experts of an MoE layer -------------------------------------
 
 // blockIdx.y is the expert; the block's four warps each own a 16-column strip of its weight
@@ -340,6 +538,92 @@ __global__ void w1_moe_naive_kernel(const __nv_bfloat16* __restrict__ A,
             acc = fmaf(__bfloat162float(A[static_cast<size_t>(m) * K + k]), w, acc);
         }
         C[static_cast<size_t>(m) * N + n] = __float2bfloat16(acc);
+    }
+}
+
+// Variant 3 of the grouped form: blockIdx.y = j takes the j-th expert that has rows (the
+// grid is sized by the row count, not by E, so at decode 6 rows launch 6 block rows instead
+// of 384 that mostly exit). An expert with at most 16 rows runs variant 3's block on its
+// strip, 8 rows at a time, with the warps along K w1gemm would pick for one expert; one
+// with more runs variant 1's warp body over 8-row chunks spread across the block's warps,
+// which is what w1gemm's variant 3 does above 16 rows. So every expert's rows come out bit
+// for bit as w1gemm on those rows alone, as the grouped form promises.
+constexpr int kMoeStreamMaxExperts = 1024;
+
+template <int BITS, int WK>
+__global__ void __launch_bounds__(WK * 32)
+    w1_moe_stream_kernel(const __nv_bfloat16* __restrict__ A, const uint32_t* __restrict__ packed,
+                         const __nv_bfloat16* __restrict__ scales,
+                         const int32_t* __restrict__ offsets, __nv_bfloat16* __restrict__ C, int E,
+                         int N, int K) {
+    __shared__ float red[WK > 1 ? WK * 4 * 32 : 1];
+    __shared__ int off_s[kMoeStreamMaxExperts + 1];
+    __shared__ int e_s;
+    for (int i = threadIdx.x; i <= E; i += WK * 32) off_s[i] = offsets[i];
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        const int lane = threadIdx.x;
+        int j = blockIdx.y, found = -1;
+        for (int base = 0; base < E && found < 0; base += 32) {
+            const int e = base + lane;
+            const unsigned b = __ballot_sync(kFullMask, e < E && off_s[e + 1] > off_s[e]);
+            const int cnt = __popc(b);
+            if (j < cnt) {
+                unsigned bb = b;
+                for (int q = 0; q < j; ++q) bb &= bb - 1;
+                found = base + __ffs(bb) - 1;
+            }
+            j -= cnt;
+        }
+        if (lane == 0) e_s = found;
+    }
+    __syncthreads();
+    const int e = e_s;
+    if (e < 0) return;
+    const int tb = off_s[e], te = off_s[e + 1];
+    const uint32_t* pe = packed + static_cast<size_t>(e) * N * w1::words_per_row(K, BITS);
+    const __nv_bfloat16* se = scales + static_cast<size_t>(e) * (K / kG) * N;
+    if (te - tb > 16) {
+        const int wk = threadIdx.x >> 5;
+        for (int m0 = tb + 8 * wk; m0 < te; m0 += 8 * WK)
+            strip_chunk<BITS>(A, pe, se, C, m0, te, N, K, blockIdx.x * 16, threadIdx.x & 31);
+        return;
+    }
+    for (int m0 = tb; m0 < te; m0 += 8)
+        stream_strip<BITS, 1, WK>(A, pe, se, C, m0, te, N, K, blockIdx.x * 16, red);
+}
+
+template <int BITS, int WK>
+void launch_moe_stream_wk(const __nv_bfloat16* A, const uint32_t* packed,
+                          const __nv_bfloat16* scales, const int32_t* offsets, __nv_bfloat16* C,
+                          int E, int N, int K, int rows, cudaStream_t stream) {
+    const dim3 grid(N / 16, std::max(1, std::min(E, rows)));
+    w1_moe_stream_kernel<BITS, WK>
+        <<<grid, WK * 32, 0, stream>>>(A, packed, scales, offsets, C, E, N, K);
+    SPARK_CHECK_LAUNCH();
+}
+
+// The warps along K are w1gemm's for one expert's weight, so the sums match it.
+template <int BITS>
+void launch_moe_stream(const __nv_bfloat16* A, const uint32_t* packed, const __nv_bfloat16* scales,
+                       const int32_t* offsets, __nv_bfloat16* C, int E, int N, int K, int rows,
+                       cudaStream_t stream) {
+    switch (stream_warps(N, K)) {
+        case 1:
+            launch_moe_stream_wk<BITS, 1>(A, packed, scales, offsets, C, E, N, K, rows, stream);
+            break;
+        case 2:
+            launch_moe_stream_wk<BITS, 2>(A, packed, scales, offsets, C, E, N, K, rows, stream);
+            break;
+        case 4:
+            launch_moe_stream_wk<BITS, 4>(A, packed, scales, offsets, C, E, N, K, rows, stream);
+            break;
+        case 8:
+            launch_moe_stream_wk<BITS, 8>(A, packed, scales, offsets, C, E, N, K, rows, stream);
+            break;
+        default:
+            launch_moe_stream_wk<BITS, 16>(A, packed, scales, offsets, C, E, N, K, rows, stream);
+            break;
     }
 }
 
@@ -393,7 +677,7 @@ void w1_quantize_bf16(const __nv_bfloat16* W, uint32_t* packed, __nv_bfloat16* s
 }
 
 int w1gemm_num_variants() {
-    return 3;
+    return 4;
 }
 
 bool w1gemm_supports(int M, int N, int K, int bits, int variant) {
@@ -423,18 +707,36 @@ void w1gemm_bf16(const __nv_bfloat16* A, const uint32_t* packed, const __nv_bflo
             else
                 launch_v1<2>(A, packed, scales, C, M, N, K, stream);
             break;
-        default:
+        case 2:
             if (bits == 1)
                 launch_v2<1>(A, packed, scales, C, M, N, K, stream);
             else
                 launch_v2<2>(A, packed, scales, C, M, N, K, stream);
+            break;
+        default:
+            if (M > 16) {
+                if (bits == 1)
+                    launch_v2<1>(A, packed, scales, C, M, N, K, stream);
+                else
+                    launch_v2<2>(A, packed, scales, C, M, N, K, stream);
+            } else if (M > 8) {
+                if (bits == 1)
+                    launch_stream<1, 2>(A, packed, scales, C, M, N, K, stream);
+                else
+                    launch_stream<2, 2>(A, packed, scales, C, M, N, K, stream);
+            } else {
+                if (bits == 1)
+                    launch_stream<1, 1>(A, packed, scales, C, M, N, K, stream);
+                else
+                    launch_stream<2, 1>(A, packed, scales, C, M, N, K, stream);
+            }
             break;
     }
 }
 
 void w1gemm_moe_bf16(const __nv_bfloat16* A, const uint32_t* packed, const __nv_bfloat16* scales,
                      const int32_t* offsets, __nv_bfloat16* C, int E, int N, int K, int bits,
-                     int variant, cudaStream_t stream) {
+                     int variant, cudaStream_t stream, int rows) {
     SPARK_REQUIRE(variant >= 0 && variant < w1gemm_num_variants(), "w1gemm_moe: bad variant");
     SPARK_REQUIRE(E >= 1 && w1gemm_supports(1, N, K, bits, variant),
                   "w1gemm_moe: needs E >= 1, bits 1 or 2, N % 16 == 0 and K % 128 == 0");
@@ -445,6 +747,15 @@ void w1gemm_moe_bf16(const __nv_bfloat16* A, const uint32_t* packed, const __nv_
         const dim3 grid(cdiv(N, 128), E);
         w1_moe_naive_kernel<<<grid, 128, 0, stream>>>(A, packed, scales, offsets, C, N, K, bits);
         SPARK_CHECK_LAUNCH();
+        return;
+    }
+    if (variant >= 3 && E <= kMoeStreamMaxExperts) {
+        const int r = rows < 0 ? E : rows;
+        if (r == 0) return;
+        if (bits == 1)
+            launch_moe_stream<1>(A, packed, scales, offsets, C, E, N, K, r, stream);
+        else
+            launch_moe_stream<2>(A, packed, scales, offsets, C, E, N, K, r, stream);
         return;
     }
     // Variants 1 and 2 share the warp kernel: an expert's token count is not known on the

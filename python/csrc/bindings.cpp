@@ -750,7 +750,7 @@ Tensor w1gemm_moe(const Tensor& a, const Tensor& packed, const Tensor& scales,
     spark::w1gemm_moe_bf16(
         bf16_ptr(a), reinterpret_cast<const uint32_t*>(packed.data_ptr<int32_t>()),
         bf16_ptr(scales), offsets.data_ptr<int32_t>(), bf16_ptr_mut(c), static_cast<int>(E),
-        static_cast<int>(N), static_cast<int>(K), bits, v, current_stream(a));
+        static_cast<int>(N), static_cast<int>(K), bits, v, current_stream(a), static_cast<int>(T));
     return c;
 }
 

@@ -212,6 +212,11 @@ Weight make_weight(const __nv_bfloat16* dW, const std::vector<__nv_bfloat16>& hW
     return wt;
 }
 
+// The variant timed per format: hgemm's and w4gemm's decode rungs, w1gemm's top rung.
+int variant_of(Format f) {
+    return f == BF16 ? 6 : f == INT4 ? 2 : spark::w1gemm_num_variants() - 1;
+}
+
 // The kernel under test on copy `c`.
 void run_kernel(const Weight& w, const __nv_bfloat16* A, __nv_bfloat16* C, int M, int c,
                 cudaStream_t stream) {
@@ -220,11 +225,7 @@ void run_kernel(const Weight& w, const __nv_bfloat16* A, __nv_bfloat16* C, int M
     else if (w.fmt == INT4)
         spark::w4gemm_bf16(A, w.p4(c), w.s(c), nullptr, C, M, w.N, w.K, 2, stream);
     else
-        spark::w1gemm_bf16(A, w.p1(c), w.s(c), C, M, w.N, w.K, 1, 2, stream);
-}
-
-int variant_of(Format f) {
-    return f == BF16 ? 6 : 2;
+        spark::w1gemm_bf16(A, w.p1(c), w.s(c), C, M, w.N, w.K, 1, variant_of(W1), stream);
 }
 
 // Device-wide numbers the rows are judged against.
@@ -278,10 +279,9 @@ void print_plan(const Weight& w, int M) {
     } else {
         const int blocks = w.N / 16;
         std::fprintf(stderr,
-                     "    plan w1gemm: %d blocks of 4 warps, no cross-block split, 8 KB each in "
-                     "flight = %.2f MB against the device's %.2f MB, %.2f waves of %d\n",
-                     blocks, blocks * 8192 / 1e6, spark::device_shape_bytes_in_flight() / 1e6,
-                     static_cast<double>(blocks) / sms, sms);
+                     "    plan w1gemm v%d: %d blocks, one per 16-column strip, 1 to 16 warps along "
+                     "K from the strip and SM counts, no cross-block split, %.2f blocks per SM\n",
+                     variant_of(W1), blocks, static_cast<double>(blocks) / sms);
     }
 }
 

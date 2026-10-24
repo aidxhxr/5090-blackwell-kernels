@@ -30,6 +30,8 @@
 
 #include <cstdint>
 
+#include "spark/common.cuh"
+
 namespace spark::w1 {
 
 // Words per row of the packed matrix.
@@ -94,6 +96,59 @@ __device__ __forceinline__ void dequant(unsigned q_lo, unsigned q_hi, unsigned s
         a[1] = ternary_pair(q_hi, ss_hi);
         a[2] = ternary_pair(q_lo >> 4, ss_lo);
         a[3] = ternary_pair(q_hi >> 4, ss_hi);
+    }
+}
+
+// ---- the lane-word layout of w1gemm variant 3 and w1moe_decode variant 3 ------------------
+//
+// The k order inside a group is free as long as both operands follow it. Here lane (g, c)
+// takes k 32c .. 32c + 31 of the group and step pair i (k16 steps 2i, 2i + 1) the 8 k at
+// 32c + 8i: k(j, kappa) = 32 c + 8 (j / 2) + 4 (j % 2) + 2 (kappa / 8) + kappa % 2. Its
+// weights are word c of each row's group (words 2c, 2c + 1 at 2 bits), so the four lanes of a
+// quad read a row's 16 bytes once between them, and its activations for step pair i are the
+// 16 bytes at k 32c + 8i.
+
+// One row's codes of one 128-k group as lane c of a quad needs them: k 32c .. 32c + 31.
+template <int BITS>
+struct LaneWords {
+    unsigned w[BITS];
+    __device__ __forceinline__ void load(const uint32_t* packed, int row, int grp, int wpr, int c) {
+        const uint32_t* p = packed + static_cast<size_t>(row) * wpr + grp * 4 * BITS + c * BITS;
+        if constexpr (BITS == 1) {
+            asm volatile("ld.global.nc.L1::no_allocate.u32 %0, [%1];\n" : "=r"(w[0]) : "l"(p));
+        } else {
+            asm volatile("ld.global.nc.L1::no_allocate.v2.u32 {%0,%1}, [%2];\n"
+                         : "=r"(w[0]), "=r"(w[1])
+                         : "l"(p));
+        }
+    }
+    // The 8 codes of step pair i (k 32c + 8i .. 32c + 8i + 7), BITS bits each.
+    __device__ __forceinline__ unsigned codes(int i) const {
+        if constexpr (BITS == 1)
+            return (w[0] >> (8 * i)) & 0xFFu;
+        else
+            return (w[i >> 1] >> (16 * (i & 1))) & 0xFFFFu;
+    }
+};
+
+template <int BITS, int NT>
+__device__ __forceinline__ void lane_group_mma(float (&acc)[NT][4], const LaneWords<BITS>& w_lo,
+                                               const LaneWords<BITS>& w_hi, unsigned ss_lo,
+                                               unsigned ss_hi, const uint4 (&act)[NT][4]) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const unsigned q_lo = w_lo.codes(i), q_hi = w_hi.codes(i);
+#pragma unroll
+        for (int jj = 0; jj < 2; ++jj) {
+            unsigned a[4];
+            w1::dequant<BITS>(q_lo >> (4 * BITS * jj), q_hi >> (4 * BITS * jj), ss_lo, ss_hi, a);
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt) {
+                const uint4& v = act[nt][i];
+                const unsigned b[2] = {jj == 0 ? v.x : v.z, jj == 0 ? v.y : v.w};
+                mma_bf16_16816(acc[nt], a, b);
+            }
+        }
     }
 }
 
