@@ -490,24 +490,47 @@ whose routed experts ship in MXFP4.
 | v0 | one thread per output, one sign-add per weight, one FMA per group |
 | v1 | one warp per 16-column strip and 8 tokens, the bits selected into bf16x2 `mma.sync` fragments, activations straight into registers |
 | v2 | warps split K for M <= 16, a register ring of the next groups' words, partial sums added in shared memory |
+| v3 | a k order that gives each lane one word of a row instead of 16 bytes, an 8-deep ring of words and a 4-deep one of activations, no predicated loads, 1 to 16 warps along K from the strip and SM counts |
 
-What the format buys is a byte count, and byte counts are all these are: nothing in this
-section has run on the card. The routed experts of one layer are 13.6 billion weights.
+Measured on the 5090, 20 launches back to back, us per launch, 1 bit (ternary and the rest in
+[the design note](docs/design/w1gemm.md)):
+
+| GEMM | tokens | floor | v2 | v3 | int4 `w4gemm` | bf16 `hgemm` |
+|---|---|---|---|---|---|---|
+| expert gate or up, 5120 to 2304 | 1 | 1.1 | 11.7 | **4.3** | 6.0 | 16.5 |
+| | 16 | 1.2 | 15.9 | **7.1** | 10.8 | 16.8 |
+| expert down, 2304 to 5120 | 1 | 1.1 | 6.4 | **3.9** | 6.4 | 15.6 |
+| gate/up, 4096 to 28672 | 1 | 10.8 | 23.6 | **17.2** | 37.9 | 145.2 |
+| grouped gate\|up, 6 of 384 experts | 1 | 13.0 | 40.9 | **27.8** | | |
+| grouped down, 6 of 384 experts | 1 | 6.5 | 24.9 | **17.3** | | |
+
+At batch 1 variant 3 is 1.4 to 2.7x variant 2 and 1.4 to 2.2x int4, where the bytes allow
+3.67x. It is still 3.5 to 4x its floor on the expert shapes: a 1-bit weight is a quarter
+of int4's bytes per instruction, and with 16 warps per SM (125 registers a thread) the
+instruction latency, not DRAM, is what Nsight shows left (DRAM at 18% of peak). Variant 3
+loses on two shapes, both written down in the note: 16 x 28672 x 4096 (31.1 against 27.6 us)
+and the grouped down GEMM from 4 tokens up. There is no rung for M > 16; at 64 tokens the
+1-bit kernel is slower than both int4 and bf16. The routed experts of one layer are 13.6
+billion weights.
 
 | format | bytes per weight | one layer's experts | 40 layers | 6 active experts, one layer | 6 active, 40 layers, per token | decode step on one layer |
 |---|---|---|---|---|---|---|
-| bf16 | 2 | 27.2 GB | 1,087 GB | 425 MB | 17.0 GB | unmeasured |
-| MXFP4 (the checkpoint) | 0.531 | 7.2 GB | 289 GB | 113 MB | 4.5 GB | unmeasured |
-| int4 g128 (`w4gemm`) | 0.516 | 7.0 GB | 280 GB | 109 MB | 4.4 GB | unmeasured |
-| ternary g128 (`w1gemm`, bits=2) | 0.266 | 3.6 GB | 144 GB | 56 MB | 2.3 GB | unmeasured |
-| 1 bit g128 (`w1gemm`, bits=1) | 0.141 | 1.9 GB | 76 GB | 30 MB | 1.2 GB | unmeasured |
+| bf16 | 2 | 27.2 GB | 1,087 GB | 425 MB | 17.0 GB | not run (277 us floor) |
+| MXFP4 (the checkpoint) | 0.531 | 7.2 GB | 289 GB | 113 MB | 4.5 GB | not run (74 us floor) |
+| int4 g128 (`w4gemm`) | 0.516 | 7.0 GB | 280 GB | 109 MB | 4.4 GB | not run (72 us floor) |
+| ternary g128 (`w1gemm`, bits=2) | 0.266 | 3.6 GB | 144 GB | 56 MB | 2.3 GB | 83 us (floor 37) |
+| 1 bit g128 (`w1gemm`, bits=1) | 0.141 | 1.9 GB | 76 GB | 30 MB | 1.2 GB | **43 us** (floor 19.5) |
 
 At 1 bit the model's experts are 68 GB of packed bits and 8.5 GB of scales, which is not a 32
 GB card; about 15 to 17 layers of them fit next to the rest, so the bench
 (`scripts/bench_deepseek_flash.py`, `bench_w1gemm`) runs per layer and rotates what fits past
 L2. The per-layer floor for the six experts' bytes at the copy roof is 19.5 us at 1 bit against
-277 at bf16 and 72 at int4. Quality is the other half and it is not a kernel question: sign
-weights with a mean-abs scale are lossy on a checkpoint trained in higher precision, and
+277 at bf16 and 72 at int4. The measured column is the fused `w1moe_decode` (variant 3: gate,
+up, SwiGLU and down of the six experts in one launch, 20 launches back to back, T = 1): 43 us,
+2.2x the floor, and still 39 us with the experts already in L2, so it is latency-bound, not
+byte-bound. Its scratch allocation used to cost 68 us a call on its own ([moe on the
+Spark](docs/design/moe_spark.md)). Quality is the other half and it is not a kernel question:
+sign weights with a mean-abs scale are lossy on a checkpoint trained in higher precision, and
 `scripts/eval_ppl.py` on the real weights is where that gets measured. Details, the floors per
 shape and what to measure first in [the design note](docs/design/w1gemm.md).
 
@@ -1032,9 +1055,9 @@ default stays on the CUDA cores.
 | `fp8gemm` e4m3 | naive `mma.sync.m16n8k32`, the swizzled cp.async tile with a 64x64 warp tile and decode configs, TMA, TMA on a Stream-K schedule with a tile per shape; all on the block-scaled instruction, with per-tensor scales or MXFP8 block scales | cuBLASLt, `torch._scaled_mm`, `F.scaled_mm` |
 | `fp4gemm` NVFP4, MXFP4 | naive `mma.sync.m16n8k64.kind::mxf4nvf4`, the swizzled cp.async tile with the block scales staged beside it, TMA with bulk-copied scales; a bf16 -> fp4 quantizer | cuBLASLt NVFP4 (bit-identical), `F.scaled_mm` |
 | `w4gemm` W4A16 | thread per output; a warp per 16 columns with the repacked int4 fragments and the activations straight into registers; warps along K on a cp.async pipeline for M <= 8 and independent warps for M <= 16, Stream-K tiles above; round-to-nearest quantizer and the offline repack | the bf16 `hgemm` on the dequantized weights, cuBLAS |
-| `w1gemm`, `w1gemm_moe` W1A16 | thread per output; a warp per 16 columns with the sign bits XORed into bf16x2 fragments and the activations straight into registers; warps along K for M <= 16; the grouped form over experts from sorted rows and offsets; the absmean quantizer at 1 and 2 bits | the bf16 `hgemm` on the dequantized weights, cuBLAS; unmeasured |
+| `w1gemm`, `w1gemm_moe` W1A16 | thread per output; a warp per 16 columns with the sign bits XORed into bf16x2 fragments and the activations straight into registers; warps along K for M <= 16; one word of a row per lane with deeper rings and the warps from the SM count; the grouped form over experts from sorted rows and offsets, sized by the row count; the absmean quantizer at 1 and 2 bits | the bf16 `hgemm` on the dequantized weights, `w4gemm`, the CPU; 4.3 us at 1 x 2304 x 5120 |
 | `grouped_gemm` bf16, e4m3 | every MoE expert in one persistent launch: the tile list scanned from device offsets, Stream-K over the last waves, fp8gemm's TMA stage with W through one 3-D map | cuBLAS grouped GEMM, the per-expert cuBLAS loop, the torch loop |
-| `w1moe_decode` | three passes through global memory; one persistent kernel per (expert, 128 columns) with the intermediate in shared memory and fp32 atomics into y; the routing weight folded into the down epilogue with the next expert's words in flight | the sorted `w1gemm_moe` path and a dense torch reference; unmeasured |
+| `w1moe_decode` | three passes through global memory; one persistent kernel per (expert, 128 columns) with the intermediate in shared memory and fp32 atomics into y; the routing weight folded into the down epilogue with the next expert's words in flight; the same item on the tensor cores with 16 warps | the sorted `w1gemm_moe` path and a dense torch reference; 43 us a DeepSeek layer at T = 1 |
 | `unified_read`, `unified_gemv` | scalar, 16-byte, four 16-byte loads in flight; a warp per row, a warp per 4 rows, a persistent grid from the SM count; over `cudaMalloc`, managed, host-mapped and system memory | CPU double sum, cuBLAS on a device copy; unmeasured |
 | `cpu_w1gemv`, `cpu_route`, `cpu_sample` | the 1-bit GEMV on the Arm cores: scalar, NEON sign masks in fp32, NEON int8 dot products; sigmoid top-k routing and top-k / top-p sampling, no CUDA | the scalar path, `reference.w1_dequantize`, `moe.route`; runs on any Arm machine |
 | `attention` bf16 | warp per row, CUDA-core flash attention, `mma.sync` flash attention, split-KV tail, TMA mbarrier pipeline, persistent tile queue with a producer warp; GQA and a flash-decoding kernel | `F.scaled_dot_product_attention` |

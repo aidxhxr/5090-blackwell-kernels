@@ -10,11 +10,11 @@ variant against a CPU reference, the floors at 273 and 1,532 GB/s) and
 down)`, `MoEBlock1Bit.decode`, `MoEBlock1Bit.random_bits`. The format, the quantizer and the
 sorted prefill path are in [w1gemm](w1gemm.md).
 
-**Not measured.** This note, the kernel, the bench and the script were written on a machine
-without a GPU or nvcc, before the Spark arrived. Every number below is a byte count from the
-model's shapes or a floor from a bandwidth figure, and none of them is a time. The 5090 can
-run everything here except the whole-model footprint, so `bench_w1moe_decode` runs there
-first; the first thing to run on the Spark is at the end.
+**Measured on the RTX 5090, not on the Spark.** This note, the kernel, the bench and the
+script were written before the Spark arrived; on 2026-10-23 they ran on the 5090, the bench and
+`tests/test_w1moe_decode.py` pass, and the 5090 columns below are measurements. The footprint
+tables are byte counts, and every number at 273 GB/s is still a floor, not a time. The first
+things to run on the Spark are at the end.
 
 ## The model, as assumed here
 
@@ -169,47 +169,117 @@ occupancy API times the SM count (`cudaDevAttrMultiProcessorCount`, 48 here, 170
 blocks on the Spark, which is one uneven wave; smaller slices (64 columns, 216 items) are
 the first knob if the tail shows.
 
+## What the 5090 said, and variant 3
+
+Two things, one of them not in the kernel.
+
+**The scratch allocation.** The launcher takes the fp32 `y` it adds into from a
+stream-ordered allocation. The device's default pool hands its memory back to the driver
+whenever the device synchronizes (release threshold 0), so after every sync the next
+`cudaMallocAsync` maps pages again: Nsight Systems put it at 68 us of host time per call, in
+front of a 57 us kernel, and the bench's events counted both, 130 us. The scratch now comes
+from a pool of the file's own whose release threshold is "never", so the allocation is a pool
+lookup. The occupancy query of the persistent grid is cached for the same reason.
+
+**The kernel.** Variant 2 alone is 57 us at T = 1 on the 5090 against 19.5 us of bytes. Nsight
+Compute: 108 blocks (6 experts x 18 slices) of 8 warps on 170 SMs, so 62 SMs idle and 2 warps
+per scheduler on the rest; one instruction issued every 10 cycles per warp, DRAM at 27% of
+peak, and the long-scoreboard stall half the samples. 12.6 million warp instructions for 212
+million weights is the 1.9 lane instructions per weight the "why CUDA cores" paragraph
+counted, so the count was right; what it left out is that each thread runs a whole 5,120-k
+row as one dependent chain of about 15,000 of them. The instruction budget only holds when
+something else hides each chain's latency, and 8 warps per SM do not.
+
+Variant 3 keeps the work item and moves it to the tensor cores with 16 warps a block, on
+`w1gemm` variant 3's lane-word body (one word of the row per lane, an 8-deep ring of words, a
+4-deep ring of activations; [w1gemm](w1gemm.md)):
+
+| phase | variant 2 | variant 3 |
+|---|---|---|
+| gate and up | 256 threads, each a whole row on the CUDA cores, 4 groups in flight per thread | 16 warps, each a 16-column strip (8 gate, 8 up) over the whole K, `mma.sync` with the item's tokens as the 8-column B tile |
+| SwiGLU | gate threads read the up threads' values from shared memory | the same from the strips' accumulators, h stored as the bf16 [token][128] tile |
+| down | thread j owns outputs j, j + 256, ...; 16 bytes of each row | 320 strips of 16 outputs, one 128-k group each, 20 per warp with the next 8 in flight, h from shared memory as B |
+| y | fp32 atomics, routing weight in the epilogue | the same |
+
+At T = 1 a tensor-core step does the same work per weight as the CUDA-core loop (one m16n8k16
+for 256 weights with 7 of its 8 token columns empty, about 17 instructions counted from the
+source), so the gain is
+not fewer instructions but 16 independent strips per block where variant 2 had 256 chains
+of 15,000 instructions on 8 warps; at T = 8 the mma does 8 tokens for the same instructions
+where the CUDA cores do 8 times the adds.
+
 ## Results
 
-`bench_w1moe_decode`, every variant, median of 20 launches on rotating routings (cold L2),
-plus the `--repeat-routing` rows. GB/s is the active bytes (the distinct experts' codes and
-scales, x, y) over the time. The 5090 columns fill first; the Spark's when it arrives.
+`bench_w1moe_decode --chain=20` on the RTX 5090, 2026-10-23 (rows in
+`results/w1moe_decode.json`, with the `--repeat-routing` rows). Every variant checks against
+the CPU reference; `tests/test_w1moe_decode.py` passes. Consecutive calls take consecutive
+routings, so each meets its experts cold. GB/s is the active bytes (the distinct experts'
+codes and scales, x and y) over the time. Single calls first (the JSON rows), then 20 calls
+back to back, us per call; the repeat column is the same six experts twice in a row, the
+second call meeting what the first left in the 96 MB L2. The Spark's columns are unmeasured.
 
-| T | bits | active MB | floor µs at 273 GB/s | floor µs at 1,532 GB/s | v0 µs | v1 µs | v2 µs | GB/s | repeat v2 µs |
-|---|---|---|---|---|---|---|---|---|---|
-| 1 | 1 | 29.9 | 109 | 19.5 | not measured | not measured | not measured | not measured | not measured |
-| 4 | 1 | about 116 (23 distinct experts) | 425 | 76 | not measured | not measured | not measured | not measured | not measured |
-| 8 | 1 | about 225 (45 distinct experts) | 824 | 147 | not measured | not measured | not measured | not measured | not measured |
-| 1 | 2 | 56.4 | 207 | 36.8 | not measured | not measured | not measured | not measured | not measured |
-| 4 | 2 | about 219 | 802 | 143 | not measured | not measured | not measured | not measured | not measured |
-| 8 | 2 | about 425 | 1,557 | 277 | not measured | not measured | not measured | not measured | not measured |
+| T | bits | active MB (experts) | floor at 273 GB/s | floor at 1,532 GB/s | v0 | v1 | v2 | v3 | v3, 20 back to back | GB/s | repeat, v1 / v3 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 1 | 29.9 (6) | 109.5 | 19.5 | 543 | 61.2 | 62.2 | **49.2** | **42.9** | 697 | 37.2 / 38.9 |
+| 4 | 1 | 117 (23.6) | 430 | 76.6 | 863 | 165 | 164 | **142** | **139** | 843 | 143 / 120 |
+| 8 | 1 | 227 (45.6) | 832 | 148 | 1,728 | 293 | 290 | **243** | **246** | 924 | 296 / 252 |
+| 1 | 2 | 56.4 (6) | 207 | 36.8 | 591 | 109 | 110 | **87.8** | **83.0** | 680 | |
+| 4 | 2 | 222 (23.6) | 812 | 145 | 904 | 377 | 376 | **303** | **298** | 743 | |
+| 8 | 2 | 429 (45.6) | 1,572 | 280 | 1,916 | 707 | 700 | **545** | **543** | 790 | |
 
-The distinct-expert counts at T = 4 and 8 are the expectation for 6 draws per token out of
-384 (the bench prints the actual ones). `scripts/bench_deepseek_spark.py`, 40 layers
-resident, T = 1, 4, 8:
+Variant 1 and 2's single calls were 130 us at T = 1 before the scratch fix; the kernel did not
+change. Variant 3 is 1.15 to 1.4x variant 2 at every T and both widths, and still 2.2x the
+copy-roof floor at T = 1 (1.7x at T = 8, 1.9x at ternary T = 8). The repeat column says why:
+with all six experts in L2, T = 1 takes 37 to 39 us on both variants, so the T = 1 step is not
+waiting on DRAM but on its own latency, 108 items on 170 SMs with the same instruction
+latency per group as `w1gemm` variant 3 (Nsight on variant 3 at T = 1: 51 us under locked
+clocks, DRAM at 33% of peak, 16 warps per SM capped by 121 registers, 3.7 of 9.3 cycles per
+instruction waiting on L1TEX). At ternary variant 3 has a 32-byte spill (`cuobjdump`);
+variants 1 and 2 at ternary have 320 and 336 bytes of stack at their 128-register cap, the
+register pressure the earlier round flagged (at 1 bit neither spills).
 
-| T | step ms | GB per step | GB/s | tokens/s (experts only) | floor ms at 273 GB/s |
-|---|---|---|---|---|---|
-| 1 | not measured | 1.39 | not measured | not measured | 5.1 |
-| 4 | not measured | about 4.8 | not measured | not measured | about 18 |
-| 8 | not measured | about 9.2 | not measured | not measured | about 34 |
+On the 5090 the fused step is level with the sorted path's GEMMs alone: the two grouped
+`w1gemm_moe` launches of one layer at T = 1 take 27.8 and 17.3 us back to back
+([w1gemm](w1gemm.md)), 45 us, against 42.9 for the fused kernel, which also does the SwiGLU,
+the routing weights and the sum. Against the 109.5 us floor at the Spark's 273 GB/s, the
+5090's 42.9 us says the kernel's own latency is well under the Spark's bytes, which is the
+case this kernel was written for; whether it streams at 273 GB/s there is the Spark's number.
 
-(1.39 GB per step at T = 1 is the routed experts plus the shared expert, 34.8 MB per layer.)
+`scripts/bench_deepseek_spark.py` on the 5090: 14.3 GB free holds one layer next to the
+12 GB reserve, so one random layer is resident and re-used 40 times with a different
+activation (so a different routing) per layer; the step is `MoEBlock1Bit.decode` per layer:
+the torch router, the fused kernel (variant 3) and the shared expert on `w1gemm`. `--check`
+at T = 4: max abs error 1.6e-2 against a max |y| of 3.0.
+
+| T | step ms | GB per step | GB/s | tokens/s (experts only) | floor ms at 273 GB/s | floor ms at 1,532 GB/s |
+|---|---|---|---|---|---|---|
+| 1 | 5.54 | 1.39 | 252 | 181 | 5.10 | 0.91 |
+| 4 | 7.40 | 4.48 | 605 | 541 | 16.4 | 2.92 |
+| 8 | 10.18 | 7.54 | 741 | 786 | 27.6 | 4.92 |
+
+At T = 1 a layer is 138 us, of which the fused kernel is 43: the rest is the router and the
+shared expert as a handful of torch and `w1gemm` launches, about 95 us a layer of host-bound
+work, which is what a CUDA graph of the layer is for. Not a Spark number either way: the
+whole model is the Spark's, and so is its 273 GB/s.
+
+`scripts/bench_deepseek_flash.py` (the sorted `forward` path, two `w1gemm_moe` launches and
+the torch gather, SwiGLU and scatter around them): 0.31 ms a layer at T = 1, 0.33 at 4, 0.58 at
+16 and 1.44 at 64, with `--check` at T = 8 at 7.8e-3 against a max |y| of 3.0. Also mostly
+launches at T = 1: the two grouped GEMMs inside it are 45 us.
 
 ## What to run first
 
-1. `bench_w1moe_decode --bits=1 --t=1` on the 5090, checks on. The CPU reference takes a few
-   seconds per T; a mismatch in variant 1 or 2 with variant 0 passing points at the item
-   ownership scan or the slice bookkeeping, a mismatch in all three at the bit order.
-2. `pytest tests/test_w1moe_decode.py`: decode against the sorted path and against the
-   dense reference at T = 1, 3, 8, both widths.
-3. The same bench on the Spark, then with `--repeat-routing`, and `bench_bandwidth` next
-   to it for the real roof. The v2 row at T = 1 against the 109 µs floor is the number this
-   note is about; the v0 row says what three launches cost here.
-4. `bench_deepseek_spark.py` with all 40 layers resident: the step time against the 4.4 ms
+Done on the 5090: the bench with checks, `tests/test_w1moe_decode.py`, the repeat rows, Nsight
+on variant 3 at T = 1, and `bench_deepseek_spark.py` with one layer resident. On the Spark:
+
+1. `bench_w1moe_decode` and `pytest tests/test_w1moe_decode.py`, the first time on sm_121,
+   then with `--repeat-routing`, and `bench_bandwidth` next to it for the real roof. The v3
+   row at T = 1 against the 109 us floor is the number this note is about; the v0 row says
+   what three launches cost there.
+2. `bench_deepseek_spark.py` with all 40 layers resident: the step time against the 4.4 ms
    expert floor, and `--check` once.
-5. Nsight on the T = 1 and T = 8 rows: issue slot utilization and `dram__throughput`
-   decide whether the CUDA-core argument above held and where T = 8 needs the mma rung.
-6. The real checkpoint through `deepseek_flash.load_moe_layer` for every layer (the loader
+3. Nsight on the T = 1 and T = 8 rows: whether the 16 warps a block that are short on the
+   5090 are enough at a sixth of its bandwidth per SM.
+4. The real checkpoint through `deepseek_flash.load_moe_layer` for every layer (the loader
    has never met the checkpoint, its key names are an assumption), and `scripts/eval_ppl.py`
    at 1 bit against the MXFP4 it ships in. Nothing above matters if that number is bad.
