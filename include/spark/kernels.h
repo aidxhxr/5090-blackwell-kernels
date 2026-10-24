@@ -635,6 +635,34 @@ void attention_window_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const
                            __nv_bfloat16* O, int B, int H_q, int H_kv, int S_q, int S_kv, int D,
                            bool causal, int window, const float* sinks, int variant,
                            cudaStream_t stream, float* lse = nullptr, int kv_cap = 0);
+// The paged decode and the varlen prefill with the same two options (window = 0 and no sinks
+// is the plain op), for both cache formats. The decode token of sequence b sees keys
+// [seq_lens[b] - window, seq_lens[b]) and the varlen query i keys
+// p - window < j <= p for p = seq_lens[b] - q_len_b + i (a window implies `causal`). Both read
+// only the slabs and tiles a window holds.
+void paged_decode_window_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* k_cache,
+                              const __nv_bfloat16* v_cache, const int* block_table,
+                              const int* seq_lens, __nv_bfloat16* O, int B, int H_q, int H_kv,
+                              int D, int page, int max_pages, int window, const float* sinks,
+                              int variant, cudaStream_t stream);
+void paged_decode_window_fp8(const __nv_bfloat16* Q, const __nv_fp8_e4m3* k_cache,
+                             const __nv_fp8_e4m3* v_cache, const float* k_scale,
+                             const float* v_scale, const int* block_table, const int* seq_lens,
+                             __nv_bfloat16* O, int B, int H_q, int H_kv, int D, int page,
+                             int max_pages, int window, const float* sinks, int variant,
+                             cudaStream_t stream);
+void attention_varlen_window_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* k_cache,
+                                  const __nv_bfloat16* v_cache, const int* cu_seqlens_q,
+                                  const int* seq_lens, const int* block_table, __nv_bfloat16* O,
+                                  int B, int T, int H_q, int H_kv, int D, int page, int max_pages,
+                                  bool causal, int window, const float* sinks, int variant,
+                                  cudaStream_t stream);
+void attention_varlen_window_fp8(const __nv_bfloat16* Q, const __nv_fp8_e4m3* k_cache,
+                                 const __nv_fp8_e4m3* v_cache, const float* k_scale,
+                                 const float* v_scale, const int* cu_seqlens_q, const int* seq_lens,
+                                 const int* block_table, __nv_bfloat16* O, int B, int T, int H_q,
+                                 int H_kv, int D, int page, int max_pages, bool causal, int window,
+                                 const float* sinks, int variant, cudaStream_t stream);
 
 // ---- FP8 attention (e4m3 in, bf16 out, forward) ------------------------------------------
 // O = softmax(sq sk Q K^T / sqrt(D)) sv V per (b, h), for Q = [B, H_q, S_q, D] and
