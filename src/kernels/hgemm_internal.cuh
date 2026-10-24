@@ -21,8 +21,11 @@ void launch(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, in
 
 // The same with K never split, whatever the shape: each CTA runs its strip over the whole of
 // K, so a row's bits do not depend on M (hgemm variant 7). On a narrow N that leaves fewer
-// CTAs than the bandwidth rule wants, which is the cost.
+// CTAs than the bandwidth rule wants, which is the cost. Takes M up to 128 (a 128-row tile
+// for 65 to 128).
 void launch_unsplit(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N,
                     int K, cudaStream_t stream, const HgemmEpilogue& ep = HgemmEpilogue());
+// True if launch_unsplit's 128-row tile (128 x 32 strips) fits N in one wave of CTAs.
+bool unsplit_tile128_fits(int N, int K);
 
 }  // namespace spark::hgemm_decode

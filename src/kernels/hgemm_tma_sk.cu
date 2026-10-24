@@ -765,6 +765,20 @@ void launch_auto(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* 
 // shape only decides which block computes which elements, so a row's bits are the same at
 // every M. The tile is the one that finishes first by a simple count: waves of whole tiles
 // times the tile's area, a 64-wide tile taken as 0.9 of the 128 x 128 tile's rate.
+// Variant 7 runs the decode kernel up to M = 64, and up to 128 (a 128-row tile) when its
+// 128 x 32 strips fit in one wave: there one CTA per strip streams B with A in L2, where the
+// best TMA tile has half as many tiles (the o and down projections: 51 to 37 us and 163 to
+// 113 to 129 us at M = 65 to 128). Wider N keeps the TMA tile, which had as many tiles and
+// won (qkv, gate_up, lm_head). SPARK_HGEMM_V7_DECODE_M=64 turns the 128-row tile off.
+bool invariant_decode(int M, int N, int K) {
+    static const int max_m = [] {
+        const char* s = std::getenv("SPARK_HGEMM_V7_DECODE_M");
+        return s ? std::atoi(s) : 128;
+    }();
+    if (M <= 64) return true;
+    return M <= 128 && max_m >= 128 && hgemm_decode::unsplit_tile128_fits(N, K);
+}
+
 int invariant_tile(int M, int N) {
     struct Cand {
         const Config* c;
@@ -790,7 +804,7 @@ int invariant_tile(int M, int N) {
 
 void launch_invariant(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M,
                       int N, int K, cudaStream_t stream, const HgemmEpilogue& ep) {
-    if (M <= 64) {
+    if (invariant_decode(M, N, K)) {
         hgemm_decode::launch_unsplit(A, B, C, M, N, K, stream, ep);
         return;
     }
@@ -854,7 +868,7 @@ void hgemm_tma_sk_invariant(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv
 
 const char* hgemm_v7_tile_name(int M, int N, int K) {
     if (!hgemm_tma_sk_supports(M, N, K)) return "unsupported";
-    if (M <= 64) return "decode, K unsplit";
+    if (v6::invariant_decode(M, N, K)) return "decode, K unsplit";
     const int t = v6::invariant_tile(M, N);
     return t == 0 ? "tma 128x128 s2, whole tiles"
                   : (t == 1 ? "tma 128x64 s4, whole tiles" : "tma 64x128 s4, whole tiles");

@@ -370,17 +370,29 @@ void launch_impl(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* 
             launch_cfg<32, 32, 64, 4, 2, 2, FUSED>(A, B, C, M, N, K, stream, ep, unsplit);
         else  // 32x64x64, 2x4 warps, 40 KB: 2 per SM, 340 slots (96), half the strips
             launch_cfg<32, 64, 64, 4, 2, 4, FUSED>(A, B, C, M, N, K, stream, ep, unsplit);
-    } else {
+    } else if (M <= 64) {
         // 64x32x128, 4 stages, 4x2 warps, 96 KB: 1 per SM, 170 slots (48). The tensor work of a
         // 64-row strip is what limits the CTA, so the tile is narrow and the warps many.
         if (fits<64, 32, 128, 4, 4, 2, FUSED>(N, K))
             launch_cfg<64, 32, 128, 4, 4, 2, FUSED>(A, B, C, M, N, K, stream, ep, unsplit);
         else  // 64x64x64, 3 stages, 2x4 warps, 48 KB: 2 per SM, 340 slots (96)
             launch_cfg<64, 64, 64, 3, 2, 4, FUSED>(A, B, C, M, N, K, stream, ep, unsplit);
+    } else {
+        // 65 to 128 rows, only from launch_unsplit (hgemm variant 7, where no tile may split
+        // K and a TMA tile leaves most SMs idle at this M): 128x32x64, 4 stages, 4x2 warps,
+        // 80 KB, 1 per SM; else 128x64x64, 3 stages, 72 KB.
+        if (fits<128, 32, 64, 4, 4, 2, FUSED>(N, K))
+            launch_cfg<128, 32, 64, 4, 4, 2, FUSED>(A, B, C, M, N, K, stream, ep, unsplit);
+        else
+            launch_cfg<128, 64, 64, 3, 4, 2, FUSED>(A, B, C, M, N, K, stream, ep, unsplit);
     }
 }
 
 }  // namespace
+
+bool unsplit_tile128_fits(int N, int K) {
+    return fits<128, 32, 64, 4, 4, 2, false>(N, K);
+}
 
 bool supports(int M, int N, int K) {
     return M >= 1 && M <= 64 && N > 0 && K > 0 && N % 64 == 0 && K % 64 == 0;
@@ -396,6 +408,8 @@ void launch(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, in
 
 void launch_unsplit(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N,
                     int K, cudaStream_t stream, const HgemmEpilogue& ep) {
+    SPARK_REQUIRE(M >= 1 && M <= 128 && N % 64 == 0 && K % 64 == 0,
+                  "hgemm_decode: launch_unsplit takes 1 <= M <= 128, N and K multiples of 64");
     if (hgemm_epi::is_plain(ep))
         launch_impl<false>(A, B, C, M, N, K, stream, ep, true);
     else
