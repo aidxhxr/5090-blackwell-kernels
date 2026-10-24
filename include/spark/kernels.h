@@ -880,7 +880,10 @@ void unified_ping_pong(volatile int* req, volatile int* ack, int rounds, int* ou
 //            touches DRAM. CUDA-core fp32 adds over the sign bits, no mma (see the source)
 // variant 2: variant 1 with the routing weight folded into the down epilogue and the next
 //            item's first gate|up groups in flight during the SwiGLU and the down pass
-// Variants 1 and 2 add into y with atomics, so the last bits can differ run to run.
+// variant 3: the same item on the tensor cores, 16 warps a block: a warp per 16-column gate
+//            or up strip on w1gemm variant 3's body, the down pass as one-group strips with
+//            the bf16 h slice as the B tile
+// Variants 1 to 3 add into y with atomics, so the last bits can differ run to run.
 void w1moe_decode_bf16(const __nv_bfloat16* x, const int32_t* expert_ids,
                        const __nv_bfloat16* expert_weights, const uint32_t* packed_gate_up,
                        const __nv_bfloat16* scales_gate_up, const uint32_t* packed_down,

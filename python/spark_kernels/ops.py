@@ -1106,7 +1106,8 @@ def w1moe_decode(
 
     Variant 0 runs three plain passes with the intermediate in global memory; variants 1 and
     2 keep it in shared memory, one persistent block per (expert, 128 intermediate columns),
-    and add into y with fp32 atomics, so the last bits can differ between runs. Needs
+    and variant 3 runs the same item on the tensor cores with 16 warps a block. Variants 1
+    to 3 add into y with fp32 atomics, so the last bits can differ between runs. Needs
     K % 256 == 0, K <= 16384, I % 128 == 0 and T * topk <= 64.
     """
     if not isinstance(experts, W1ExpertWeights) or not isinstance(down, W1ExpertWeights):

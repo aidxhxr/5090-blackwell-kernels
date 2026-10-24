@@ -20,6 +20,9 @@
 //      value the sorted path uses) and the first groups of the next item's gate|up rows
 //      loaded into registers before the SwiGLU and the down pass, so the weight stream
 //      does not drain at the item boundary.
+//   3  the same item on the tensor cores with 16 warps a block: a warp per 16-column gate or
+//      up strip over the whole K on w1gemm variant 3's lane-word body, the SwiGLU through
+//      shared memory, the down pass as one-group strips with h as the B tile (see below).
 //
 // Why CUDA cores and not mma.sync: at T <= 8 this is a byte stream with almost no reuse.
 // Per weight bit the inner loop spends one bit test and T predicated fp32 adds (the sign is
@@ -527,6 +530,192 @@ __global__ void __launch_bounds__(kThreads, 2)
     }
 }
 
+// ---- variant 3: the fused step on the tensor cores -----------------------------------------
+
+// Variant 2 measured 57 us at T = 1 against the 19.5 us of its bytes on the 5090 (Nsight: 108
+// blocks of 8 warps on 170 SMs, one instruction every 10 cycles per warp, the long-scoreboard
+// stall half the samples): every thread walks a whole 5,120-k row on the CUDA cores, about
+// 15,000 dependent instructions. This rung keeps the work item, (expert, 128 intermediate
+// columns), and gives it 16 warps on w1gemm variant 3's lane-word body:
+//   gate|up  warp w streams one 16-column strip of the slice (gate strips 0..7, up 8..15)
+//            over the whole K with an 8-deep ring of words and a 4-deep ring of the
+//            activations of the expert's tokens (one m16n8k16 B tile, up to 8 tokens);
+//   SwiGLU   the strips' accumulators in shared memory, h = bf16(silu(bf16 g) * bf16 u) as
+//            bf16 [token][128], the sorted path's rounding;
+//   down     the slice is one 128-k group of every down row, so the 5,120 outputs are 320
+//            one-group strips, 20 per warp with the next 8 in flight, B the h tile from
+//            shared memory, the routing weight applied as each sum is added into y (fp32
+//            atomics, as variants 1 and 2).
+// One block per item, no persistence: an item a block does not own (its expert came earlier
+// in the routing) exits after the scan.
+constexpr int kV3Warps = 16;
+
+template <int BITS>
+__global__ void __launch_bounds__(kV3Warps * 32)
+    w1moe_mma_kernel(const __nv_bfloat16* __restrict__ x, const int32_t* __restrict__ ids,
+                     const __nv_bfloat16* __restrict__ wts, const uint32_t* __restrict__ packed_gu,
+                     const __nv_bfloat16* __restrict__ scales_gu,
+                     const uint32_t* __restrict__ packed_dn,
+                     const __nv_bfloat16* __restrict__ scales_dn, float* __restrict__ yacc, int T,
+                     int topk, int K, int I) {
+    constexpr int D = 8, AD = 4;
+    __shared__ float gu_s[2][kG][kMaxTok];                    // gate, up accumulators [col][token]
+    __shared__ __align__(16) __nv_bfloat16 h_s[kMaxTok][kG];  // the slice of h, [token][i]
+    __shared__ int toks_s[kMaxTok];
+    __shared__ float wts_s[kMaxTok];
+    __shared__ int ne_s, e_s;
+
+    const int n_slices = I / kG;
+    const int pair = blockIdx.x / n_slices, slice = blockIdx.x % n_slices;
+    const int n_pairs = T * topk;
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    const int g = lane >> 2, c = lane & 3;
+    if (threadIdx.x < 32) {
+        const int e = ids[pair];
+        int first = n_pairs;
+        for (int j = lane; j < n_pairs; j += 32)
+            if (ids[j] == e) first = min(first, j);
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) first = min(first, __shfl_xor_sync(kFullMask, first, o));
+        if (lane == 0) {
+            int ne = 0;
+            if (first == pair)
+                for (int j = 0; j < n_pairs; ++j)
+                    if (ids[j] == e) {
+                        toks_s[ne] = j / topk;
+                        wts_s[ne] = __bfloat162float(wts[j]);
+                        ++ne;
+                    }
+            ne_s = ne;
+            e_s = e;
+        }
+    }
+    __syncthreads();
+    const int ne = ne_s, e = e_s;
+    if (ne == 0) return;
+
+    // ---- gate|up: warp w's strip over the whole K ----
+    {
+        const int G = K / kG, N = 2 * I;
+        const int wpr = w1::words_per_row(K, BITS);
+        const int col0 = (w < 8 ? 0 : I) + slice * kG + 16 * (w & 7);
+        const uint32_t* pe = packed_gu + static_cast<size_t>(e) * N * wpr;
+        const unsigned short* sb = reinterpret_cast<const unsigned short*>(scales_gu) +
+                                   static_cast<size_t>(e) * G * N + col0 + g;
+        // Lanes past the expert's last token read its last token: their sums go to columns of
+        // the tile the SwiGLU ignores, and the load needs no predicate (see w1gemm.cu).
+        const uint4* arow =
+            reinterpret_cast<const uint4*>(x + static_cast<size_t>(toks_s[min(g, ne - 1)]) * K) +
+            4 * c;
+        w1::LaneWords<BITS> wr[D][2];
+        unsigned sr[D];
+        uint4 act[AD][1][4];
+        auto load_w = [&](int slot, int grp) {
+            wr[slot][0].load(pe, col0 + g, grp, wpr, c);
+            wr[slot][1].load(pe, col0 + g + 8, grp, wpr, c);
+            const size_t srow = static_cast<size_t>(grp) * N;
+            sr[slot] = static_cast<unsigned>(__ldg(sb + srow)) |
+                       (static_cast<unsigned>(__ldg(sb + srow + 8)) << 16);
+        };
+        auto load_a = [&](int buf, int grp) {
+#pragma unroll
+            for (int q = 0; q < 4; ++q) act[buf][0][q] = __ldg(arow + grp * 16 + q);
+        };
+        float acc[1][4] = {{0.f, 0.f, 0.f, 0.f}};
+#pragma unroll
+        for (int d = 0; d < D; ++d)
+            if (d < G) load_w(d, d);
+#pragma unroll
+        for (int d = 0; d < AD - 1; ++d)
+            if (d < G) load_a(d, d);
+        for (int i0 = 0; i0 < G; i0 += D) {
+#pragma unroll
+            for (int d = 0; d < D; ++d) {
+                const int i = i0 + d;
+                if (i < G) {
+                    if (i + AD - 1 < G) load_a((d + AD - 1) % AD, i + AD - 1);
+                    const unsigned s2 = sr[d];
+                    w1::lane_group_mma<BITS, 1>(acc, wr[d][0], wr[d][1], w1::splat(s2 & 0xFFFFu),
+                                                w1::splat(s2 >> 16), act[d % AD]);
+                    if (i + D < G) load_w(d, i + D);
+                }
+            }
+        }
+        float(*dst)[kMaxTok] = gu_s[w < 8 ? 0 : 1];
+        const int cl = 16 * (w & 7) + g;
+        dst[cl][2 * c] = acc[0][0];
+        dst[cl][2 * c + 1] = acc[0][1];
+        dst[cl + 8][2 * c] = acc[0][2];
+        dst[cl + 8][2 * c + 1] = acc[0][3];
+    }
+    __syncthreads();
+
+    // ---- SwiGLU into the bf16 h tile ----
+    for (int idx = threadIdx.x; idx < kG * kMaxTok; idx += kV3Warps * 32) {
+        const int t = idx / kG, i = idx % kG;
+        float h = 0.f;
+        if (t < ne) {
+            const float gv = bf16_round(gu_s[0][i][t]);
+            const float uv = bf16_round(gu_s[1][i][t]);
+            h = silu(gv) * uv;
+        }
+        h_s[t][i] = __float2bfloat16(h);
+    }
+    __syncthreads();
+
+    // ---- down: 16-output strips of one group each, h as the B tile ----
+    {
+        const int wpr = w1::words_per_row(I, BITS);
+        const uint32_t* pe = packed_dn + static_cast<size_t>(e) * K * wpr;
+        const unsigned short* sb = reinterpret_cast<const unsigned short*>(scales_dn) +
+                                   (static_cast<size_t>(e) * n_slices + slice) * K + g;
+        uint4 act[1][4];
+#pragma unroll
+        for (int q = 0; q < 4; ++q)
+            act[0][q] = *reinterpret_cast<const uint4*>(&h_s[g][32 * c + 8 * q]);
+        const int strips = K / 16;
+        const int ns = strips > w ? (strips - w + kV3Warps - 1) / kV3Warps : 0;
+        w1::LaneWords<BITS> wr[D][2];
+        unsigned sr[D];
+        auto load_w = [&](int slot, int j) {
+            const int n0 = (w + j * kV3Warps) * 16;
+            wr[slot][0].load(pe, n0 + g, slice, wpr, c);
+            wr[slot][1].load(pe, n0 + g + 8, slice, wpr, c);
+            sr[slot] = static_cast<unsigned>(__ldg(sb + n0)) |
+                       (static_cast<unsigned>(__ldg(sb + n0 + 8)) << 16);
+        };
+        const int t0 = 2 * c, t1 = 2 * c + 1;
+        const float w0 = t0 < ne ? wts_s[t0] : 0.f, w1v = t1 < ne ? wts_s[t1] : 0.f;
+        float* y0 = t0 < ne ? yacc + static_cast<size_t>(toks_s[t0]) * K : nullptr;
+        float* y1 = t1 < ne ? yacc + static_cast<size_t>(toks_s[t1]) * K : nullptr;
+#pragma unroll
+        for (int d = 0; d < D; ++d)
+            if (d < ns) load_w(d, d);
+        for (int j0 = 0; j0 < ns; j0 += D) {
+#pragma unroll
+            for (int d = 0; d < D; ++d) {
+                const int j = j0 + d;
+                if (j < ns) {
+                    float acc[1][4] = {{0.f, 0.f, 0.f, 0.f}};
+                    const unsigned s2 = sr[d];
+                    w1::lane_group_mma<BITS, 1>(acc, wr[d][0], wr[d][1], w1::splat(s2 & 0xFFFFu),
+                                                w1::splat(s2 >> 16), act);
+                    if (j + D < ns) load_w(d, j + D);
+                    const int n = (w + j * kV3Warps) * 16 + g;
+                    if (y0) {
+                        atomicAdd(y0 + n, w0 * acc[0][0]);
+                        atomicAdd(y0 + n + 8, w0 * acc[0][2]);
+                    }
+                    if (y1) {
+                        atomicAdd(y1 + n, w1v * acc[0][1]);
+                        atomicAdd(y1 + n + 8, w1v * acc[0][3]);
+                    }
+                }
+            }
+        }
+    }
+}
+
 __global__ void f32_to_bf16_kernel(const float* __restrict__ src, __nv_bfloat16* __restrict__ dst,
                                    int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -592,7 +781,7 @@ void launch_fused(const __nv_bfloat16* x, const int32_t* ids, const __nv_bfloat1
 }  // namespace
 
 int w1moe_decode_num_variants() {
-    return 3;
+    return 4;
 }
 
 bool w1moe_decode_supports(int T, int topk, int K, int I, int bits, int variant) {
@@ -639,7 +828,18 @@ void w1moe_decode_bf16(const __nv_bfloat16* x, const int32_t* expert_ids,
     Scratch scratch(y_elems * sizeof(float), stream);
     auto* yacc = static_cast<float*>(scratch.p);
     SPARK_CUDA_CHECK(cudaMemsetAsync(yacc, 0, y_elems * sizeof(float), stream));
-    if (variant == 1) {
+    if (variant >= 3) {
+        const int n_items = n_pairs * (I / kG);
+        if (bits == 1)
+            w1moe_mma_kernel<1><<<n_items, kV3Warps * 32, 0, stream>>>(
+                x, expert_ids, expert_weights, packed_gate_up, scales_gate_up, packed_down,
+                scales_down, yacc, T, topk, K, I);
+        else
+            w1moe_mma_kernel<2><<<n_items, kV3Warps * 32, 0, stream>>>(
+                x, expert_ids, expert_weights, packed_gate_up, scales_gate_up, packed_down,
+                scales_down, yacc, T, topk, K, I);
+        SPARK_CHECK_LAUNCH();
+    } else if (variant == 1) {
         if (bits == 1)
             launch_fused<1, false>(x, expert_ids, expert_weights, packed_gate_up, scales_gate_up,
                                    packed_down, scales_down, yacc, T, topk, K, I, stream);
