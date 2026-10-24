@@ -989,8 +989,9 @@ The GB10 is the machine this repo was named for, and it is a different machine f
 in every way that matters to a decode step: 48 SMs instead of 170, 273 GB/s of LPDDR5X instead
 of 1.5 TB/s, a 24 MB L2, 128 GB that the GPU shares with 20 Arm cores, and no PCIe between
 them. None of the kernels above were tuned for that, so these are the experiments I want to
-run the day it arrives. All of it is written, none of it has compiled against `sm_121` or run.
-Every note below says so and names what to run first.
+run the day it arrives. All of it now compiles and runs on the 5090 (sm_120), and the notes
+have the 5090's numbers; none of it has run on a GB10, and every note says what to run there
+first.
 
 | experiment | question | code |
 |---|---|---|
@@ -1001,8 +1002,12 @@ Every note below says so and names what to run first.
 
 The decode-grid change is the one that touches kernels with measured numbers: the grids
 that used to assume 170 SMs now ask the device, and on a device that reports 170 they pick
-the same constants as before. `SPARK_FORCE_SMS=48` makes the 5090 launch the Spark's grid, so
-that path can be checked before the box is here. Notes: [unified](docs/design/unified.md),
+the same constants as before: the decode and int4 tables above came out within 2% when
+measured again through the new grids, all but one row (7%). `SPARK_FORCE_SMS=48` makes the
+5090 launch the Spark's grid, and every shape and format checks out on it. On the 5090 a
+kernel can take a plain `malloc` pointer under HMM: the pages migrate on first touch (1.3 s for
+1 GB) and then stream at the device's 1,695 GB/s; a CPU-GPU flag round trip is 1.5 us against
+4.9 for a copy and a sync. Notes: [unified](docs/design/unified.md),
 [decode grids](docs/design/decode_spark.md), [grace](docs/design/grace.md),
 [moe on the Spark](docs/design/moe_spark.md), and [the GB10 sheet](docs/GB10.md).
 
@@ -1058,7 +1063,7 @@ default stays on the CUDA cores.
 | `w1gemm`, `w1gemm_moe` W1A16 | thread per output; a warp per 16 columns with the sign bits XORed into bf16x2 fragments and the activations straight into registers; warps along K for M <= 16; one word of a row per lane with deeper rings and the warps from the SM count; the grouped form over experts from sorted rows and offsets, sized by the row count; the absmean quantizer at 1 and 2 bits | the bf16 `hgemm` on the dequantized weights, `w4gemm`, the CPU; 4.3 us at 1 x 2304 x 5120 |
 | `grouped_gemm` bf16, e4m3 | every MoE expert in one persistent launch: the tile list scanned from device offsets, Stream-K over the last waves, fp8gemm's TMA stage with W through one 3-D map | cuBLAS grouped GEMM, the per-expert cuBLAS loop, the torch loop |
 | `w1moe_decode` | three passes through global memory; one persistent kernel per (expert, 128 columns) with the intermediate in shared memory and fp32 atomics into y; the routing weight folded into the down epilogue with the next expert's words in flight; the same item on the tensor cores with 16 warps | the sorted `w1gemm_moe` path and a dense torch reference; 43 us a DeepSeek layer at T = 1 |
-| `unified_read`, `unified_gemv` | scalar, 16-byte, four 16-byte loads in flight; a warp per row, a warp per 4 rows, a persistent grid from the SM count; over `cudaMalloc`, managed, host-mapped and system memory | CPU double sum, cuBLAS on a device copy; unmeasured |
+| `unified_read`, `unified_gemv` | scalar, 16-byte, four 16-byte loads in flight; a warp per row, a warp per 4 rows, a persistent grid from the SM count; over `cudaMalloc`, managed, host-mapped and system memory | CPU double sum, cuBLAS on device copies; measured on the 5090 only |
 | `cpu_w1gemv`, `cpu_route`, `cpu_sample` | the 1-bit GEMV on the Arm cores: scalar, NEON sign masks in fp32, NEON int8 dot products; sigmoid top-k routing and top-k / top-p sampling, no CUDA | the scalar path, `reference.w1_dequantize`, `moe.route`; runs on any Arm machine |
 | `attention` bf16 | warp per row, CUDA-core flash attention, `mma.sync` flash attention, split-KV tail, TMA mbarrier pipeline, persistent tile queue with a producer warp; GQA and a flash-decoding kernel | `F.scaled_dot_product_attention` |
 | `attention_fp8` e4m3 | warp per row on dequantized inputs, variant 5's persistent TMA kernel with both products on the block-scaled fp8 `mma.sync`, P rounded to e4m3 in registers, V transposed by `ldmatrix.trans` and byte permutes | the bf16 kernel, `F.scaled_dot_product_attention` in bf16 |

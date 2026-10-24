@@ -6,10 +6,10 @@ any kind of memory, and the signal kernels). Bench: `bench_unified`. Python:
 `sk.unified_read_sum`, `sk.unified_gemv`, `sk.unified_device_caps`. Test:
 `tests/test_unified.py`.
 
-**Not measured.** Written on a machine without a GPU or nvcc, before the Spark arrived. The
-kernels have not compiled, the bench has no rows, the test has not run. Every number below is
-a byte count or a floor computed from a spec sheet; none is a time anyone observed. The
-"what to run first" list at the end is the order to fill the table in.
+**Measured on the RTX 5090, not on the GB10.** Written before the Spark arrived, first run on
+the 5090 on 2026-10-23: the kernels compile, the bench validates every row, and the 5090
+columns below are measurements. Every GB10 column is still unmeasured, and the expectations
+for the Spark in the sections before the results are still expectations.
 
 ## Why this matters on the Spark
 
@@ -41,8 +41,10 @@ reaches. On the GB10 that model is incomplete in three ways.
    running kernel in a few microseconds, the engine can route on a Grace core while the GPU
    streams the shared expert, and hand the expert indices over by writing them.
 
-On the RTX 5090 the same calls are the same calls, over PCIe 5.0 x16, 64 GB/s each way on the
-spec sheet against 1,792 GB/s of GDDR7. The bench builds and runs there, and the point of
+On the RTX 5090 the same calls are the same calls, over PCIe against 1,792 GB/s of GDDR7. The
+card is PCIe 5.0, but the host this one sits in links it at 4.0 x16 (`nvidia-smi`:
+`pcie.link.gen.gpumax` 5, `hostmax` 4, width 16), 31.5 GB/s each way on paper and 26.8 GB/s
+measured below. The bench builds and runs there, and the point of
 running it there is the contrast: the 5090 column says what the API costs when the memory is
 far, the GB10 column says what it costs when it is the same memory.
 
@@ -54,7 +56,7 @@ far, the GB10 column says what it costs when it is the same memory.
 |---|---|---|---|
 | `device` | `cudaMalloc` | GDDR7, the baseline | the pool, GPU page tables, the baseline |
 | `managed` | `cudaMallocManaged` | pages migrate on first touch each way; advice and prefetch steer them | one pool, so "migration" is at most a page-table change; the question is whether the driver still does one |
-| `host_mapped` | `cudaHostAlloc(cudaHostAllocMapped)` | pinned host pages read over PCIe every time, bounded by 64 GB/s | pinned pages read over the fabric, bounded by whatever the fabric path costs |
+| `host_mapped` | `cudaHostAlloc(cudaHostAllocMapped)` | pinned host pages read over PCIe every time: 26.8 GB/s on this host's 4.0 x16 link | pinned pages read over the fabric, bounded by whatever the fabric path costs |
 | `system` | `posix_memalign`, nothing else | readable in place only with HMM (open kernel modules, Linux 6.1+); otherwise `unified_alloc` falls back to `cudaHostRegister` and records `registered` | the GB10 is expected to report `pageableMemoryAccess` through ATS, so the GPU reads the CPU's pages through the CPU's page tables, no CUDA call at all |
 
 `unified_device_caps()` reports the attributes that decide which of these work:
@@ -138,8 +140,8 @@ Bytes per call and the floor at the spec bandwidth, for the shapes the bench run
 
 A Llama-3-8B decode step reads 32 layers x (2 x 33.6 + 2 x 8.4 + 3 x 117.4) MB = 14.0 GB
 of bf16 weights; at 273 GB/s that is 51 ms, about 19 tokens/s, the number every memory kind
-will be judged against on the Spark. The `host_mapped` row on the 5090 cannot beat 64 GB/s, so
-that row's job is to show what a far read looks like, not to compete.
+will be judged against on the Spark. The `host_mapped` row on the 5090 cannot beat the link
+(26.8 GB/s measured), so that row's job is to show what a far read looks like, not to compete.
 
 ## The latency experiment
 
@@ -192,51 +194,97 @@ row to fill.
 ## Results
 
 `bench_unified`, 1 GB buffer, median of 20 launches per row, 1000 round trips per signal row.
-GB/s is the bytes read once over the time. Unmeasured on both machines.
+GB/s is the bytes read once over the time. 5090: driver 595.58 with the open kernel module,
+Linux 6.17, so HMM is on: the caps line reads `pageableMemoryAccess 1` (host page tables 0),
+`concurrentManagedAccess 1`, `directManagedMemAccessFromHost 0`, `hostNativeAtomicSupported 0`,
+and the `system` rows ran on plain `malloc` pages (path `hmm`), not the `cudaHostRegister`
+fallback. Rows in `results/unified.json`. The GB10 columns are unmeasured.
 
 ### Streaming read, 1 GB bf16
 
-| kind | advice | GB10 v0 GB/s | GB10 v1 | GB10 v2 | GB10 first touch ms | 5090 v0 | 5090 v1 | 5090 v2 | 5090 first touch ms |
-|---|---|---|---|---|---|---|---|---|---|
-| device | none | not measured | not measured | not measured | not measured | not measured | not measured | not measured | not measured |
-| managed | none | not measured | not measured | not measured | not measured | not measured | not measured | not measured | not measured |
-| managed | preferred_gpu | not measured | not measured | not measured | not measured | not measured | not measured | not measured | not measured |
-| managed | preferred_cpu | not measured | not measured | not measured | not measured | not measured | not measured | not measured | not measured |
-| managed | accessed_by_gpu | not measured | not measured | not measured | not measured | not measured | not measured | not measured | not measured |
-| managed | read_mostly | not measured | not measured | not measured | not measured | not measured | not measured | not measured | not measured |
-| managed | prefetch_gpu | not measured | not measured | not measured | not measured | not measured | not measured | not measured | not measured |
-| host_mapped | none | not measured | not measured | not measured | not measured | not measured | not measured | not measured | not measured |
-| system (hmm / ats) | none | not measured | not measured | not measured | not measured | not measured | not measured | not measured | not measured |
-| system | preferred_gpu | not measured | not measured | not measured | not measured | not measured | not measured | not measured | not measured |
-| system | read_mostly | not measured | not measured | not measured | not measured | not measured | not measured | not measured | not measured |
-| system | prefetch_gpu | not measured | not measured | not measured | not measured | not measured | not measured | not measured | not measured |
+| kind | advice | GB10 v0 / v1 / v2 GB/s | GB10 first touch ms | 5090 v0 | 5090 v1 | 5090 v2 | 5090 first touch ms |
+|---|---|---|---|---|---|---|---|
+| device | none | not measured | not measured | 1,637 | **1,695** | 1,690 | 0.78 |
+| managed | none | not measured | not measured | 1,632 | 1,695 | 1,689 | 117 |
+| managed | preferred_gpu | not measured | not measured | 1,626 | 1,695 | 1,689 | 115 |
+| managed | preferred_cpu | not measured | not measured | 24.5 | 26.8 | 26.8 | 1,151 |
+| managed | accessed_by_gpu | not measured | not measured | 24.5 | 26.8 | 26.8 | 40 |
+| managed | read_mostly | not measured | not measured | 1,634 | 1,695 | 1,689 | 75 |
+| managed | prefetch_gpu | not measured | not measured | 1,636 | 1,695 | 1,689 | 0.64 |
+| host_mapped | none | not measured | not measured | 14.1 | 26.8 | 26.8 | 40 |
+| system (hmm) | none | not measured | not measured | 1,416 | 1,689 | 1,685 | 1,263 |
+| system | preferred_gpu | not measured | not measured | 1,419 | 1,695 | 1,684 | 1,086 |
+| system | preferred_cpu | not measured | not measured | 13.8 | 26.8 | 26.8 | 263 |
+| system | accessed_by_gpu | not measured | not measured | 1,416 | 1,690 | 1,684 | 1,258 |
+| system | read_mostly | not measured | not measured | 1,416 | 1,689 | 1,684 | 1,257 |
+| system | prefetch_gpu | not measured | not measured | 1,423 | 1,695 | 1,689 | 0.64 |
+
+"First touch" is the first launch after the host filled the buffer, timed alone. What the 5090
+says:
+
+* A read-only stream of device memory runs at 1,695 GB/s, above the 1,532 GB/s of
+  `cudaMemcpy`, which also writes. One 16-byte load per thread already gets there; four in
+  flight (v2) add nothing. Two-byte loads (v0) cost 3% on device memory and 16% on migrated
+  `malloc` pages.
+* Every kind the driver can migrate ends up at the device number once it has: managed with
+  no advice, `preferred_gpu`, `read_mostly`, `prefetch_gpu`, and plain `malloc` pages under
+  HMM. The migration is the first touch: 117 ms for 1 GB of managed memory (9.2 GB/s, about a
+  third of the link) and 1.26 s for 1 GB of `malloc` pages (0.85 GB/s), which HMM moves on GPU
+  page faults. A prefetch does the same move up front, and the read after it is the device
+  read.
+* Pages that stay on the host are read over the link every time: `host_mapped`, managed with
+  `preferred_cpu` or `accessed_by_gpu`, system with `preferred_cpu`. All of them read at
+  26.8 GB/s, 85% of PCIe 4.0 x16, and 2-byte loads halve that.
+* `system` with no advice is the case that matters for an `mmap`ed checkpoint, and on this
+  machine it works: a kernel reads a plain CPU pointer, the driver migrates what it touches,
+  and from the second pass it is device memory. The cost is that first pass, at 0.85 GB/s.
 
 ### Decode GEMV, best variant, GB/s of the weight
 
 | kind | advice | 4096x4096 GB10 | 14336x4096 GB10 | 4096x14336 GB10 | 2304x5120 GB10 | 4096x4096 5090 | 14336x4096 5090 | 4096x14336 5090 | 2304x5120 5090 |
 |---|---|---|---|---|---|---|---|---|---|
-| device | none | not measured | not measured | not measured | not measured | not measured | not measured | not measured | not measured |
-| managed | none | not measured | not measured | not measured | not measured | not measured | not measured | not measured | not measured |
-| managed | preferred_cpu | not measured | not measured | not measured | not measured | not measured | not measured | not measured | not measured |
-| managed | prefetch_gpu | not measured | not measured | not measured | not measured | not measured | not measured | not measured | not measured |
-| host_mapped | none | not measured | not measured | not measured | not measured | not measured | not measured | not measured | not measured |
-| system | none | not measured | not measured | not measured | not measured | not measured | not measured | not measured | not measured |
-| cuBLAS, device copy | | not measured | not measured | not measured | not measured | not measured | not measured | not measured | not measured |
+| device | none | not measured | not measured | not measured | not measured | 1,427 | 1,619 | 1,614 | 1,353 |
+| managed | none | not measured | not measured | not measured | not measured | 1,423 | 1,618 | 1,576 | 1,345 |
+| managed | preferred_cpu | not measured | not measured | not measured | not measured | 26.6 | 26.7 | 26.8 | 26.5 |
+| managed | prefetch_gpu | not measured | not measured | not measured | not measured | 1,421 | 1,618 | 1,615 | 1,353 |
+| host_mapped | none | not measured | not measured | not measured | not measured | 26.7 | 26.8 | 26.8 | 26.7 |
+| system | none | not measured | not measured | not measured | not measured | 1,324 | 1,594 | 1,573 | 1,209 |
+| system | prefetch_gpu | not measured | not measured | not measured | not measured | 1,413 | 1,617 | 1,594 | 1,209 |
+| cuBLAS, device copies rotated | | not measured | not measured | not measured | not measured | 1,248 | 1,582 | 1,511 | 1,108 |
+
+The weight rotates over the copies the 1 GB buffer holds (32 of a 4096 x 4096 weight), so
+every row reads memory, not L2, and so does cuBLAS now. On device memory variant 0, one warp
+per row, is the best or tied on every shape (the rungs above it lose 5% at 4096 x 14336 and
+9% at 2304 x 5120); on migrated `malloc` pages variant 2's four loads in flight win the two
+small shapes, by 10% over variant 0 at 4096 x 4096. The GEMV beats cuBLAS's GEMM-as-GEMV on
+every shape, by 14% at 4096 x 4096 and 22% on the expert. `malloc` pages, migrated on fault
+or prefetched, read 1 to 7% below device memory at 4096 x 4096 and 11% below on the expert
+(1,209 against 1,353 GB/s), level on the two big shapes: the same pages, so the difference
+is how they are mapped, which this bench does not show. The 2304 x 5120 expert is 23.6 MB in 17.4 us, a short launch, which is where its
+1,353 GB/s comes from. A first run of the bench timed cuBLAS on a single device copy, so its
+weight sat in L2 (17.4 us for 33.5 MB); it now rotates device copies past L2 too.
 
 ### CPU-GPU round trip, median of 1000 (min in parentheses)
 
 | path | GB10 us | 5090 us |
 |---|---|---|
-| cudaMemcpyAsync 4 B up + 4 B down + sync | not measured | not measured |
-| poll_flag, launch + one trip | not measured | not measured |
-| ping_pong, host_mapped | not measured | not measured |
-| ping_pong, system | not measured | not measured |
-| ping_pong, managed, no advice | not measured | not measured |
-| ping_pong, managed, preferred_cpu + accessed_by | not measured | not measured |
+| cudaMemcpyAsync 4 B up + 4 B down + sync | not measured | 4.93 |
+| poll_flag, launch + one trip | not measured | 5.6 |
+| ping_pong, host_mapped | not measured | 1.49 (1.30) |
+| ping_pong, system | not measured | 1.50 (1.36) |
+| ping_pong, managed, no advice | not measured | 1.50 (1.12) |
+| ping_pong, managed, preferred_cpu + accessed_by | not measured | 1.50 (1.09) |
+
+On the 5090 a flag the host writes reaches a spinning kernel and its answer reaches the host
+in 1.5 us, whichever memory holds the flag, against 4.9 us for the copy-and-sync a decode
+loop uses today: about one PCIe read each way, and the GPU sees the flag on its first spin
+after the host's store (the bench counts one spin per trip). So the routing-on-a-core engine
+of the section above clears its 10 us bar even across PCIe; the Spark's number is still the
+one it is about.
 
 ## What to run first
 
-In this order, on the Spark, then the same on the 5090 for the other column:
+The 5090 column is done. In this order, on the Spark:
 
 1. `./build/bench_unified --kinds=device --skip-signal --mb=256` and read the caps line.
    `pageableMemoryAccess` decides whether the `system` kind is the real thing or the

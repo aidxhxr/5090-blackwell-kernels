@@ -8,11 +8,12 @@ query), the call sites in the three kernels. Bench: `bench_decode_spark`. Python
 `spark_kernels.ops.device_shape()`, `ops.split_k_for(...)`, `ops.fits_l2(...)`, test
 `tests/test_launch_config.py`.
 
-**Not measured.** This note was written before a GB10 was in reach and on a machine without
-nvcc. Nothing in it has run, on either card. Every number below is a byte count, a count of
-CTAs, or a division by 273 GB/s; none is a time. The one physical quantity the whole page
-turns on, the loaded DRAM latency of the GB10's LPDDR5X behind its unified fabric, has not
-been published by anyone, so it is a variable here and the first thing to measure.
+**Measured on the RTX 5090, not on the GB10.** Written before a GB10 was in reach; first run
+on the 5090 on 2026-10-23, at its own 170 SMs and with `SPARK_FORCE_SMS=48`. The results
+section has the 5090's numbers and the check that the refactored grids launch what the
+measured kernels launched before. Everything about the Spark itself (the loaded latency of
+its LPDDR5X, the splits it wants, the L2 second call) is still a byte count, a CTA count or
+a division by 273 GB/s, and the latency is still the first thing to measure there.
 
 ## What a decode kernel is on either card
 
@@ -193,32 +194,84 @@ that could be resident, and the design choice is the format, not the tile.
 
 ## Results
 
-Not measured. Columns to be filled by `bench_decode_spark` on the GB10; the floor is the
-weight's bytes at 273 GB/s.
+`bench_decode_spark` on the RTX 5090, 2026-10-23, median of 100 single launches, weights
+rotated past L2 (rows in `results/decode_spark.json`, the `SPARK_FORCE_SMS=48` run in
+`results/decode_spark_force48.json`). GB/s is the weight's bytes over the time; the roof is
+the bench's own `cudaMemcpy` measurement, 1,530 GB/s. The variant is each format's decode
+rung: `hgemm` 6, `w4gemm` 2, `w1gemm` 3 (the top one, new since this note was written; see
+[w1gemm](w1gemm.md)). The 48-SM column is the correctness check of the Spark's grids run on
+the 5090.
 
-| shape (M x N x K) | format | bytes (MB) | floor at 273 GB/s (us) | measured (us) | GB/s | % of spec | split chosen | best split (sweep) | 2nd call (us) |
-|---|---|---|---|---|---|---|---|---|---|
-| 1 x 6144 x 4096 | bf16 | 50.33 | 184 | not measured | | | 1 | | |
-| 1 x 6144 x 4096 | int4 | 12.98 | 48 | not measured | | | 1 | | |
-| 1 x 6144 x 4096 | 1 bit | 3.54 | 13 | not measured | | | in-block | | |
-| 1 x 4096 x 4096 | bf16 | 33.55 | 123 | not measured | | | 1 | | |
-| 1 x 4096 x 4096 | int4 | 8.65 | 32 | not measured | | | 1 | | |
-| 1 x 4096 x 4096 | 1 bit | 2.36 | 8.6 | not measured | | | in-block | | |
-| 1 x 28672 x 4096 | bf16 | 234.9 | 860 | not measured | | | 1 | | |
-| 1 x 28672 x 4096 | int4 | 60.56 | 222 | not measured | | | 1 | | |
-| 1 x 28672 x 4096 | 1 bit | 16.52 | 61 | not measured | | | in-block | | |
-| 1 x 4096 x 14336 | bf16 | 234.9 | 860 | not measured | | | 1 | | |
-| 1 x 4096 x 14336 | int4 | 59.64 | 218 | not measured | | | 1 | | |
-| 1 x 4096 x 14336 | 1 bit | 15.60 | 57 | not measured | | | in-block | | |
-| 1 x 2304 x 5120 | bf16 | 23.59 | 86 | not measured | | | 1 | | |
-| 1 x 2304 x 5120 | int4 | 6.08 | 22 | not measured | | | 1 | | |
-| 1 x 2304 x 5120 | 1 bit | 1.66 | 6.1 | not measured | | | in-block | | |
-| 1 x 5120 x 2304 | bf16 | 23.59 | 86 | not measured | | | 1 | | |
-| 1 x 5120 x 2304 | int4 | 6.08 | 22 | not measured | | | 1 | | |
-| 1 x 5120 x 2304 | 1 bit | 1.66 | 6.1 | not measured | | | in-block | | |
-| 16 x (each of the above) | all | same | same | not measured | | | same | | |
+| shape (M x N x K) | format | variant | us | GB/s | % of the copy roof | ok, 170 SMs | ok, 48-SM grids |
+|---|---|---|---|---|---|---|---|
+| 1 x 6144 x 4096 | bf16 | v6 | 33.7 | 1,495 | 98% | yes | yes |
+| 16 x 6144 x 4096 | bf16 | v6 | 33.7 | 1,495 | 98% | yes | yes |
+| 1 x 6144 x 4096 | int4 | v2 | 11.2 | 1,155 | 76% | yes | yes |
+| 16 x 6144 x 4096 | int4 | v2 | 13.3 | 977 | 64% | yes | yes |
+| 1 x 6144 x 4096 | 1 bit | v3 | 9.2 | 385 | 25% | yes | yes |
+| 16 x 6144 x 4096 | 1 bit | v3 | 11.2 | 315 | 21% | yes | yes |
+| 1 x 4096 x 4096 | bf16 | v6 | 23.5 | 1,429 | 93% | yes | yes |
+| 16 x 4096 x 4096 | bf16 | v6 | 23.4 | 1,432 | 94% | yes | yes |
+| 1 x 4096 x 4096 | int4 | v2 | 9.2 | 942 | 62% | yes | yes |
+| 16 x 4096 x 4096 | int4 | v2 | 11.2 | 775 | 51% | yes | yes |
+| 1 x 4096 x 4096 | 1 bit | v3 | 7.2 | 329 | 22% | yes | yes |
+| 16 x 4096 x 4096 | 1 bit | v3 | 9.2 | 255 | 17% | yes | yes |
+| 1 x 28672 x 4096 | bf16 | v6 | 146.2 | 1,606 | 105% | yes | yes |
+| 16 x 28672 x 4096 | bf16 | v6 | 148.3 | 1,584 | 104% | yes | yes |
+| 1 x 28672 x 4096 | int4 | v2 | 39.9 | 1,519 | 99% | yes | yes |
+| 16 x 28672 x 4096 | int4 | v2 | 41.9 | 1,446 | 94% | yes | yes |
+| 1 x 28672 x 4096 | 1 bit | v3 | 19.2 | 860 | 56% | yes | yes |
+| 16 x 28672 x 4096 | 1 bit | v3 | 33.7 | 490 | 32% | yes | yes |
+| 1 x 4096 x 14336 | bf16 | v6 | 72.5 | 1,619 | 106% | yes | yes |
+| 16 x 4096 x 14336 | bf16 | v6 | 74.4 | 1,579 | 103% | yes | yes |
+| 1 x 4096 x 14336 | int4 | v2 | 23.3 | 1,298 | 85% | yes | yes |
+| 16 x 4096 x 14336 | int4 | v2 | 26.0 | 1,165 | 76% | yes | yes |
+| 1 x 4096 x 14336 | 1 bit | v3 | 15.3 | 541 | 35% | yes | yes |
+| 16 x 4096 x 14336 | 1 bit | v3 | 30.7 | 269 | 18% | yes | yes |
+| 1 x 2304 x 5120 | bf16 | v6 | 17.4 | 1,353 | 88% | yes | yes |
+| 16 x 2304 x 5120 | bf16 | v6 | 19.3 | 1,225 | 80% | yes | yes |
+| 1 x 2304 x 5120 | int4 | v2 | 7.1 | 856 | 56% | yes | yes |
+| 16 x 2304 x 5120 | int4 | v2 | 13.3 | 458 | 30% | yes | yes |
+| 1 x 2304 x 5120 | 1 bit | v3 | 5.2 | 320 | 21% | yes | yes |
+| 16 x 2304 x 5120 | 1 bit | v3 | 9.2 | 179 | 12% | yes | yes |
+| 1 x 5120 x 2304 | bf16 | v6 | 17.3 | 1,363 | 89% | yes | yes |
+| 16 x 5120 x 2304 | bf16 | v6 | 17.2 | 1,368 | 89% | yes | yes |
+| 1 x 5120 x 2304 | int4 | v2 | 7.1 | 860 | 56% | yes | yes |
+| 16 x 5120 x 2304 | int4 | v2 | 9.1 | 667 | 44% | yes | yes |
+| 1 x 5120 x 2304 | 1 bit | v3 | 5.2 | 322 | 21% | yes | yes |
+| 16 x 5120 x 2304 | 1 bit | v3 | 7.3 | 227 | 15% | yes | yes |
 
-Per decode step of Llama-3-8B (32 layers' projections only, no lm_head, no attention, no
-cache): 13.96 GB at bf16, 51 ms at 273 GB/s; 3.60 GB at int4 with scales, 13.2 ms; 0.98 GB
-at 1 bit with scales, 3.6 ms. Those are the floors the step can be judged against once it
-runs; the kernels' share of the gap is what this bench will show.
+**The refactor launches what it launched before.** On 170 SMs the plan lines print the old
+constants (64 CTAs at 24 KB for `hgemm_decode`, 128 blocks at 12 KB for `w4gemm`, split 1
+everywhere but the 36-strip expert, split 2, which is `cdiv(64, 36)` as before), and the
+times match the README's decode and int4 tables, which were measured before the refactor:
+
+| shape | format | README | now |
+|---|---|---|---|
+| 1 x 4096 x 4096 | bf16 | 23.5 | 23.5 |
+| 16 x 4096 x 4096 | bf16 | 23.4 | 23.4 |
+| 1 x 6144 x 4096 | bf16 | 33.7 | 33.7 |
+| 1 x 28672 x 4096 | bf16 | 147.2 | 146.2 |
+| 1 x 4096 x 14336 | bf16 | 72.4 | 72.5 |
+| 1 x 6144 x 4096 | int4 | 11.2 | 11.2 |
+| 16 x 6144 x 4096 | int4 | 13.3 | 13.3 |
+| 1 x 4096 x 4096 | int4 | 9.1 | 9.2 |
+| 16 x 4096 x 4096 | int4 | 11.1 | 11.2 |
+| 1 x 28672 x 4096 | int4 | 39.7 | 39.9 |
+| 16 x 28672 x 4096 | int4 | 41.8 | 41.9 |
+| 1 x 4096 x 14336 | int4 | 23.3 | 23.3 |
+| 16 x 4096 x 14336 | int4 | 25.5 | 26.0 |
+
+`bench_w4gemm` itself on the same shapes, the same hour: 11.2, 13.2, 9.0, 11.2, 39.8, 41.9,
+23.4 and 27.4 us. The last one, 16 x 4096 x 14336, is the only row more than 2% off the README
+(7%), and `bench_decode_spark` timed it at 26.0 in the same session.
+
+**The 48-SM grids are correct.** With `SPARK_FORCE_SMS=48` every shape and format checks out
+against its reference. The times of that run say nothing about the Spark (the 5090's 1.5 TB/s
+and its own 1.57 MB of bytes in flight, so the split rule still picks this card's splits),
+but they show what the smaller grid costs here: `w4gemm` slows from 9.2 to 21.4 us at
+1 x 4096 x 4096 and 23.3 to 66.5 us at 1 x 4096 x 14336 on 384 slots instead of 1,360,
+`hgemm_decode` does not move, and `w1gemm` variant 3 moves at most 7%.
+
+On the Spark the columns to fill are still the ones above at 273 GB/s, the split sweep and the
+second-call ratio; the order is under "What to run first on the Spark".
