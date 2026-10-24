@@ -5,6 +5,7 @@
 //   ./bench_w1moe_decode                           # T = 1, 4, 8; bits 1 and 2; every variant
 //   ./bench_w1moe_decode --t=1 --bits=1 --variant=2 --iters=50
 //   ./bench_w1moe_decode --repeat-routing          # the same six experts twice back to back
+//   ./bench_w1moe_decode --chain=20                # also 20 calls per event pair
 //
 // One layer's routed experts are allocated at the requested width (1.91 GB at 1 bit, 3.61 GB
 // at ternary, packed plus scales) and filled with random codes and scales on the device: the
@@ -267,6 +268,11 @@ std::vector<float> to_host_f32(const __nv_bfloat16* d, size_t n) {
     return out;
 }
 
+// --chain=N: also time N calls between one event pair, the calls queued back to back as a
+// decode step queues its layers, so the launcher's host work (the scratch, the memset, three
+// launches) overlaps the previous call's kernels instead of sitting inside the event pair.
+int g_chain = 1;
+
 bool run_t(cudaStream_t stream, const Layer& L, int T, const std::vector<int>& variants, int iters,
            int n_routings, bool repeat_routing) {
     const int K = L.K, I = L.I, topk = kTopK;
@@ -363,6 +369,17 @@ bool run_t(cudaStream_t stream, const Layer& L, int T, const std::vector<int>& v
                      "bound %.0f tok/s at T=%d\n",
                      t.median_ms * 1e3 / floor_gb10_us, t.median_ms * 1e3 / floor_5090_us,
                      T * 1e3 / (40.0 * t.median_ms), T);
+        if (g_chain > 1 && v > 0 && !repeat_routing) {
+            const auto c = spark::bench::time_kernel(
+                [&] {
+                    for (int i = 0; i < g_chain; ++i) launch(routings[turn++ % n_routings]);
+                },
+                stream, 2, std::min(it, 20));
+            const double us = c.median_ms * 1e3 / g_chain;
+            std::fprintf(stderr,
+                         "    chain of %d: %.1f us per call, %.0f GB/s, %.2fx the 1,532 floor\n",
+                         g_chain, us, active / (us * 1e-6) / 1e9, us / floor_5090_us);
+        }
         all_ok = all_ok && ok;
     }
     for (auto& r : routings) {
@@ -381,6 +398,7 @@ int run(int argc, char** argv) {
     spark::bench::print_device_banner();
 
     const int iters = args.geti("iters", 20);
+    g_chain = std::max(1, args.geti("chain", 1));
     const int n_routings = std::max(1, args.geti("routings", 16));
     const bool repeat = args.has("repeat-routing");
     const int E = args.geti("experts", kExperts);

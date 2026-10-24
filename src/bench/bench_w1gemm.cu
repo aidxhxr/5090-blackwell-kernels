@@ -4,6 +4,9 @@
 //   ./bench_w1gemm                               # DeepSeek V4.1 Flash experts + a Llama row
 //   ./bench_w1gemm --m=1 --n=2304 --k=5120 --bits=1 --variant=2 --iters=50
 //   ./bench_w1gemm --bits=2                      # ternary rows only
+//   ./bench_w1gemm --moe                         # the grouped w1gemm_moe rows only
+//   ./bench_w1gemm --no-moe                      # the single-weight rows only
+//   ./bench_w1gemm --chain=20                    # also 20 launches per event pair
 //
 // For every weight shape the bench quantizes a random bf16 W [K, N] on the GPU
 // (w1_quantize_bf16) at 1 and at 2 bits, checks the codes and scales bit for bit against the
@@ -18,6 +21,16 @@
 // int4 path (w4gemm variant 2 on the same W, symmetric) is printed on stderr next to it.
 // gbps = the weight bytes streamed (packed + scales) per second.
 //
+// The grouped rows (w1gemm_moe) run DeepSeek V4.1 Flash's two expert GEMMs of one layer,
+// gate|up (K 5120, N 4608) and down (K 2304, N 5120), over 384 experts of random codes and
+// scales filled on the device (a layer of bf16 experts to quantize would be 27 GB), with T
+// tokens routed to 6 distinct experts each and the T * 6 rows sorted by expert. The
+// reference is the CPU product on the routed experts' codes copied back, for the first 12
+// sorted rows (all of them at T = 1). Consecutive timed launches take consecutive
+// routings, so each meets its experts cold. gbps there = the distinct experts' packed bytes
+// and scales over the time, and stderr has the floor of those bytes at 1,532 GB/s and the
+// time of the same rows as one w1gemm launch per routed expert.
+//
 // stdout: one JSON object per row (collected by scripts/run_all_benches.sh)
 // stderr: human-readable table incl. the speedups over the bf16 and the int4 paths
 
@@ -28,6 +41,8 @@
 #include <cstdio>
 #include <exception>
 #include <functional>
+#include <random>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -257,6 +272,20 @@ std::vector<float> to_host_f32(const __nv_bfloat16* d, size_t n) {
     return out;
 }
 
+// --chain=N: also time N launches between one event pair (the per-launch time of a decode
+// step's launches queued back to back), for every variant and for the bf16 and int4 paths.
+int g_chain = 1;
+
+// Per-launch time of `chain` launches between one event pair (median over `iters` pairs).
+double time_chain(const std::function<void()>& fn, cudaStream_t stream, int chain, int iters) {
+    const auto t = spark::bench::time_kernel(
+        [&] {
+            for (int i = 0; i < chain; ++i) fn();
+        },
+        stream, 2, iters);
+    return t.median_ms / chain;
+}
+
 // Runs every requested variant on one M against one weight. Returns false on a mismatch.
 bool run_m(cudaStream_t stream, const Weight& w, const W4Weight* w4, int M,
            const std::vector<int>& variants, int iters, bool skip_slow_v0) {
@@ -310,6 +339,21 @@ bool run_m(cudaStream_t stream, const Weight& w, const W4Weight* w4, int M,
                    stream, 5, iters)
                    .median_ms;
 
+    double c_bf16 = 0.0, c_w4 = 0.0;
+    if (g_chain > 1) {
+        if (hgemm_ok)
+            c_bf16 = time_chain([&] { spark::hgemm_bf16(dA, w.d(turn++), dC, M, N, K, 6, stream); },
+                                stream, g_chain, std::min(iters, 20));
+        if (w4 && spark::w4gemm_supports(M, N, K, 2))
+            c_w4 = time_chain(
+                [&] {
+                    spark::w4gemm_bf16(dA, w4->p(turn), w4->s(turn), nullptr, dC, M, N, K, 2,
+                                       stream);
+                    ++turn;
+                },
+                stream, g_chain, std::min(iters, 20));
+    }
+
     const std::string shape = std::to_string(M) + "x" + std::to_string(N) + "x" + std::to_string(K);
     const double wbytes = static_cast<double>(w.bytes_per_copy());
     const double flops = 2.0 * M * N * static_cast<double>(K);
@@ -356,8 +400,251 @@ bool run_m(cudaStream_t stream, const Weight& w, const W4Weight* w4, int M,
                      t_bf16 > 0 ? t_bf16 / t.median_ms : 0.0, t_bf16 * 1e3,
                      t_w4 > 0 ? t_w4 / t.median_ms : 0.0, t_w4 * 1e3, row.gbps,
                      2.0 * K * N / (t.median_ms * 1e-3) / 1e9);
+        if (g_chain > 1 && v > 0) {
+            const double c = time_chain(
+                [&] {
+                    spark::w1gemm_bf16(dA, w.p(turn), w.s(turn), dC, M, N, K, w.bits, v, stream);
+                    ++turn;
+                },
+                stream, g_chain, std::min(iters, 20));
+            std::fprintf(stderr,
+                         "    chain of %d: %.2f us per launch, %.0f GB/s | bf16 hgemm %.2f us | "
+                         "int4 w4gemm %.2f us\n",
+                         g_chain, c * 1e3, wbytes / (c * 1e-3) / 1e9, c_bf16 * 1e3, c_w4 * 1e3);
+        }
         all_ok = all_ok && ok;
     }
+    SPARK_CUDA_CHECK(cudaFree(dA));
+    SPARK_CUDA_CHECK(cudaFree(dC));
+    return all_ok;
+}
+
+// ---- the grouped form ------------------------------------------------------------------
+
+__host__ __device__ __forceinline__ uint32_t hash32(uint64_t v) {
+    v ^= v >> 33;
+    v *= 0xff51afd7ed558ccdull;
+    v ^= v >> 33;
+    v *= 0xc4ceb9fe1a85ec53ull;
+    v ^= v >> 33;
+    return static_cast<uint32_t>(v);
+}
+
+// Random packed words (at 2 bits the codes are 0, 1, 2, never 3) and bf16 scales in
+// [0.008, 0.024], the mean |w| of N(0, 0.02) weights give or take half.
+__global__ void fill_words_kernel(uint32_t* w, size_t n, int bits, uint64_t seed) {
+    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    uint32_t v = hash32(seed * 0x9E3779B97F4A7C15ull + i);
+    if (bits == 2) v &= ~((v & 0x55555555u) << 1);
+    w[i] = v;
+}
+
+__global__ void fill_scales_kernel(__nv_bfloat16* s, size_t n, uint64_t seed) {
+    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float u = (hash32(seed * 0x9E3779B97F4A7C15ull + i) >> 8) * (1.0f / 16777216.0f);
+    s[i] = __float2bfloat16(0.016f * (0.5f + u));
+}
+
+struct Experts {
+    int E = 0, N = 0, K = 0, bits = 1;
+    size_t words = 0, groups_n = 0;  // per expert
+    uint32_t* packed = nullptr;
+    __nv_bfloat16* scales = nullptr;
+    size_t bytes_per_expert() const { return words * 4 + groups_n * 2; }
+    void free_all() {
+        if (packed) SPARK_CUDA_CHECK(cudaFree(packed));
+        if (scales) SPARK_CUDA_CHECK(cudaFree(scales));
+    }
+};
+
+Experts make_experts(int E, int N, int K, int bits, cudaStream_t stream) {
+    Experts x;
+    x.E = E;
+    x.N = N;
+    x.K = K;
+    x.bits = bits;
+    x.words = static_cast<size_t>(N) * K * bits / 32;
+    x.groups_n = static_cast<size_t>(K / kG) * N;
+    x.packed = dmalloc<uint32_t>(x.words * E);
+    x.scales = dmalloc<__nv_bfloat16>(x.groups_n * E);
+    const size_t nw = x.words * E, ns = x.groups_n * E;
+    fill_words_kernel<<<static_cast<unsigned>((nw + 255) / 256), 256, 0, stream>>>(x.packed, nw,
+                                                                                   bits, 11 + N);
+    SPARK_CHECK_LAUNCH();
+    fill_scales_kernel<<<static_cast<unsigned>((ns + 255) / 256), 256, 0, stream>>>(x.scales, ns,
+                                                                                    13 + N);
+    SPARK_CHECK_LAUNCH();
+    SPARK_CUDA_CHECK(cudaStreamSynchronize(stream));
+    return x;
+}
+
+// T tokens, topk distinct experts each, as sorted rows: offsets [E + 1] and the expert of
+// every sorted row, on the host and the device.
+struct Routing {
+    std::vector<int32_t> offsets;
+    int distinct = 0;
+    int32_t* d_offsets = nullptr;
+};
+
+Routing make_routing(int T, int topk, int E, uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<int> pick(0, E - 1);
+    std::vector<int> count(E, 0);
+    for (int t = 0; t < T; ++t) {
+        std::set<int> chosen;
+        while (static_cast<int>(chosen.size()) < topk) chosen.insert(pick(rng));
+        for (int e : chosen) ++count[e];
+    }
+    Routing r;
+    r.offsets.assign(E + 1, 0);
+    for (int e = 0; e < E; ++e) {
+        r.offsets[e + 1] = r.offsets[e] + count[e];
+        r.distinct += count[e] > 0;
+    }
+    r.d_offsets = dmalloc<int32_t>(E + 1);
+    SPARK_CUDA_CHECK(
+        cudaMemcpy(r.d_offsets, r.offsets.data(), (E + 1) * 4, cudaMemcpyHostToDevice));
+    return r;
+}
+
+// Rows [0, check_rows) of the sorted product on the host, each with its expert's codes.
+std::vector<double> moe_reference(const Experts& x, const Routing& r, const std::vector<float>& hA,
+                                  int check_rows) {
+    const int N = x.N, K = x.K;
+    std::vector<double> ref(static_cast<size_t>(check_rows) * N, 0.0);
+    std::vector<uint32_t> pk(x.words);
+    std::vector<__nv_bfloat16> sc(x.groups_n);
+    for (int e = 0; e < x.E; ++e) {
+        const int tb = r.offsets[e], te = std::min(r.offsets[e + 1], check_rows);
+        if (tb >= te) continue;
+        SPARK_CUDA_CHECK(
+            cudaMemcpy(pk.data(), x.packed + e * x.words, x.words * 4, cudaMemcpyDeviceToHost));
+        SPARK_CUDA_CHECK(cudaMemcpy(sc.data(), x.scales + e * x.groups_n, x.groups_n * 2,
+                                    cudaMemcpyDeviceToHost));
+        for (int n = 0; n < N; ++n)
+            for (int k = 0; k < K; ++k) {
+                const float s = __bfloat162float(sc[static_cast<size_t>(k / kG) * N + n]);
+                const int q = code_of(pk, n, k, K, x.bits);
+                const double w = __bfloat162float(
+                    __float2bfloat16(x.bits == 1 ? (q ? s : -s) : s * static_cast<float>(q - 1)));
+                for (int m = tb; m < te; ++m)
+                    ref[static_cast<size_t>(m) * N + n] += hA[static_cast<size_t>(m) * K + k] * w;
+            }
+    }
+    return ref;
+}
+
+bool run_moe(cudaStream_t stream, const Experts& x, int T, const std::vector<int>& variants,
+             int iters, int n_routings) {
+    constexpr int kTopK = 6;
+    const int N = x.N, K = x.K, rows = T * kTopK;
+    const size_t nA = static_cast<size_t>(rows) * K, nC = static_cast<size_t>(rows) * N;
+    std::vector<float> hA(nA);
+    spark::bench::fill_uniform(hA, -1.0f, 1.0f, 4321 + T);
+    std::vector<__nv_bfloat16> hAb(nA);
+    for (size_t i = 0; i < nA; ++i) {
+        hAb[i] = __float2bfloat16(hA[i]);
+        hA[i] = __bfloat162float(hAb[i]);
+    }
+    __nv_bfloat16* dA = dmalloc<__nv_bfloat16>(nA);
+    __nv_bfloat16* dC = dmalloc<__nv_bfloat16>(nC);
+    SPARK_CUDA_CHECK(cudaMemcpy(dA, hAb.data(), nA * 2, cudaMemcpyHostToDevice));
+
+    std::vector<Routing> rs;
+    double distinct = 0.0;
+    for (int i = 0; i < n_routings; ++i) {
+        rs.push_back(make_routing(T, kTopK, x.E, 31 * T + i));
+        distinct += rs.back().distinct;
+    }
+    distinct /= n_routings;
+    const int check_rows = std::min(rows, 12);
+    const auto refd = moe_reference(x, rs[0], hA, check_rows);
+    std::vector<float> ref(refd.size());
+    double max_ref = 0.0;
+    for (size_t i = 0; i < refd.size(); ++i) {
+        ref[i] = static_cast<float>(refd[i]);
+        max_ref = std::max(max_ref, std::fabs(refd[i]));
+    }
+    const double tol = 2e-2 * max_ref + 1e-3;
+    const double active = distinct * static_cast<double>(x.bytes_per_expert());
+    const double floor_us = active / 1532e9 * 1e6;
+
+    // The same rows as one w1gemm launch per routed expert, the top variant.
+    int turn = 0;
+    const int top = spark::w1gemm_num_variants() - 1;
+    const double t_loop =
+        spark::bench::time_kernel(
+            [&] {
+                const Routing& r = rs[turn++ % n_routings];
+                for (int e = 0; e < x.E; ++e) {
+                    const int tb = r.offsets[e], te = r.offsets[e + 1];
+                    if (tb < te)
+                        spark::w1gemm_bf16(dA + static_cast<size_t>(tb) * K, x.packed + e * x.words,
+                                           x.scales + e * x.groups_n,
+                                           dC + static_cast<size_t>(tb) * N, te - tb, N, K, x.bits,
+                                           top, stream);
+                }
+            },
+            stream, 3, iters)
+            .median_ms;
+
+    const std::string shape = "moe_T" + std::to_string(T) + "_k6of" + std::to_string(x.E) + "_" +
+                              std::to_string(N) + "x" + std::to_string(K);
+    std::fprintf(stderr,
+                 "  T=%d: %d rows over %.1f distinct experts, %.1f MB active, floor %.1f us at "
+                 "1,532 GB/s; one w1gemm per expert %.1f us\n",
+                 T, rows, distinct, active / 1e6, floor_us, t_loop * 1e3);
+    bool all_ok = true;
+    for (int v : variants) {
+        if (v == 0 && T > 16) continue;
+        SPARK_CUDA_CHECK(cudaMemset(dC, 0, nC * 2));
+        spark::w1gemm_moe_bf16(dA, x.packed, x.scales, rs[0].d_offsets, dC, x.E, N, K, x.bits, v,
+                               stream, rows);
+        SPARK_CUDA_CHECK(cudaStreamSynchronize(stream));
+        const auto got = to_host_f32(dC, static_cast<size_t>(check_rows) * N);
+        const auto err = spark::bench::compare(got.data(), ref.data(), ref.size());
+        const bool ok = err.max_abs <= tol;
+        if (!ok)
+            std::fprintf(stderr, "  FAIL w1gemm_moe variant %d bits=%d %s: max_abs=%.4e tol=%.4e\n",
+                         v, x.bits, shape.c_str(), err.max_abs, tol);
+        const auto t = spark::bench::time_kernel(
+            [&] {
+                spark::w1gemm_moe_bf16(dA, x.packed, x.scales, rs[turn++ % n_routings].d_offsets,
+                                       dC, x.E, N, K, x.bits, v, stream, rows);
+            },
+            stream, 3, v == 0 ? std::min(iters, 5) : iters);
+        spark::bench::Row row;
+        row.kernel = "w1gemm_moe";
+        row.dtype = x.bits == 1 ? "w1a16" : "w2a16";
+        row.variant = v;
+        row.shape = shape;
+        row.median_ms = t.median_ms;
+        row.min_ms = t.min_ms;
+        row.gbps = active / (t.median_ms * 1e-3) / 1e9;
+        row.tflops = 2.0 * rows * N * static_cast<double>(K) / (t.median_ms * 1e-3) / 1e12;
+        row.ref_ms = t_loop;
+        row.max_abs_err = err.max_abs;
+        row.max_rel_err = err.max_rel;
+        row.ok = ok;
+        spark::bench::print_row(row);
+        std::fprintf(stderr, "    %.2fx the floor | %.2fx the per-expert w1gemm loop\n",
+                     t.median_ms * 1e3 / floor_us, t_loop / t.median_ms);
+        if (g_chain > 1 && v > 0) {
+            const double c = time_chain(
+                [&] {
+                    spark::w1gemm_moe_bf16(dA, x.packed, x.scales,
+                                           rs[turn++ % n_routings].d_offsets, dC, x.E, N, K, x.bits,
+                                           v, stream, rows);
+                },
+                stream, g_chain, std::min(iters, 20));
+            std::fprintf(stderr, "    chain of %d: %.2f us per launch, %.2fx the floor\n", g_chain,
+                         c * 1e3, c * 1e3 / floor_us);
+        }
+        all_ok = all_ok && ok;
+    }
+    for (auto& r : rs) SPARK_CUDA_CHECK(cudaFree(r.d_offsets));
     SPARK_CUDA_CHECK(cudaFree(dA));
     SPARK_CUDA_CHECK(cudaFree(dC));
     return all_ok;
@@ -382,9 +669,15 @@ int run(int argc, char** argv) {
         // K = 5120, N = 2304 and down is K = 2304, N = 5120; decode (1, 8 tokens, the 6 active
         // experts of one token or a small batch) to a 64-token chunk of a prefill. Then one
         // dense Llama-3-8B row, the fused gate|up at M = 1, next to bench_w4gemm's.
-        weights = {{2304, 5120, {1, 8, 16, 64}}, {5120, 2304, {1, 8, 16, 64}}, {28672, 4096, {1}}};
+        weights = {{2304, 5120, {1, 2, 4, 8, 16, 64}},
+                   {5120, 2304, {1, 2, 4, 8, 16, 64}},
+                   {4096, 4096, {1, 16}},
+                   {28672, 4096, {1, 16}}};
     }
+    const bool moe_only = args.has("moe"), dense = !moe_only;
+    const bool moe = moe_only || (!custom && !args.has("no-moe"));
     const int iters = args.geti("iters", 50);
+    g_chain = std::max(1, args.geti("chain", 1));
     std::vector<int> variants;
     if (args.has("variant"))
         variants.push_back(args.geti("variant", 2));
@@ -400,6 +693,7 @@ int run(int argc, char** argv) {
     spark::bench::print_header();
     bool all_ok = true;
     for (const auto& ws : weights) {
+        if (!dense) break;
         const auto hW = random_weight(ws.N, ws.K);
         W4Weight w4 = make_w4(hW, ws.N, ws.K, stream);
         for (int bits : bits_list) {
@@ -410,6 +704,20 @@ int run(int argc, char** argv) {
             w.free_all();
         }
         w4.free_all();
+    }
+    if (moe) {
+        // DeepSeek V4.1 Flash, one layer: gate|up [5120 -> 2 x 2304] and down [2304 -> 5120].
+        const int E = args.geti("experts", 384);
+        const int n_routings = std::max(1, args.geti("routings", 16));
+        for (int bits : bits_list)
+            for (const auto& nk : {std::pair<int, int>{4608, 5120}, {5120, 2304}}) {
+                Experts x = make_experts(E, nk.first, nk.second, bits, stream);
+                std::fprintf(stderr, "  experts: %d x %dx%d bits=%d, %.2f GB\n", E, nk.second,
+                             nk.first, bits, x.bytes_per_expert() * static_cast<double>(E) / 1e9);
+                for (int T : {1, 4, 16, 64})
+                    all_ok = run_moe(stream, x, T, variants, iters, n_routings) && all_ok;
+                x.free_all();
+            }
     }
     if (!all_ok) {
         std::fprintf(stderr, "CORRECTNESS FAILURE\n");
