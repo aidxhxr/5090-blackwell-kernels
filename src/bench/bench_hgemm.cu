@@ -5,6 +5,7 @@
 //   ./bench_hgemm --m=4096 --n=4096 --k=4096 --bias --act=gelu --residual   # fused epilogue
 //   ./bench_hgemm --m=16 --n=22016 --k=4096 --swiglu   # interleaved gate/up, C is [16][11008]
 //   ./bench_hgemm --models[=llama3-8b] [--ms=128,512] [--tiles]   # real projection shapes
+//   ./bench_hgemm --models --ms=128 --split=2,4,8 --tiles --v6only  # split-K sweep
 //
 // Fused rows (--bias, --act=silu|gelu|relu, --residual, --accumulate for C += ..., --swiglu;
 // variant 6 unless --variant says otherwise) are validated against the fused math applied on
@@ -23,6 +24,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -506,7 +508,9 @@ const FusedRow fused_rows[] = {
 // rotated over copies that exceed L2 whenever one copy would fit, as a real forward pass
 // sees each layer's weight once. Rows are "MxNxK@label" with label v3, v4, v5, v6old
 // (variant 6's route before this sweep), v6 (the default, the per-shape rule) and, with --tiles,
-// v6t<n> (TMA tile n forced).
+// v6t<n> (TMA tile n forced). v6nosplit is the default with the split-K off, listed only
+// where the rule splits; --split=<S,...> adds v6s<S> (S K-slices forced) and, with --tiles,
+// v6t<n>s<S>; --v6only leaves out v3 to v6old.
 
 // The weight list and the two helpers below are shared with bench_fp8gemm --models
 // (model_shapes.hpp).
@@ -534,9 +538,42 @@ void fill_uniform_dev(__nv_bfloat16* p, size_t n, unsigned seed) {
     SPARK_CUDA_CHECK(cudaGetLastError());
 }
 
+// --queued=<n>: each sample is n launches back to back between one pair of events, divided by
+// n. Single launches between events fall on a grid of about 2 us here, which hides the
+// differences a split-K sweep is after; queued launches overlap one launch's ramp-down with
+// the next one's start, so they read lower than single ones. For sweeps only: the rows of
+// the results files are single launches, like every other bench.
+spark::bench::Timing time_queued(const std::function<void()>& fn, cudaStream_t stream, int n,
+                                 int iters) {
+    spark::bench::ramp_clocks(fn, stream);
+    cudaEvent_t start, stop;
+    SPARK_CUDA_CHECK(cudaEventCreate(&start));
+    SPARK_CUDA_CHECK(cudaEventCreate(&stop));
+    for (int i = 0; i < n; ++i) fn();
+    std::vector<float> samples;
+    for (int i = 0; i < iters; ++i) {
+        SPARK_CUDA_CHECK(cudaEventRecord(start, stream));
+        for (int j = 0; j < n; ++j) fn();
+        SPARK_CUDA_CHECK(cudaEventRecord(stop, stream));
+        SPARK_CUDA_CHECK(cudaEventSynchronize(stop));
+        float ms = 0.f;
+        SPARK_CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
+        samples.push_back(ms / n);
+    }
+    SPARK_CUDA_CHECK(cudaEventDestroy(start));
+    SPARK_CUDA_CHECK(cudaEventDestroy(stop));
+    std::sort(samples.begin(), samples.end());
+    spark::bench::Timing t;
+    t.iters = iters;
+    t.min_ms = samples.front();
+    t.median_ms = samples[samples.size() / 2];
+    return t;
+}
+
 // One weight at every M of `ms`. Returns false on a correctness failure.
 bool run_models_weight(cublasHandle_t handle, cudaStream_t stream, const ModelWeight& w,
-                       const std::vector<int>& ms, bool tiles, int iters) {
+                       const std::vector<int>& ms, bool tiles, const std::vector<int>& splits,
+                       bool v6only, int queued, int iters) {
     const int N = w.N, K = w.K;
     const int max_m = *std::max_element(ms.begin(), ms.end());
     const size_t nB = static_cast<size_t>(K) * N;
@@ -558,23 +595,34 @@ bool run_models_weight(cublasHandle_t handle, cudaStream_t stream, const ModelWe
         SPARK_CUDA_CHECK(cudaMemcpy(dB + c * nB, dB, b_bytes, cudaMemcpyDeviceToDevice));
     SPARK_CUDA_CHECK(cudaDeviceSynchronize());
 
-    // The candidates: label, variant, v6 route.
+    // The candidates: label, variant, v6 route, v6 split.
     struct Cand {
         std::string label;
         int variant;
         int route;
+        int split = spark::HGEMM_V6_SPLIT_RULE;
     };
-    std::vector<Cand> cands = {{"v3", 3, spark::HGEMM_V6_ROUTE_DEFAULT},
-                               {"v4", 4, spark::HGEMM_V6_ROUTE_DEFAULT},
-                               {"v5", 5, spark::HGEMM_V6_ROUTE_DEFAULT},
-                               {"v6old", 6, spark::HGEMM_V6_ROUTE_LEGACY},
-                               {"v6", 6, spark::HGEMM_V6_ROUTE_DEFAULT}};
+    std::vector<Cand> cands;
+    if (!v6only)
+        cands = {{"v3", 3, spark::HGEMM_V6_ROUTE_DEFAULT},
+                 {"v4", 4, spark::HGEMM_V6_ROUTE_DEFAULT},
+                 {"v5", 5, spark::HGEMM_V6_ROUTE_DEFAULT},
+                 {"v6old", 6, spark::HGEMM_V6_ROUTE_LEGACY}};
+    cands.push_back({"v6nosplit", 6, spark::HGEMM_V6_ROUTE_DEFAULT, spark::HGEMM_V6_SPLIT_OFF});
+    cands.push_back({"v6", 6, spark::HGEMM_V6_ROUTE_DEFAULT});
     if (tiles)
         for (int t = 0; t < spark::hgemm_v6_num_tiles(); ++t)
-            cands.push_back({"v6t" + std::to_string(t), 6, t});
+            cands.push_back({"v6t" + std::to_string(t), 6, t, spark::HGEMM_V6_SPLIT_OFF});
+    for (int sp : splits) {
+        cands.push_back({"v6s" + std::to_string(sp), 6, spark::HGEMM_V6_ROUTE_DEFAULT, sp});
+        if (tiles)
+            for (int t = 0; t < spark::hgemm_v6_num_tiles(); ++t)
+                cands.push_back({"v6t" + std::to_string(t) + "s" + std::to_string(sp), 6, t, sp});
+    }
 
     bool all_ok = true;
     const int saved_route = spark::hgemm_v6_route();
+    const int saved_split = spark::hgemm_v6_split();
     for (int M : ms) {
         const size_t nc = static_cast<size_t>(M) * N;
         const std::string shape =
@@ -584,22 +632,34 @@ bool run_models_weight(cublasHandle_t handle, cudaStream_t stream, const ModelWe
         cublas_gemm(handle, dA, dB, dRef, M, N, K);
         int turn = 0;
         auto next_b = [&] { return dB + static_cast<size_t>(turn++ % copies) * nB; };
-        const auto t_ref = spark::bench::time_kernel(
-            [&] { cublas_gemm(handle, dA, next_b(), dC, M, N, K); }, stream, 5, iters);
+        auto timed = [&](const std::function<void()>& fn) {
+            return queued > 0 ? time_queued(fn, stream, queued, iters)
+                              : spark::bench::time_kernel(fn, stream, 5, iters);
+        };
+        const auto t_ref = timed([&] { cublas_gemm(handle, dA, next_b(), dC, M, N, K); });
         const double flops = 2.0 * M * N * static_cast<double>(K);
         std::fprintf(stderr, "    cuBLAS %.4f ms, %.1f TFLOPS\n", t_ref.median_ms,
                      flops / (t_ref.median_ms * 1e-3) / 1e12);
+        std::vector<std::string> v6_seen;  // what the v6 rows ran so far at this M
         for (const auto& c : cands) {
             if (!spark::hgemm_supports(M, N, K, c.variant)) continue;
-            if (c.route >= 0) {
-                // A forced tile that does not divide N falls back to the rule, and a forced
-                // tile the rule picks anyway is the v6 row: skip both duplicates.
-                spark::hgemm_v6_set_route(spark::HGEMM_V6_ROUTE_DEFAULT);
-                const std::string by_rule = spark::hgemm_v6_route_name(M, N, K);
-                spark::hgemm_v6_set_route(c.route);
-                if (by_rule == spark::hgemm_v6_route_name(M, N, K)) continue;
-            }
             spark::hgemm_v6_set_route(c.route);
+            spark::hgemm_v6_set_split(c.split);
+            if (c.variant == 6 && c.label != "v6old") {
+                // A forced tile or split that lands on a route an earlier v6 row ran (the
+                // rule picks it anyway, or the tile does not divide N) is a duplicate: skip it.
+                // v6nosplit is kept only where the rule splits, next to the v6 row.
+                const std::string name = spark::hgemm_v6_route_name(M, N, K);
+                if (c.label == "v6nosplit") {
+                    spark::hgemm_v6_set_split(spark::HGEMM_V6_SPLIT_RULE);
+                    const bool same = name == spark::hgemm_v6_route_name(M, N, K);
+                    spark::hgemm_v6_set_split(c.split);
+                    if (same) continue;
+                } else if (std::find(v6_seen.begin(), v6_seen.end(), name) != v6_seen.end()) {
+                    continue;
+                }
+                v6_seen.push_back(name);
+            }
             SPARK_CUDA_CHECK(cudaMemsetAsync(dC, 0, nc * sizeof(__nv_bfloat16), stream));
             spark::hgemm_bf16(dA, dB, dC, M, N, K, c.variant, stream);
             const auto err = max_err_dev(dC, dRef, nc, scratch, stream);
@@ -610,9 +670,8 @@ bool run_models_weight(cublasHandle_t handle, cudaStream_t stream, const ModelWe
                              c.label.c_str(), err.first, tol);
             all_ok = all_ok && ok;
             turn = 0;
-            const auto t = spark::bench::time_kernel(
-                [&] { spark::hgemm_bf16(dA, next_b(), dC, M, N, K, c.variant, stream); }, stream, 5,
-                iters);
+            const auto t =
+                timed([&] { spark::hgemm_bf16(dA, next_b(), dC, M, N, K, c.variant, stream); });
             spark::bench::Row row;
             row.kernel = "hgemm_models";
             row.dtype = "bf16";
@@ -633,6 +692,7 @@ bool run_models_weight(cublasHandle_t handle, cudaStream_t stream, const ModelWe
         }
     }
     spark::hgemm_v6_set_route(saved_route);
+    spark::hgemm_v6_set_split(saved_split);
     for (auto* d : {dA, dB, dC, dRef}) SPARK_CUDA_CHECK(cudaFree(d));
     SPARK_CUDA_CHECK(cudaFree(scratch));
     return all_ok;
@@ -681,13 +741,20 @@ int run(int argc, char** argv) {
     spark::bench::print_header();
     bool all_ok = true;
     if (args.has("models")) {
-        // --models[=<model substring>] [--ms=128,256,...] [--tiles]
+        // --models[=<model substring>] [--ms=128,256,...] [--tiles] [--split=2,4,...]
+        // [--v6only] [--weights=<name substring>] [--queued=<n>]
         const std::string filter = args.get("models", "1");
+        const std::string wfilter = args.get("weights", "");
         const std::vector<int> ms = parse_int_list(args.get("ms", "128,256,512,1024,2048,4096"));
+        const std::vector<int> splits = parse_int_list(args.get("split", ""));
         SPARK_REQUIRE(!ms.empty(), "--ms: expected a comma-separated list of M");
         for (const auto& w : model_weights()) {
             if (filter != "1" && std::string(w.model).find(filter) == std::string::npos) continue;
-            all_ok = run_models_weight(handle, stream, w, ms, args.has("tiles"), iters) && all_ok;
+            if (!wfilter.empty() && std::string(w.name).find(wfilter) == std::string::npos)
+                continue;
+            all_ok = run_models_weight(handle, stream, w, ms, args.has("tiles"), splits,
+                                       args.has("v6only"), args.geti("queued", 0), iters) &&
+                     all_ok;
         }
     } else if (fused.any()) {
         const int v = args.has("variant") ? args.geti("variant", 6) : 6;
