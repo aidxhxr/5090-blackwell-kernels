@@ -57,6 +57,7 @@
 // scales [E, K / 128, 2I]; down packed [E, K, I bits / 32], scales [E, I / 128, K].
 #include <algorithm>
 #include <cstdint>
+#include <mutex>
 
 #include "spark/common.cuh"
 #include "spark/kernels.h"
@@ -532,13 +533,38 @@ __global__ void f32_to_bf16_kernel(const float* __restrict__ src, __nv_bfloat16*
     if (i < n) dst[i] = __float2bfloat16(src[i]);
 }
 
+// A stream-ordered pool of this file's own that keeps what it was given. The device's
+// default pool returns its memory to the driver whenever the device synchronizes (release
+// threshold 0), so after every sync a cudaMallocAsync maps pages again: 65 us of host time
+// per call on the 5090, in front of a 57 us kernel, which the bench's events counted. One
+// pool per device, created on first use, never destroyed (it holds one call's scratch).
+cudaMemPool_t scratch_pool() {
+    static std::mutex mu;
+    static cudaMemPool_t pools[64] = {};
+    int dev = 0;
+    SPARK_CUDA_CHECK(cudaGetDevice(&dev));
+    SPARK_REQUIRE(dev >= 0 && dev < 64, "w1moe_decode: device index out of range");
+    const std::lock_guard<std::mutex> lock(mu);
+    if (!pools[dev]) {
+        cudaMemPoolProps props = {};
+        props.allocType = cudaMemAllocationTypePinned;
+        props.location.type = cudaMemLocationTypeDevice;
+        props.location.id = dev;
+        SPARK_CUDA_CHECK(cudaMemPoolCreate(&pools[dev], &props));
+        uint64_t keep = UINT64_MAX;
+        SPARK_CUDA_CHECK(
+            cudaMemPoolSetAttribute(pools[dev], cudaMemPoolAttrReleaseThreshold, &keep));
+    }
+    return pools[dev];
+}
+
 // Stream-ordered scratch memory, freed when the launcher returns (the free is queued after
 // the kernels, so the buffer lives until they finish).
 struct Scratch {
     void* p = nullptr;
     cudaStream_t stream;
     Scratch(size_t bytes, cudaStream_t s) : stream(s) {
-        SPARK_CUDA_CHECK(cudaMallocAsync(&p, bytes, stream));
+        SPARK_CUDA_CHECK(cudaMallocFromPoolAsync(&p, bytes, scratch_pool(), stream));
     }
     ~Scratch() {
         if (p) cudaFreeAsync(p, stream);
@@ -551,10 +577,13 @@ void launch_fused(const __nv_bfloat16* x, const int32_t* ids, const __nv_bfloat1
                   const uint32_t* packed_dn, const __nv_bfloat16* scales_dn, float* yacc, int T,
                   int topk, int K, int I, cudaStream_t stream) {
     const int n_items = T * topk * (I / kG);
-    int per_sm = 1;
-    SPARK_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-        &per_sm, w1moe_fused_kernel<BITS, FOLD>, kThreads, 0));
-    const int grid = std::min(n_items, std::max(1, per_sm) * num_sms());
+    static const int per_sm = [] {
+        int v = 1;
+        SPARK_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &v, w1moe_fused_kernel<BITS, FOLD>, kThreads, 0));
+        return std::max(1, v);
+    }();
+    const int grid = std::min(n_items, per_sm * num_sms());
     w1moe_fused_kernel<BITS, FOLD><<<grid, kThreads, 0, stream>>>(
         x, ids, wts, packed_gu, scales_gu, packed_dn, scales_dn, yacc, T, topk, K, I, n_items);
     SPARK_CHECK_LAUNCH();
