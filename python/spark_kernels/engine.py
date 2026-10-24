@@ -49,11 +49,19 @@ running request samples, the steps run `sk.sample` over every slot (a greedy slo
 its argmax) from a second set of captured graphs. Each request draws from its own Philox
 stream (its seed) at the offset of the token's index in its output, so its random draws do
 not depend on what else is in the batch, on which slot it runs in, or on being preempted.
-The logits they are drawn from can: paged_decode splits the keys of the whole batch over the
-SMs, and a mixed step's decode row and a resumed sequence's first token go through
-attention_varlen, so another schedule rounds them differently. Greedy and sampled tokens
-alike can change at a near tie (top logits one bf16 ulp apart), and the run goes on from
-there; the same schedule gives the same tokens every time.
+By default the logits they are drawn from can: hgemm picks its kernel, tile and K split from
+M (the tokens in the forward), paged_decode splits the keys of the whole batch over the SMs,
+and a resumed sequence's tokens and a verify forward's rows go through attention_varlen, so
+another schedule rounds them differently. Greedy and sampled tokens alike can change at a
+near tie (top logits one bf16 ulp apart), and the run goes on from there; the same schedule
+gives the same tokens every time. With `batch_invariant` (SparkModel, Engine, or
+SPARK_BATCH_INVARIANT=1) the model runs kernels whose bits for a row do not depend on the
+batch: hgemm variant 7 (no K split at any M) and variant 2 of paged_decode and
+attention_varlen (a sequence's keys in fixed 256-key chunks folded in order, the same
+arithmetic in both). A request's logits are then the same bits in any schedule: alone or in
+a full batch, in any slot or graph bucket, with its prompt chunked or its prefix cached,
+preempted and resumed, or verified by speculative decoding. bf16 weights and cache only;
+docs/design/batch_invariant.md has what it costs.
 
 Weights: `ModelWeights.random()` draws every matrix on the GPU. w_gate_up is stored in the
 interleaved layout of `interleave_gate_up` (gate_j at column 2j, up_j at 2j + 1), the layout
@@ -63,6 +71,7 @@ interleaved layout of `interleave_gate_up` (gate_j at column 2j, up_j at 2j + 1)
 from __future__ import annotations
 
 import math
+import os
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -271,12 +280,26 @@ class SparkModel:
     bf16 lm_head (decode steps and the quantized GEMMs are not affected). 4 keeps the prefill
     off the TMA kernels, whose first launch takes 3.4 GiB of device memory outside torch's
     allocator: what a 100K-token cache next to the bf16 weights on a 32 GB card does not
-    have (docs/design/llm_models.md)."""
+    have (docs/design/llm_models.md).
+
+    `batch_invariant` (default: the SPARK_BATCH_INVARIANT environment variable, off) runs
+    the kernels whose bits for a row do not depend on the batch: hgemm variant 7 for every
+    GEMM (no K split at any M), paged_decode and attention_varlen variant 2 (a sequence's
+    keys in fixed chunks, folded in order, the same arithmetic in both). A token's logits
+    are then the same whatever else is in its forward. bf16 weights and a bf16 cache only;
+    `prefill_variant` is not used in this mode (docs/design/batch_invariant.md)."""
 
     context_prefill = True  # prefill rows may continue a cached context (attention_varlen)
 
     def __init__(self, weights: ModelWeights, rope: RoPE, weights_format: str = "bf16",
-                 keep_bf16: bool = False, head_format: str = "bf16", prefill_variant: int = -1):
+                 keep_bf16: bool = False, head_format: str = "bf16", prefill_variant: int = -1,
+                 batch_invariant: bool | None = None):
+        if batch_invariant is None:
+            batch_invariant = os.environ.get("SPARK_BATCH_INVARIANT", "0") not in ("", "0")
+        if batch_invariant and (weights_format != "bf16" or head_format != "bf16"):
+            raise ValueError("batch_invariant covers bf16 weights only (the quantized GEMMs "
+                             "pick their kernels from M)")
+        self.batch_invariant = bool(batch_invariant)
         self.w = weights
         self.rope = rope
         self.prefill_variant = prefill_variant
@@ -338,22 +361,37 @@ class SparkModel:
         return ModelWeights(embed=self.w.embed, layers=layers, final_norm=self.w.final_norm,
                             lm_head=head)
 
+    def set_batch_invariant(self, on: bool) -> None:
+        """Switches the batch-invariant kernels on or off (see the class docstring)."""
+        if on and (self.lin is not None or self.head is not None):
+            raise ValueError("batch_invariant covers bf16 weights only")
+        self.batch_invariant = bool(on)
+
+    def _gemm_variant(self, decode: bool) -> int:
+        if self.batch_invariant:
+            return 7  # hgemm's batch-invariant rung
+        return -1 if decode else self.prefill_variant
+
     def _attention(self, qkv, x, b: Batch, cache: PagedKVCache, layer: int, decode: bool):
         kc, vc, sc = cache.k[layer], cache.v[layer], cache.scales(layer)
+        if self.batch_invariant and sc:
+            raise ValueError("batch_invariant covers a bf16 cache only")
+        av = 2 if self.batch_invariant else -1  # the paged ops' batch-invariant rung
         q = sk.rope_append_paged_(qkv, self.rope.cos, self.rope.sin, b.positions, b.slots,
                                   kc, vc, N_HEADS, N_KV_HEADS, **sc)
         if decode:
-            o = sk.paged_decode(q, kc, vc, b.block_table, b.seq_lens, **sc)
+            o = sk.paged_decode(q, kc, vc, b.block_table, b.seq_lens, av, **sc)
         elif b.n_dec:
-            o = self._mixed_attention(q, kc, vc, b, sc)
+            o = self._mixed_attention(q, kc, vc, b, sc, av)
         else:
-            o = sk.attention_varlen(q, kc, vc, b.cu_seqlens, b.seq_lens, b.block_table, **sc)
+            o = sk.attention_varlen(q, kc, vc, b.cu_seqlens, b.seq_lens, b.block_table,
+                                    variant=av, **sc)
         return o.view(x.shape[0], Q_WIDTH)
 
     def _layers(self, x: torch.Tensor, b: Batch, cache: PagedKVCache, decode: bool):
         if self.lin is not None:
             return self._layers_quant(x, b, cache, decode)
-        v = -1 if decode else self.prefill_variant
+        v = self._gemm_variant(decode)
         for layer, w in enumerate(self.w.layers):
             h = sk.rmsnorm(x, w.attn_norm, EPS)
             qkv = sk.hgemm(h, w.w_qkv, v)
@@ -367,7 +405,7 @@ class SparkModel:
         return x
 
     @staticmethod
-    def _mixed_attention(q, kc, vc, b: Batch, sc: dict) -> torch.Tensor:
+    def _mixed_attention(q, kc, vc, b: Batch, sc: dict, variant: int = -1) -> torch.Tensor:
         """A mixed step's attention: the prompts' rows through attention_varlen and the
         decode rows (one per sequence, at the end) through paged_decode. attention_varlen
         would give each decode row a whole 128-row query tile, 128x the work it needs."""
@@ -375,8 +413,9 @@ class SparkModel:
         tp = q.shape[0] - b.n_dec
         o = torch.empty_like(q)
         o[:tp] = sk.attention_varlen(q[:tp], kc, vc, b.cu_seqlens[:nb + 1], b.seq_lens[:nb],
-                                     b.block_table[:nb], **sc)
-        o[tp:] = sk.paged_decode(q[tp:], kc, vc, b.block_table[nb:], b.seq_lens[nb:], **sc)
+                                     b.block_table[:nb], variant=variant, **sc)
+        o[tp:] = sk.paged_decode(q[tp:], kc, vc, b.block_table[nb:], b.seq_lens[nb:], variant,
+                                 **sc)
         return o
 
     def _layers_quant(self, x: torch.Tensor, b: Batch, cache: PagedKVCache, decode: bool):
@@ -407,25 +446,26 @@ class SparkModel:
         launch would keep the address of a freed buffer. After this the buffer has its final
         size for every M a graphed decode step (and any prefill of <= 64 tokens) runs."""
         w = self.w.layers[0]
+        v = self._gemm_variant(True)
         for m in range(max_m, 0, -1):
             x = torch.zeros(m, HIDDEN, device=w.w_qkv.device, dtype=torch.bfloat16)
-            sk.hgemm(x, w.w_qkv)
-            sk.hgemm(x.new_zeros(m, Q_WIDTH), w.w_o, residual=x, out=x.clone())
-            sk.hgemm_swiglu(x, w.w_gate_up)
-            sk.hgemm(x.new_zeros(m, INTERMEDIATE), w.w_down, residual=x, out=x.clone())
-            sk.hgemm(x, self.w.lm_head)
+            sk.hgemm(x, w.w_qkv, v)
+            sk.hgemm(x.new_zeros(m, Q_WIDTH), w.w_o, v, residual=x, out=x.clone())
+            sk.hgemm_swiglu(x, w.w_gate_up, v)
+            sk.hgemm(x.new_zeros(m, INTERMEDIATE), w.w_down, v, residual=x, out=x.clone())
+            sk.hgemm(x, self.w.lm_head, v)
 
     def prefill(self, b: Batch, cache: PagedKVCache, all_logits: bool = False) -> torch.Tensor:
         """Logits [B, V] of each prompt's last token, or [T, V] of every packed token with
         `all_logits`; the prompts' K/V land in the cache."""
         x = F.embedding(b.ids, self.w.embed)
         x = self._layers(x, b, cache, decode=False)
-        return self._logits(x if all_logits else x[b.last], self.prefill_variant)
+        return self._logits(x if all_logits else x[b.last], self._gemm_variant(False))
 
     def decode(self, b: Batch, cache: PagedKVCache) -> torch.Tensor:
         """Logits [B, V] of one token per sequence, appended to the cache first."""
         x = F.embedding(b.ids, self.w.embed)
-        return self._logits(self._layers(x, b, cache, decode=True))
+        return self._logits(self._layers(x, b, cache, decode=True), self._gemm_variant(True))
 
 
 class TorchModel:
@@ -649,7 +689,16 @@ class Engine:
 
     `kv_format="fp8"` keeps the cache in e4m3 (PagedKVCache), twice the tokens for the same
     `cache_bytes`; `kv_scales` = (k_scale, v_scale), [n_layers, 8] each, replaces the default
-    scales of 1."""
+    scales of 1.
+
+    `batch_invariant=True` (or False) switches the model to the batch-invariant kernels (or
+    off them) before anything is captured; None keeps the model's setting (SparkModel reads
+    SPARK_BATCH_INVARIANT). In that mode a request's logits, token by token, are the same
+    bits whatever else shares its steps: with any batch, slot or bucket, a chunked prompt, a
+    prefix taken from the cache, after a preemption, and in a verify forward of speculative
+    decoding. It needs SparkModel with bf16 weights and a bf16 cache. `log_logits` keeps
+    every generated token's logits row, per sequence id in `logit_log` (a test hook: a long
+    run keeps them all)."""
 
     def __init__(self, model, n_layers: int, max_batch: int = 64, max_seq: int = 4096,
                  num_pages: int | None = None, page: int = PAGE, cache_bytes: int | None = None,
@@ -658,9 +707,18 @@ class Engine:
                  stop_ids: list[int] | None = None, preempt: bool = True,
                  speculative: int = 0, prefix_cache: bool | None = None,
                  device="cuda", kv_format: str = "bf16",
-                 kv_scales: tuple[torch.Tensor, torch.Tensor] | None = None):
+                 kv_scales: tuple[torch.Tensor, torch.Tensor] | None = None,
+                 batch_invariant: bool | None = None, log_logits: bool = False):
         if max_batch > BUCKETS[-1]:
             raise ValueError(f"max_batch is at most {BUCKETS[-1]}")
+        if batch_invariant is not None:
+            if not hasattr(model, "set_batch_invariant"):
+                if batch_invariant:
+                    raise ValueError("batch_invariant needs a SparkModel")
+            else:
+                model.set_batch_invariant(batch_invariant)
+        if getattr(model, "batch_invariant", False) and kv_format != "bf16":
+            raise ValueError("batch_invariant covers a bf16 cache only")
         # a decode step runs a whole bucket, so the per-slot buffers are bucket sized
         max_batch = next(x for x in BUCKETS if x >= max_batch)
         if num_pages is None:
@@ -741,6 +799,9 @@ class Engine:
         self.sample_graphs: dict[int, torch.cuda.CUDAGraph] = {}  # sk.sample steps
         # (sequence ids, device tensor of their new tokens) per forward, when log_tokens
         self.log: list[tuple[list[int], torch.Tensor]] | None = [] if log_tokens else None
+        # sid -> the logits row of each token it generated, in order, when log_logits
+        self.logit_log: dict[int, list[torch.Tensor]] | None = {} if log_logits else None
+        self.graph_logits: dict[tuple[int, bool], torch.Tensor] = {}  # each graph's output
         if graphs:
             self._capture_all()
 
@@ -751,7 +812,7 @@ class Engine:
                      seq_lens=self.seq_lens[:bp], block_table=self.block_table[:bp],
                      max_len=max_len)
 
-    def _decode_once(self, bp: int, max_len: int = 0, sample: bool = False) -> None:
+    def _decode_once(self, bp: int, max_len: int = 0, sample: bool = False) -> torch.Tensor:
         logits = self.model.decode(self._decode_batch(bp, max_len), self.cache)
         if sample:
             new = sk.sample(logits, self.temperature[:bp], self.top_k[:bp], self.top_p[:bp],
@@ -760,6 +821,15 @@ class Engine:
             new = torch.argmax(logits, dim=-1)
         self.ids[:bp].copy_(new)
         self._record(self.ids[:bp], self.gen_n[:bp], slice(0, bp))
+        return logits
+
+    def _log_logits(self, seqs: list[Sequence], rows: torch.Tensor) -> None:
+        """Appends rows[j] to seqs[j]'s logits log (log_logits)."""
+        if self.logit_log is None:
+            return
+        rows = rows.clone()  # a graph's output is overwritten by its next replay
+        for j, s in enumerate(seqs):
+            self.logit_log.setdefault(s.sid, []).append(rows[j])
 
     def _record(self, toks: torch.Tensor, col: torch.Tensor, rows) -> None:
         """gen[rows, col] = toks, then col += 1 (saturating, so an empty slot's counter never
@@ -793,7 +863,7 @@ class Engine:
                 torch.cuda.current_stream().wait_stream(side)
                 g = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(g, pool=pool):
-                    self._decode_once(bp, sample=sample)
+                    self.graph_logits[(bp, sample)] = self._decode_once(bp, sample=sample)
                 graphs[bp] = g
         torch.cuda.synchronize()
         self.ids.zero_()
@@ -1015,6 +1085,7 @@ class Engine:
             both = [parts[i][0] for i in fin] + rows_dec
             slots = torch.tensor([s.slot for s in both], device=self.device)
             lg = logits[torch.tensor(rows, device=self.device)]
+            self._log_logits(both, lg)
             if any(not s.params.greedy for s in both):
                 off = self.offsets[slots]
                 new = sk.sample(lg, self.temperature[slots], self.top_k[slots],
@@ -1157,8 +1228,12 @@ class Engine:
         graphs = self.sample_graphs if sample else self.graphs
         if bp in graphs:
             graphs[bp].replay()
+            logits = self.graph_logits.get((bp, sample))
         else:
-            self._decode_once(bp, max(lens), sample)
+            logits = self._decode_once(bp, max(lens), sample)
+        if self.logit_log is not None:
+            self._log_logits([self.running[i] for i in live],
+                             logits[torch.tensor(live, device=self.device)])
         if self.log is not None:
             self.log.append(([self.running[i].sid for i in live],
                              self.ids[torch.tensor(live, device=self.device)]))
@@ -1219,6 +1294,7 @@ class Engine:
         for s, r in zip(live, rows, strict=True):
             d = r[1:]
             new = accept(d, pred[t0:t0 + len(r)])
+            first = t0  # token j of `new` is the argmax of row first + j
             t0 += len(r)
             self.stats.spec_proposed += len(d)
             self.stats.spec_accepted += len(new) - 1
@@ -1230,6 +1306,8 @@ class Engine:
                 if hit:
                     s.stopped = s.generated + len(new)
                     self.stop_counts[s.sid] = s.stopped
+            if self.logit_log is not None:
+                self._log_logits([s] * len(new), logits[first:first + len(new)])
             col = s.generated - s.resumed_at  # the slot's gen_n
             g_rows += [s.slot] * len(new)
             g_cols += range(col, col + len(new))

@@ -201,7 +201,7 @@ def test_invariant_attention_refuses_fp8(sk):
 
 def _requests(n_req=10, seed=11):
     """Prompts of 1 to 300 tokens, a few sharing a 40-token prefix (prefix-cache hits), and
-    6 to 40 new tokens each; one request samples (temperature, top-k, its own seed)."""
+    6 to 47 new tokens each; one request samples (temperature, top-k, its own seed)."""
     g = torch.Generator().manual_seed(seed)
     shared = torch.randint(0, VOCAB, (40,), generator=g)
     prompts, news, params = [], [], []
@@ -211,7 +211,7 @@ def _requests(n_req=10, seed=11):
         if i % 4 == 1:
             p = torch.cat([shared, p[:60]])
         prompts.append(p)
-        news.append(int(torch.randint(6, 40, (), generator=g)))
+        news.append(int(torch.randint(6, 48, (), generator=g)))
         params.append(E.SamplingParams(temperature=0.8, top_k=40, seed=7) if i == 3 else None)
     return prompts, news, params
 
@@ -239,7 +239,7 @@ SCHEDULES = {
     "batch": dict(max_batch=8),
     "slots_4_chunked": dict(max_batch=4, prefill_tokens=64),
     "eager_no_mixed": dict(max_batch=16, graphs=False, mixed=False, compact=False),
-    "preempting": dict(max_batch=8, num_pages=40, prefill_tokens=128),
+    "preempting": dict(max_batch=8, num_pages=24, prefill_tokens=128),
 }
 
 
