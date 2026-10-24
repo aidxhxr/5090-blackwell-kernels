@@ -251,10 +251,10 @@ bool fp8gemm_mx_supports(int M, int N, int K, int variant);
 // exists. On a plain sm_120 build the per-tensor mode runs the plain instruction and MX mode
 // is refused.
 bool fp8gemm_mx_available();
-// Variant 3's route (docs/design/fp8gemm.md, "Model shapes"): DEFAULT and LEGACY send every
-// shape where the default went before variant 3 (variant 2 if it takes the shape, else
-// variant 1), n in [0, fp8gemm_v3_num_tiles()) forces TMA tile n where N and K tile (the old
-// route elsewhere). Process-wide, initial value from SPARK_FP8GEMM_V3_ROUTE;
+// Variant 3's route (docs/design/fp8gemm.md, "Model shapes"): DEFAULT is the per-shape rule,
+// LEGACY sends every shape where the default went before variant 3 (variant 2 if it takes the
+// shape, else variant 1), n in [0, fp8gemm_v3_num_tiles()) forces TMA tile n where N and K
+// tile (the old route elsewhere). Process-wide, initial value from SPARK_FP8GEMM_V3_ROUTE;
 // M <= 64 always runs variant 1's decode kernels. fp8gemm_v3_route_name says what variant 3
 // runs for a shape under the current route.
 enum Fp8gemmV3Route { FP8GEMM_V3_ROUTE_DEFAULT = -1, FP8GEMM_V3_ROUTE_LEGACY = -2 };

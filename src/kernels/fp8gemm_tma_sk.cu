@@ -20,9 +20,9 @@
 // out-of-range box row) and skipped by the epilogue, so any M >= 1 works; N % BN == 0 and
 // K % BK == 0 are the tile's requirements.
 //
-// What variant 3 runs for a shape is one of the TMA tiles in TILES when the route forces it
-// (fp8gemm_v3_set_route), and otherwise the route before it: variant 2 where it takes the
-// shape, else variant 1, which also has the decode kernels.
+// What variant 3 runs for a shape is route_rule below: one of the TMA tiles in TILES, or the
+// route before it (variant 2 where it takes the shape, else variant 1, which also has the
+// decode kernels); the measurements behind it are in docs/design/fp8gemm.md, "Model shapes".
 // MX mode always takes the route before it: a Stream-K piece can start at any k-step, and the
 // MX k-loop runs whole groups of scale chunks.
 
@@ -288,14 +288,15 @@ __global__ void __launch_bounds__((WM * WN + 1) * 32, MIN_BLOCKS)
 // Schedule knobs. The k-step here is 128 bytes of K, twice hgemm's, so the k-step counts are
 // half of hgemm variant 6's (docs/design/fp8gemm.md, "Model shapes").
 struct Knobs {
-    int min_share = 16;    // static mode: least k-steps per block
-    int min_pass = 4;      // queue mode: no K-pass shorter than this
-    int static_waves = 2;  // static ranges up to this many waves (always when in L2)
-    int group = -1;        // raster group: > 0 fixed, -1 the L2-footprint rule
+    int min_share = 16;     // static mode: least k-steps per block
+    int min_share_128 = 9;  // the rule: least k-steps per block for the 128x128 tile
+    int min_pass = 4;       // queue mode: no K-pass shorter than this
+    int static_waves = 2;   // static ranges up to this many waves (always when in L2)
+    int group = -1;         // raster group: > 0 fixed, -1 the L2-footprint rule
 };
 
-// Sweep overrides, read once: SPARK_FP8GEMM_V3_MIN_SHARE, _MIN_PASS, _STATIC_WAVES and
-// _GROUP. SPARK_FP8GEMM_V3_ROUTE is the initial route
+// Sweep overrides, read once: SPARK_FP8GEMM_V3_MIN_SHARE, _MIN_SHARE_128, _MIN_PASS,
+// _STATIC_WAVES and _GROUP. SPARK_FP8GEMM_V3_ROUTE is the initial route
 // (fp8gemm_v3_set_route).
 const Knobs& knobs() {
     static Knobs k;
@@ -307,6 +308,7 @@ const Knobs& knobs() {
             return s ? std::atoi(s) : fallback;
         };
         k.min_share = std::max(1, geti("SPARK_FP8GEMM_V3_MIN_SHARE", k.min_share));
+        k.min_share_128 = geti("SPARK_FP8GEMM_V3_MIN_SHARE_128", k.min_share_128);
         k.min_pass = geti("SPARK_FP8GEMM_V3_MIN_PASS", k.min_pass);
         k.static_waves = geti("SPARK_FP8GEMM_V3_STATIC_WAVES", k.static_waves);
         k.group = geti("SPARK_FP8GEMM_V3_GROUP", k.group);
@@ -357,6 +359,20 @@ void plan(Params& p, hgemm_sk::Workspace& w, int M, int N, int K, int BM, int BN
     if (use_static) {
         p.grid = static_cast<int>(
             std::min<long long>(resident, std::max<long long>(p.tiles, total / k.min_share)));
+        if (p.tiles < resident) {
+            if (2 * p.grid < resident) {
+                // Most of the card idle: an even two-way split of every tile if its halves
+                // are 8 k-steps or more (128x768x2048, 12 tiles: 116% of cuBLASLt on 24
+                // blocks, 93% on 12; four ways, 95%).
+                p.grid = std::max(
+                    p.grid, p.tiles * std::max(1, std::min({2, resident / p.tiles, p.KT / 8})));
+            } else if (4 * p.grid < 5 * p.tiles && p.KT <= 2 * k.min_share) {
+                // A split that buys under a quarter more blocks cuts most tiles in two
+                // uneven pieces and a fixup: on a short K it costs more than it gives
+                // (128x5120x2304, 80 tiles of 18 k-steps: 117% on 80 blocks, 102% on 90).
+                p.grid = p.tiles;
+            }
+        }
         p.dp_tiles = 0;
         p.passes = 0;
         p.sk_iters = p.tiles * p.KT;
@@ -457,6 +473,7 @@ const TileConfig TILES[] = {
 };
 #undef SPARK_V3_TILE
 constexpr int NUM_TILES = static_cast<int>(sizeof(TILES) / sizeof(TILES[0]));
+constexpr int kTile128x256 = 0, kTile128 = 1, kTile128x64 = 3, kTile64x128 = 4;
 
 // What variant 3 runs for a shape: the route before it (variant 2 or 1, in fp8gemm.cu), or a
 // tile of TILES.
@@ -469,6 +486,37 @@ bool tile_fits(const TileConfig& t, int N, int K) {
     return N % t.bn == 0 && K % t.bk == 0;
 }
 
+// The per-shape rule, from the forced-tile sweep over the 120 model shapes
+// (docs/design/fp8gemm.md, "Model shapes"). With W the blocks of a wave (170):
+//   1. 128x256 when M >= 512 and it has at least 3/4 W tiles. Under that it lost to 128x128
+//      on every shape, by up to 17% (512x4096x4096: 161% of cuBLASLt against 193%), and at
+//      M = 256 on all but the lm_head even with more tiles (256x28672x8192: 168% against 182%).
+//   2. 128x128 when M > 128, it has at least W / 4 tiles, and either each block gets
+//      min_share_128 k-steps or there are 3/4 W tiles. Short K is what the share catches:
+//      256x5120x2304 (80 tiles, 8.5 k-steps a block) ran 99% on 128x128 and 123% on 64x128,
+//      2048x768x2048 (96 tiles, 9) 157% against 151%.
+//   3. Otherwise the 64-wide tile with fewer zero-filled rows past M (128x64 on a tie, or
+//      when N % 128 != 0). At M = 128 it beat 128x128 on all twenty weights, and it beats the
+//      old route even with few tiles (128x1024x4096: 124% against 106% on variant 1).
+Route route_rule(int M, int N, int K) {
+    const Knobs& k = knobs();
+    if (M <= 64 || K % 128 != 0) return {Route::OLD, 0};
+    const int wave = TILES[kTile128].resident();
+    auto tiles = [&](const TileConfig& t) { return cdiv(M, t.bm) * (N / t.bn); };
+    const TileConfig& wide = TILES[kTile128x256];
+    const TileConfig& big = TILES[kTile128];
+    if (M >= 512 && tile_fits(wide, N, K) && 4 * tiles(wide) >= 3 * wave)
+        return {Route::TILE, kTile128x256};
+    if (M > 128 && tile_fits(big, N, K) && 4 * tiles(big) >= wave) {
+        const long long share = static_cast<long long>(tiles(big)) * (K / big.bk) / wave;
+        if (share >= k.min_share_128 || 4 * tiles(big) >= 3 * wave) return {Route::TILE, kTile128};
+    }
+    const int small =
+        (N % 128 != 0 || cdiv(M, 128) * 128 <= cdiv(M, 64) * 64) ? kTile128x64 : kTile64x128;
+    if (!tile_fits(TILES[small], N, K)) return {Route::OLD, 0};
+    return {Route::TILE, small};
+}
+
 Route choose(int M, int N, int K) {
     const int r = route_slot().load(std::memory_order_relaxed);
     if (r == FP8GEMM_V3_ROUTE_LEGACY || M <= 64) return {Route::OLD, 0};
@@ -476,7 +524,7 @@ Route choose(int M, int N, int K) {
         if (tile_fits(TILES[r], N, K)) return {Route::TILE, r};
         return {Route::OLD, 0};
     }
-    return {Route::OLD, 0};
+    return route_rule(M, N, K);
 }
 
 }  // namespace v3
