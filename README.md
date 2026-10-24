@@ -20,7 +20,11 @@ step is a weight stream and the weights got four times smaller. Put together on 
 cache, the kernels run the whole 32-layer Llama-3-8B for a batch of mixed-length requests,
 and a decode step at 64 sequences is 3.5 times `torch.compile`'s. On real Llama-3-8B
 weights that engine is closer to an fp32 reference than transformers is, and it matches or
-beats vLLM on every static batch, decode and prefill row I measured. And four things about
+beats vLLM on every static batch, decode and prefill row I measured. Over 120 real
+projection shapes the bf16 GEMM averages 112% of cuBLAS and the fp8 GEMM 129% of cuBLASLt. A
+whole MoE layer on these kernels is ahead of vLLM's `fused_moe` on 11 of the 12 rows I ran, and
+a batch-invariant mode gives a request the same logits bit for bit whatever else is in its
+batch, for under 2% on a decode step. And four things about
 this card turned out to be different from the spec sheet, which is the part I'd read first.
 
 This started as spark-kernels, for a DGX Spark that hasn't shipped, and the Python package still
