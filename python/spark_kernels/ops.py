@@ -645,6 +645,9 @@ def paged_decode(
     length 0 gets zeros, which is how a CUDA graph pads a batch. The default (variant 1)
     divides the keys of the whole batch evenly over the SMs whatever the lengths; the
     lengths are read on the device, so a captured step replays correctly as they grow.
+    Variant 2 is batch invariant and opt-in: each sequence's keys in chunks of 256 at fixed
+    offsets, folded in order, so a row's bits depend on its own sequence only and equal
+    `attention_varlen` variant 2's for the same query (bf16 caches only).
     Returns [B, H_q, D] bfloat16.
 
     The caches may be float8_e4m3fn (`rope_append_paged_` with scales), read as
@@ -686,7 +689,9 @@ def attention_varlen(
     j <= seq_lens[b] - q_len_b + i: the usual causal mask for a fresh prompt, and the right
     one for a chunk of a longer prompt. Returns [T, H_q, D] bfloat16, which is [T, H_q * D]
     for the output projection without a transpose. float8_e4m3fn caches take k_scale and
-    v_scale as `paged_decode` does.
+    v_scale as `paged_decode` does. Variant 2 (opt-in, bf16 only) computes every row with
+    `paged_decode` variant 2's arithmetic, so a row has the same bits whatever the batch,
+    however its prompt is chunked, and as a decode row.
 
     `window` > 0 adds a left edge to the causal mask (and implies it): query i sees keys
     p - window < j <= p for its position p = seq_lens[b] - q_len_b + i. `sinks` (float32

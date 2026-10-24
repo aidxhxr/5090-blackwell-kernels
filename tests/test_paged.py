@@ -15,13 +15,16 @@ import torch.nn.functional as F
 TOL = dict(atol=2e-2, rtol=2e-2)  # one bf16 rounding of an fp32 result, P in bf16
 
 
-def _variants(name):
+def _variants(name, fp8=False):
+    """Every variant of `name`; with fp8, the ones that take an e4m3 cache (variant 2 of both
+    ops, the batch-invariant one, is bf16 only)."""
     try:
         import spark_kernels
 
-        return list(range(spark_kernels.num_variants(name)))
+        vs = list(range(spark_kernels.num_variants(name)))
     except Exception:
-        return [0, 1]
+        vs = [0, 1]
+    return [v for v in vs if v != 2] if fp8 else vs
 
 
 def _paged_cache(lens, H_kv, D, page, seed=0, spare_pages=3):
@@ -318,7 +321,7 @@ def _paged_cache_fp8(lens, H_kv, D, page, seed=0):
     return k8, v8, ks, vs, bt, sl, k_list, v_list
 
 
-@pytest.mark.parametrize("variant", _variants("paged_decode"))
+@pytest.mark.parametrize("variant", _variants("paged_decode", fp8=True))
 @pytest.mark.parametrize("case", DECODE_CASES, ids=_case_id)
 def test_paged_decode_fp8_matches_dequantized(sk, case, variant):
     lens, hq, hkv, d, page = case
@@ -349,7 +352,7 @@ def test_paged_decode_fp8_is_deterministic_and_long(sk):
         torch.testing.assert_close(got[b].float(), ref, **TOL)
 
 
-@pytest.mark.parametrize("variant", _variants("attention_varlen"))
+@pytest.mark.parametrize("variant", _variants("attention_varlen", fp8=True))
 @pytest.mark.parametrize("causal", [True, False], ids=["causal", "full"])
 @pytest.mark.parametrize("case", VARLEN_CASES, ids=_varlen_id)
 def test_attention_varlen_fp8_matches_dequantized(sk, case, causal, variant):

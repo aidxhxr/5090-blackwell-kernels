@@ -689,11 +689,17 @@ bool attention_bwd_supports(int S_q, int S_kv, int D, int variant);
 //            pipeline across sequence boundaries; pieces of a (b, kv head) that span warps
 //            are merged by a second kernel. Needs H_q / H_kv <= 16. Uses a per-process
 //            workspace: two launches must not run concurrently on different streams
+// variant 2: batch invariant (docs/design/batch_invariant.md): each (b, kv head) cut into
+//            chunks of 256 keys at fixed offsets, the chunks of the batch spread over the
+//            warps (never one chunk over two), and a sequence's chunks folded in order, so a
+//            row's bits depend on its own sequence only, and equal varlen variant 2's for the
+//            same row. bf16 caches only; opt-in (paged_decode_default_variant is 1)
 void paged_decode_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* k_cache,
                        const __nv_bfloat16* v_cache, const int* block_table, const int* seq_lens,
                        __nv_bfloat16* O, int B, int H_q, int H_kv, int D, int page, int max_pages,
                        int variant, cudaStream_t stream);
 int paged_decode_num_variants();
+int paged_decode_default_variant();
 
 // Varlen prefill: Q, O = [T, H_q, D], the new tokens of B sequences packed back to back,
 // sequence b's at rows cu_seqlens_q[b] .. cu_seqlens_q[b+1]-1 (cu_seqlens_q [B + 1] int32,
@@ -704,12 +710,16 @@ int paged_decode_num_variants();
 // variant 0: one warp per (token, query head), keys one at a time
 // variant 1: attention variant 2's 128 x 64 mma.sync tile with the K/V rows gathered through
 //            the block table and each block's (sequence, q tile) found on the device
+// variant 2: batch invariant: variant 1's tile with paged decode variant 2's arithmetic (16-key
+//            steps, chunks of 256 keys folded in order), so a query row has the same bits in
+//            any batch, any chunk of its prompt, and as a decode row. bf16 only; opt-in
 void attention_varlen_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* k_cache,
                            const __nv_bfloat16* v_cache, const int* cu_seqlens_q,
                            const int* seq_lens, const int* block_table, __nv_bfloat16* O, int B,
                            int T, int H_q, int H_kv, int D, int page, int max_pages, bool causal,
                            int variant, cudaStream_t stream);
 int attention_varlen_num_variants();
+int attention_varlen_default_variant();
 
 // Both ops on an e4m3 cache written by rope_append_paged_fp8: key j of kv head h is
 // k_scale[h] * k_cache[...], value v_scale[h] * v_cache[...] (k_scale, v_scale [H_kv] fp32 in

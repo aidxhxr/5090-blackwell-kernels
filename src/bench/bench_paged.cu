@@ -346,6 +346,7 @@ bool run_decode(const Cfg& c, const std::vector<int>& lens, const std::vector<in
         };
         for (size_t vi = 0; vi < variants.size(); ++vi) {
             const int v = variants[vi];
+            if (fp8 && v == 2) continue;  // variant 2 (batch invariant) is bf16 only
             run(v, 0);
             SPARK_CUDA_CHECK(cudaStreamSynchronize(stream));
             const std::vector<float> got = fetch(dout, nq);
@@ -495,6 +496,7 @@ bool run_prefill(const Cfg& c, const std::vector<int>& lens, const std::vector<i
         };
         for (size_t vi = 0; vi < variants.size(); ++vi) {
             const int v = variants[vi];
+            if (fp8 && v == 2) continue;  // variant 2 (batch invariant) is bf16 only
             run(v);
             SPARK_CUDA_CHECK(cudaStreamSynchronize(stream));
             const std::vector<float> got = fetch(dout, nq);

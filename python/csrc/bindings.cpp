@@ -1483,7 +1483,8 @@ Tensor paged_decode(const Tensor& q, const Tensor& k_cache, const Tensor& v_cach
     TORCH_CHECK(aligned16(q), "paged_decode needs 16-byte aligned q");
     const c10::cuda::CUDAGuard guard(q.device());
     Tensor out = at::empty_like(q);
-    const int var = resolve_variant(variant, spark::paged_decode_num_variants());
+    const int var = variant < 0 ? spark::paged_decode_default_variant()
+                                : resolve_variant(variant, spark::paged_decode_num_variants());
     if (fp8) {
         spark::paged_decode_fp8(
             bf16_ptr(q), fp8_ptr(k_cache), fp8_ptr(v_cache), k_scale->data_ptr<float>(),
@@ -1526,7 +1527,8 @@ Tensor attention_varlen(const Tensor& q, const Tensor& k_cache, const Tensor& v_
     TORCH_CHECK(T * H_q <= INT32_MAX, "attention_varlen dims too large for int32");
     const c10::cuda::CUDAGuard guard(q.device());
     Tensor out = at::empty_like(q);
-    const int var = resolve_variant(variant, spark::attention_varlen_num_variants());
+    const int var = variant < 0 ? spark::attention_varlen_default_variant()
+                                : resolve_variant(variant, spark::attention_varlen_num_variants());
     if (fp8) {
         spark::attention_varlen_fp8(
             bf16_ptr(q), fp8_ptr(k_cache), fp8_ptr(v_cache), k_scale->data_ptr<float>(),
