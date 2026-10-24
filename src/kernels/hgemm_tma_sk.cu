@@ -85,8 +85,10 @@ constexpr int smem_bytes() {
 
 // T is the block tile (hgemm_tma_tile.cuh): 128x128 by default, the others for the shapes in
 // the "Model shapes" section of docs/design/hgemm.md. The names below shadow the 128x128
-// ones at namespace scope.
-template <class T, int BK, int STAGES, int MIN_BLOCKS, bool FUSED>
+// ones at namespace scope. SPLIT is the split-K form for grids that do not fill the card:
+// block b computes K-slice b % p.splits of tile b / p.splits, and the slices are summed in
+// slice order by whichever warp arrives last (the consumer side below).
+template <class T, int BK, int STAGES, int MIN_BLOCKS, bool FUSED, bool SPLIT = false>
 __global__ void __launch_bounds__(T::THREADS, MIN_BLOCKS)
     hgemm_v6_kernel(const __grid_constant__ CUtensorMap tmA,
                     const __grid_constant__ CUtensorMap tmB, __nv_bfloat16* __restrict__ C, int M,
@@ -163,7 +165,11 @@ __global__ void __launch_bounds__(T::THREADS, MIN_BLOCKS)
                 }
             };
 
-            if (p.passes == 0) {
+            if constexpr (SPLIT) {
+                // Split-K: one slice of one tile, k-steps [j KT / S, (j + 1) KT / S).
+                const int tile = blockIdx.x / p.splits, j = blockIdx.x % p.splits;
+                piece(tile, j * p.KT / p.splits, (j + 1) * p.KT / p.splits);
+            } else if (p.passes == 0) {
                 // Static ranges, walked from the top: the piece that starts a tile (and
                 // never waits) comes first, the piece that ends one last. dp_tiles is 0, so
                 // a tile's raster index is its slot index.
@@ -235,7 +241,7 @@ __global__ void __launch_bounds__(T::THREADS, MIN_BLOCKS)
         // registers, dead again after the store).
         const hgemm_epi::Geo geo{M, N, bm + wm * WM + g, bn + wn * WN + c2};
         hgemm_epi::Pre<MT, NT> pre;
-        if constexpr (FUSED) {
+        if constexpr (FUSED && !SPLIT) {  // a split-K slice learns it stores after its k-loop
             if (ke == p.KT) hgemm_epi::prefetch(pre, ep, geo);
         }
 
@@ -254,7 +260,84 @@ __global__ void __launch_bounds__(T::THREADS, MIN_BLOCKS)
         // Fixup, as in variant 4, with a named barrier in place of __syncthreads: the
         // producer lane is not part of it (it is already loading the next piece).
         bool finish = true;
-        if (kb > 0 || ke < p.KT) {
+        if constexpr (SPLIT) {
+            // Split-K. Every slice writes its partial to its own fp32 slot (fragment order, as
+            // the chain below), and each warp counts itself in at its region of the tile: the
+            // warp that brings a region's count to S is the last of the S slices there, and it
+            // sums the S slots in slice order 0, 1, ..., S - 1 (its own included, read back
+            // like the others) and stores. Nothing waits on anything, the counter is an
+            // integer, and the sum is the same left fold whichever block arrived last, so the
+            // output is the same bits every run. Per warp rather than per block: no block
+            // barrier, and the eight regions of a tile can finish in eight different blocks.
+            constexpr int SLOT = BM * BN / 4;  // float4s per slice
+            const int S = p.splits;
+            float4* slots =
+                reinterpret_cast<float4*>(p.slots) + static_cast<size_t>(tile) * S * SLOT;
+            float4* mine = slots + static_cast<size_t>(blockIdx.x % S) * SLOT;
+#pragma unroll
+            for (int mi = 0; mi < MT; ++mi) {
+                if (wm * WM + mi * 16 >= m_valid) continue;  // the whole m16 tile is past M
+#pragma unroll
+                for (int nj = 0; nj < NT; ++nj)
+                    __stcg(mine + slot_idx<MT, NT>(warp, lane, mi, nj),
+                           make_float4(acc[mi][nj][0], acc[mi][nj][1], acc[mi][nj][2],
+                                       acc[mi][nj][3]));
+            }
+            __threadfence();
+            __syncwarp();
+            unsigned* count = p.arrivals + tile * CONSUMER_WARPS + warp;
+            int last = 0;
+            if (lane == 0) last = atomicAdd(count, 1u) == static_cast<unsigned>(S - 1);
+            last = __shfl_sync(0xffffffffu, last, 0);
+            finish = last != 0;
+            if (finish) {
+                if (lane == 0) atomicExch(count, 0u);  // every slice has arrived: reset
+                __threadfence();
+                if constexpr (FUSED) hgemm_epi::prefetch(pre, ep, geo);
+                // The loads of BATCH slices go out together (64 registers of them), then the
+                // adds run in slice order; the first slice is assigned, not added to zero.
+                constexpr int BATCH = MT * NT >= 16 ? 1 : 16 / (MT * NT);
+                for (int i0 = 0; i0 < S; i0 += BATCH) {
+                    float4 v[BATCH][MT][NT];
+#pragma unroll
+                    for (int b = 0; b < BATCH; ++b) {
+                        if (i0 + b >= S) break;
+                        const float4* s = slots + static_cast<size_t>(i0 + b) * SLOT;
+#pragma unroll
+                        for (int mi = 0; mi < MT; ++mi) {
+                            if (wm * WM + mi * 16 >= m_valid) continue;
+#pragma unroll
+                            for (int nj = 0; nj < NT; ++nj)
+                                v[b][mi][nj] = __ldcg(s + slot_idx<MT, NT>(warp, lane, mi, nj));
+                        }
+                    }
+#pragma unroll
+                    for (int b = 0; b < BATCH; ++b) {
+                        if (i0 + b >= S) break;
+#pragma unroll
+                        for (int mi = 0; mi < MT; ++mi) {
+                            if (wm * WM + mi * 16 >= m_valid) continue;
+#pragma unroll
+                            for (int nj = 0; nj < NT; ++nj) {
+                                const float4 x = v[b][mi][nj];
+                                float* a = acc[mi][nj];
+                                if (i0 + b == 0) {
+                                    a[0] = x.x;
+                                    a[1] = x.y;
+                                    a[2] = x.z;
+                                    a[3] = x.w;
+                                } else {
+                                    a[0] += x.x;
+                                    a[1] += x.y;
+                                    a[2] += x.z;
+                                    a[3] += x.w;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else if (kb > 0 || ke < p.KT) {
             const int tile_r = tile - p.dp_tiles;
             float4* slot =
                 reinterpret_cast<float4*>(p.slots + static_cast<size_t>(tile_r) * (BM * BN));
@@ -372,16 +455,17 @@ std::atomic<int>& route_slot() {
     return slot;
 }
 
-template <class T, int BK, int STAGES, int MIN_BLOCKS, bool FUSED>
+template <class T, int BK, int STAGES, int MIN_BLOCKS, bool FUSED, bool SPLIT = false>
 int resident_blocks() {
     constexpr int bytes = smem_bytes<T, BK, STAGES>();
     static int resident = 0;
     if (resident == 0) {
-        SPARK_CUDA_CHECK(cudaFuncSetAttribute(hgemm_v6_kernel<T, BK, STAGES, MIN_BLOCKS, FUSED>,
-                                              cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+        SPARK_CUDA_CHECK(
+            cudaFuncSetAttribute(hgemm_v6_kernel<T, BK, STAGES, MIN_BLOCKS, FUSED, SPLIT>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
         int per_sm = 0;
         SPARK_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &per_sm, hgemm_v6_kernel<T, BK, STAGES, MIN_BLOCKS, FUSED>, T::THREADS, bytes));
+            &per_sm, hgemm_v6_kernel<T, BK, STAGES, MIN_BLOCKS, FUSED, SPLIT>, T::THREADS, bytes));
         resident = (per_sm > 0 ? per_sm : 1) * num_sms();
     }
     return resident;
@@ -404,6 +488,69 @@ void launch(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, in
 using LaunchFn = void (*)(const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, int, int,
                           cudaStream_t, const HgemmEpilogue&, const hgemm_sk::Knobs&);
 
+// Split-K workspace, one per instantiation: tiles x splits fp32 slots and one arrival counter
+// per (tile, consumer warp), grown on demand. The counters are zeroed once here and put back
+// to zero by the last warp to arrive, so a launch needs no memset. Like the Stream-K
+// workspace, not safe to share between streams that run the same kernel concurrently.
+struct SplitWorkspace {
+    float* slots = nullptr;
+    size_t slot_floats = 0;
+    unsigned* arrivals = nullptr;
+    size_t counters = 0;
+};
+
+// The split-K plan: tiles x S blocks, block b on K-slice b % S of tile b / S, the tiles in
+// column-major order (the tile rows that share a strip of B are neighbours). Nothing in it
+// depends on run-time state, only on the shape and S.
+inline void plan_split(Params& p, SplitWorkspace& w, int M, int N, int K, int BM, int BN, int BK,
+                       int S) {
+    p.tiles_m = cdiv(M, BM);
+    p.tiles_n = N / BN;
+    p.tiles = p.tiles_m * p.tiles_n;
+    p.KT = K / BK;
+    p.group = p.tiles_m;
+    p.dp_tiles = 0;
+    p.passes = 0;
+    p.sk_iters = 0;
+    p.splits = S;
+    p.grid = p.tiles * S;
+    const size_t floats = static_cast<size_t>(p.tiles) * S * BM * BN;
+    if (w.slot_floats < floats) {
+        if (w.slots) SPARK_CUDA_CHECK(cudaFree(w.slots));
+        w.slot_floats = floats;
+        SPARK_CUDA_CHECK(cudaMalloc(&w.slots, floats * sizeof(float)));
+    }
+    const size_t counters = static_cast<size_t>(p.tiles) * CONSUMER_WARPS;
+    if (w.counters < counters) {
+        if (w.arrivals) SPARK_CUDA_CHECK(cudaFree(w.arrivals));
+        w.counters = counters;
+        SPARK_CUDA_CHECK(cudaMalloc(&w.arrivals, counters * sizeof(unsigned)));
+        SPARK_CUDA_CHECK(cudaMemset(w.arrivals, 0, counters * sizeof(unsigned)));  // once
+    }
+    p.slots = w.slots;
+    p.arrivals = w.arrivals;
+    p.flags = nullptr;
+    p.queue = nullptr;
+    p.epoch = 0;
+}
+
+template <class T, int BK, int STAGES, int MIN_BLOCKS, bool FUSED>
+void launch_split(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* C, int M, int N,
+                  int K, cudaStream_t stream, const HgemmEpilogue& ep, int splits) {
+    constexpr int bytes = smem_bytes<T, BK, STAGES>();
+    resident_blocks<T, BK, STAGES, MIN_BLOCKS, FUSED, true>();  // sets the smem attribute once
+    CUtensorMap tmA, tmB;
+    T::template make_maps<BK>(A, B, M, N, K, tmA, tmB);
+    static SplitWorkspace w;
+    Params p;
+    plan_split(p, w, M, N, K, T::BM, T::BN, BK, splits);
+    hgemm_v6_kernel<T, BK, STAGES, MIN_BLOCKS, FUSED, true><<<p.grid, T::THREADS, bytes, stream>>>(
+        tmA, tmB, C, M, N, K, p, env().serial, hgemm_epi::make(ep));
+}
+
+using SplitFn = void (*)(const __nv_bfloat16*, const __nv_bfloat16*, __nv_bfloat16*, int, int, int,
+                         cudaStream_t, const HgemmEpilogue&, int);
+
 // A tile and pipeline configuration with a plain and a fused instantiation; the plain one's
 // residency is what the choice below is made from (the two agree: smem sets it).
 struct Config {
@@ -412,11 +559,19 @@ struct Config {
     LaunchFn launch_fused;
     int (*resident)();
     int bm, bn, bk;
+    SplitFn split = nullptr;  // the split-K form of the tile, if it has one
+    SplitFn split_fused = nullptr;
 };
 #define SPARK_V6_CONFIG(name, T, BK, ST, MB)                             \
     {                                                                    \
         name, launch<T, BK, ST, MB, false>, launch<T, BK, ST, MB, true>, \
             resident_blocks<T, BK, ST, MB, false>, T::BM, T::BN, BK      \
+    }
+#define SPARK_V6_SPLIT_TILE(name, T, BK, ST, MB)                                  \
+    {                                                                             \
+        name, launch<T, BK, ST, MB, false>, launch<T, BK, ST, MB, true>,          \
+            resident_blocks<T, BK, ST, MB, false>, T::BM, T::BN, BK,              \
+            launch_split<T, BK, ST, MB, false>, launch_split<T, BK, ST, MB, true> \
     }
 
 // Pipeline configurations of the 128x128 tile (BK, stages, blocks per SM), the same six as
@@ -444,17 +599,20 @@ constexpr int CONFIG_DEFAULT = 0;
 using Tile128x256 = Tile<128, 256, 2, 4>;
 using Tile128x64 = Tile<128, 64, 4, 2>;
 using Tile64x128 = Tile<64, 128, 2, 4>;
+using Tile64x64 = Tile<64, 64, 2, 4>;  // warp tile 32 x 16, for the split-K
 const Config TILES[] = {
-    SPARK_V6_CONFIG("tma 128x128 s2", Tile128, 64, 2, 1),       // 0
-    SPARK_V6_CONFIG("tma 128x256 s2", Tile128x256, 64, 2, 1),   // 1
-    SPARK_V6_CONFIG("tma 128x64 s4", Tile128x64, 64, 4, 1),     // 2
-    SPARK_V6_CONFIG("tma 64x128 s4", Tile64x128, 64, 4, 1),     // 3
-    SPARK_V6_CONFIG("tma 128x64 s2 x2", Tile128x64, 64, 2, 2),  // 4
-    SPARK_V6_CONFIG("tma 64x128 s2 x2", Tile64x128, 64, 2, 2),  // 5
+    SPARK_V6_CONFIG("tma 128x128 s2", Tile128, 64, 2, 1),        // 0
+    SPARK_V6_CONFIG("tma 128x256 s2", Tile128x256, 64, 2, 1),    // 1
+    SPARK_V6_SPLIT_TILE("tma 128x64 s4", Tile128x64, 64, 4, 1),  // 2
+    SPARK_V6_SPLIT_TILE("tma 64x128 s4", Tile64x128, 64, 4, 1),  // 3
+    SPARK_V6_CONFIG("tma 128x64 s2 x2", Tile128x64, 64, 2, 2),   // 4
+    SPARK_V6_CONFIG("tma 64x128 s2 x2", Tile64x128, 64, 2, 2),   // 5
+    SPARK_V6_SPLIT_TILE("tma 64x64 s4", Tile64x64, 64, 4, 1),    // 6
 };
 #undef SPARK_V6_CONFIG
+#undef SPARK_V6_SPLIT_TILE
 constexpr int NUM_TILES = static_cast<int>(sizeof(TILES) / sizeof(TILES[0]));
-constexpr int kTile128 = 0, kTile128x256 = 1, kTile128x64 = 2, kTile64x128 = 3;
+constexpr int kTile128 = 0, kTile128x256 = 1, kTile128x64 = 2, kTile64x128 = 3, kTile64x64 = 6;
 
 // k-steps per block of a configuration on this shape, -1 when N does not tile.
 long long share_of(const Config& c, int M, int N, int K) {

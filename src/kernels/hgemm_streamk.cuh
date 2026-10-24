@@ -33,6 +33,10 @@ struct Params {
     unsigned long long* flags;  // per Stream-K tile: (epoch << 32) | k-steps accumulated
     unsigned* queue;            // [0]: next work item, [1]: blocks done
     unsigned epoch;
+    int splits;          // variant 6's split-K (hgemm_tma_sk.cu): K-slices per tile, one block
+                         // each, slots holding tiles x splits partials. 0 for plan() below.
+    unsigned* arrivals;  // split-K: one arrival counter per (tile, consumer warp), zero
+                         // between launches
 };
 
 __device__ __forceinline__ void st_release_gpu(unsigned long long* p, unsigned long long v) {
@@ -211,6 +215,8 @@ inline void plan(Params& p, Workspace& w, int M, int N, int K, int BM, int BN, i
     p.flags = w.flags;
     p.queue = w.queue;
     p.epoch = w.epoch;
+    p.splits = 0;
+    p.arrivals = nullptr;
 }
 
 }  // namespace spark::hgemm_sk
