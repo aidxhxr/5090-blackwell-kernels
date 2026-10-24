@@ -681,6 +681,36 @@ bits of dQ run-to-run dependent; `deterministic=True` computes dQ in a separate 
 1.4x the time under the causal mask. The numbers, the profiles and the experiments that lost
 are in [the design note](docs/design/attention_bwd.md).
 
+### sliding window and sinks
+
+Most models people run now mix local attention in. Mistral 7B and Gemma 2 limit layers to the
+last 4096 keys, Gemma 3 to 1024, and gpt-oss puts a 128-key window on every other layer plus a
+learned sink logit per head in every softmax denominator. The forward, the decode kernels and
+the varlen prefill take both, `window=` and `sinks=`. The window is causal and aligned to the
+last key, so a decode step sees the last W keys of the cache. Every kernel starts its K/V
+tiles at the first one a row's window reaches, and variant 5's warps also skip the 16-key
+blocks outside their rows' windows, so the work follows the window and not the sequence.
+D = 64, gpt-oss's head size, works like 128.
+
+| 32/8 heads, D = 128 | full causal | W = 4096 | W = 1024 | W = 128 | flex_attention, W = 128 |
+|---|---|---|---|---|---|
+| 16K tokens | 9.11 ms | 4.10 | 1.22 | 0.247 | 0.451 |
+| 32K tokens | 36.96 ms | 8.87 | 2.46 | **0.488** | 0.861 |
+| decode, 128K cached keys | 324 us | **17.3 us** | | 5.0 us | 143 us at W = 4096 |
+
+Times of variant 5 from `bench_attention --sweep=window`, every row checked against the CPU
+reference; flex is torch's `flex_attention` compiled with the window's block mask, from
+`scripts/bench_attention_window.py`, whose own prefill times for ours are within 2% of these. A
+4096-key window of a 128K cache costs what a 4096-token cache costs. At 128 keys the kernel is
+bound by bytes, not products: Q and O are read and written whatever the window, and the 32K row
+moves its 671 MB of Q, K, V and O at 1,375 GB/s, 90% of the copy roof. flex is 1.13 to 2.0x
+slower from 4K to 32K tokens and 3.6 to 4.6x on gpt-oss's own heads (64/8 at D = 64, W = 128)
+with its sinks; SDPA with the window as an explicit mask takes 226 ms at 32K. The paged decode
+reads only the windows too: 16 sequences of 32K tokens with W = 4096 take 176 us a step against
+1,305 us. The kernels the headline rows above run compile to the same SASS as before, up to one
+swapped `FMNMX` operand at D = 64, and those rows did not move. The rest is in [the design
+note](docs/design/attention.md#sliding-window-and-sinks).
+
 ## a whole layer
 
 The kernels run together as one Llama-3-8B decoder layer in `spark_kernels.layer`: two
@@ -1025,6 +1055,9 @@ c = sk.w1gemm(a_bf16, w1)                  # a @ (±s), 14x fewer weight bytes t
 ex = sk.W1ExpertWeights.quantize(w_experts, bits=1)       # [E, K, N], every expert in one tensor
 c = sk.w1gemm_moe(a_sorted, ex, offsets)   # rows sorted by expert, int32 offsets [E+1], one launch
 o = sk.attention(q, k, v, causal=True)     # q is [B, H, S, D] bf16; k and v may have fewer heads
+o = sk.attention(q, k, v, window=4096)     # sliding window: each query sees the last 4096 keys up to it
+o = sk.attention(q, k, v, window=128, sinks=s)   # gpt-oss: s is float32 [H_q], one sink logit per head
+o = sk.paged_decode(q, k_cache, v_cache, block_table, seq_lens, window=128, sinks=s)  # attention_varlen too
 (q8, sq), (k8, sk8), (v8, sv) = (sk.quantize_fp8(x) for x in (q, k, v))   # e4m3 + descale
 o = sk.attention_fp8(q8, k8, v8, sq, sk8, sv, causal=True)   # both products on the fp8 tensor cores
 q = sk.rope_append_(qkv, cos, sin, k_cache, v_cache, pos, 32, 8)  # RoPE; q head-major; k, v into the cache

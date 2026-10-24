@@ -1160,6 +1160,234 @@ zero-filled as before. The binding reads it off the strides of `cache[:, :, :len
 a layer's cache with room to grow is read where it is, and `bench_attention --kvcap=N`
 times the strided read against the packed one (four such rows are in the default sweep).
 
+## Sliding window and sinks
+
+Most models people run now mix local attention into the stack. Mistral 7B and Gemma 2 limit
+layers to a window of the last 4096 keys, Gemma 3 to 1024, and gpt-oss puts a 128-key window
+on every other layer and a learned "sink" logit per head on every layer. The ladder did
+causal and non-causal attention and nothing else, so I added both options to the forward
+(every rung), the flash-decoding kernel, the paged decode and the varlen prefill.
+
+**What it computes.** A window of `W` keys means each query sees at most the last `W` keys up
+to its own position, its own included. It is causal and aligned to the last key: query `i`
+sits at key position `p = i + S_kv - S_q` and sees keys `p - W < j <= p`, whatever `causal`
+says. For prefill (`S_q = S_kv`) that is torch's top-left causal mask with a left edge, for a
+decode step it is the last `W` keys of the cache, and the varlen prefill's bottom-right mask
+was already aligned this way. It is HF's sliding-window mask (`kv_idx > q_idx - W`) and
+flash-attn's `window_size = (W - 1, 0)`. A sink is one more logit per query head in the
+softmax denominator, with no value vector:
+
+```
+O_i = sum_j exp(s_ij - m) v_j / (exp(sink_h - m) + sum_j exp(s_ij - m))
+```
+
+with `s_ij = q_i . k_j / sqrt(D)` and `m` the max over the row's scores and the sink. That is
+gpt-oss's reference: concatenate the sink as a column of the logits, softmax, drop the
+column. The C++ entry points are `attention_window_bf16`, `paged_decode_window_bf16 / _fp8`
+and `attention_varlen_window_bf16 / _fp8`; in Python, `window=` and `sinks=` on
+`sk.attention`, `sk.paged_decode` and `sk.attention_varlen`. Head sizes are the ladder's:
+`D` in {64, 128} everywhere, so gpt-oss's 64 query heads over 8 K/V heads at `D = 64` run on
+the same kernels, and its decode group of 8 heads fits the 16-row decode tile.
+
+**Skipping the tiles.** The speed is in not touching keys outside every row's window. A
+128-row Q tile at rows `q0 .. q0 + 127` needs the KV tiles from the one holding key
+`q0 + off - W + 1` (its first row's left edge, `off = S_kv - S_q`) to the one holding
+`q0 + 127 + off` (its last row's causal bound): `kv_tiles` in `attention.cu`. Every
+variant's tile range, the split of the tail and the persistent queue's items start there.
+The tiles inside the range are masked exactly: a tile runs the mask code when it starts
+before its last row's window edge (`kv0 < q0 + BM + off - W`) or reaches past its first row's
+causal bound, and per element `j <= p - W` joins `j > p` and `j >= S_kv`.
+
+Inside variant 5 two skips follow the window per warp. The dead-tile skip of the causal
+diagonal gets its mirror image: a warp whose 16 rows' windows all start after a tile's last
+key skips the tile and moves on. And a warp skips the 16-key blocks of a live tile that lie
+outside all of its rows' windows, both products of them (`SPARK_ATTN_V5_WSKIP=0` turns that
+off). At `W = 128` a Q tile spans 4 KV tiles; each warp needs 3 of them whole, 192 keys for
+the 128 its rows see, and with the block skip 144: warp 0's rows `q0 .. q0 + 15` see keys
+`q0 - 127 .. q0 + 15`, which is all of the first two tiles and one block of the third. At
+1024 and 4096 the edges are a few percent of the work.
+
+The block skip, on and off (`bench_attention`, TFLOPS by the pairs the window holds, two
+rounds each, the same session; at 4096 tokens a 4096-key window is the plain kernel, so that
+row is not here):
+
+| shape (32 / 8 heads, D = 128 unless noted) | W | block skip off | on |
+|---|---|---|---|
+| 4096 tokens | 128 | 123.7 / 123.7 | 127.9 / 127.6 |
+| 4096 tokens | 1024 | 208.7 / 209.2 | 210.8 / 210.7 |
+| 16384 tokens | 128 | 125.0 / 125.0 | **130.4 / 130.3** |
+| 16384 tokens | 1024 | 212.2 / 212.3 | 215.2 / 214.3 |
+| 16384 tokens | 4096 | 231.0 / 231.0 | 232.1 / 232.3 |
+| 64 / 8 heads, D = 64, sinks, 4096 tokens | 128 | 120.2 / 120.2 | 120.2 / 120.2 |
+| 64 / 8 heads, D = 64, sinks, 16384 tokens | 128 | 118.8 / 118.4 | 120.4 / 120.2 |
+
+It cuts a quarter of the products at `W = 128` and buys 4%, so the products are not what
+limits these rows. The bytes are. A row of a 128-key window is 4 x 128 x D FLOP, and Q and
+O are read and written once each whatever the window: at 16K tokens and 32 / 8 heads
+the floor is 335 MB (268 MB of it Q and O) against 34 GFLOP, about 100 FLOP per byte, under
+the card's 144 FLOP/byte ridge. In the sweep below the kernel moves those 335 MB at 1.36 TB/s, 89%
+of the 1,532 GB/s copy roof, so `W = 128` attention at `D = 128` is a memory-bound kernel on this
+card and the TFLOPS column undersells it. At 1024 keys it is compute-bound again, 215 to
+220 TFLOPS, and at 4096 the window costs little next to the full causal kernel (233 to 235
+against 238 to 242).
+
+**The sink** costs nothing in the loop. It joins the denominator once per row, in the
+epilogue, as `inv = a / (l a + 2^(sink - M))` with `M = max(m, sink)` and `a = 2^(m - M)` in
+the kernels' log2 domain (`sink_norm` in `attention_internal.cuh`), so neither exponential
+overflows whichever side is larger. A row that is split across blocks (the tail slices of
+variants 3 to 5, the flash-decoding kernel's key slices, the paged decode's pieces) writes
+its partial without the sink and the merge adds it once. The forward's `lse` includes it,
+`log(exp(sink) + sum_j exp(s_j))`.
+
+**Decode reads only the window.** The flash-decoding kernel's slab range starts at the slab
+holding the first token's window edge, so its split over blocks divides the window's keys,
+not the cache's: a step at 128K cached keys with a 4096-key window streams 4096 keys per K/V
+head. In the paged decode a sequence's segment in the flat slab list starts at the slab
+holding key `len - W`, so the length-aware split hands the warps window slabs and nothing
+else; the combine sees shorter segments and nothing new.
+
+**The plain path.** Every compute-bound kernel the options touch is a template with an `EXT`
+flag, and the plain instantiation is the code as it was. I compiled main's `attention.cu`,
+`attention_decode.cu` and `attention_paged.cu` next to these and compared the SASS function
+by function, constant-bank offsets aside (the parameter structs grew): variant 5's shipped
+kernel at `D = 128`, variant 4, variant 2's 64-row tile and the flash-decoding kernel are
+identical; variant 5 at `D = 64` and variant 2's 128-row tile differ by the operand order of
+one `FMNMX`; the varlen kernel's loop is identical and its per-block prologue is scheduled a
+little differently. The paged decode, the combine kernels and variants 0 and 1 take the
+options at run time. A first version of the varlen prefill did too, and it measured 0.9%
+slower on the single 4096-token prompt in both rounds, which is why it is a template now.
+Same session, main's sources and this branch interleaved, two rounds each (three for the
+varlen rows):
+
+| row | main | this branch |
+|---|---|---|
+| 1 x 32 x 4096 x 128 | 238.9 / 238.9 | 238.7 / 238.8 |
+| 1 x 32 x 4096 x 128, causal | 232.8 / 232.8 | 232.8 / 231.9 |
+| 1 x 32 x 8192 x 128, causal | 235.1 / 234.9 | 235.1 / 234.7 |
+| 4 x 32 x 2048 x 128, causal | 215.6 / 215.6 | 215.6 / 215.6 |
+| 1 x 32 x 4096 x 64, causal | 229.3 / 229.2 | 229.3 / 229.3 |
+| 1 x 32/8 x 4096 x 128, causal | 233.5 / 233.4 | 233.4 / 233.1 |
+| decode, 4096 keys, 32/8 heads | 966 / 966 GB/s | 970 / 970 GB/s |
+| decode, 4096 keys, 32 heads | 1,458 / 1,459 GB/s | 1,459 / 1,459 GB/s |
+| decode, 128K keys, 32/8 heads | 1,655 / 1,655 GB/s | 1,655 / 1,655 GB/s |
+| decode, batch 8, 4096 keys, 32/8 heads | 1,567 / 1,563 GB/s | 1,583 / 1,583 GB/s |
+| paged decode, 1 x 32768 + 50 x 500 | 159.3 / 159.3 us | 159.4 / 159.5 us |
+| paged decode, 64 x U(1, 8192) | 755.2 / 754.4 us | 754.4 / 755.4 us |
+| varlen prefill, 1 x 4096 | 654.2 / 655.5 / 654.3 us | 654.2 / 654.0 / 654.0 us |
+| varlen prefill, 16 x U(64, 1024) | 358.6 / 358.6 / 358.5 us | 357.2 / 357.2 / 357.9 us |
+
+(TFLOPS unless noted, variant 5 and the decode paths it shares with variant 3, medians of 30
+for prefill and 50 for decode; `bench_paged` medians of 30 and 50, variant 1. The prefill
+rows are 2 to 5% under the README's from 2026-09-28 on both builds alike, the card on the
+day.)
+
+### The window sweep
+
+`bench_attention --sweep=window` (`results/attention_window.json`), variant 5, medians of 50,
+every row checked against the CPU double-precision reference on 64 sampled rows (max error
+4.4e-4 to 1.5e-3 against a tolerance near 2e-2; a 128-key window averages fewer values than
+the full mask, and its 1.1e-3 to 1.5e-3 are the larger ones). TFLOPS by the
+(query, key) pairs the window holds, counted exactly; GB/s of Q, K, V and O once; the last
+column is the full causal kernel on the same shape over the windowed time. 32 / 8 heads,
+`D = 128` unless noted, the card idle before the run:
+
+| tokens | W | ms | TFLOPS | GB/s | full causal ms | speedup |
+|---|---|---|---|---|---|---|
+| 4096 | 128 | 0.0644 | 131.4 | 1,304 | 0.589 | 9.1x |
+| 4096 | 1024 | 0.2792 | 215.4 | 300 | 0.589 | 2.1x |
+| 4096, sinks | 128 | 0.0664 | 127.4 | 1,263 | 0.589 | 8.9x |
+| 4096, sinks | 1024 | 0.2813 | 213.8 | 298 | 0.589 | 2.1x |
+| 16384 | 128 | 0.2465 | 138.9 | **1,361** | 9.106 | 36.9x |
+| 16384 | 1024 | 1.2182 | 218.6 | 275 | 9.106 | 7.5x |
+| 16384 | 4096 | 4.0977 | 234.8 | 82 | 9.106 | 2.2x |
+| 16384, sinks | 128 | 0.2504 | 136.7 | 1,340 | 9.106 | 36.4x |
+| 16384, sinks | 1024 | 1.2213 | 218.0 | 275 | 9.106 | 7.5x |
+| 32768 | 128 | 0.4881 | 140.5 | 1,375 | 36.964 | **75.7x** |
+| 32768 | 1024 | 2.4572 | 220.2 | 273 | 36.964 | 15.0x |
+| 32768 | 4096 | 8.8662 | 232.5 | 76 | 36.964 | 4.2x |
+| 4096, 64 / 8 heads, D = 64, sinks | 128 | 0.0683 | 123.8 | 1,105 | 0.581 | 8.5x |
+| 16384, 64 / 8 heads, D = 64, sinks | 128 | 0.2689 | 127.3 | 1,123 | 9.341 | 34.7x |
+
+(The full causal kernel runs at 233.4, 241.5 and 238.0 TFLOPS at 4K, 16K and 32K. At 4096
+tokens a 4096-key window is the full causal kernel itself and is left out.) The sink costs
+0.3 to 3%, most at `W = 128` and 4K tokens, where an item is three tiles of work per warp and
+the epilogue's extra `__ldg`, `ex2` and division per row are a larger share of it.
+
+Decode, one step against 128K cached keys:
+
+| step | us | GB/s | whole cache us | speedup |
+|---|---|---|---|---|
+| 32 / 8 heads, D = 128, W = 4096 | 17.3 | 970 | 324.4 | 18.7x |
+| 32 / 8 heads, D = 128, W = 128 | 5.0 | 108 | 324.4 | 64.9x |
+| 64 / 8 heads, D = 64, W = 128, sinks | 5.0 | 56 | 166.6 | 33.3x |
+
+The 4096-key step is the 4096-token decode row of the "Long-context decode" table to the
+microsecond (17.3 us, 966 to 972 GB/s): a window of a long cache costs what a cache of the
+window's length costs, and the 128-key steps are launch and pipeline fill.
+
+**Against torch** (`scripts/bench_attention_window.py`, CUDA events, medians of 30; both
+sides timed by the same loop, so the ours column is the script's own and a few us above the
+C++ bench on the short rows). `flex_attention` is compiled (`dynamic=False`) with the block
+mask of a sliding-window `mask_mod`, so it skips the tiles outside the window too; it agrees
+with ours to 4e-3. SDPA gets the window as a boolean `[S, S]` mask with K and V repeated to
+the 32 query heads; it takes 5.5 times the full causal mask's time, so whichever of torch's
+kernels it picks (I did not check) visits every tile. The last column is SDPA's
+FlashAttention-2 on the full causal mask, what a model without a window kernel runs instead.
+
+| tokens | W | ours ms | flex ms | ours / flex | SDPA + mask ms | SDPA, full causal ms |
+|---|---|---|---|---|---|---|
+| 4096 | 128 | 0.067 | 0.137 | 2.04x | 3.71 | 0.78 |
+| 4096 | 1024 | 0.284 | 0.393 | 1.39x | 3.73 | 0.78 |
+| 16384 | 128 | 0.250 | 0.451 | 1.80x | 56.7 | 10.4 |
+| 16384 | 1024 | 1.225 | 1.533 | 1.25x | 57.0 | 10.4 |
+| 16384 | 4096 | 4.102 | 4.749 | 1.16x | 56.9 | 10.4 |
+| 32768 | 128 | 0.494 | 0.861 | 1.74x | 226.3 | 40.1 |
+| 32768 | 1024 | 2.466 | 3.048 | 1.24x | 227.0 | 40.1 |
+| 32768 | 4096 | 8.896 | 10.023 | 1.13x | 224.7 | 40.1 |
+
+The gap is widest where the window is smallest: at 128 keys flex runs 62 to 80 TFLOPS by the
+same count, under half of ours, and at 4096 it is 13 to 16% behind, about the margin by
+which our full causal kernel leads FlashAttention-2.
+
+gpt-oss's attention (64 query / 8 K/V heads, D = 64, W = 128, a sink per head). flex has no
+sink, so its side is `return_lse=True` and the correction `out * sigmoid(lse - sink)`, which
+is the same math (the two agree to 1.6e-2, two bf16 roundings on flex's side):
+
+| tokens | ours ms | flex + sink correction ms | ours / flex |
+|---|---|---|---|
+| 4096 | 0.073 | 0.263 | 3.59x |
+| 16384 | 0.276 | 1.265 | 4.59x |
+
+Decode, one step against 128K cached keys, K and V rotated through shifted copies so every
+launch reads its window from DRAM (`flex` is the same compiled call at `S_q = 1`; "SDPA on
+the slice" is FlashAttention-2 on `k[:, :, -W:]`, what a torch decode step with a window
+does):
+
+| step | ours us | ours, whole cache us | flex us | SDPA on the slice us |
+|---|---|---|---|---|
+| 32 / 8 heads, D = 128, W = 4096 | 19.9 | 329.8 | 143.2 | 38.2 |
+| 64 / 8 heads, D = 64, W = 128, sinks | 8.6 | 169.9 | 106.3 | |
+
+The paged decode, one step for a batch, against the same batch without a window (the same
+script, `sk.paged_decode`, pages of 16 in shuffled order; GB/s of the keys the windows
+hold):
+
+| batch | W | ours us | no window us | GB/s |
+|---|---|---|---|---|
+| 16 x 32768, 32 / 8 heads, D = 128 | 4096 | 176.0 | 1,305.5 | 1,526 |
+| 16 x 32768, 32 / 8 heads, D = 128 | 128 | 11.9 | 1,304.8 | 725 |
+| 1 x 32768 + 50 x 500, 32 / 8 heads, D = 128 | 4096 | 79.4 | 164.6 | 1,512 |
+| 16 x 32768, 64 / 8 heads, D = 64, sinks | 128 | 12.0 | 670.9 | 372 |
+
+A 4096-key window over 16 long sequences is 268 MB of K and V per step, read at the copy roof;
+at 128 keys a step is 2,048 keys of the batch and the launch is most of the 12 us.
+
+The tail split stays off under a window, as under the causal mask. My first version turned
+it on, reasoning that windowed tiles are nearly equal, as without a mask; forced both ways
+(`SPARK_ATTN_V5_SPLIT`, two rounds) the split measured the same or slower, off against on
+128.1 and 127.9 TFLOPS at 4K tokens and `W = 128`, 212.2 and 210.8 at 1024, 214.2 and 213.8
+at 16K and 1024: the queue already evens the items out, and the split adds a combine launch.
+
 ## What remains
 
 - **The last 3%.** The tensor pipe is 96 to 97.5% active in variant 5; the block prologue
@@ -1186,3 +1414,10 @@ times the strided read against the packed one (four such rows are in the default
 - **Decode with more rows per K/V head** (8 heads x 8 tokens, speculative decoding) on the
   flash-decoding kernel: two or four m16 tiles per warp instead of one, which the register
   budget (64 accumulators per m16 tile at `D = 128`) allows twice over.
+- **Local attention, the rest.** The backward takes no window or sinks, so training a
+  gpt-oss-style model is not covered (the sink's own gradient is
+  `-sum_i P_i,sink (dO_i . O_i)`, one more row reduction). `attention_fp8` has no window.
+  The engine and the layer run Llama-shaped models only, so no model here uses the options
+  yet. At `W = 128` the kernel is at 89% of the copy roof on `D = 128` but about 73% on
+  gpt-oss's `D = 64` rows, where a key costs half the products and the same softmax, so it
+  is at neither roof; I have not profiled those rows.
