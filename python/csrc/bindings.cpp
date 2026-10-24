@@ -971,6 +971,166 @@ Tensor ce_transpose(const Tensor& x, int64_t c0, int64_t c1, int64_t ld, const T
     return out;
 }
 
+// ---- MoE layer pieces: grouped_gemm's SwiGLU form, routing, permute, combine -------------
+
+// grouped_gemm with the SwiGLU in the epilogue: w [E, 2I, K] with rows alternating gate and
+// up (interleave_experts) -> [T, I] bf16, silu(a w_gate^T) * (a w_up^T) from fp32 sums.
+Tensor grouped_gemm_swiglu(const Tensor& a, const Tensor& w, const Tensor& offsets,
+                           const std::optional<Tensor>& scale_a,
+                           const std::optional<Tensor>& scale_b) {
+    check_cuda_contig(a, "a");
+    check_cuda_contig(w, "w");
+    check_cuda_contig(offsets, "offsets");
+    const bool fp8 = a.scalar_type() == at::kFloat8_e4m3fn;
+    TORCH_CHECK((fp8 && w.scalar_type() == at::kFloat8_e4m3fn) ||
+                    (a.scalar_type() == at::kBFloat16 && w.scalar_type() == at::kBFloat16),
+                "grouped_gemm_swiglu expects a and w both bfloat16 or both float8_e4m3fn");
+    TORCH_CHECK(a.dim() == 2 && w.dim() == 3,
+                "grouped_gemm_swiglu expects a [T, K] and w [E, 2I, K]");
+    const int64_t T = a.size(0), K = a.size(1), E = w.size(0), N = w.size(1);
+    TORCH_CHECK(w.size(2) == K, "w is ", w.sizes(), ", expected [E, 2I, ", K, "]");
+    TORCH_CHECK(offsets.scalar_type() == at::kInt && offsets.dim() == 1 && offsets.size(0) == E + 1,
+                "offsets must be int32 [E + 1]");
+    TORCH_CHECK(w.device() == a.device() && offsets.device() == a.device(),
+                "w and offsets must be on a's device");
+    TORCH_CHECK(T <= INT32_MAX && K <= INT32_MAX && N <= INT32_MAX, "grouped_gemm dims too large");
+    TORCH_CHECK(spark::grouped_gemm_supports(static_cast<int>(E), static_cast<int>(N),
+                                             static_cast<int>(K), fp8),
+                "grouped_gemm_swiglu needs 1 <= E <= 512, 2I a multiple of 128 and K a multiple "
+                "of ",
+                fp8 ? 128 : 64, ", got E = ", E, ", 2I = ", N, ", K = ", K);
+    TORCH_CHECK(aligned16(a) && aligned16(w), "grouped_gemm_swiglu needs 16-byte aligned a and w");
+    const float* sa = nullptr;
+    const float* sb = nullptr;
+    Tensor sb_full;
+    if (fp8) {
+        if (scale_a.has_value()) {
+            TORCH_CHECK(scale_a->is_cuda() && scale_a->scalar_type() == at::kFloat &&
+                            scale_a->numel() == 1 && scale_a->device() == a.device(),
+                        "scale_a must be a float32 tensor with one element on a's device");
+            sa = scale_a->data_ptr<float>();
+        }
+        if (scale_b.has_value()) {
+            TORCH_CHECK(scale_b->is_cuda() && scale_b->scalar_type() == at::kFloat &&
+                            (scale_b->numel() == 1 || scale_b->numel() == E) &&
+                            scale_b->device() == a.device(),
+                        "scale_b must be float32 with 1 or E elements on a's device");
+            sb_full = scale_b->reshape({-1}).expand({E}).contiguous();
+            sb = sb_full.data_ptr<float>();
+        }
+    } else {
+        TORCH_CHECK(!scale_a.has_value() && !scale_b.has_value(),
+                    "grouped_gemm_swiglu: scales are for float8_e4m3fn inputs only");
+    }
+    const c10::cuda::CUDAGuard guard(a.device());
+    Tensor c = at::empty({T, N / 2}, a.options().dtype(at::kBFloat16));
+    if (fp8) {
+        spark::grouped_gemm_swiglu_fp8(
+            reinterpret_cast<const __nv_fp8_e4m3*>(a.data_ptr()),
+            reinterpret_cast<const __nv_fp8_e4m3*>(w.data_ptr()), offsets.data_ptr<int32_t>(),
+            bf16_ptr_mut(c), static_cast<int>(T), static_cast<int>(E), static_cast<int>(N),
+            static_cast<int>(K), sa, sb, current_stream(a));
+    } else {
+        spark::grouped_gemm_swiglu_bf16(bf16_ptr(a), bf16_ptr(w), offsets.data_ptr<int32_t>(),
+                                        bf16_ptr_mut(c), static_cast<int>(T), static_cast<int>(E),
+                                        static_cast<int>(N), static_cast<int>(K),
+                                        current_stream(a));
+    }
+    return c;
+}
+
+// The routing's outputs, allocated and filled by one moe_route launch: ids [T, k] int32,
+// weights [T, k] fp32, offsets [E + 1] int32 and rank [T, k] int32 (made into pos by whoever
+// runs next).
+struct MoeRouting {
+    Tensor ids, weights, offsets, pos;
+    spark::MoeRoutePlan plan;
+    int T, E, k;
+};
+
+MoeRouting run_moe_route(const Tensor& logits, int64_t top_k, bool renormalize) {
+    check_cuda_contig(logits, "logits");
+    check_float_or_bf16(logits, "logits");
+    TORCH_CHECK(logits.dim() == 2, "logits must be [T, E]");
+    const int64_t T = logits.size(0), E = logits.size(1);
+    TORCH_CHECK(T * top_k <= INT32_MAX, "moe_route: too many tokens");
+    TORCH_CHECK(spark::moe_route_supports(static_cast<int>(E), static_cast<int>(top_k)),
+                "moe_route needs 1 <= top_k <= min(E, 16) and E <= 512, got E = ", E,
+                ", top_k = ", top_k);
+    const c10::cuda::CUDAGuard guard(logits.device());
+    const auto i32 = logits.options().dtype(at::kInt);
+    MoeRouting r;
+    r.T = static_cast<int>(T);
+    r.E = static_cast<int>(E);
+    r.k = static_cast<int>(top_k);
+    r.ids = at::empty({T, top_k}, i32);
+    r.weights = at::empty({T, top_k}, logits.options().dtype(at::kFloat));
+    r.offsets = at::empty({E + 1}, i32);
+    r.pos = at::empty({T, top_k}, i32);
+    r.plan = spark::moe_route(logits.data_ptr(), logits.scalar_type() == at::kFloat, r.T, r.E, r.k,
+                              renormalize, r.ids.data_ptr<int32_t>(), r.weights.data_ptr<float>(),
+                              r.pos.data_ptr<int32_t>(), r.offsets.data_ptr<int32_t>(),
+                              current_stream(logits));
+    return r;
+}
+
+// Softmax top-k routing: (ids, weights, offsets, pos), pos [T, k] the row of expert order each
+// (token, slot) goes to. Two launches (the routing, then the positions).
+std::tuple<Tensor, Tensor, Tensor, Tensor> moe_route(const Tensor& logits, int64_t top_k,
+                                                     bool renormalize) {
+    MoeRouting r = run_moe_route(logits, top_k, renormalize);
+    spark::moe_positions(r.ids.data_ptr<int32_t>(), r.pos.data_ptr<int32_t>(), r.plan, r.T, r.E,
+                         r.k, current_stream(logits));
+    return {r.ids, r.weights, r.offsets, r.pos};
+}
+
+// The routing and the rows in expert order: (xs [T * k, D], ids, weights, offsets, pos), two
+// launches (the routing, then the permute, which finishes pos as it moves the rows).
+std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> moe_dispatch(const Tensor& x,
+                                                                const Tensor& logits, int64_t top_k,
+                                                                bool renormalize) {
+    check_cuda_contig(x, "x");
+    TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.dim() == 2, "x must be bfloat16 [T, D]");
+    TORCH_CHECK(logits.dim() == 2 && logits.size(0) == x.size(0),
+                "logits must be [T, E] with x's T");
+    TORCH_CHECK(x.device() == logits.device(), "x and logits must be on one device");
+    const int64_t D = x.size(1);
+    TORCH_CHECK(spark::moe_permute_supports(static_cast<int>(D), static_cast<int>(top_k)),
+                "moe_dispatch needs D a multiple of 8, at most 8192, and top_k <= 16");
+    TORCH_CHECK(aligned16(x), "moe_dispatch needs 16-byte aligned x");
+    MoeRouting r = run_moe_route(logits, top_k, renormalize);
+    const c10::cuda::CUDAGuard guard(x.device());
+    Tensor xs = at::empty({x.size(0) * top_k, D}, x.options());
+    spark::moe_permute_bf16(bf16_ptr(x), r.ids.data_ptr<int32_t>(), r.pos.data_ptr<int32_t>(),
+                            r.plan, bf16_ptr_mut(xs), r.T, r.E, r.k, static_cast<int>(D),
+                            current_stream(x));
+    return {xs, r.ids, r.weights, r.offsets, r.pos};
+}
+
+// out [T, D] = sum over s of weights[t, s] * y[pos[t, s]], fp32 in slot order, one rounding.
+Tensor moe_combine(const Tensor& y, const Tensor& pos, const Tensor& weights) {
+    check_cuda_contig(y, "y");
+    check_cuda_contig(pos, "pos");
+    check_cuda_contig(weights, "weights");
+    TORCH_CHECK(y.scalar_type() == at::kBFloat16 && y.dim() == 2, "y must be bfloat16 [T * k, D]");
+    TORCH_CHECK(pos.scalar_type() == at::kInt && pos.dim() == 2, "pos must be int32 [T, k]");
+    TORCH_CHECK(weights.scalar_type() == at::kFloat && weights.sizes() == pos.sizes(),
+                "weights must be float32 with pos's shape");
+    TORCH_CHECK(y.device() == pos.device() && y.device() == weights.device(),
+                "y, pos and weights must be on one device");
+    const int64_t T = pos.size(0), k = pos.size(1), D = y.size(1);
+    TORCH_CHECK(y.size(0) == T * k, "y has ", y.size(0), " rows, pos says ", T * k);
+    TORCH_CHECK(spark::moe_permute_supports(static_cast<int>(D), static_cast<int>(k)),
+                "moe_combine needs D a multiple of 8, at most 8192, and k <= 16");
+    TORCH_CHECK(aligned16(y), "moe_combine needs 16-byte aligned y");
+    const c10::cuda::CUDAGuard guard(y.device());
+    Tensor out = at::empty({T, D}, y.options());
+    spark::moe_combine_bf16(bf16_ptr(y), pos.data_ptr<int32_t>(), weights.data_ptr<float>(),
+                            bf16_ptr_mut(out), static_cast<int>(T), static_cast<int>(k),
+                            static_cast<int>(D), current_stream(y));
+    return out;
+}
+
 // The rows each K/V head is allocated when k and v are the leading S_kv rows of every head of
 // a [B, H_kv, cap, D] cache (`cache[:, :, :length]`, the filled part of a cache with spare
 // capacity), which the forward reads in place; 0 for packed k and v. Anything else is not a
@@ -1739,6 +1899,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "columns [c0, c1) of x [rows, cols] bf16 transposed into out [c1 - c0, ld], zero "
           "past rows",
           py::arg("x"), py::arg("c0"), py::arg("c1"), py::arg("ld"), py::arg("out"));
+    m.def("grouped_gemm_swiglu", &grouped_gemm_swiglu,
+          "grouped_gemm with the SwiGLU in the epilogue: w [E, 2I, K] with rows alternating gate "
+          "and up -> [T, I] bf16",
+          py::arg("a"), py::arg("w"), py::arg("offsets"), py::arg("scale_a") = py::none(),
+          py::arg("scale_b") = py::none());
+    m.def("moe_route", &moe_route,
+          "softmax top-k routing of logits [T, E]: (ids [T, k] int32, weights [T, k] fp32, "
+          "offsets [E + 1] int32, pos [T, k] int32, the row of expert order)",
+          py::arg("logits"), py::arg("top_k"), py::arg("renormalize") = true);
+    m.def("moe_dispatch", &moe_dispatch,
+          "moe_route plus the rows of x [T, D] in expert order: (xs [T * k, D], ids, weights, "
+          "offsets, pos)",
+          py::arg("x"), py::arg("logits"), py::arg("top_k"), py::arg("renormalize") = true);
+    m.def("moe_combine", &moe_combine,
+          "out [T, D] = sum over s of weights[t, s] * y[pos[t, s]], fp32, fixed order",
+          py::arg("y"), py::arg("pos"), py::arg("weights"));
     m.def("attention", &attention,
           "softmax(q k^T / sqrt(D)) v over [B, H, S, D] bf16 tensors (k, v may have fewer heads)",
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("causal") = false,

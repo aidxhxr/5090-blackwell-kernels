@@ -493,6 +493,50 @@ def moe_offsets(expert_ids: torch.Tensor, num_experts: int) -> tuple[torch.Tenso
     return order, offsets
 
 
+# ---- MoE layer pieces (src/kernels/moe_route.cu, moe_permute.cu; docs/design/moe_layer.md) ----
+def interleave_experts(w_gate: torch.Tensor, w_up: torch.Tensor) -> torch.Tensor:
+    """[E, I, K] gate and up weights (nn.Linear's layout per expert) as the [E, 2I, K] weight
+    `grouped_gemm_swiglu` takes: row 2j is gate_j, row 2j+1 is up_j. Done once at load time."""
+    if w_gate.shape != w_up.shape or w_gate.dim() != 3:
+        raise ValueError(f"gate and up must be the same [E, I, K], got {tuple(w_gate.shape)} and "
+                         f"{tuple(w_up.shape)}")
+    E, i, k = w_gate.shape
+    return torch.stack((w_gate, w_up), dim=2).reshape(E, 2 * i, k)
+
+
+def grouped_gemm_swiglu(a: torch.Tensor, w13: torch.Tensor, offsets: torch.Tensor,
+                        scale_a: torch.Tensor | None = None,
+                        scale_b: torch.Tensor | None = None) -> torch.Tensor:
+    """`grouped_gemm` with an MoE expert's SwiGLU in the epilogue: a [T, K] sorted by expert,
+    w13 [E, 2I, K] from `interleave_experts` -> [T, I] bf16, silu(a @ w_gate.T) * (a @ w_up.T)
+    with both products from the fp32 sums and one rounding. Same types, scales and shape rules
+    as grouped_gemm with N = 2I."""
+    return _C.grouped_gemm_swiglu(a, w13, offsets, scale_a, scale_b)
+
+
+def moe_route(logits: torch.Tensor, top_k: int, renormalize: bool = True
+              ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Softmax top-k routing on the device: logits [T, E] (fp32 or bf16, E <= 512) ->
+    (ids [T, k] int32, the experts largest first; weights [T, k] fp32, the softmax over all E
+    at those experts, renormalized to sum 1 when `renormalize`; offsets [E + 1] int32, rows per
+    expert in expert order; pos [T, k] int32, the row of expert order each (token, slot) takes,
+    sorted by expert, then token, then slot). No host sync; k <= 16."""
+    return _C.moe_route(logits, top_k, renormalize)
+
+
+def moe_dispatch(x: torch.Tensor, logits: torch.Tensor, top_k: int, renormalize: bool = True
+                 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """`moe_route` plus the rows: (xs [T * k, D] bf16 with xs[pos[t, s]] = x[t], ids, weights,
+    offsets, pos), two launches. xs and offsets are what grouped_gemm takes."""
+    return _C.moe_dispatch(x, logits, top_k, renormalize)
+
+
+def moe_combine(y: torch.Tensor, pos: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    """out [T, D] = sum over s of weights[t, s] * y[pos[t, s]]: y [T * k, D] bf16 in expert
+    order, the sum in fp32 in slot order and rounded once, so the same bits every run."""
+    return _C.moe_combine(y, pos, weights)
+
+
 def rope_append_(
     qkv: torch.Tensor,
     cos: torch.Tensor,

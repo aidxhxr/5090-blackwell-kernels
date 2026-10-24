@@ -189,3 +189,17 @@ from .ops import (  # noqa: E402
 )
 
 __all__ += ["cpu_bandwidth_probe", "cpu_route", "cpu_sample", "cpu_w1gemv"]
+
+# The pieces of a whole MoE layer (docs/design/moe_layer.md): softmax top-k routing, the rows
+# into expert order and back, and the grouped GEMM with the SwiGLU in its epilogue.
+# `spark_kernels.moe_layer` puts them together.
+from .ops import (  # noqa: E402
+    grouped_gemm_swiglu,
+    interleave_experts,
+    moe_combine,
+    moe_dispatch,
+    moe_route,
+)
+
+__all__ += ["grouped_gemm_swiglu", "interleave_experts", "moe_combine", "moe_dispatch",
+            "moe_route"]
