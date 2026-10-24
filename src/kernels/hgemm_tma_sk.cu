@@ -45,7 +45,9 @@
 // residual and the gate/up product all happen once, on the finished sum. The FUSED
 // instantiation is separate from the plain one so the plain kernel is unchanged.
 
+#include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 
 #include "hgemm_epilogue.cuh"
@@ -418,7 +420,7 @@ constexpr int kMinShareSmall = 8;
 // the least k-steps per block, SPARK_HGEMM_V6_MIN_SHARE_SMALL the rule's floor above,
 // SPARK_HGEMM_V6_MIN_PASS the shortest K-pass, SPARK_HGEMM_V6_SERIAL=1 the
 // serialized-prologue experiment. SPARK_HGEMM_V6_ROUTE is the initial tile route
-// (hgemm_v6_set_route).
+// (hgemm_v6_set_route), SPARK_HGEMM_V6_SPLIT the split-K switch (hgemm_v6_set_split).
 struct Env {
     int cfg = -1;
     int serial = 0;
@@ -451,6 +453,16 @@ std::atomic<int>& route_slot() {
     static std::atomic<int> slot([] {
         const char* s = std::getenv("SPARK_HGEMM_V6_ROUTE");
         return s ? std::atoi(s) : static_cast<int>(HGEMM_V6_ROUTE_DEFAULT);
+    }());
+    return slot;
+}
+
+// The split-K switch (hgemm_v6_set_split), the same way: SPARK_HGEMM_V6_SPLIT=0 turns the
+// split off and gives the unsplit route back, n >= 2 forces n K-slices.
+std::atomic<int>& split_slot() {
+    static std::atomic<int> slot([] {
+        const char* s = std::getenv("SPARK_HGEMM_V6_SPLIT");
+        return s ? std::atoi(s) : static_cast<int>(HGEMM_V6_SPLIT_RULE);
     }());
     return slot;
 }
@@ -622,9 +634,10 @@ long long share_of(const Config& c, int M, int N, int K) {
 
 // What variant 6 runs for a shape.
 struct Route {
-    enum Kind { DECODE, V4, CONFIG, TILE } kind;
-    int index;      // into CONFIGS or TILES
-    int min_share;  // the static schedule's least k-steps per block
+    enum Kind { DECODE, V4, CONFIG, TILE, SPLIT } kind;
+    int index;       // into CONFIGS or TILES
+    int min_share;   // the static schedule's least k-steps per block
+    int splits = 0;  // SPLIT: K-slices per tile
 };
 
 // The per-shape rule, the default route since the model-shape sweep (docs/design/hgemm.md,
@@ -665,13 +678,52 @@ Route route_rule(int M, int N, int K) {
     return {Route::TILE, small, e.min_share_small};
 }
 
+// The split-K tile and count for a shape. The count comes from the shape alone: as many
+// K-slices as fill one wave of resident blocks, at least kMinSplitSteps k-steps each, at most
+// kMaxSplits. splits < 2 means no split.
+constexpr int kMinSplitSteps = 4;
+constexpr int kMaxSplits = 16;
+
+int split_count(const Config& c, int M, int N, int K, int min_steps, int max_splits) {
+    const int tiles = cdiv(M, c.bm) * (N / c.bn);
+    const int S = std::min({c.resident() / std::max(tiles, 1), K / c.bk / min_steps, max_splits});
+    return std::max(S, 1);
+}
+
+// S equal K-slices per tile, on tiles x S blocks.
+Route split_route(int tile, int S) {
+    return {Route::SPLIT, tile, 0, S};
+}
+
+// The split-K rule (docs/design/hgemm.md, "Model shapes"), from the shape alone: the 64x64
+// tile cut into as many K-slices as one wave of resident blocks holds, floor(170 / tiles) on
+// the RTX 5090, wherever that is two or more. That is a grid of 64x64 tiles under half a wave:
+// on the model shapes N <= 2304 at 128 tokens and N <= 1024 at 256, the shapes cuBLAS takes
+// with its own split-K.
+Route split_rule(int M, int N, int K, const Route& unsplit) {
+    const int S = split_count(TILES[kTile64x64], M, N, K, kMinSplitSteps, kMaxSplits);
+    if (S < 2) return unsplit;
+    return split_route(kTile64x64, S);
+}
+
 Route choose(int M, int N, int K) {
     const Env& e = env();
     if (M <= 64)  // decode: stream B (hgemm_decode.cu), or variant 4's 64-row tile
         return {hgemm_decode::supports(M, N, K) ? Route::DECODE : Route::V4, 0, 0};
     const int r = route_slot().load(std::memory_order_relaxed);
+    const int sp = split_slot().load(std::memory_order_relaxed);
+    if (sp >= 2) {
+        // A forced split count (the sweeps): on the forced tile when it has a split form, on
+        // the rule's 64x64 tile otherwise, at least one k-step per slice.
+        const bool forced = r >= 0 && r < NUM_TILES && N % TILES[r].bn == 0 && TILES[r].split;
+        const int tile = forced ? r : kTile64x64;
+        return split_route(tile, std::min(sp, K / TILES[tile].bk));
+    }
     if (r >= 0 && r < NUM_TILES && N % TILES[r].bn == 0) return {Route::TILE, r, e.knobs.min_share};
-    if (r != HGEMM_V6_ROUTE_LEGACY && e.cfg < 0) return route_rule(M, N, K);
+    if (r != HGEMM_V6_ROUTE_LEGACY && e.cfg < 0) {
+        const Route unsplit = route_rule(M, N, K);
+        return sp == HGEMM_V6_SPLIT_OFF ? unsplit : split_rule(M, N, K, unsplit);
+    }
     // The route before the model-shape sweep (and the one SPARK_HGEMM_V6_CONFIG sweeps):
     // the 128x128 tile when each block's share of the (tile, k-step) space is at least
     // kMinShare k-steps, variant 4's smaller tiles below that.
@@ -692,6 +744,11 @@ void launch_auto(const __nv_bfloat16* A, const __nv_bfloat16* B, __nv_bfloat16* 
         hgemm_streamk_bf16(A, B, C, M, N, K, stream, ep);
         return;
     }
+    if (r.kind == Route::SPLIT) {
+        const Config& c = TILES[r.index];
+        (hgemm_epi::is_plain(ep) ? c.split : c.split_fused)(A, B, C, M, N, K, stream, ep, r.splits);
+        return;
+    }
     const Config& c = r.kind == Route::CONFIG ? CONFIGS[r.index] : TILES[r.index];
     hgemm_sk::Knobs knobs = env().knobs;
     knobs.min_share = r.min_share;
@@ -710,6 +767,11 @@ const char* route_name(int M, int N, int K) {
             return "v4 cp.async";
         case Route::CONFIG:
             return CONFIGS[r.index].name;
+        case Route::SPLIT: {
+            static thread_local char name[64];
+            std::snprintf(name, sizeof(name), "%s, split %d", TILES[r.index].name, r.splits);
+            return name;
+        }
         default:
             if (r.min_share != env().knobs.min_share)
                 return r.index == kTile64x128 ? "tma 64x128 s4, small share"
@@ -745,6 +807,14 @@ int hgemm_v6_route() {
 
 int hgemm_v6_num_tiles() {
     return v6::NUM_TILES;
+}
+
+void hgemm_v6_set_split(int split) {
+    v6::split_slot().store(split, std::memory_order_relaxed);
+}
+
+int hgemm_v6_split() {
+    return v6::split_slot().load(std::memory_order_relaxed);
 }
 
 const char* hgemm_v6_route_name(int M, int N, int K) {

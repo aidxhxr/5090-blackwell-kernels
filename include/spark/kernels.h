@@ -206,6 +206,15 @@ void hgemm_v6_set_route(int route);
 int hgemm_v6_route();
 int hgemm_v6_num_tiles();
 const char* hgemm_v6_route_name(int M, int N, int K);
+// Variant 6's split-K for M > 64 (docs/design/hgemm.md, "Model shapes"): K cut into slices
+// whose fp32 partials the last warp to arrive sums in slice order, so the bits are the same
+// every run (and differ from the unsplit kernel's). RULE splits the shapes the rule picks,
+// OFF never splits (the route before the split), n >= 2 forces n K-slices on every shape
+// with M > 64 (for the sweeps; on the forced tile when it has a split form). Process-wide,
+// initial value from SPARK_HGEMM_V6_SPLIT.
+enum HgemmV6Split { HGEMM_V6_SPLIT_RULE = -1, HGEMM_V6_SPLIT_OFF = 0 };
+void hgemm_v6_set_split(int split);
+int hgemm_v6_split();
 
 // ---- FP8GEMM (e4m3 tensor cores) ----------------------------------------------------------
 // C = scale_a * scale_b * A * Bt^T, with A [M,K] and Bt [N,K] both e4m3 and row-major (K
