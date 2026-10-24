@@ -46,23 +46,36 @@ HGEMM_SHAPES_NOT_V5 = [(1024, 1024, 1024), (16, 4096, 4096), (2048, 2112, 2048),
 # that is not a multiple of 16 (1000x4096x4096: 256 tiles, the last tile row 104 rows tall,
 # zero-filled by the copy engine), the queue with two K-passes per Stream-K tile on operands
 # that fit in L2 (2064x11008x2048: 1462 tiles, 8.6 waves) and with three passes on operands
-# that do not (2100x11008x4096), and the shapes the TMA tile hands to variant 4's tiles or
-# the decode kernel: under a 32 k-step share per block (1024^3, 272x128x4096, 100x1024x1024),
-# N % 128 != 0 (128x64x16384), M <= 64 (16x4096x1024, 1x4096x4096).
+# that do not (2100x11008x4096), and the shapes the TMA tile hands elsewhere: variant 4's
+# tiles under a 32 k-step share per block (1024^3), the split-K on grids of 64x64 tiles under
+# half a wave (272x128x4096, 100x1024x1024, and 128x64x16384 with N % 128 != 0), the decode
+# kernel at M <= 64 (16x4096x1024, 1x4096x4096).
 HGEMM_SHAPES_V6 = [(2048, 2048, 2048), (1000, 4096, 4096), (2064, 11008, 2048),
                    (2100, 11008, 4096), (1024, 1024, 1024), (272, 128, 4096), (100, 1024, 1024),
                    (128, 64, 16384), (16, 4096, 1024), (1, 4096, 4096)]
+# variant 6's split-K (docs/design/hgemm.md, "Model shapes"): when a grid of 64x64 tiles is
+# under half a wave, K is cut into floor(170 / tiles) slices on the RTX 5090 and the last warp
+# to arrive at each region of a tile sums the slices' fp32 partials in slice order. The
+# Qwen 3 30B-A3B expert at 128 and 256 tokens (24 tiles in 7 slices, 48 in 3), the Llama 3 8B
+# k/v projection (128x1024x4096), the DeepSeek expert (128x2304x5120, 2 slices), a short K
+# (128x2048x768), ragged M in the second 64-row tile (96 and 100 rows, and 65 with one row
+# there), and a narrow N with a deep K (272x128x4096: 10 tiles in 16 slices of 4 k-steps).
+HGEMM_SHAPES_V6_SPLIT = [(128, 768, 2048), (256, 768, 2048), (128, 1024, 4096),
+                         (128, 2304, 5120), (128, 2048, 768), (96, 1024, 4096),
+                         (100, 1024, 1024), (65, 768, 2048), (272, 128, 4096)]
 HGEMM_TOL = dict(atol=3e-2, rtol=3e-2)
 # The fused epilogue (variants 4 and 6): one shape per route the default variant takes.
 # 1000x4096x4096 is the TMA tile on static ranges with a ragged M; 2064x11008x2048 the queue
 # with two K-passes per Stream-K tile (the finishing piece applies the epilogue after the
-# fixup); 1024^3 and 272x128x4096 variant 4's 64-row tiles; 128x64x16384 its 64-column tile
-# with 8 pieces per tile; 16x4096x1024 and 1x4096x4096 the decode kernel unsplit; 33x256x4096
-# and 5x4096x256 the decode kernel with K split four ways, where the last slice to arrive
-# applies the epilogue from the fp32 workspace.
+# fixup); 1024^3 and 272x128x4096 variant 4's 64-row tiles (272x128x4096 is variant 6's
+# split-K); 128x64x16384 its 64-column tile with 8 pieces per tile; 16x4096x1024 and
+# 1x4096x4096 the decode kernel unsplit; 33x256x4096 and 5x4096x256 the decode kernel with K
+# split four ways, where the last slice to arrive applies the epilogue from the fp32
+# workspace; 128x768x2048 and 96x1024x4096 variant 6's split-K, where the last warp to arrive
+# applies it after the slice-order sum.
 HGEMM_SHAPES_EPILOGUE = [(1000, 4096, 4096), (2064, 11008, 2048), (1024, 1024, 1024),
                          (272, 128, 4096), (128, 64, 16384), (16, 4096, 1024), (1, 4096, 4096),
-                         (33, 256, 4096), (5, 4096, 256)]
+                         (33, 256, 4096), (5, 4096, 256), (128, 768, 2048), (96, 1024, 4096)]
 # (bias, act, residual mode): every option alone, then the decoder-block combinations.
 HGEMM_EPILOGUES = [(True, None, None), (False, "silu", None), (False, "gelu", None),
                    (False, "relu", None), (False, None, "residual"), (False, None, "accumulate"),
@@ -314,6 +327,80 @@ def test_hgemm_variant6_is_deterministic(sk, shape):
     for _ in range(5):
         again = sk.hgemm(a, b, 6)
         assert torch.equal(first, again)
+
+
+@contextlib.contextmanager
+def hgemm_v6_split(sk, split):
+    """Variant 6's split-K switch for the duration: -1 the rule, 0 off, n forced."""
+    prev = sk._C.hgemm_v6_split()
+    sk._C.hgemm_v6_set_split(split)
+    try:
+        yield
+    finally:
+        sk._C.hgemm_v6_set_split(prev)
+
+
+@pytest.mark.parametrize("shape", HGEMM_SHAPES_V6_SPLIT, ids=lambda s: f"M{s[0]}_N{s[1]}_K{s[2]}")
+def test_hgemm_variant6_split_k(sk, shape):
+    # The rule splits these. The slices are summed in slice order by whichever warp arrives
+    # last, so repeated calls give the same bits; the arrival counters and slots are reused
+    # across launches and never cleared by the host.
+    if 6 not in _variants("hgemm"):
+        pytest.skip("variant 6 not built")
+    M, N, K = shape
+    with hgemm_v6_split(sk, -1):
+        assert "split" in sk._C.hgemm_v6_route_name(M, N, K)
+        torch.manual_seed(1)
+        a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+        b = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
+        ref = (a.float() @ b.float()).to(torch.bfloat16)
+        first = sk.hgemm(a, b, 6)
+        torch.testing.assert_close(first.float(), ref.float(), **HGEMM_TOL)
+        for _ in range(5):
+            assert torch.equal(first, sk.hgemm(a, b, 6))
+        assert torch.equal(first, sk.hgemm(a, b))  # the default variant takes the same route
+    # Off, the route before the split: the same check, other bits allowed.
+    with hgemm_v6_split(sk, 0):
+        assert "split" not in sk._C.hgemm_v6_route_name(M, N, K)
+        torch.testing.assert_close(sk.hgemm(a, b, 6).float(), ref.float(), **HGEMM_TOL)
+
+
+@pytest.mark.parametrize("split", [2, 3, 7, 16])
+def test_hgemm_variant6_split_k_forced(sk, split):
+    # A forced split count on a shape the rule leaves alone (512 tokens, 128 tiles of 64x64)
+    # and on one it splits: a second wave of slices, or more slices than the rule's, still
+    # sum in order.
+    if 6 not in _variants("hgemm"):
+        pytest.skip("variant 6 not built")
+    for M, N, K in [(512, 1024, 4096), (128, 768, 2048)]:
+        torch.manual_seed(2)
+        a = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+        b = torch.randn(K, N, device="cuda", dtype=torch.bfloat16)
+        ref = (a.float() @ b.float()).to(torch.bfloat16)
+        with hgemm_v6_split(sk, split):
+            assert f"split {split}" in sk._C.hgemm_v6_route_name(M, N, K)
+            first = sk.hgemm(a, b, 6)
+            torch.testing.assert_close(first.float(), ref.float(), **HGEMM_TOL)
+            for _ in range(3):
+                assert torch.equal(first, sk.hgemm(a, b, 6))
+
+
+def test_hgemm_variant6_split_k_env_switch(sk):
+    # SPARK_HGEMM_V6_SPLIT=0 turns the split off for the process, and the legacy route
+    # (SPARK_HGEMM_V6_ROUTE=-2) never splits.
+    import os
+    import subprocess
+    import sys
+
+    if 6 not in _variants("hgemm"):
+        pytest.skip("variant 6 not built")
+    code = "import spark_kernels as sk; print(sk._C.hgemm_v6_route_name(128, 768, 2048))"
+    for env in ({"SPARK_HGEMM_V6_SPLIT": "0"}, {"SPARK_HGEMM_V6_ROUTE": "-2"}, {}):
+        e = {k: v for k, v in os.environ.items()
+             if k not in ("SPARK_HGEMM_V6_SPLIT", "SPARK_HGEMM_V6_ROUTE")}
+        out = subprocess.run([sys.executable, "-c", code], env={**e, **env}, check=True,
+                             capture_output=True, text=True).stdout.strip()
+        assert ("split" in out) == (not env), (env, out)
 
 
 def test_hgemm_rejects_unaligned(sk):

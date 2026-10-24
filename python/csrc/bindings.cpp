@@ -1924,4 +1924,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("bytes"), py::arg("device") = "");
     m.def("decode_force_split_k", &spark::decode_force_split_k,
           "force the K split of every decode kernel that has one (0 = the rule)", py::arg("split"));
+
+    // hgemm variant 6's route and its split-K switch (tests/test_gemm.py, the sweeps).
+    m.def(
+        "hgemm_v6_route_name",
+        [](int M, int N, int K) { return std::string(spark::hgemm_v6_route_name(M, N, K)); },
+        "what hgemm variant 6 runs for an M x N x K problem under the current route", py::arg("M"),
+        py::arg("N"), py::arg("K"));
+    m.def("hgemm_v6_set_split", &spark::hgemm_v6_set_split,
+          "hgemm variant 6's split-K: -1 the rule, 0 off, n >= 2 forces n K-slices",
+          py::arg("split"));
+    m.def("hgemm_v6_split", &spark::hgemm_v6_split, "hgemm variant 6's split-K setting");
 }
