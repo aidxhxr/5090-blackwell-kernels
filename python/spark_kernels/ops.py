@@ -516,7 +516,8 @@ def rope_append_(
 
 
 def attention(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool = False, variant: int = -1
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool = False, variant: int = -1,
+    window: int = 0, sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fused attention forward: softmax(q @ k^T / sqrt(D)) @ v, fp32 math, bf16 out.
 
@@ -528,7 +529,18 @@ def attention(
     and S_kv; a decode step is S_q = 1 against the cache, and the default variant runs a
     flash-decoding kernel for it that reads each k/v head once for all the query heads that
     share it. Returns [B, H_q, S_q, D] bfloat16.
+
+    `window` > 0 is a sliding window (Mistral, Gemma, gpt-oss): each query sees at most the
+    last `window` keys up to its own position, its own included. It is causal and aligned to
+    the last key whatever `causal` says: query i sits at key position i + S_kv - S_q (S_q <=
+    S_kv), so a prefill (S_q = S_kv) gets the causal mask with a left edge and a decode step
+    the last `window` keys of the cache. The kernels skip the k/v tiles outside every row's
+    window. `sinks` is a float32 [H_q] tensor of per-head logits added to every softmax
+    denominator with no value vector (gpt-oss's attention sinks):
+    out_i = sum_j exp(s_ij - m) v_j / (exp(sinks[h] - m) + sum_j exp(s_ij - m)).
     """
+    if window or sinks is not None:
+        return _C.attention_window(q, k, v, causal, window, sinks, variant)
     return _C.attention(q, k, v, causal, variant)
 
 
@@ -571,6 +583,8 @@ def paged_decode(
     variant: int = -1,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    window: int = 0,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """One decode step of a batch against a paged K/V cache: softmax(q k^T / sqrt(D)) v per
     sequence, fp32 math, bf16 out.
@@ -588,7 +602,14 @@ def paged_decode(
     k_scale[h] * k_cache and v_scale[h] * v_cache with k_scale, v_scale float32 [H_kv]: half
     the bytes of a bf16 cache, the same variants. The e4m3 values are converted to bf16
     exactly, so the only rounding added is the cache's own.
+
+    `window` > 0: sequence b's token sees only keys [seq_lens[b] - window, seq_lens[b]), and
+    the default variant splits and streams only those. `sinks` (float32 [H_q]) as in
+    `attention`.
     """
+    if window or sinks is not None:
+        return _C.paged_decode_window(q, k_cache, v_cache, block_table, seq_lens, window, sinks,
+                                      variant, k_scale, v_scale)
     return _C.paged_decode(q, k_cache, v_cache, block_table, seq_lens, variant, k_scale,
                            v_scale)
 
@@ -604,6 +625,8 @@ def attention_varlen(
     variant: int = -1,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    window: int = 0,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Attention for a packed batch of prompts against a paged K/V cache, no padding.
 
@@ -615,7 +638,15 @@ def attention_varlen(
     one for a chunk of a longer prompt. Returns [T, H_q, D] bfloat16, which is [T, H_q * D]
     for the output projection without a transpose. float8_e4m3fn caches take k_scale and
     v_scale as `paged_decode` does.
+
+    `window` > 0 adds a left edge to the causal mask (and implies it): query i sees keys
+    p - window < j <= p for its position p = seq_lens[b] - q_len_b + i. `sinks` (float32
+    [H_q]) as in `attention`.
     """
+    if window or sinks is not None:
+        return _C.attention_varlen_window(q, k_cache, v_cache, cu_seqlens_q, seq_lens,
+                                          block_table, causal, window, sinks, variant, k_scale,
+                                          v_scale)
     return _C.attention_varlen(q, k_cache, v_cache, cu_seqlens_q, seq_lens, block_table, causal,
                                variant, k_scale, v_scale)
 

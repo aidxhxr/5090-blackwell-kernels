@@ -1236,6 +1236,132 @@ Tensor attention_varlen(const Tensor& q, const Tensor& k_cache, const Tensor& v_
     return out;
 }
 
+// ---- sliding-window attention and attention sinks (docs/design/attention.md) ------------
+// The three attention ops above with a window of `window` keys (0: none; causal, aligned to the
+// last key) and per-head sink logits (float32 [H_q] on q's device, or none). The inputs are
+// checked by the same rules as the plain ops.
+
+int window_arg(int64_t window) {
+    TORCH_CHECK(window >= 0 && window <= INT32_MAX, "window must be >= 0, got ", window);
+    return static_cast<int>(window);
+}
+
+const float* sinks_ptr(const std::optional<Tensor>& sinks, const Tensor& q, int64_t H_q) {
+    if (!sinks.has_value()) return nullptr;
+    const Tensor& s = *sinks;
+    check_cuda_contig(s, "sinks");
+    TORCH_CHECK(s.scalar_type() == at::kFloat && s.dim() == 1 && s.size(0) == H_q,
+                "sinks must be float32 [H_q] with H_q = ", H_q, ", got ", s.sizes(), " ",
+                s.scalar_type());
+    TORCH_CHECK(s.device() == q.device(), "sinks must be on q's device");
+    return s.data_ptr<float>();
+}
+
+Tensor attention_window(const Tensor& q, const Tensor& k, const Tensor& v, bool causal,
+                        int64_t window, const std::optional<Tensor>& sinks, int variant) {
+    check_attention_inputs(q, k, v, /*cache_kv=*/true);
+    const int w = window_arg(window);
+    TORCH_CHECK(w == 0 || q.size(2) <= k.size(2),
+                "a window needs S_q <= S_kv (the queries are the last S_q positions), got S_q = ",
+                q.size(2), ", S_kv = ", k.size(2));
+    const float* sp = sinks_ptr(sinks, q, q.size(1));
+    const c10::cuda::CUDAGuard guard(q.device());
+    Tensor out = at::empty_like(q);
+    spark::attention_window_bf16(bf16_ptr(q), bf16_ptr(k), bf16_ptr(v), bf16_ptr_mut(out),
+                                 static_cast<int>(q.size(0)), static_cast<int>(q.size(1)),
+                                 static_cast<int>(k.size(1)), static_cast<int>(q.size(2)),
+                                 static_cast<int>(k.size(2)), static_cast<int>(q.size(3)), causal,
+                                 w, sp, attention_variant(q, k, variant), current_stream(q),
+                                 nullptr, static_cast<int>(kv_capacity(k, v)));
+    return out;
+}
+
+Tensor paged_decode_window(const Tensor& q, const Tensor& k_cache, const Tensor& v_cache,
+                           const Tensor& block_table, const Tensor& seq_lens, int64_t window,
+                           const std::optional<Tensor>& sinks, int variant,
+                           const std::optional<Tensor>& k_scale,
+                           const std::optional<Tensor>& v_scale) {
+    check_cuda_contig(q, "q");
+    const bool fp8 = check_cache(k_cache, v_cache, k_scale, v_scale);
+    check_int32(block_table, "block_table");
+    check_int32(seq_lens, "seq_lens");
+    TORCH_CHECK(q.scalar_type() == at::kBFloat16 && q.dim() == 3,
+                "paged_decode expects q as [B, H_q, D] bfloat16");
+    const int64_t B = q.size(0), H_q = q.size(1), D = q.size(2), H_kv = k_cache.size(1);
+    TORCH_CHECK(k_cache.size(3) == D, "q and the caches must agree on D");
+    TORCH_CHECK(H_q % H_kv == 0, "q must have a multiple of the caches' heads");
+    TORCH_CHECK(block_table.dim() == 2 && block_table.size(0) == B,
+                "block_table must be [B, max_pages]");
+    TORCH_CHECK(seq_lens.numel() == B, "seq_lens must have B entries");
+    TORCH_CHECK(aligned16(q), "paged_decode needs 16-byte aligned q");
+    const int w = window_arg(window);
+    const float* sp = sinks_ptr(sinks, q, H_q);
+    const c10::cuda::CUDAGuard guard(q.device());
+    Tensor out = at::empty_like(q);
+    const int var = resolve_variant(variant, spark::paged_decode_num_variants());
+    if (fp8) {
+        spark::paged_decode_window_fp8(
+            bf16_ptr(q), fp8_ptr(k_cache), fp8_ptr(v_cache), k_scale->data_ptr<float>(),
+            v_scale->data_ptr<float>(), block_table.data_ptr<int>(), seq_lens.data_ptr<int>(),
+            bf16_ptr_mut(out), static_cast<int>(B), static_cast<int>(H_q), static_cast<int>(H_kv),
+            static_cast<int>(D), static_cast<int>(k_cache.size(2)),
+            static_cast<int>(block_table.size(1)), w, sp, var, current_stream(q));
+        return out;
+    }
+    spark::paged_decode_window_bf16(
+        bf16_ptr(q), bf16_ptr(k_cache), bf16_ptr(v_cache), block_table.data_ptr<int>(),
+        seq_lens.data_ptr<int>(), bf16_ptr_mut(out), static_cast<int>(B), static_cast<int>(H_q),
+        static_cast<int>(H_kv), static_cast<int>(D), static_cast<int>(k_cache.size(2)),
+        static_cast<int>(block_table.size(1)), w, sp, var, current_stream(q));
+    return out;
+}
+
+Tensor attention_varlen_window(const Tensor& q, const Tensor& k_cache, const Tensor& v_cache,
+                               const Tensor& cu_seqlens_q, const Tensor& seq_lens,
+                               const Tensor& block_table, bool causal, int64_t window,
+                               const std::optional<Tensor>& sinks, int variant,
+                               const std::optional<Tensor>& k_scale,
+                               const std::optional<Tensor>& v_scale) {
+    check_cuda_contig(q, "q");
+    const bool fp8 = check_cache(k_cache, v_cache, k_scale, v_scale);
+    check_int32(cu_seqlens_q, "cu_seqlens_q");
+    check_int32(seq_lens, "seq_lens");
+    check_int32(block_table, "block_table");
+    TORCH_CHECK(q.scalar_type() == at::kBFloat16 && q.dim() == 3,
+                "attention_varlen expects q as [T, H_q, D] bfloat16");
+    const int64_t T = q.size(0), H_q = q.size(1), D = q.size(2), H_kv = k_cache.size(1);
+    const int64_t B = seq_lens.numel();
+    TORCH_CHECK(k_cache.size(3) == D, "q and the caches must agree on D");
+    TORCH_CHECK(H_q % H_kv == 0, "q must have a multiple of the caches' heads");
+    TORCH_CHECK(cu_seqlens_q.numel() == B + 1, "cu_seqlens_q must have B + 1 entries");
+    TORCH_CHECK(block_table.dim() == 2 && block_table.size(0) == B,
+                "block_table must be [B, max_pages]");
+    TORCH_CHECK(aligned16(q), "attention_varlen needs 16-byte aligned q");
+    TORCH_CHECK(T * H_q <= INT32_MAX, "attention_varlen dims too large for int32");
+    const int w = window_arg(window);
+    const float* sp = sinks_ptr(sinks, q, H_q);
+    const c10::cuda::CUDAGuard guard(q.device());
+    Tensor out = at::empty_like(q);
+    const int var = resolve_variant(variant, spark::attention_varlen_num_variants());
+    if (fp8) {
+        spark::attention_varlen_window_fp8(
+            bf16_ptr(q), fp8_ptr(k_cache), fp8_ptr(v_cache), k_scale->data_ptr<float>(),
+            v_scale->data_ptr<float>(), cu_seqlens_q.data_ptr<int>(), seq_lens.data_ptr<int>(),
+            block_table.data_ptr<int>(), bf16_ptr_mut(out), static_cast<int>(B),
+            static_cast<int>(T), static_cast<int>(H_q), static_cast<int>(H_kv), static_cast<int>(D),
+            static_cast<int>(k_cache.size(2)), static_cast<int>(block_table.size(1)), causal, w, sp,
+            var, current_stream(q));
+        return out;
+    }
+    spark::attention_varlen_window_bf16(
+        bf16_ptr(q), bf16_ptr(k_cache), bf16_ptr(v_cache), cu_seqlens_q.data_ptr<int>(),
+        seq_lens.data_ptr<int>(), block_table.data_ptr<int>(), bf16_ptr_mut(out),
+        static_cast<int>(B), static_cast<int>(T), static_cast<int>(H_q), static_cast<int>(H_kv),
+        static_cast<int>(D), static_cast<int>(k_cache.size(2)),
+        static_cast<int>(block_table.size(1)), causal, w, sp, var, current_stream(q));
+    return out;
+}
+
 // ---------------------------------------------------------------------------
 // Launch configuration (src/kernels/launch_config.cu): what the decode kernels decided
 // ---------------------------------------------------------------------------
@@ -1490,6 +1616,25 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("seq_lens"), py::arg("block_table"), py::arg("causal") = true,
           py::arg("variant") = -1, py::arg("k_scale") = py::none(),
           py::arg("v_scale") = py::none());
+    // ---- sliding-window attention and attention sinks --------------------------------------
+    m.def("attention_window", &attention_window,
+          "attention with a causal window of `window` keys aligned to the last key (0: none) "
+          "and sink logits float32 [H_q] added to every softmax denominator",
+          py::arg("q"), py::arg("k"), py::arg("v"), py::arg("causal") = false,
+          py::arg("window") = 0, py::arg("sinks") = py::none(), py::arg("variant") = -1);
+    m.def("paged_decode_window", &paged_decode_window,
+          "paged_decode with each token seeing the last `window` keys of its sequence and sink "
+          "logits float32 [H_q]",
+          py::arg("q"), py::arg("k_cache"), py::arg("v_cache"), py::arg("block_table"),
+          py::arg("seq_lens"), py::arg("window") = 0, py::arg("sinks") = py::none(),
+          py::arg("variant") = -1, py::arg("k_scale") = py::none(),
+          py::arg("v_scale") = py::none());
+    m.def("attention_varlen_window", &attention_varlen_window,
+          "attention_varlen with a causal window of `window` keys and sink logits float32 [H_q]",
+          py::arg("q"), py::arg("k_cache"), py::arg("v_cache"), py::arg("cu_seqlens_q"),
+          py::arg("seq_lens"), py::arg("block_table"), py::arg("causal") = true,
+          py::arg("window") = 0, py::arg("sinks") = py::none(), py::arg("variant") = -1,
+          py::arg("k_scale") = py::none(), py::arg("v_scale") = py::none());
     m.def("num_variants", &num_variants, "number of implementation variants for a kernel",
           py::arg("name"));
     // The CPU-side ops for the GB10's Arm cores (python/csrc/cpu_bindings.cpp, no CUDA).
