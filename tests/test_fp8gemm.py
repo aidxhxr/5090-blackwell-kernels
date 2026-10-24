@@ -101,7 +101,7 @@ def test_fp8gemm_variant2_steps_down(sk, shape):
     a, b_t, sa, sb = _inputs(M, N, K)
     with pytest.raises(ValueError):  # an explicit variant is never substituted
         sk.fp8gemm(a, b_t, sa, sb, 2)
-    got = sk.fp8gemm(a, b_t, sa, sb)  # the default steps down to variant 1
+    got = sk.fp8gemm(a, b_t, sa, sb)  # the default (variant 3) takes any shape
     torch.testing.assert_close(got.float(), _reference(a, b_t, sa, sb).float(), **TOL)
 
 
@@ -128,7 +128,7 @@ def test_fp8gemm_rejects_bad_inputs(sk):
 
 
 def test_fp8gemm_num_variants(sk):
-    assert sk.num_variants("fp8gemm") == 3
+    assert sk.num_variants("fp8gemm") == 4
 
 
 # ---- MX mode: sfa [M, K/32] and sfb [N, K/32] ue8m0 block scales -------------------------

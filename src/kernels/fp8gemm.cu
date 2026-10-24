@@ -14,6 +14,9 @@
 //              of Bt for decode shapes (M <= 64).
 //   variant 2: variant 1's 128x128 tile fed by TMA through a warp-specialized mbarrier
 //              pipeline (fp8gemm_tma.cu).
+//   variant 3: variant 2's mainloop on hgemm's Stream-K schedule with a block tile per shape
+//              (fp8gemm_tma_sk.cu); the shapes its route does not take run what the default
+//              ran before it, variant 2 where it takes the shape and variant 1 elsewhere.
 //
 // MX mode (fp8gemm_mx): the same three variants with a ue8m0 scale per row per 32 k on both
 // operands, sfa[M][K/32] and sfb[N][K/32], applied by the block-scaled mma itself
@@ -36,6 +39,10 @@ bool fp8gemm_tma_supports(int M, int N, int K);
 void fp8gemm_tma(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat16* C, int M, int N,
                  int K, const float* scale_a, const float* scale_b, fp8gemm_tile::MxScales mx,
                  cudaStream_t stream);
+// Variant 3 lives in fp8gemm_tma_sk.cu: false (nothing launched) when its route sends the shape
+// to the old one.
+bool fp8gemm_tma_sk(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat16* C, int M, int N,
+                    int K, const float* scale_a, const float* scale_b, cudaStream_t stream);
 
 namespace {
 
@@ -470,6 +477,17 @@ void run(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat16* C, int 
         case 2:
             fp8gemm_tma(A, Bt, C, M, N, K, scale_a, scale_b, mx, stream);
             break;
+        case 3:
+            // MX mode and the shapes the route leaves alone: variant 2 or variant 1.
+            if (MX || !fp8gemm_tma_sk(A, Bt, C, M, N, K, scale_a, scale_b, stream)) {
+                if (fp8gemm_tma_supports(M, N, K))
+                    fp8gemm_tma(A, Bt, C, M, N, K, scale_a, scale_b, mx, stream);
+                else if (MX)
+                    v1::launch_auto<true>(a, b, C, M, N, K, scale_a, scale_b, mx, stream);
+                else
+                    v1::launch_auto<false>(a, b, C, M, N, K, scale_a, scale_b, mx, stream);
+            }
+            break;
         default:
             break;
     }
@@ -479,7 +497,7 @@ void run(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat16* C, int 
 }  // namespace
 
 int fp8gemm_num_variants() {
-    return 3;
+    return 4;
 }
 
 bool fp8gemm_supports(int M, int N, int K, int variant) {
@@ -488,7 +506,7 @@ bool fp8gemm_supports(int M, int N, int K, int variant) {
     if (N % 64 != 0 || K % 64 != 0) return false;
     if (variant == 0) return M % 16 == 0;
     if (variant == 2) return fp8gemm_tma_supports(M, N, K);
-    return true;  // variant 1 zero-fills rows past M
+    return true;  // variant 1 zero-fills rows past M; variant 3 runs it where its tiles do not
 }
 
 bool fp8gemm_mx_supports(int M, int N, int K, int variant) {

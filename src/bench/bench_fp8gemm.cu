@@ -3,7 +3,7 @@
 //   ./bench_fp8gemm                       # default shape sweep (bench_hgemm's), all variants,
 //                                         # per-tensor scales (dtype e4m3) then MX (dtype mxfp8)
 //   ./bench_fp8gemm --m=4096 --n=4096 --k=4096 --variant=1 --iters=50 --mode=mx
-//   ./bench_fp8gemm --models[=llama3-8b] [--ms=128,512] [--mode=mx]   # real projection shapes
+//   ./bench_fp8gemm --models[=llama3-8b] [--ms=128,512] [--tiles] [--mode=mx]   # model shapes
 //
 // C = scale_a * scale_b * A[M,K] * Bt[N,K]^T, e4m3 in, bf16 out. cuBLASLt's fp8 path only takes
 // this layout (A row-major, B column-major, both K-contiguous), so the reference is timed on
@@ -431,15 +431,18 @@ std::vector<unsigned char> random_ue8m0(size_t n, uint32_t seed) {
     return v;
 }
 
-// A candidate row: label and variant.
+// A candidate row: label, variant and variant 3's route. Labels: v1, v2, v3old (variant 3
+// on the route before it, which is what the default ran before variant 3), v3 (the
+// default) and, with --tiles, v3t<n> (TMA tile n forced).
 struct ModelCand {
     std::string label;
     int variant;
+    int route;
 };
 
 // One weight at every M of `ms`. Returns false on a correctness failure.
 bool run_models_weight(cudaStream_t stream, const spark::bench::ModelWeight& w,
-                       const std::vector<int>& ms, bool mx, int iters) {
+                       const std::vector<int>& ms, bool mx, bool tiles, int iters) {
     const int N = w.N, K = w.K, KB = K / 32;
     const int max_m = *std::max_element(ms.begin(), ms.end());
     const size_t nB = static_cast<size_t>(N) * K;  // bytes
@@ -488,9 +491,15 @@ bool run_models_weight(cudaStream_t stream, const spark::bench::ModelWeight& w,
     }
     SPARK_CUDA_CHECK(cudaDeviceSynchronize());
 
-    std::vector<ModelCand> cands;
-    for (int v = 1; v < spark::fp8gemm_num_variants(); ++v)
-        cands.push_back({"v" + std::to_string(v), v});
+    const int dflt = spark::FP8GEMM_V3_ROUTE_DEFAULT;
+    std::vector<ModelCand> cands = {{"v1", 1, dflt},
+                                    {"v2", 2, dflt},
+                                    {"v3old", 3, spark::FP8GEMM_V3_ROUTE_LEGACY},
+                                    {"v3", 3, dflt}};
+    if (tiles && !mx)
+        for (int t = 0; t < spark::fp8gemm_v3_num_tiles(); ++t)
+            cands.push_back({"v3t" + std::to_string(t), 3, t});
+    const int saved_route = spark::fp8gemm_v3_route();
 
     bool all_ok = true;
     for (int M : ms) {
@@ -523,6 +532,16 @@ bool run_models_weight(cudaStream_t stream, const spark::bench::ModelWeight& w,
             const bool sup = mx ? spark::fp8gemm_mx_supports(M, N, K, c.variant)
                                 : spark::fp8gemm_supports(M, N, K, c.variant);
             if (!sup) continue;
+            if (c.route >= 0) {
+                // A forced tile that does not fit falls back to the old route, and a forced
+                // tile the rule picks anyway is the v3 row: skip both duplicates.
+                spark::fp8gemm_v3_set_route(dflt);
+                const std::string by_rule = spark::fp8gemm_v3_route_name(M, N, K);
+                spark::fp8gemm_v3_set_route(c.route);
+                const std::string forced = spark::fp8gemm_v3_route_name(M, N, K);
+                if (by_rule == forced || forced == "v1" || forced == "v2") continue;
+            }
+            spark::fp8gemm_v3_set_route(c.route);
             auto run_ours = [&](int copy) {
                 const __nv_fp8_e4m3* b = dB + static_cast<size_t>(copy) * nB;
                 if (mx)
@@ -557,10 +576,12 @@ bool run_models_weight(cudaStream_t stream, const spark::bench::ModelWeight& w,
             row.max_rel_err = err.second > 0 ? err.first / err.second : 0.0;
             row.ok = ok;
             spark::bench::print_row(row);
-            std::fprintf(stderr, "    %-8s %.1f%% of cuBLASLt\n", c.label.c_str(),
+            std::fprintf(stderr, "    %-8s %-34s %.1f%% of cuBLASLt\n", c.label.c_str(),
+                         c.variant == 3 && !mx ? spark::fp8gemm_v3_route_name(M, N, K) : "",
                          100.0 * t_ref.median_ms / t.median_ms);
         }
     }
+    spark::fp8gemm_v3_set_route(saved_route);
     for (void* d : {static_cast<void*>(dA), static_cast<void*>(dB), static_cast<void*>(dC),
                     static_cast<void*>(dRef), static_cast<void*>(dScale),
                     static_cast<void*>(scratch), static_cast<void*>(dSfa), static_cast<void*>(dSfb),
@@ -611,7 +632,7 @@ int run(int argc, char** argv) {
     spark::bench::print_header();
     bool all_ok = true;
     if (args.has("models")) {
-        // --models[=<model substring>] [--ms=128,256,...] [--mode=tensor|mx|both]
+        // --models[=<model substring>] [--ms=128,256,...] [--mode=tensor|mx|both] [--tiles]
         const std::string filter = args.get("models", "1");
         const std::vector<int> ms =
             spark::bench::parse_int_list(args.get("ms", "128,256,512,1024,2048,4096"));
@@ -620,7 +641,7 @@ int run(int argc, char** argv) {
             for (const auto& w : spark::bench::model_weights()) {
                 if (filter != "1" && std::string(w.model).find(filter) == std::string::npos)
                     continue;
-                all_ok = run_models_weight(stream, w, ms, mx, iters) && all_ok;
+                all_ok = run_models_weight(stream, w, ms, mx, args.has("tiles"), iters) && all_ok;
             }
         }
     } else {
