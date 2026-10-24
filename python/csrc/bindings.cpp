@@ -1610,7 +1610,9 @@ Tensor paged_decode_window(const Tensor& q, const Tensor& k_cache, const Tensor&
     const float* sp = sinks_ptr(sinks, q, H_q);
     const c10::cuda::CUDAGuard guard(q.device());
     Tensor out = at::empty_like(q);
-    const int var = resolve_variant(variant, spark::paged_decode_num_variants());
+    // -1 is the default rung, not the top one: variant 2 (batch invariant) has no window.
+    const int var = variant < 0 ? spark::paged_decode_default_variant()
+                                : resolve_variant(variant, spark::paged_decode_num_variants());
     if (fp8) {
         spark::paged_decode_window_fp8(
             bf16_ptr(q), fp8_ptr(k_cache), fp8_ptr(v_cache), k_scale->data_ptr<float>(),
@@ -1654,7 +1656,9 @@ Tensor attention_varlen_window(const Tensor& q, const Tensor& k_cache, const Ten
     const float* sp = sinks_ptr(sinks, q, H_q);
     const c10::cuda::CUDAGuard guard(q.device());
     Tensor out = at::empty_like(q);
-    const int var = resolve_variant(variant, spark::attention_varlen_num_variants());
+    // -1 is the default rung, not the top one: variant 2 (batch invariant) has no window.
+    const int var = variant < 0 ? spark::attention_varlen_default_variant()
+                                : resolve_variant(variant, spark::attention_varlen_num_variants());
     if (fp8) {
         spark::attention_varlen_window_fp8(
             bf16_ptr(q), fp8_ptr(k_cache), fp8_ptr(v_cache), k_scale->data_ptr<float>(),

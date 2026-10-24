@@ -13,13 +13,19 @@ TOL = dict(atol=2e-2, rtol=2e-2)  # one bf16 rounding of an fp32 result, P in bf
 WINDOWS = [0, 1, 64, 128, 1000, 100000]  # 0: sinks alone; 100000: longer than any sequence
 
 
+# The paged ops' variant 2 is the batch-invariant rung (docs/design/batch_invariant.md),
+# which takes no window or sinks; the window rungs are the ones below it.
+_NO_WINDOW = {"paged_decode": {2}, "attention_varlen": {2}}
+
+
 def _variants(name):
     try:
         import spark_kernels
 
-        return list(range(spark_kernels.num_variants(name)))
+        n = spark_kernels.num_variants(name)
     except Exception:
         return [0]
+    return [v for v in range(n) if v not in _NO_WINDOW.get(name, set())]
 
 
 def _sinks(H, seed=11):
@@ -262,6 +268,34 @@ def test_paged_decode_window_matches_reference(sk, case, window, sink, variant):
         # the paged ops align the mask to the last key; window 0 is an unbounded one
         ref = _reference(q[b][:, None], ks[b], vs[b], window or 1 << 30, sinks)[:, 0]
         torch.testing.assert_close(got[b].float(), ref, **TOL)
+
+
+def test_paged_window_default_is_not_the_invariant_rung(sk):
+    # With a window, variant -1 runs the default rung, never variant 2 (batch invariant),
+    # which takes no window or sinks and says so rather than ignoring them.
+    lens, hq, hkv, d, page = DECODE_CASES[0]
+    kc, vc, bt, sl, _, _, _ = _paged_cache(lens, hkv, d, page)
+    torch.manual_seed(1)
+    q = torch.randn(len(lens), hq, d, device="cuda", dtype=torch.bfloat16)
+    sinks = _sinks(hq)
+    want = sk.paged_decode(q, kc, vc, bt, sl, variant=1, window=300, sinks=sinks)
+    got = sk.paged_decode(q, kc, vc, bt, sl, window=300, sinks=sinks)
+    assert torch.equal(got, want)
+    if sk.num_variants("paged_decode") > 2:
+        with pytest.raises(RuntimeError):
+            sk.paged_decode(q, kc, vc, bt, sl, variant=2, window=300)
+        with pytest.raises(RuntimeError):
+            sk.paged_decode(q, kc, vc, bt, sl, variant=2, sinks=sinks)
+    tq = torch.randn(sum(lens[:3]), hq, d, device="cuda", dtype=torch.bfloat16)
+    cu = torch.tensor([0, lens[0], lens[0] + lens[1], sum(lens[:3])], dtype=torch.int32,
+                      device="cuda")
+    sl3, bt3 = sl[:3].contiguous(), bt[:3].contiguous()
+    want = sk.attention_varlen(tq, kc, vc, cu, sl3, bt3, variant=1, window=300, sinks=sinks)
+    got = sk.attention_varlen(tq, kc, vc, cu, sl3, bt3, window=300, sinks=sinks)
+    assert torch.equal(got, want)
+    if sk.num_variants("attention_varlen") > 2:
+        with pytest.raises(RuntimeError):
+            sk.attention_varlen(tq, kc, vc, cu, sl3, bt3, variant=2, window=300)
 
 
 def test_paged_decode_window_long_context_and_fp8(sk):

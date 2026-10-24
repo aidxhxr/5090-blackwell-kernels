@@ -1366,6 +1366,8 @@ void decode_impl(const bf16* Q, const void* K, const void* V, const float* k_sca
     }
     if (variant == 2) {
         SPARK_REQUIRE(!fp8, "paged_decode: variant 2 (batch invariant) takes a bf16 cache only");
+        SPARK_REQUIRE(window == 0 && sinks == nullptr,
+                      "paged_decode: variant 2 (batch invariant) takes no window or sinks");
         paged_decode_invariant_bf16(Q, static_cast<const bf16*>(K), static_cast<const bf16*>(V),
                                     block_table, seq_lens, O, B, H_q, H_kv, D, shift, max_pages,
                                     stream);
@@ -1445,6 +1447,8 @@ void varlen_impl(const bf16* Q, const void* K, const void* V, const float* k_sca
     if (variant == 2) {
         SPARK_REQUIRE(!fp8,
                       "attention_varlen: variant 2 (batch invariant) takes a bf16 cache only");
+        SPARK_REQUIRE(window == 0 && sinks == nullptr,
+                      "attention_varlen: variant 2 (batch invariant) takes no window or sinks");
         attention_varlen_invariant_bf16(Q, static_cast<const bf16*>(K), static_cast<const bf16*>(V),
                                         cu_seqlens_q, seq_lens, block_table, O, B, T, H_q, H_kv, D,
                                         shift, max_pages, causal, stream);
