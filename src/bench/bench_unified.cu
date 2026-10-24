@@ -25,7 +25,7 @@
 // bytes read and the device's unified-memory attributes. gbps = bytes read once / time;
 // ref_ms is the first-touch launch for read rows, cuBLAS on the device copy for gemv rows
 // and the copy path for the signal rows.
-// Nothing here has been run: no GPU in reach while it was written.
+// First run on the RTX 5090 on 2026-10-23 (docs/design/unified.md has the table).
 //
 // stdout: one JSON object per row (collected by scripts/run_all_benches.sh)
 // stderr: a human table and the notes
@@ -303,12 +303,17 @@ bool run_gemv(cublasHandle_t handle, const Buffer& b, size_t bytes, const std::s
     spark::bench::fill_uniform(hA, -1.0f, 1.0f, 1234 + s.K);
     std::vector<__nv_bfloat16> hAb(s.K);
     for (int k = 0; k < s.K; ++k) hAb[k] = __float2bfloat16(hA[k]);
+    // cuBLAS reads device copies rotated past the 96 MB L2 the way the kernel's weight is, or
+    // its row would be an L2 number (17 us for a 33.5 MB weight, above the copy roof).
+    const int ref_copies = static_cast<int>((size_t{256} << 20) / (nW * 2)) + 1;
     __nv_bfloat16* dA = dmalloc<__nv_bfloat16>(s.K);
-    __nv_bfloat16* dW = dmalloc<__nv_bfloat16>(nW);
+    __nv_bfloat16* dW = dmalloc<__nv_bfloat16>(nW * ref_copies);
     __nv_bfloat16* dy = dmalloc<__nv_bfloat16>(s.N);
     __nv_bfloat16* dref = dmalloc<__nv_bfloat16>(s.N);
     SPARK_CUDA_CHECK(cudaMemcpy(dA, hAb.data(), s.K * 2, cudaMemcpyHostToDevice));
     SPARK_CUDA_CHECK(cudaMemcpy(dW, b.host_src(), nW * 2, cudaMemcpyDefault));
+    for (int c = 1; c < ref_copies; ++c)
+        SPARK_CUDA_CHECK(cudaMemcpy(dW + c * nW, dW, nW * 2, cudaMemcpyDeviceToDevice));
     cublas_gemv(handle, dW, dA, dref, s.N, s.K);
     SPARK_CUDA_CHECK(cudaStreamSynchronize(stream));
     const auto ref = to_host_f32(dref, s.N);
@@ -317,11 +322,16 @@ bool run_gemv(cublasHandle_t handle, const Buffer& b, size_t bytes, const std::s
     // bf16 output on both sides, fp32 sums in different orders: one bf16 ulp of the largest
     // output plus a little.
     const double tol = 1e-2 * max_ref + 1e-2;
+    int turn = 0;
     const auto t_ref = spark::bench::time_kernel(
-        [&] { cublas_gemv(handle, dW, dA, dref, s.N, s.K); }, stream, 3, iters);
+        [&] {
+            cublas_gemv(handle, dW + static_cast<size_t>(turn++ % ref_copies) * nW, dA, dref, s.N,
+                        s.K);
+        },
+        stream, 3, iters);
 
     bool all_ok = true;
-    int turn = 0;
+    turn = 0;
     for (int v = 0; v < spark::unified_gemv_num_variants(); ++v) {
         SPARK_CUDA_CHECK(cudaMemset(dy, 0, s.N * 2));
         spark::unified_gemv_bf16(dA, b.x(), dy, s.N, s.K, v, stream);
@@ -356,8 +366,8 @@ bool run_gemv(cublasHandle_t handle, const Buffer& b, size_t bytes, const std::s
         all_ok = all_ok && ok;
     }
     std::fprintf(stderr,
-                 "    %s: cuBLAS on the device copy %.1f us, weight rotated over %d copies\n",
-                 s.what, t_ref.median_ms * 1e3, copies);
+                 "    %s: cuBLAS on %d device copies %.1f us, weight rotated over %d copies\n",
+                 s.what, ref_copies, t_ref.median_ms * 1e3, copies);
     SPARK_CUDA_CHECK(cudaFree(dA));
     SPARK_CUDA_CHECK(cudaFree(dW));
     SPARK_CUDA_CHECK(cudaFree(dy));
