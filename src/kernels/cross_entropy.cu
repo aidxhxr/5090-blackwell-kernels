@@ -1,19 +1,24 @@
 // Linear cross-entropy for a large vocabulary: loss = CE(h w^T, y) with h [T, D] and the
 // lm_head weight w [V, D] (nn.Linear's layout), without torch's [T, V] logits and their
-// fp32 copies (docs/design/cross_entropy.md). This file holds the pieces; the ladder that
-// puts them together is linear_cross_entropy in python/spark_kernels/ops.py.
+// fp32 copies. The kernels here are the pieces; python/spark_kernels/ops.py puts them
+// together as a ladder (docs/design/cross_entropy.md):
 //
 //   v1  Liger's recipe on these kernels: a chunk of rows at a time, the logits by ce_gemm
 //       (LOGITS), one row kernel that reads a logits row and writes its loss and, in place,
 //       its gradient row (softmax minus one-hot, times the reduction scale), then dh and dw
-//       by hgemm, dw from a transposed slab of the gradient.
+//       by hgemm;
+//   v2  the forward without the logits: ce_gemm (STATS) reduces each 128 x 128 tile in the
+//       epilogue to a per-row max and sum of exponentials, writes those [T][V/128] partials
+//       and the target's logit, and ce_combine merges them into the log-sum-exp. The
+//       backward recomputes a chunk of logits by ce_gemm (GRAD), whose epilogue turns each
+//       tile into softmax minus one-hot times the scale before the one rounding to bf16.
 //
 // ce_gemm is grouped_gemm's bf16 kernel with one expert: logits = h w^T with both operands
 // K-contiguous, a persistent grid of one 288-thread block per SM, one producer lane issuing
 // two TMA boxes per stage, eight consumer warps on mma.sync.m16n8k16, the last partial wave
 // plus one wave split along K Stream-K style and summed through hgemm's deterministic
-// chain fixup. The epilogue runs once per tile, on the finished fp32 sums (the piece that
-// ends a tile's K chain), so the output is the same bits every run.
+// chain fixup. Only the epilogue is new, and it runs once per tile, on the finished fp32
+// sums (the piece that ends a tile's K chain), so every mode gives the same bits every run.
 
 #include <cuda_bf16.h>
 
@@ -195,6 +200,7 @@ constexpr int CONSUMERS = CONSUMER_WARPS * 32;
 constexpr int THREADS = CONSUMERS + 32;
 constexpr int ITEM_DEPTH = 2;     // pieces the producer may publish ahead of the consumers
 constexpr int FIXUP_BARRIER = 1;  // named barrier for the 256 consumer threads
+constexpr int EPI_BARRIER = 2;    // and one for the STATS epilogue's exchange
 constexpr int MIN_SHARE = 32;     // least k-steps per Stream-K block (hgemm_sk::kMinShare)
 constexpr int BKB = 128;          // bytes of K per stage: 64 bf16
 constexpr int STAGES = 2;         // grouped_gemm's and hgemm v6's bf16 choice
@@ -202,11 +208,16 @@ constexpr int STAGES = 2;         // grouped_gemm's and hgemm v6's bf16 choice
 using C = fp8gemm_tile::Cfg<BM, BN, BKB, STAGES, WARPS_M, WARPS_N>;
 using Acc = C::Acc;
 
+// The STATS epilogue's cross-warp exchange: two buffers (alternate tiles) of [WARPS_N][BM]
+// (max, sum) pairs, one per warp column per tile row.
+constexpr int RED_PAIRS = 2 * WARPS_N * BM;
+
 constexpr int smem_bytes() {
-    return (STAGES * C::STAGE + ITEM_DEPTH * 16 + (2 * STAGES + 2 * ITEM_DEPTH) * 8 + 1023) / 1024 *
-           1024;
+    return (STAGES * C::STAGE + ITEM_DEPTH * 16 + (2 * STAGES + 2 * ITEM_DEPTH) * 8 +
+            RED_PAIRS * 8 + 1023) /
+           1024 * 1024;
 }
-static_assert(smem_bytes() <= 101376, "two 32 KB stages fit");
+static_assert(smem_bytes() <= 101376, "two 32 KB stages and the exchange fit");
 
 struct Params {
     int M, N;      // T rows of h, V rows of w
@@ -217,7 +228,13 @@ struct Params {
     float* slots;  // 2 * grid Stream-K tiles of BM x BN fp32
     unsigned long long* flags;
     unsigned epoch;
-    __nv_bfloat16* out;  // LOGITS: the logits, [M][N]
+    __nv_bfloat16* out;  // LOGITS: the logits, GRAD: the gradient, [M][N]
+    float2* part;        // STATS: [M][tiles_n] (max, sum of exp(x - max)) per row per tile
+    float* tgt_logit;    // STATS: [M], the target column's logit
+    const int64_t* targets;
+    int ignore_index;
+    const float* lse;    // GRAD: [M]
+    const float* scale;  // GRAD: [1], d loss / d loss_row for a row that counts
 };
 
 struct Split {
@@ -276,6 +293,88 @@ __device__ __forceinline__ void bf16_stage(const unsigned char* as, const unsign
     bf16_step<96>(as, bs, wm, wn, lane, acc);
 }
 
+// STATS epilogue. Lane (g, t) of warp (wm, wn) holds rows wm*64 + mi*16 + g (+8) and columns
+// wn*32 + nj*8 + 2t (+1) of the tile: 8 values per row. The four lanes of a quad share rows,
+// so two shuffles give the warp's (max, sum) over its 32 columns; the four warp columns meet
+// in shared memory and one thread per row merges them and writes the tile's pair. The lane
+// that holds the target column writes the target's logit; exactly one lane in the grid does.
+__device__ __forceinline__ void epi_stats(const Acc& acc, const Params& p, int row0, int nt,
+                                          float2* red, int wm, int wn, int lane, int tid) {
+    constexpr int MT = C::MT, NT = C::NT;
+    const int g = lane >> 2;
+    const int t = lane & 3;
+    const int bn = nt * BN;
+#pragma unroll
+    for (int mi = 0; mi < MT; ++mi) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            float m = -INFINITY;
+#pragma unroll
+            for (int nj = 0; nj < NT; ++nj)
+                m = fmaxf(m, fmaxf(acc[mi][nj][2 * h], acc[mi][nj][2 * h + 1]));
+            m = fmaxf(m, __shfl_xor_sync(kFullMask, m, 1));
+            m = fmaxf(m, __shfl_xor_sync(kFullMask, m, 2));
+            const float mb = m * kLog2e;
+            float s = 0.f;
+#pragma unroll
+            for (int nj = 0; nj < NT; ++nj)
+                s += exp2f(fmaf(acc[mi][nj][2 * h], kLog2e, -mb)) +
+                     exp2f(fmaf(acc[mi][nj][2 * h + 1], kLog2e, -mb));
+            s += __shfl_xor_sync(kFullMask, s, 1);
+            s += __shfl_xor_sync(kFullMask, s, 2);
+            const int r = wm * C::WROWS + mi * 16 + g + 8 * h;
+            if (t == 0) red[wn * BM + r] = make_float2(m, s);
+            const int row = row0 + r;
+            if (row < p.M) {
+                const long long c = __ldg(p.targets + row) - (bn + wn * C::WCOLS + 2 * t);
+#pragma unroll
+                for (int nj = 0; nj < NT; ++nj) {
+                    if (c == nj * 8) p.tgt_logit[row] = acc[mi][nj][2 * h];
+                    if (c == nj * 8 + 1) p.tgt_logit[row] = acc[mi][nj][2 * h + 1];
+                }
+            }
+        }
+    }
+    named_barrier_sync(EPI_BARRIER, CONSUMERS);
+    if (tid < BM && row0 + tid < p.M) {
+        float m = red[tid].x, s = red[tid].y;
+#pragma unroll
+        for (int w = 1; w < WARPS_N; ++w) merge(m, s, red[w * BM + tid].x, red[w * BM + tid].y);
+        p.part[static_cast<size_t>(row0 + tid) * p.tiles_n + nt] = make_float2(m, s);
+    }
+}
+
+// GRAD epilogue: g = (exp(x - lse) - [col == y]) * scale, 0 on a row that does not count,
+// rounded once to bf16 and stored like the plain epilogue (two columns per 4-byte store).
+__device__ __forceinline__ void epi_grad(const Acc& acc, const Params& p, int row0, int bn, int wm,
+                                         int wn, int lane) {
+    constexpr int MT = C::MT, NT = C::NT;
+    const int g = lane >> 2;
+    const int c2 = (lane & 3) * 2;
+    const float scale = __ldg(p.scale);
+#pragma unroll
+    for (int mi = 0; mi < MT; ++mi) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int row = row0 + wm * C::WROWS + mi * 16 + g + 8 * h;
+            if (row >= p.M) continue;
+            const long long y = __ldg(p.targets + row);
+            const bool counts = y != p.ignore_index && y >= 0 && y < p.N;
+            const float coef = counts ? scale : 0.f;
+            const float lb = __ldg(p.lse + row) * kLog2e;
+            __nv_bfloat16* out = p.out + static_cast<size_t>(row) * p.N;
+#pragma unroll
+            for (int nj = 0; nj < NT; ++nj) {
+                const int col = bn + wn * C::WCOLS + nj * 8 + c2;
+                const float p0 = exp2f(fmaf(acc[mi][nj][2 * h], kLog2e, -lb)) - (col == y);
+                const float p1 = exp2f(fmaf(acc[mi][nj][2 * h + 1], kLog2e, -lb)) - (col + 1 == y);
+                *reinterpret_cast<__nv_bfloat162*>(out + col) =
+                    __floats2bfloat162_rn(p0 * coef, p1 * coef);
+            }
+        }
+    }
+}
+
 template <int MODE>
 __global__ void __launch_bounds__(THREADS, 1)
     ce_gemm_kernel(const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMap tmB,
@@ -289,6 +388,7 @@ __global__ void __launch_bounds__(THREADS, 1)
     uint64_t* empty_bar = full_bar + STAGES;
     uint64_t* item_full = empty_bar + STAGES;
     uint64_t* item_empty = item_full + ITEM_DEPTH;
+    float2* red = reinterpret_cast<float2*>(item_empty + ITEM_DEPTH);
     if (smem_u32(smem) % 1024 != 0) __trap();
 
     const int tid = threadIdx.x;
@@ -363,6 +463,7 @@ __global__ void __launch_bounds__(THREADS, 1)
     const int wn = warp % WARPS_N;
     unsigned g_kt = 0;
     unsigned n_item = 0;
+    unsigned n_fin = 0;
     Acc acc;
 
     for (;;) {
@@ -438,8 +539,14 @@ __global__ void __launch_bounds__(THREADS, 1)
             }
         }
         if (!finish) continue;
-        if constexpr (MODE == CE_GEMM_LOGITS)
+        if constexpr (MODE == CE_GEMM_LOGITS) {
             fp8gemm_tile::store_bf16<C>(acc, 1.f, p.out, p.M, p.N, row0, bn);
+        } else if constexpr (MODE == CE_GEMM_STATS) {
+            epi_stats(acc, p, row0, nt, red + (n_fin & 1) * (WARPS_N * BM), wm, wn, lane, tid);
+        } else {
+            epi_grad(acc, p, row0, bn, wm, wn, lane);
+        }
+        ++n_fin;
     }
 }
 
@@ -503,6 +610,36 @@ void launch(const __nv_bfloat16* h, const __nv_bfloat16* w, int M, int N, int K,
     SPARK_CHECK_LAUNCH();
 }
 
+// ---- combine: the per-tile partials of a row into its log-sum-exp and loss ---------------
+
+__global__ void ce_combine_kernel(const float2* __restrict__ part, const float* __restrict__ tgt,
+                                  const int64_t* __restrict__ targets, int M, int tiles_n, int N,
+                                  int ignore_index, float* __restrict__ lse,
+                                  float* __restrict__ loss) {
+    const int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (row >= M) return;
+    const float2* pr = part + static_cast<size_t>(row) * tiles_n;
+    float m = -INFINITY, s = 0.f;
+    for (int j = lane; j < tiles_n; j += 32) {
+        const float2 v = __ldg(pr + j);
+        merge(m, s, v.x, v.y);
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float m2 = __shfl_xor_sync(kFullMask, m, o);
+        const float s2 = __shfl_xor_sync(kFullMask, s, o);
+        merge(m, s, m2, s2);
+    }
+    if (lane == 0) {
+        const float l = m + logf(s);
+        const long long y = targets[row];
+        const bool counts = y != ignore_index && y >= 0 && y < N;
+        lse[row] = l;
+        loss[row] = counts ? l - tgt[row] : 0.f;
+    }
+}
+
 }  // namespace ce
 
 }  // namespace
@@ -541,14 +678,41 @@ void ce_gemm_bf16(const __nv_bfloat16* h, const __nv_bfloat16* w, int T, int V, 
     if (T <= 0) return;
     ce::Params p{};
     p.out = ep.out;
+    p.part = reinterpret_cast<float2*>(ep.partials);
+    p.tgt_logit = ep.target_logit;
+    p.targets = ep.targets;
+    p.ignore_index = ep.ignore_index;
+    p.lse = ep.lse;
+    p.scale = ep.scale;
     switch (mode) {
         case CE_GEMM_LOGITS:
             SPARK_REQUIRE(ep.out, "ce_gemm (logits): needs out");
             ce::launch<CE_GEMM_LOGITS>(h, w, T, V, D, p, stream);
             break;
+        case CE_GEMM_STATS:
+            SPARK_REQUIRE(ep.partials && ep.target_logit && ep.targets,
+                          "ce_gemm (stats): needs partials, target_logit and targets");
+            ce::launch<CE_GEMM_STATS>(h, w, T, V, D, p, stream);
+            break;
+        case CE_GEMM_GRAD:
+            SPARK_REQUIRE(ep.out && ep.targets && ep.lse && ep.scale,
+                          "ce_gemm (grad): needs out, targets, lse and scale");
+            ce::launch<CE_GEMM_GRAD>(h, w, T, V, D, p, stream);
+            break;
         default:
             SPARK_REQUIRE(false, "ce_gemm: unknown mode");
     }
+}
+
+void ce_combine(const float* partials, const float* target_logit, const int64_t* targets, int T,
+                int V, int ignore_index, float* lse, float* loss, cudaStream_t stream) {
+    if (T <= 0) return;
+    constexpr int threads = 256;
+    const int rows_per_block = threads / 32;
+    ce::ce_combine_kernel<<<cdiv(T, rows_per_block), threads, 0, stream>>>(
+        reinterpret_cast<const float2*>(partials), target_logit, targets, T, V / ce::BN, V,
+        ignore_index, lse, loss);
+    SPARK_CHECK_LAUNCH();
 }
 
 }  // namespace spark

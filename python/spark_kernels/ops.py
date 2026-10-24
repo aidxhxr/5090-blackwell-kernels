@@ -801,7 +801,7 @@ def attention_with_grad(
 # ---------------------------------------------------------------------------
 # Linear cross-entropy (src/kernels/cross_entropy.cu, docs/design/cross_entropy.md)
 # ---------------------------------------------------------------------------
-CE_CHUNK = 2048  # rows of logits held at once by variant 1
+CE_CHUNK = 2048  # rows of logits (or of their gradient) held at once by variants 1 and 2
 CE_SLAB = 16384  # vocabulary rows per transposed slab of the gradient for dw += g^T h
 
 
@@ -900,6 +900,36 @@ class LinearCrossEntropyChunked(torch.autograd.Function):
         return dh, dw, None, None, None, None, None
 
 
+class LinearCrossEntropyFused(torch.autograd.Function):
+    """Variant 2: the forward never writes logits (`ce_stats`: per-tile (max, sum) partials
+    from the GEMM's epilogue, merged into the log-sum-exp) and saves only the [T] lse. The
+    backward recomputes a chunk of logits with the softmax-minus-one-hot folded into the
+    GEMM's epilogue (`ce_grad`), then dh and dw as variant 1 does."""
+
+    @staticmethod
+    def forward(ctx, h, w, targets, ignore_index, reduction, chunk, need_grad):
+        lse, loss_rows = _C.ce_stats(h, w, targets, ignore_index)
+        if need_grad:
+            ctx.save_for_backward(h, w, targets, lse)
+        ctx.ignore_index, ctx.reduction, ctx.chunk = ignore_index, reduction, chunk
+        return _ce_reduce(loss_rows, targets, ignore_index, reduction)
+
+    @staticmethod
+    def backward(ctx, grad):
+        h, w, targets, lse = ctx.saved_tensors
+        T, V = h.shape[0], w.shape[0]
+        # The upstream gradient joins the reduction scale on the device: no sync.
+        scale = _ce_scale(targets, ctx.ignore_index, ctx.reduction) * grad.float().reshape(1)
+        dh = torch.empty_like(h)
+        dw = torch.empty_like(w)
+        g, slab_buf = _ce_buffers(h, V, T, ctx.chunk)
+        for t0, t1 in _ce_chunks(T, ctx.chunk):
+            gc = g[: t1 - t0]
+            _C.ce_grad(h[t0:t1], w, targets[t0:t1], lse[t0:t1], scale, ctx.ignore_index, gc)
+            _ce_backprop_chunk(gc, h[t0:t1], w, dh[t0:t1], dw, t0 == 0, slab_buf)
+        return dh, dw, None, None, None, None, None
+
+
 def linear_cross_entropy(
     h: torch.Tensor,
     w: torch.Tensor,
@@ -919,8 +949,12 @@ def linear_cross_entropy(
       1  chunked over T, Liger's recipe on these kernels: per chunk of `chunk` rows the
          logits, a fused row kernel for the loss and the gradient in place, dh and dw by
          hgemm, all inside the forward; holds one chunk of logits
+      2  the forward with no logits (the GEMM's epilogue keeps a per-row max and sum per
+         128-column tile), the backward recomputing a chunk of logits with softmax minus
+         one-hot in the GEMM's epilogue; between the two passes it holds only a [T] lse
 
-    -1 picks 1. Variant 1 needs V a multiple of 128 and D a multiple of 64; -1 falls back to
+    -1 picks 1 when a gradient is needed (three GEMMs against variant 2's four) and 2 when
+    not. Variants 1 and 2 need V a multiple of 128 and D a multiple of 64; -1 falls back to
     0 otherwise. dw is accumulated in bf16 across chunks (one rounding per chunk).
     """
     if reduction not in ("mean", "sum"):
@@ -929,19 +963,19 @@ def linear_cross_entropy(
     fits = V % 128 == 0 and D % 64 == 0
     need_grad = torch.is_grad_enabled() and (h.requires_grad or w.requires_grad)
     if variant == -1:
-        variant = 1 if fits else 0
+        variant = 0 if not fits else 1 if need_grad else 2
     if variant == 0:
         return _ce_reference(h, w, targets, ignore_index, reduction)
-    if variant != 1:
-        raise ValueError(f"linear_cross_entropy: variant must be -1, 0 or 1, got {variant}")
+    if variant not in (1, 2):
+        raise ValueError(f"linear_cross_entropy: variant must be -1, 0, 1 or 2, got {variant}")
     if not fits:
         raise ValueError(f"linear_cross_entropy variant {variant} needs V % 128 == 0 and "
                          f"D % 64 == 0, got V = {V}, D = {D}")
     chunk = CE_CHUNK if chunk is None else int(chunk)
     if chunk < 1:
         raise ValueError(f"chunk must be positive, got {chunk}")
-    return LinearCrossEntropyChunked.apply(h, w, targets, ignore_index, reduction, chunk,
-                                           need_grad)
+    fn = LinearCrossEntropyChunked if variant == 1 else LinearCrossEntropyFused
+    return fn.apply(h, w, targets, ignore_index, reduction, chunk, need_grad)
 
 
 # ---------------------------------------------------------------------------

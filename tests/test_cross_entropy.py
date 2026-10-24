@@ -1,8 +1,8 @@
 """Parity of linear_cross_entropy (and its pieces) against torch in fp32: the loss and both
 gradients for every variant, rows with ignore_index, T not a multiple of any tile or chunk,
 "mean" and "sum", an upstream gradient other than 1, the no-grad forward, and the kernels
-on their own (the fused row kernel on bf16 logits, the logits GEMM, the padded
-transpose)."""
+on their own (the fused row kernel on bf16 logits, the GEMM's stats and gradient epilogues,
+the padded transpose)."""
 
 import pytest
 import torch
@@ -45,7 +45,7 @@ def _assert_close(got, ref, name, rel=2e-2, floor=1e-6):
     assert err <= tol, f"{name}: max error {err:.3e} > tolerance {tol:.3e}"
 
 
-@pytest.mark.parametrize("variant", [0, 1])
+@pytest.mark.parametrize("variant", [0, 1, 2])
 @pytest.mark.parametrize("chunk", CHUNKS, ids=lambda c: f"chunk{c}")
 @pytest.mark.parametrize("shape", SHAPES, ids=_shape_id)
 def test_linear_cross_entropy_matches_fp32(sk, shape, chunk, variant):
@@ -62,7 +62,7 @@ def test_linear_cross_entropy_matches_fp32(sk, shape, chunk, variant):
     assert hh.grad.dtype == torch.bfloat16 and ww.grad.dtype == torch.bfloat16
 
 
-@pytest.mark.parametrize("variant", [1])
+@pytest.mark.parametrize("variant", [1, 2])
 def test_sum_reduction_and_upstream_gradient(sk, variant):
     h, w, y = _inputs(500, 256, 1024, seed=3)
     ref_loss, ref_dh, ref_dw = _reference(h, w, y, reduction="sum", upstream=0.37)
@@ -75,7 +75,7 @@ def test_sum_reduction_and_upstream_gradient(sk, variant):
     _assert_close(ww.grad, ref_dw, "dw")
 
 
-@pytest.mark.parametrize("variant", [1])
+@pytest.mark.parametrize("variant", [1, 2])
 def test_custom_ignore_index_and_grad_of_one_input(sk, variant):
     h, w, y = _inputs(200, 128, 512, seed=4, ignore_frac=0.5, ignore_index=7)
     ref_loss, ref_dh, _ = _reference(h, w, y, ignore_index=7)
@@ -86,7 +86,7 @@ def test_custom_ignore_index_and_grad_of_one_input(sk, variant):
     _assert_close(hh.grad, ref_dh, "dh")
 
 
-@pytest.mark.parametrize("variant", [-1, 1])
+@pytest.mark.parametrize("variant", [-1, 1, 2])
 def test_forward_without_grad(sk, variant):
     h, w, y = _inputs(300, 256, 1024, seed=5)
     ref_loss, _, _ = _reference(h, w, y)
@@ -98,8 +98,9 @@ def test_forward_without_grad(sk, variant):
 def test_every_row_ignored_is_nan_like_torch(sk):
     h, w, y = _inputs(64, 64, 256, seed=6)
     y.fill_(-100)
-    loss = sk.linear_cross_entropy(h, w, y, variant=1)
-    assert torch.isnan(loss)
+    for variant in (1, 2):
+        loss = sk.linear_cross_entropy(h, w, y, variant=variant)
+        assert torch.isnan(loss)
 
 
 def test_unsupported_shapes(sk):
@@ -138,6 +139,25 @@ def test_ce_rows_matches_torch_on_bf16_logits(sk, rows, V):
 
 
 @pytest.mark.parametrize("shape", SHAPES, ids=_shape_id)
+def test_ce_stats_and_grad_epilogues(sk, shape):
+    h, w, y = _inputs(*shape, seed=7)
+    x = h.float() @ w.float().t()
+    lse, loss = sk.ops._C.ce_stats(h, w, y, -100)
+    keep = y != -100
+    ref_lse = torch.logsumexp(x, 1)
+    torch.testing.assert_close(lse, ref_lse, atol=1e-3, rtol=1e-4)
+    ref_loss = F.cross_entropy(x, y, reduction="none")
+    torch.testing.assert_close(loss, ref_loss, atol=1e-3, rtol=1e-4)
+    assert (loss[~keep] == 0).all()
+    scale = torch.full((1,), 0.25, device="cuda")
+    g = sk.ops._C.ce_grad(h, w, y, lse, scale, -100)
+    ref_g = torch.softmax(x, 1)
+    ref_g[keep, y[keep]] -= 1
+    ref_g[~keep] = 0
+    torch.testing.assert_close(g.float(), ref_g * 0.25, atol=1e-5, rtol=1e-2)
+
+
+@pytest.mark.parametrize("shape", SHAPES, ids=_shape_id)
 def test_ce_logits_is_the_bf16_gemm(sk, shape):
     h, w, _ = _inputs(*shape, seed=7)
     x = h.float() @ w.float().t()
@@ -146,8 +166,11 @@ def test_ce_logits_is_the_bf16_gemm(sk, shape):
 
 def test_ce_gemm_is_deterministic(sk):
     # T = 2000 rows on V = 4096: a partial last wave, so the Stream-K fixup runs
-    h, w, _ = _inputs(2000, 1024, 4096, seed=8)
+    h, w, y = _inputs(2000, 1024, 4096, seed=8)
     assert torch.equal(sk.ops._C.ce_logits(h, w), sk.ops._C.ce_logits(h, w))
+    a = sk.ops._C.ce_stats(h, w, y, -100)
+    b = sk.ops._C.ce_stats(h, w, y, -100)
+    assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
 
 
 def test_ce_transpose_pads_with_zeros(sk):

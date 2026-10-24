@@ -75,6 +75,7 @@ from . import engine, layer, reference
 from .ops import (
     AttentionFunction,
     LinearCrossEntropyChunked,
+    LinearCrossEntropyFused,
     W1ExpertWeights,
     W1Weight,
     W4Weight,
@@ -118,6 +119,7 @@ from .ops import (
 __all__ = [
     "AttentionFunction",
     "LinearCrossEntropyChunked",
+    "LinearCrossEntropyFused",
     "W1ExpertWeights",
     "W1Weight",
     "W4Weight",

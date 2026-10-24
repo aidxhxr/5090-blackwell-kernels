@@ -881,6 +881,46 @@ Tensor ce_logits(const Tensor& h, const Tensor& w, const std::optional<Tensor>& 
     return c;
 }
 
+// (lse, loss), float32 [T] each, from the GEMM's per-tile (max, sum) partials; no logits.
+std::tuple<Tensor, Tensor> ce_stats(const Tensor& h, const Tensor& w, const Tensor& targets,
+                                    int64_t ignore_index) {
+    const CeShape s = ce_check(h, w, &targets, "ce_stats");
+    const c10::cuda::CUDAGuard guard(h.device());
+    const auto f32 = h.options().dtype(at::kFloat);
+    Tensor part = at::empty({s.T, s.V / 128, 2}, f32);
+    Tensor tgt = at::empty({s.T}, f32);
+    Tensor lse = at::empty({s.T}, f32);
+    Tensor loss = at::empty({s.T}, f32);
+    spark::CeGemmEpilogue ep;
+    ep.partials = part.data_ptr<float>();
+    ep.target_logit = tgt.data_ptr<float>();
+    ep.targets = targets.data_ptr<int64_t>();
+    ep.ignore_index = static_cast<int>(ignore_index);
+    cudaStream_t stream = current_stream(h);
+    spark::ce_gemm_bf16(bf16_ptr(h), bf16_ptr(w), s.T, s.V, s.D, spark::CE_GEMM_STATS, ep, stream);
+    spark::ce_combine(ep.partials, ep.target_logit, ep.targets, s.T, s.V, ep.ignore_index,
+                      lse.data_ptr<float>(), loss.data_ptr<float>(), stream);
+    return {lse, loss};
+}
+
+// d loss / d logits = (softmax - one-hot) * scale, bf16 [T, V], recomputed from h and w and
+// the forward's lse; scale is float32 [1] on the device.
+Tensor ce_grad(const Tensor& h, const Tensor& w, const Tensor& targets, const Tensor& lse,
+               const Tensor& scale, int64_t ignore_index, const std::optional<Tensor>& out) {
+    const CeShape s = ce_check(h, w, &targets, "ce_grad");
+    const c10::cuda::CUDAGuard guard(h.device());
+    Tensor c = ce_out(out, h, s.T, s.V);
+    spark::CeGemmEpilogue ep;
+    ep.out = bf16_ptr_mut(c);
+    ep.targets = targets.data_ptr<int64_t>();
+    ep.ignore_index = static_cast<int>(ignore_index);
+    ep.lse = ce_f32(lse, s.T, h, "lse");
+    ep.scale = ce_f32(scale, 1, h, "scale");
+    spark::ce_gemm_bf16(bf16_ptr(h), bf16_ptr(w), s.T, s.V, s.D, spark::CE_GEMM_GRAD, ep,
+                        current_stream(h));
+    return c;
+}
+
 // The fused row kernel on bf16 logits [rows, V]: (loss, lse) float32 [rows]; with `scale`
 // (float32 [1] on the device) the logits are overwritten by the gradient rows.
 std::tuple<Tensor, Tensor> ce_rows(const Tensor& logits_in, const Tensor& targets,
@@ -1682,6 +1722,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("scale_b") = py::none());
     m.def("ce_logits", &ce_logits, "logits = h @ w.T, h [T, D] and w [V, D] bf16 -> [T, V] bf16",
           py::arg("h"), py::arg("w"), py::arg("out") = py::none());
+    m.def("ce_stats", &ce_stats,
+          "cross-entropy forward without the logits: (lse, loss) float32 [T] from h, w and "
+          "int64 targets",
+          py::arg("h"), py::arg("w"), py::arg("targets"), py::arg("ignore_index") = -100);
+    m.def("ce_grad", &ce_grad,
+          "(softmax(h @ w.T) - one_hot(targets)) * scale as bf16 [T, V], from the forward's lse",
+          py::arg("h"), py::arg("w"), py::arg("targets"), py::arg("lse"), py::arg("scale"),
+          py::arg("ignore_index") = -100, py::arg("out") = py::none());
     m.def("ce_rows", &ce_rows,
           "cross-entropy rows of bf16 logits: (loss, lse) float32; with scale the logits are "
           "overwritten by (softmax - one_hot) * scale",
