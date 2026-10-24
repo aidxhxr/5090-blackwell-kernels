@@ -803,6 +803,7 @@ def attention_with_grad(
 # ---------------------------------------------------------------------------
 CE_CHUNK = 2048  # rows of logits (or of their gradient) held at once by variants 1 and 2
 CE_SLAB = 16384  # vocabulary rows per transposed slab of the gradient for dw += g^T h
+CE_STATS_CHUNK = 8192  # rows per STATS GEMM in variant 2's forward, so h stays in L2
 
 
 def _ce_reference(h, w, targets, ignore_index, reduction):
@@ -851,6 +852,18 @@ def _ce_backprop_chunk(g, h_c, w, dh_c, dw, first, slab_buf):
 
 def _ce_chunks(T, chunk):
     return [(t0, min(T, t0 + chunk)) for t0 in range(0, T, chunk)]
+
+
+def _ce_stats(h, w, targets, ignore_index):
+    """(lse, loss) float32 [T] by the STATS GEMM, CE_STATS_CHUNK rows at a time: the GEMM
+    walks every row of h against each strip of w, and past 8192 rows (64 MB at D = 4096) h
+    no longer stays in the 96 MB L2 while w streams through."""
+    T = h.shape[0]
+    if T <= CE_STATS_CHUNK:
+        return _C.ce_stats(h, w, targets, ignore_index)
+    parts = [_C.ce_stats(h[t0:t1], w, targets[t0:t1], ignore_index)
+             for t0, t1 in _ce_chunks(T, CE_STATS_CHUNK)]
+    return torch.cat([p[0] for p in parts]), torch.cat([p[1] for p in parts])
 
 
 def _ce_buffers(h, V, T, chunk, need_grad=True):
@@ -908,7 +921,7 @@ class LinearCrossEntropyFused(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, h, w, targets, ignore_index, reduction, chunk, need_grad):
-        lse, loss_rows = _C.ce_stats(h, w, targets, ignore_index)
+        lse, loss_rows = _ce_stats(h, w, targets, ignore_index)
         if need_grad:
             ctx.save_for_backward(h, w, targets, lse)
         ctx.ignore_index, ctx.reduction, ctx.chunk = ignore_index, reduction, chunk

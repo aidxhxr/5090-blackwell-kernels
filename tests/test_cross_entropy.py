@@ -95,6 +95,20 @@ def test_forward_without_grad(sk, variant):
     torch.testing.assert_close(loss, ref_loss, atol=2e-3, rtol=2e-3)
 
 
+def test_forward_in_stats_chunks(sk, monkeypatch):
+    # variant 2's forward runs the STATS GEMM CE_STATS_CHUNK rows at a time past that size
+    monkeypatch.setattr(sk.ops, "CE_STATS_CHUNK", 128)
+    h, w, y = _inputs(300, 256, 1024, seed=9)
+    ref_loss, ref_dh, ref_dw = _reference(h, w, y)
+    hh = h.clone().requires_grad_()
+    ww = w.clone().requires_grad_()
+    loss = sk.linear_cross_entropy(hh, ww, y, variant=2, chunk=96)
+    loss.backward()
+    torch.testing.assert_close(loss, ref_loss, atol=2e-3, rtol=2e-3)
+    _assert_close(hh.grad, ref_dh, "dh")
+    _assert_close(ww.grad, ref_dw, "dw")
+
+
 def test_every_row_ignored_is_nan_like_torch(sk):
     h, w, y = _inputs(64, 64, 256, seed=6)
     y.fill_(-100)
