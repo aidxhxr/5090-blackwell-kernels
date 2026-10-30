@@ -289,6 +289,71 @@ def test_fp8gemm_mx_variant3(sk, shape):
     _mx_case(sk, shape, 3)
 
 
+# Variant 3's tiles forced in MX mode: the Stream-K pieces cut on scale-chunk groups, both
+# chunk widths (K % 512 == 0 fetches 16-byte chunks, four stages a group; K = 768, 2304 and
+# 11008 the 8-byte ones, two a group), group counts that do not divide into the ring or the
+# grid (9 groups at K = 2304, 43 at 11008), and rows past M.
+# Every tile forced: one piece per tile, static ranges that split a tile over several
+# blocks on group boundaries, rows past M, the queue with K-passes, and the 8-byte chunks.
+MX_SHAPES_V3_FORCED = [(128, 2048, 512), (200, 1024, 4096), (777, 2560, 2304), (256, 81920, 1024),
+                       (300, 1024, 768)]
+
+
+@pytest.mark.parametrize("shape", MX_SHAPES_V3_FORCED, ids=lambda s: f"M{s[0]}_N{s[1]}_K{s[2]}")
+def test_fp8gemm_mx_variant3_forced_tiles(sk, v3_route, shape):
+    _mx_supported(sk)
+    for tile in range(sk._C.fp8gemm_v3_num_tiles()):
+        v3_route(tile)
+        assert sk._C.fp8gemm_v3_route_name(*shape, mx=True).startswith("tma")
+        _mx_case(sk, shape, 3)
+
+
+def test_fp8gemm_mx_variant3_pieces_carry_the_scales(sk, v3_route):
+    # The pieces of a tile each fetch their own scale chunks and are summed in K order
+    # through the slot. Inputs that are multiples of 1/16 in [-1, 1] with block scales in
+    # 2^-1 .. 2^1 at K = 2304: every product is a multiple of 2^-12, every partial sum is at
+    # most 2^14 in magnitude, so the fp32 sums are exact whatever the split, and every tile
+    # must give variant 0's bits (which are cuBLASLt's). 128x768 is 12 tiles of 128x64 or 6
+    # of 128x128 on a grid that cuts each into two or more pieces of 9 groups of two stages;
+    # 300 rows add a ragged tile.
+    _mx_supported(sk)
+    for M, N, K in [(128, 768, 2304), (300, 768, 2304), (128, 4096, 11008)]:
+        torch.manual_seed(M + K)
+        a = (torch.randint(-16, 17, (M, K), device="cuda") / 16.0).to(torch.float8_e4m3fn)
+        b_t = (torch.randint(-16, 17, (N, K), device="cuda") / 16.0).to(torch.float8_e4m3fn)
+        sfa = torch.randint(126, 129, (M, K // 32), device="cuda").to(torch.uint8)
+        sfb = torch.randint(126, 129, (N, K // 32), device="cuda").to(torch.uint8)
+        if K > 4096:  # 2^-12 granularity against 2^14 of magnitude at K = 2304; scale 1 above
+            sfa.fill_(127)
+            sfb.fill_(127)
+        want = sk.fp8gemm(a[: M // 16 * 16], b_t, variant=0, sfa=sfa[: M // 16 * 16], sfb=sfb)
+        for tile in [-1] + list(range(sk._C.fp8gemm_v3_num_tiles())):
+            v3_route(tile)
+            got = sk.fp8gemm(a, b_t, variant=3, sfa=sfa, sfb=sfb)
+            assert torch.equal(got[: M // 16 * 16], want), (M, N, K, tile)
+
+
+def test_fp8gemm_mx_variant3_same_bits_every_run(sk, v3_route):
+    # Gaussian MX inputs at K = 8192: the partial sums are not exact, and the K-ordered fixup
+    # makes the bits independent of which block computed which piece, on every tile.
+    _mx_supported(sk)
+    a, sfa, b_t, sfb = _mx_inputs(384, 2048, 8192, seed=5)
+    for tile in range(sk._C.fp8gemm_v3_num_tiles()):
+        v3_route(tile)
+        first = sk.fp8gemm(a, b_t, variant=3, sfa=sfa, sfb=sfb)
+        for _ in range(3):
+            assert torch.equal(sk.fp8gemm(a, b_t, variant=3, sfa=sfa, sfb=sfb), first), tile
+
+
+def test_fp8gemm_mx_variant3_legacy_route(sk, v3_route):
+    _mx_supported(sk)
+    v3_route(-2)
+    a, sfa, b_t, sfb = _mx_inputs(2048, 2048, 2048, seed=7)
+    assert sk._C.fp8gemm_v3_route_name(2048, 2048, 2048, mx=True) == "v2"
+    assert torch.equal(sk.fp8gemm(a, b_t, variant=3, sfa=sfa, sfb=sfb),
+                       sk.fp8gemm(a, b_t, variant=2, sfa=sfa, sfb=sfb))
+
+
 def test_fp8gemm_mx_default_steps_down(sk):
     _mx_supported(sk)
     a, sfa, b_t, sfb = _mx_inputs(1024, 1024, 1024)  # too few tiles for variant 2
@@ -308,7 +373,8 @@ def test_fp8gemm_mx_unit_scales_match_per_tensor_bitwise(sk):
     # magnitude) is exact in fp32 whatever the split-K order, which MX mode changes: its
     # slices start on chunk-group boundaries.
     _mx_supported(sk)
-    for M, N, K in [(256, 256, 256), (272, 1088, 4096), (33, 4096, 768), (2048, 2048, 2048)]:
+    for M, N, K in [(256, 256, 256), (272, 1088, 4096), (33, 4096, 768), (2048, 2048, 2048),
+                    (128, 768, 2304), (200, 1024, 11008)]:
         torch.manual_seed(M + N + K)
         a = (torch.randint(-16, 17, (M, K), device="cuda") / 16.0).to(torch.float8_e4m3fn)
         b_t = (torch.randint(-16, 17, (N, K), device="cuda") / 16.0).to(torch.float8_e4m3fn)
