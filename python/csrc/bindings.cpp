@@ -642,7 +642,8 @@ Tensor w4gemm(const Tensor& a, const Tensor& packed, const Tensor& scales,
         "w4gemm needs 16-byte aligned a, packed, scales and zeros storage");
     const c10::cuda::CUDAGuard guard(a.device());
     Tensor c = at::empty({M, N}, a.options());
-    const int v = resolve_variant(variant, spark::w4gemm_num_variants());
+    const int v = variant < 0 ? spark::w4gemm_default_variant()
+                              : resolve_variant(variant, spark::w4gemm_num_variants());
     spark::w4gemm_bf16(bf16_ptr(a), packed.data_ptr<int32_t>(), bf16_ptr(scales), zp,
                        bf16_ptr_mut(c), static_cast<int>(M), static_cast<int>(N),
                        static_cast<int>(K), v, current_stream(a));

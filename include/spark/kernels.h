@@ -403,10 +403,16 @@ void w4_repack(const int32_t* qweight, int32_t* packed, int K, int N, cudaStream
 //            activations, on a Stream-K grid. A K split across blocks goes through an fp32
 //            workspace with atomics (those outputs are not bitwise reproducible run to run),
 //            which the kernel leaves zeroed: one launch, no memset
+// variant 3: batch invariant (docs/design/batch_invariant.md): variant 2's block shapes with
+//            four warps along K (warp w on every fourth 128-k group from w, in order) and no
+//            K split across blocks, the four partials summed in warp order, so every output
+//            is the same chain of k16 steps and adds at every M and row i of C has the same
+//            bits whatever M is. Opt-in: variant -1 is still 2 (w4gemm_default_variant)
 void w4gemm_bf16(const __nv_bfloat16* A, const int32_t* packed, const __nv_bfloat16* scales,
                  const uint8_t* zeros, __nv_bfloat16* C, int M, int N, int K, int variant,
                  cudaStream_t stream);
 int w4gemm_num_variants();
+int w4gemm_default_variant();
 bool w4gemm_supports(int M, int N, int K, int variant);
 
 // ---- 1-bit / ternary weight GEMM (src/kernels/w1gemm.cu) ----------------------------------

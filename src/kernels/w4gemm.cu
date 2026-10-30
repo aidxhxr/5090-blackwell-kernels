@@ -8,6 +8,9 @@
 //      ring of weight loads several groups deep and the activations one group ahead;
 //      M > 16: a block tile with warps along N and M sharing activations through a
 //      multi-stage cp.async pipeline in shared memory, on a Stream-K schedule
+//   3  batch invariant (docs/design/batch_invariant.md): variant 2's four-warps-along-K
+//      shapes with no K split across blocks, so an output is four fixed k16 chains summed in
+//      a fixed order whatever M is; opt-in, -1 stays variant 2
 // The packed layout, the k order inside a group and the dequant: w4gemm_internal.cuh.
 // Design and measurements: docs/design/w4gemm.md.
 #include <algorithm>
@@ -843,6 +846,9 @@ const Entry kEntries[] = {
     pipe_entry<2, 4, 32, 1, 4, 1, 3>(),  // 10: 128 x 32
     pipe_entry<1, 4, 32, 2, 4, 1, 3>(),  // 11: 64 x 64
     pipe_entry<2, 4, 32, 2, 4, 1, 3>(),  // 12: 128 x 64
+    // pipelined, four warps along K and four along N: variant 3's shapes above 32 rows
+    pipe_entry<1, 4, 32, 1, 4, 4, 2>(),  // 13: 64 x 32, 97 KB
+    pipe_entry<1, 2, 16, 1, 4, 4, 2>(),  // 14: 64 x 16, 66 KB
 };
 constexpr int kNumEntries = sizeof(kEntries) / sizeof(kEntries[0]);
 
@@ -904,6 +910,38 @@ void launch_v2(const Args& a) {
     (a.Z ? e.asym : e.sym)(a, split);
 }
 
+// Variant 3, batch invariant: the shapes with four warps along K (WK = 4) and the K split
+// across blocks forced to 1, at every M. Each of the four warps accumulates every fourth
+// 128-k group in order (warp w the groups w, w + 4, ...), in the warp kernel (entries 0 and
+// 1) and the pipelined kernel (5, 13 and 14) alike, and the block sums the four partials in
+// shared memory in warp order, ((p0 + p1) + p2) + p3, so an output element's chain is the
+// same whichever shape M picks. The shape per M is the fastest of the family on the Llama
+// projections (docs/design/batch_invariant.md). One warp per strip (entries 3 and 4, no
+// split at all, what the default runs on a wide N) was tried first: it costs 2 to 3x on the
+// narrow projections at M <= 16 (o 7.8 to 19 us, down 21 to 65 us), and a deeper ring of
+// loads per warp does not help (17 and 64 us with 16 groups in flight): 256 one-warp blocks
+// leave most SMs with one warp to issue from.
+int pick_invariant(const Args& a) {
+    int idx;
+    if (a.M <= 1)
+        idx = 5;
+    else if (a.M <= 8)
+        idx = 0;
+    else if (a.M <= 32)
+        idx = 1;
+    else if (a.M <= 64)
+        idx = 14;
+    else
+        idx = 13;
+    if (a.N % kEntries[idx].bn != 0) idx = 1;
+    return idx;
+}
+
+void launch_v3(const Args& a) {
+    const Entry& e = kEntries[pick_invariant(a)];
+    (a.Z ? e.asym : e.sym)(a, 1);
+}
+
 }  // namespace
 
 bool w4gemm_supports(int M, int N, int K, int variant) {
@@ -912,7 +950,11 @@ bool w4gemm_supports(int M, int N, int K, int variant) {
 }
 
 int w4gemm_num_variants() {
-    return 3;
+    return 4;
+}
+
+int w4gemm_default_variant() {
+    return 2;  // 3 is batch invariant and opt-in
 }
 
 void w4gemm_bf16(const __nv_bfloat16* A, const int32_t* packed, const __nv_bfloat16* scales,
@@ -940,8 +982,11 @@ void w4gemm_bf16(const __nv_bfloat16* A, const int32_t* packed, const __nv_bfloa
             SPARK_CHECK_LAUNCH();
             break;
         }
-        default:
+        case 2:
             launch_v2(Args{A, pk, scales, zeros, C, M, N, K, stream});
+            break;
+        default:
+            launch_v3(Args{A, pk, scales, zeros, C, M, N, K, stream});
     }
 }
 

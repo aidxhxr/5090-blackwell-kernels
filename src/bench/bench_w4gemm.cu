@@ -423,7 +423,7 @@ int run(int argc, char** argv) {
         }
         if (!custom && !asym_only) {
             Weight w = make_weight(ws.N, ws.K, true, stream);
-            const std::vector<int> top = {spark::w4gemm_num_variants() - 1};
+            const std::vector<int> top = {spark::w4gemm_default_variant()};
             for (int m : {1, 16})
                 all_ok = run_m(handle, stream, w, m, top, iters, chain, true) && all_ok;
             all_ok = all_ok && w.quant_ok;
