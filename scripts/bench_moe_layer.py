@@ -6,7 +6,8 @@ Qwen3-30B-A3B (128, top-8, 2048 -> 768). Writes results/moe_layer.json (JSON lin
 config, token count and implementation; a rerun replaces the rows it measures) and prints a
 table plus, for ours, the kernel time per stage from the torch profiler.
 
-    python scripts/bench_moe_layer.py         # ours, ours_unfused, torch, torch_grouped
+    python scripts/bench_moe_layer.py         # ours, ours_graph, ours_gather, ours_permute,
+                                              # ours_unfused, torch, torch_grouped
     ~/vllm-env/bin/python scripts/bench_moe_layer.py --impls vllm
     python scripts/bench_moe_layer.py --config qwen3 --tokens 1 16 --iters 100
 
@@ -23,8 +24,14 @@ DRAM: one Qwen3 expert is 9.4 MB and 8 of them would otherwise sit in the 96 MB 
 implementation includes the router GEMM (F.linear on the same router weight).
 
 impls:
-  ours           router GEMM, moe_dispatch (route + permute), grouped_gemm_swiglu,
-                 grouped_gemm, moe_combine
+  ours           router GEMM, the routing, grouped_gemm_swiglu, grouped_gemm, moe_combine;
+                 the gate/up GEMM gathers x through the routing's row table (moe_route_rows)
+                 where moe_layer's rule says so, else moe_dispatch writes the permuted copy
+  ours_graph     ours captured in a CUDA graph for the token count (MoEGraph) and replayed,
+                 up to 1024 tokens; the copy of the input into the graph's static buffer is
+                 inside the timing
+  ours_gather    ours with the gather forced at every token count
+  ours_permute   ours with the permuted copy forced at every token count
   ours_unfused   the same with the plain grouped GEMM on gate|up and the swiglu kernel after it
   torch          moe_layer.torch_moe: transformers' loop, a torch.where per expert hit
   torch_grouped  moe_layer.torch_grouped_moe: argsort, torch._grouped_mm twice, a gather and
@@ -35,6 +42,7 @@ impls:
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib.util
 import json
 import statistics
@@ -48,9 +56,12 @@ import torch.nn.functional as F
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "results" / "moe_layer.json"
 TOKENS = [1, 16, 128, 1024, 4096, 16384]
-DEFAULT_IMPLS = ["ours", "ours_unfused", "torch", "torch_grouped"]
+DEFAULT_IMPLS = ["ours", "ours_graph", "ours_gather", "ours_permute", "ours_unfused", "torch",
+                 "torch_grouped"]
+OURS = ("ours", "ours_gather", "ours_permute", "ours_unfused")
 STAGES = ["router", "route", "permute", "gate_up", "down", "combine"]
 MEM_GB = 10.0  # device memory this process may take
+GRAPH_MAX_TOKENS = 1024  # ours_graph rows stop here: a graph is for decode-sized steps
 
 
 def load_moe_layer(use_package: bool):
@@ -94,13 +105,13 @@ def stage_of(name: str) -> str:
     """Our kernels by name; anything else in our layer is the router GEMM."""
     if "route_kernel" in name:
         return "route"
-    if "permute_kernel" in name:
+    if "permute_kernel" in name or "positions_kernel" in name:
         return "permute"
     if "combine_kernel" in name:
         return "combine"
-    if "grouped_kernel<" in name:  # the last template argument is the SwiGLU flag
-        args = name.split("grouped_kernel<", 1)[1].split(">", 1)[0]
-        return "gate_up" if args.replace(" ", "").endswith("true") else "down"
+    if "grouped_kernel<" in name:  # <FP8, BM, BKB, STAGES, SWIGLU, GATHER>
+        args = name.split("grouped_kernel<", 1)[1].split(">", 1)[0].replace(" ", "").split(",")
+        return "gate_up" if args[4] == "true" else "down"
     return "router"
 
 
@@ -137,9 +148,17 @@ def vllm_fn(cfg, wts):
 
 def impl_fns(ml, cfg, wts, impls):
     fns = {}
-    for name in impls:
+    ours = None  # the layer the ours_* variants share their interleaved w13 with (1.75 GB
+    for name in impls:  # on Mixtral; one copy fits the memory cap, four did not)
+        if name in ("ours", "ours_graph", "ours_gather", "ours_permute") and ours is None:
+            ours = ml.MoELayer(wts)
         if name == "ours":
-            fns[name] = ml.MoELayer(wts)
+            fns[name] = ours
+        elif name == "ours_graph":
+            fns[name] = None  # captured per token count in run_config, from `ours`
+        elif name in ("ours_gather", "ours_permute"):
+            fns[name] = copy.copy(ours)
+            fns[name].gather = name == "ours_gather"
         elif name == "ours_unfused":
             fns[name] = ml.MoELayer(wts, fuse_swiglu=False)
         elif name == "torch":
@@ -183,6 +202,10 @@ def run_config(ml, cfg, args) -> list[dict]:
         for name, fn in fns.items():
             torch.cuda.empty_cache()  # one implementation's cached blocks at a time
             torch.cuda.reset_peak_memory_stats()
+            if name == "ours_graph":
+                if T > GRAPH_MAX_TOKENS:
+                    continue
+                fn = ml.MoEGraph(fns.get("ours") or copy.copy(fns["ours_gather"]), T)
             out = fn(pool[0])
             err = (out.float() - ref).abs().max().item() / scale
             if err > 2e-2:
@@ -196,9 +219,10 @@ def run_config(ml, cfg, args) -> list[dict]:
                    "weight_bytes": moved, "gflop": gflop,
                    "weight_gbps": moved / (med * 1e-3) / 1e9,
                    "tflops": gflop / (med * 1e-3) / 1e3}
-            if name in ("ours", "ours_unfused"):
+            if name in OURS:
                 row["route_mismatch"] = route_mismatch(ml, fn, wts, pool[0])
-            if name == "ours" and not args.no_profile:
+                row["gather"] = fn.gathers(T)
+            if name in ("ours", "ours_gather", "ours_permute") and not args.no_profile:
                 row["breakdown_us"] = breakdown(fn, pool)
             if name == "vllm":
                 import vllm
