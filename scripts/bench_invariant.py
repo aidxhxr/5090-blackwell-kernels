@@ -2,7 +2,9 @@
 """What batch invariance costs: the engine and its kernels, default against invariant.
 
     python scripts/bench_invariant.py --part kernels   # hgemm 6 vs 7, paged ops 1 vs 2
+    python scripts/bench_invariant.py --part quant     # fp8gemm 3 vs 4, w4gemm 2 vs 3, fp8 cache
     python scripts/bench_invariant.py --part engine    # decode ms/step and prefill tok/s
+    python scripts/bench_invariant.py --part engine --weights-format int4 --kv-format fp8
 
 The kernel rows time each op on its own: hgemm variant 6 (the default) against variant 7 on
 the Llama-3-8B projections at decode and prefill M, paged_decode and attention_varlen variant
@@ -11,11 +13,17 @@ the Llama-3-8B projections at decode and prefill M, paged_decode and attention_v
 the weights (or the K/V pages) rotated over copies past the 96 MB L2 when one copy would fit
 in it, and the two variants' outputs checked against each other first.
 
+The quant rows do the same for the quantized rungs: fp8gemm variant 3 (the default) against
+4 and w4gemm variant 2 against 3 on the same projections, and paged_decode and
+attention_varlen variant 1 against 2 on an e4m3 cache.
+
 The engine rows are scripts/bench_serve.py's static batches (prompts log-uniform in 64..2048,
 --new tokens each, greedy) on the same random weights, once with the default kernels and once
 with Engine(batch_invariant=True). --layers defaults to 8 of Llama-3-8B's 32, so the weights,
 the 1 GB lm_head and the cache stay under 10 GB; a step's layer part scales with the layer
-count, the lm_head part does not.
+count, the lm_head part does not. --weights-format and --kv-format pick the quantized
+engine (quant.INVARIANT_FORMATS, the fp8 cache): one model, quantized once, switched between
+the modes.
 """
 
 from __future__ import annotations
@@ -108,11 +116,61 @@ def bench_gemm(sk, ms, iters, rows):
         torch.cuda.empty_cache()
 
 
+def bench_quant_gemm(sk, ms, iters, rows):
+    """fp8gemm 3 against 4 and w4gemm 2 against 3 on the Llama projections, as bench_gemm."""
+    if not ms:
+        return
+    one = torch.ones(1, device="cuda")
+    for name, k, n in GEMMS:
+        g = torch.Generator(device="cuda").manual_seed(0)
+        w = torch.empty(k, n, device="cuda", dtype=torch.bfloat16).normal_(
+            0, 1 / math.sqrt(k), generator=g)
+        ncopy8 = copies_for(k * n) if max(ms) <= 64 else 1
+        bts = [w.t().contiguous().to(torch.float8_e4m3fn) for _ in range(ncopy8)]
+        ncopy4 = copies_for(k * n // 2) if max(ms) <= 64 else 1
+        w4s = [sk.W4Weight.quantize(w) for _ in range(ncopy4)]
+        del w
+        for m in ms:
+            if name == "lm_head" and m > 2048:
+                continue
+            a = torch.randn(m, k, device="cuda").to(torch.bfloat16)
+            a8 = sk.fp8_quantize(a, "row")[0]
+            c3, c4 = sk.fp8gemm(a8, bts[0], one, one, 3), sk.fp8gemm(a8, bts[0], one, one, 4)
+            assert torch.allclose(c3[:64].float(), c4[:64].float(), atol=5e-2, rtol=5e-2)
+            same = bool(torch.equal(c3, c4))
+            t = {v: time_ms(rotating(lambda i, v=v, a8=a8, bts=bts: sk.fp8gemm(
+                a8, bts[i % len(bts)], one, one, v)), iters) for v in (3, 4)}
+            flops = 2.0 * m * n * k
+            rows.append({"kind": "fp8gemm", "gemm": name, "M": m, "N": n, "K": k,
+                         "copies": ncopy8, "same_bits": same, "v3_ms": t[3], "v4_ms": t[4],
+                         "v4_over_v3": t[4] / t[3], "v3_tflops": flops / t[3] / 1e9,
+                         "v4_tflops": flops / t[4] / 1e9,
+                         "v4_route": sk._C.fp8gemm_v4_route_name(m, n, k)})
+            print(f"fp8gemm {name:8s} {m:5d} x {n:6d} x {k:5d}: v3 {t[3] * 1e3:9.1f} us  v4 "
+                  f"{t[4] * 1e3:9.1f} us  v4/v3 {t[4] / t[3]:.3f}"
+                  f"{'  same bits' if same else ''}", file=sys.stderr)
+            c2, c3 = sk.w4gemm(a, w4s[0], variant=2), sk.w4gemm(a, w4s[0], variant=3)
+            assert torch.allclose(c2[:64].float(), c3[:64].float(), atol=3e-2, rtol=3e-2)
+            same = bool(torch.equal(c2, c3))
+            t = {v: time_ms(rotating(lambda i, v=v, a=a, w4s=w4s: sk.w4gemm(
+                a, w4s[i % len(w4s)], variant=v)), iters) for v in (2, 3)}
+            rows.append({"kind": "w4gemm", "gemm": name, "M": m, "N": n, "K": k,
+                         "copies": ncopy4, "same_bits": same, "v2_ms": t[2], "v3_ms": t[3],
+                         "v3_over_v2": t[3] / t[2], "v2_tflops": flops / t[2] / 1e9,
+                         "v3_tflops": flops / t[3] / 1e9})
+            print(f"w4gemm  {name:8s} {m:5d} x {n:6d} x {k:5d}: v2 {t[2] * 1e3:9.1f} us  v3 "
+                  f"{t[3] * 1e3:9.1f} us  v3/v2 {t[3] / t[2]:.3f}"
+                  f"{'  same bits' if same else ''}", file=sys.stderr)
+        del bts, w4s
+        torch.cuda.empty_cache()
+
+
 H_Q, H_KV, D, PAGE = 32, 8, 128, 16
 
 
-def paged_inputs(lens, copies, seed=0):
-    """A page pool holding `copies` replicas of the batch's pages; block tables per copy."""
+def paged_inputs(lens, copies, seed=0, fp8=False):
+    """A page pool holding `copies` replicas of the batch's pages; block tables per copy.
+    With fp8 the pool is e4m3 with a scale per kv head, and the scale keywords come last."""
     g = torch.Generator(device="cuda").manual_seed(seed)
     npg = [(n + PAGE - 1) // PAGE for n in lens]
     total = sum(npg)
@@ -125,7 +183,15 @@ def paged_inputs(lens, copies, seed=0):
         base[b, :n] = torch.arange(i, i + n, dtype=torch.int32)
         i += n
     bts = [(base + c * total).cuda() for c in range(copies)]
-    return k, v, bts, torch.tensor(lens, dtype=torch.int32, device="cuda")
+    sc = {}
+    if fp8:
+        from spark_kernels.ops import quantize_kv_cache
+
+        ks = torch.full((H_KV,), 4.0 / 448, device="cuda")
+        vs = torch.full((H_KV,), 3.0 / 448, device="cuda")
+        k, v = quantize_kv_cache(k, ks), quantize_kv_cache(v, vs)
+        sc = dict(k_scale=ks, v_scale=vs)
+    return k, v, bts, torch.tensor(lens, dtype=torch.int32, device="cuda"), sc
 
 
 DECODE_BATCHES = {"1x4096": [4096], "1x32768": [32768], "8x4096": [4096] * 8,
@@ -136,44 +202,47 @@ PREFILL_BATCHES = {"1x4096": [4096], "4x2048": [2048] * 4,
                                      760, 200, 350, 900]}
 
 
-def bench_paged(sk, iters, rows):
+def bench_paged(sk, iters, rows, fp8=False):
+    kind = "_fp8" if fp8 else ""
     for name, lens in DECODE_BATCHES.items():
-        kv = sum(lens) * H_KV * D * 2 * 2
+        kv = sum(lens) * H_KV * D * 2 * (1 if fp8 else 2)
         ncopy = copies_for(kv)
-        k, v, bts, sl = paged_inputs(lens, ncopy)
+        k, v, bts, sl, sc = paged_inputs(lens, ncopy, fp8=fp8)
         q = torch.randn(len(lens), H_Q, D, device="cuda").to(torch.bfloat16)
-        a, b = sk.paged_decode(q, k, v, bts[0], sl, 1), sk.paged_decode(q, k, v, bts[0], sl, 2)
+        a = sk.paged_decode(q, k, v, bts[0], sl, 1, **sc)
+        b = sk.paged_decode(q, k, v, bts[0], sl, 2, **sc)
         assert torch.allclose(a.float(), b.float(), atol=2e-2, rtol=2e-2)
-        t = {var: time_ms(rotating(lambda i, q=q, k=k, v=v, bts=bts, sl=sl, var=var:
-                                   sk.paged_decode(q, k, v, bts[i % len(bts)], sl, var)), iters)
-             for var in (1, 2)}
-        row = {"kind": "paged_decode", "batch": name, "keys": sum(lens), "kv_mb": kv / 1e6,
-               "copies": ncopy, "v1_ms": t[1], "v2_ms": t[2], "v2_over_v1": t[2] / t[1],
-               "v1_gbps": kv / t[1] / 1e6, "v2_gbps": kv / t[2] / 1e6}
+        t = {var: time_ms(rotating(lambda i, q=q, k=k, v=v, bts=bts, sl=sl, var=var, sc=sc:
+                                   sk.paged_decode(q, k, v, bts[i % len(bts)], sl, var, **sc)),
+                          iters) for var in (1, 2)}
+        row = {"kind": "paged_decode" + kind, "batch": name, "keys": sum(lens),
+               "kv_mb": kv / 1e6, "copies": ncopy, "v1_ms": t[1], "v2_ms": t[2],
+               "v2_over_v1": t[2] / t[1], "v1_gbps": kv / t[1] / 1e6, "v2_gbps": kv / t[2] / 1e6}
         rows.append(row)
-        print(f"paged_decode {name:16s} {kv / 1e6:7.1f} MB: v1 {t[1] * 1e3:8.1f} us  v2 "
+        print(f"paged_decode{kind} {name:16s} {kv / 1e6:7.1f} MB: v1 {t[1] * 1e3:8.1f} us  v2 "
               f"{t[2] * 1e3:8.1f} us  v2/v1 {t[2] / t[1]:.3f}", file=sys.stderr)
         del k, v
         torch.cuda.empty_cache()
     for name, lens in PREFILL_BATCHES.items():
-        k, v, bts, sl = paged_inputs(lens, 1)
+        k, v, bts, sl, sc = paged_inputs(lens, 1, fp8=fp8)
         T = sum(lens)
         q = torch.randn(T, H_Q, D, device="cuda").to(torch.bfloat16)
         cu = torch.tensor([0] + lens, dtype=torch.int32).cumsum(0, dtype=torch.int32).cuda()
-        a = sk.attention_varlen(q, k, v, cu, sl, bts[0], True, 1)
-        b = sk.attention_varlen(q, k, v, cu, sl, bts[0], True, 2)
+        a = sk.attention_varlen(q, k, v, cu, sl, bts[0], True, 1, **sc)
+        b = sk.attention_varlen(q, k, v, cu, sl, bts[0], True, 2, **sc)
         assert torch.allclose(a.float(), b.float(), atol=2e-2, rtol=2e-2)
-        t = {var: time_ms(rotating(lambda i, q=q, k=k, v=v, cu=cu, sl=sl, bt=bts[0], var=var:
-                                   sk.attention_varlen(q, k, v, cu, sl, bt, True, var)), iters)
+        t = {var: time_ms(rotating(lambda i, q=q, k=k, v=v, cu=cu, sl=sl, bt=bts[0], var=var,
+                                   sc=sc: sk.attention_varlen(q, k, v, cu, sl, bt, True, var,
+                                                              **sc)), iters)
              for var in (1, 2)}
         flops = sum(4.0 * H_Q * D * n * n / 2 for n in lens)  # causal: half the products
-        row = {"kind": "attention_varlen", "batch": name, "tokens": T, "v1_ms": t[1],
+        row = {"kind": "attention_varlen" + kind, "batch": name, "tokens": T, "v1_ms": t[1],
                "v2_ms": t[2], "v2_over_v1": t[2] / t[1], "v1_tflops": flops / t[1] / 1e9,
                "v2_tflops": flops / t[2] / 1e9}
         rows.append(row)
-        print(f"attention_varlen {name:14s}: v1 {t[1] * 1e3:8.1f} us ({row['v1_tflops']:.0f} "
-              f"TFLOPS)  v2 {t[2] * 1e3:8.1f} us ({row['v2_tflops']:.0f})  v2/v1 "
-              f"{t[2] / t[1]:.3f}", file=sys.stderr)
+        print(f"attention_varlen{kind} {name:14s}: v1 {t[1] * 1e3:8.1f} us "
+              f"({row['v1_tflops']:.0f} TFLOPS)  v2 {t[2] * 1e3:8.1f} us ({row['v2_tflops']:.0f})"
+              f"  v2/v1 {t[2] / t[1]:.3f}", file=sys.stderr)
         del k, v
         torch.cuda.empty_cache()
 
@@ -190,14 +259,18 @@ def bench_engine(args, rows):
     vocab = weights.embed.shape[0]
     rope = RoPE(max_seq)
     cache_bytes = int(args.cache_gb * (1 << 30))
-    print(f"model: {args.layers} layers, {weights.bytes() / 1e9:.2f} GB of bf16 weights, "
-          f"{args.cache_gb:g} GB of cache", file=sys.stderr)
+    fmt, kv = args.weights_format, args.kv_format
+    print(f"model: {args.layers} layers, {weights.bytes() / 1e9:.2f} GB of bf16 weights "
+          f"({fmt} projections, {kv} cache), {args.cache_gb:g} GB of cache", file=sys.stderr)
     modes = [m for m in args.modes.split(",") if m]
+    # one model for both modes: the quantized projections are made once (the bf16 copies are
+    # freed) and the mode is switched on it before each engine is built around it
+    model = E.SparkModel(weights, rope, weights_format=fmt)
     for mode in modes:
         inv = mode == "invariant"
-        eng = E.Engine(E.SparkModel(weights, rope, batch_invariant=inv), args.layers,
-                       max_batch=max(batches), max_seq=max_seq, cache_bytes=cache_bytes,
-                       prefill_tokens=args.prefill_tokens, graphs=True)
+        eng = E.Engine(model, args.layers, max_batch=max(batches), max_seq=max_seq,
+                       cache_bytes=cache_bytes, prefill_tokens=args.prefill_tokens, graphs=True,
+                       kv_format=kv, batch_invariant=inv)
         warm_up(eng, [x for x in E.BUCKETS if x <= max(batches)], vocab)
         for b in batches:
             gen = torch.Generator().manual_seed(args.seed + b)
@@ -205,6 +278,7 @@ def bench_engine(args, rows):
             r = static_batch(eng, prompts_for(lens, vocab, gen), args.new)
             ptoks = sum(lens)
             row = {"kind": "engine", "mode": mode, "layers": args.layers, "batch": b,
+                   "weights_format": fmt, "kv_format": kv,
                    "prompt_tokens": ptoks, "new": args.new,
                    "prefill_tok_s": ptoks / r["prefill_s"],
                    "decode_ms_per_step": r["decode_s"] * 1e3 / max(1, r["steps"]),
@@ -226,6 +300,7 @@ def bench_engine(args, rows):
             st = eng.run()
             dt = time.perf_counter() - t0
             row = {"kind": "engine_continuous", "mode": mode, "layers": args.layers,
+                   "weights_format": fmt, "kv_format": kv,
                    "requests": args.requests, "max_batch": max(batches),
                    "prompt_tokens": sum(lens), "generated": st.generated, "wall_s": dt,
                    "gen_tok_s": st.generated / dt, "mixed_rows": st.mixed_rows,
@@ -240,7 +315,7 @@ def bench_engine(args, rows):
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--part", choices=("kernels", "gemm", "attention", "engine"),
+    ap.add_argument("--part", choices=("kernels", "gemm", "attention", "quant", "engine"),
                     default="kernels")
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--ms", default="1,8,32,64,128,512,2048,4096", help="hgemm M values")
@@ -253,6 +328,8 @@ def main() -> int:
     ap.add_argument("--cache-gb", type=float, default=2.0, help="K/V cache size, all layers")
     ap.add_argument("--prefill-tokens", type=int, default=16384)
     ap.add_argument("--requests", type=int, default=0, help="a continuous run of this many")
+    ap.add_argument("--weights-format", default="bf16", help="the engine's projections")
+    ap.add_argument("--kv-format", default="bf16", choices=("bf16", "fp8"))
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default=str(OUT))
     args = ap.parse_args()
@@ -266,6 +343,11 @@ def main() -> int:
         bench_gemm(sk, [m for m in ms if m > 64], max(10, args.iters // 5), rows)
     if args.part in ("kernels", "attention"):
         bench_paged(sk, args.iters, rows)
+    if args.part == "quant":
+        ms = [int(x) for x in args.ms.split(",") if x]
+        bench_quant_gemm(sk, [m for m in ms if m <= 64], args.iters, rows)
+        bench_quant_gemm(sk, [m for m in ms if m > 64], max(10, args.iters // 5), rows)
+        bench_paged(sk, args.iters, rows, fp8=True)
     if args.part == "engine":
         bench_engine(args, rows)
     out = Path(args.out)
