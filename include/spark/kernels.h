@@ -539,6 +539,29 @@ bool ce_gemm_supports(int V, int D);
 // row that counts, 0 otherwise. One warp per row.
 void ce_combine(const float* partials, const float* target_logit, const int64_t* targets, int T,
                 int V, int ignore_index, float* lse, float* loss, cudaStream_t stream);
+// ce_backward_bf16: variant 3's backward for one band of T rows of h, with no [T, V]
+// chunk. One persistent kernel recomputes each 128 x 128 tile of d loss / d logits from h,
+// w and the forward's lse, and adds tile @ w[v-tile] into dh (fp32, the band's rows, zero
+// on entry: the caller casts it to bf16 after) and tile^T @ h[t-tile] into dw through
+// cp.reduce.async.bulk; dw accumulates per vocabulary strip in one of ce_backward_slots()
+// recycled fp32 strips and is folded into bf16 dw when the strip's last tile completes
+// (stored on the first band, added on the others). The reductions are L2 atomics, so dh
+// and dw differ in the last bits between runs. Same shape rules as ce_gemm_bf16.
+struct CeBackwardArgs {
+    const int64_t* targets = nullptr;  // [T]
+    const float* lse = nullptr;        // [T]
+    const float* scale = nullptr;      // [1]: d loss / d loss_row for a row that counts
+    int ignore_index = -100;
+    float* dh = nullptr;          // [cdiv(T, 128) * 128][D] fp32, zero on entry
+    float* slots = nullptr;       // [slots_n * 128][D] fp32, zero on entry and exit
+    int slots_n = 0;              // recycled strips in `slots`; ce_backward_slots() is the default
+    int* flags = nullptr;         // [2 * V / 128 + 1] int32, zero on entry
+    __nv_bfloat16* dw = nullptr;  // [V][D]
+    bool first = true;            // this band stores dw; later bands add to it
+};
+void ce_backward_bf16(const __nv_bfloat16* h, const __nv_bfloat16* w, int T, int V, int D,
+                      const CeBackwardArgs& a, cudaStream_t stream);
+int ce_backward_slots();
 
 // ---- MoE layer: routing, permute, combine (src/kernels/moe_route.cu, moe_permute.cu) ------
 // moe_route: logits [T, E] (fp32 or bf16) -> ids [T, k] int32 (the top k experts of each
