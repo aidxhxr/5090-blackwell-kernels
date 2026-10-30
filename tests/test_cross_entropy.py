@@ -1,8 +1,9 @@
 """Parity of linear_cross_entropy (and its pieces) against torch in fp32: the loss and both
-gradients for every variant, rows with ignore_index, T not a multiple of any tile or chunk,
-"mean" and "sum", an upstream gradient other than 1, the no-grad forward, and the kernels
-on their own (the fused row kernel on bf16 logits, the GEMM's stats and gradient epilogues,
-the padded transpose)."""
+gradients for every variant (3 through bands of a few tiles and more vocabulary strips than
+its slot pool, so the fold and the slot recycling run), rows with ignore_index, T not a
+multiple of any tile or chunk, "mean" and "sum", an upstream gradient other than 1, the
+no-grad forward, and the kernels on their own (the fused row kernel on bf16 logits, the
+GEMM's stats and gradient epilogues, the band kernel of variant 3, the padded transpose)."""
 
 import pytest
 import torch
@@ -45,7 +46,7 @@ def _assert_close(got, ref, name, rel=2e-2, floor=1e-6):
     assert err <= tol, f"{name}: max error {err:.3e} > tolerance {tol:.3e}"
 
 
-@pytest.mark.parametrize("variant", [0, 1, 2])
+@pytest.mark.parametrize("variant", [0, 1, 2, 3])
 @pytest.mark.parametrize("chunk", CHUNKS, ids=lambda c: f"chunk{c}")
 @pytest.mark.parametrize("shape", SHAPES, ids=_shape_id)
 def test_linear_cross_entropy_matches_fp32(sk, shape, chunk, variant):
@@ -62,7 +63,7 @@ def test_linear_cross_entropy_matches_fp32(sk, shape, chunk, variant):
     assert hh.grad.dtype == torch.bfloat16 and ww.grad.dtype == torch.bfloat16
 
 
-@pytest.mark.parametrize("variant", [1, 2])
+@pytest.mark.parametrize("variant", [1, 2, 3])
 def test_sum_reduction_and_upstream_gradient(sk, variant):
     h, w, y = _inputs(500, 256, 1024, seed=3)
     ref_loss, ref_dh, ref_dw = _reference(h, w, y, reduction="sum", upstream=0.37)
@@ -75,7 +76,7 @@ def test_sum_reduction_and_upstream_gradient(sk, variant):
     _assert_close(ww.grad, ref_dw, "dw")
 
 
-@pytest.mark.parametrize("variant", [1, 2])
+@pytest.mark.parametrize("variant", [1, 2, 3])
 def test_custom_ignore_index_and_grad_of_one_input(sk, variant):
     h, w, y = _inputs(200, 128, 512, seed=4, ignore_frac=0.5, ignore_index=7)
     ref_loss, ref_dh, _ = _reference(h, w, y, ignore_index=7)
@@ -86,7 +87,7 @@ def test_custom_ignore_index_and_grad_of_one_input(sk, variant):
     _assert_close(hh.grad, ref_dh, "dh")
 
 
-@pytest.mark.parametrize("variant", [-1, 1, 2])
+@pytest.mark.parametrize("variant", [-1, 1, 2, 3])
 def test_forward_without_grad(sk, variant):
     h, w, y = _inputs(300, 256, 1024, seed=5)
     ref_loss, _, _ = _reference(h, w, y)
@@ -112,7 +113,7 @@ def test_forward_in_stats_chunks(sk, monkeypatch):
 def test_every_row_ignored_is_nan_like_torch(sk):
     h, w, y = _inputs(64, 64, 256, seed=6)
     y.fill_(-100)
-    for variant in (1, 2):
+    for variant in (1, 2, 3):
         loss = sk.linear_cross_entropy(h, w, y, variant=variant)
         assert torch.isnan(loss)
 
@@ -185,6 +186,32 @@ def test_ce_gemm_is_deterministic(sk):
     a = sk.ops._C.ce_stats(h, w, y, -100)
     b = sk.ops._C.ce_stats(h, w, y, -100)
     assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
+
+
+def test_ce_backward_bands_accumulate_dw(sk):
+    # the band kernel on its own: two bands of rows, the second added to the first's dw, with
+    # 32 vocabulary strips over a pool of 16 slots, against the fp32 reference
+    T, D, V = 300, 256, 4096
+    h, w, y = _inputs(T, D, V, seed=11)
+    _, ref_dh, ref_dw = _reference(h, w, y, reduction="sum")
+    C_ = sk.ops._C
+    lse, _ = C_.ce_stats(h, w, y, -100)
+    scale = torch.ones(1, device="cuda")
+    f32 = dict(device="cuda", dtype=torch.float32)
+    dh = torch.empty(T, D, device="cuda", dtype=torch.bfloat16)
+    dw = torch.empty_like(w)
+    slots = torch.zeros(C_.ce_backward_slots() * 128, D, **f32)
+    flags = torch.zeros(2 * (V // 128) + 1, device="cuda", dtype=torch.int32)
+    for i, (t0, t1) in enumerate(((0, 160), (160, T))):
+        dh_f32 = torch.zeros(256, D, **f32)
+        flags.zero_()
+        C_.ce_backward(h[t0:t1], w, y[t0:t1], lse[t0:t1], scale, -100, dh_f32, slots, flags,
+                       dw, i == 0)
+        dh[t0:t1] = dh_f32[: t1 - t0].to(torch.bfloat16)
+    assert (slots == 0).all()  # every strip folded and its slot handed back zeroed
+    assert (flags[V // 128: 2 * (V // 128)] == 1).all()  # every strip folded
+    _assert_close(dh, ref_dh, "dh")
+    _assert_close(dw, ref_dw, "dw")
 
 
 def test_ce_transpose_pads_with_zeros(sk):
