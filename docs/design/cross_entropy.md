@@ -12,7 +12,8 @@ the card shared: other tenants held about 18 GB, so the bench caps its own proce
 (`torch.cuda.set_per_process_memory_fraction`) and records a method that would need more as
 not fitting. Every timed method's first call was checked first, its loss and both gradients
 against the first method that fit at that shape (torch, `torch.compile` where torch did
-not fit, variant 1 where neither did), and the 47 tests in `tests/test_cross_entropy.py` pass.
+not fit, variant 1 where neither did), and the 59 tests in `tests/test_cross_entropy.py`
+pass. Variant 3 and its section were measured on 2026-10-30 under the same conditions.
 
 ## The problem
 
@@ -44,10 +45,11 @@ and recomputes them in the backward.
 | 0 | torch: bf16 logits, `F.cross_entropy` in fp32 | torch autograd | the fp32 log-softmax | several `[T, V]` |
 | 1 | per chunk: logits GEMM, the fused row kernel (loss and gradient row in place), dh and dw by `hgemm` | a scale by the upstream gradient | dh and dw | one chunk of logits and one transposed slab |
 | 2 | one GEMM whose epilogue keeps (max, sum of exp) per row per 128-column tile, a combine | per chunk: the GEMM again with softmax minus one-hot in its epilogue, dh and dw by `hgemm` | the `[T]` log-sum-exp | forward: the `[T, V/128]` partials; backward: as variant 1 |
+| 3 | variant 2's | one kernel per band of `chunk` rows: each 128 x 128 tile of the gradient recomputed and multiplied straight into dh and dw through L2 reductions | the `[T]` log-sum-exp | a band of fp32 dh (32 MB at 2048 rows) and 16 fp32 strips of dw (32 MB); nothing of size T x V |
 
-Variant 1 does three GEMMs of 2TVD flops each, the same as torch. Variant 2 does four: the
-price of holding nothing between the passes is computing the logits twice. `variant=-1`
-takes 1 when a gradient is needed and 2 when not (an eval loss).
+Variant 1 does three GEMMs of 2TVD flops each, the same as torch. Variants 2 and 3 do
+four: the price of holding nothing between the passes is computing the logits twice.
+`variant=-1` takes 1 when a gradient is needed and 2 when not (an eval loss); 3 is opt-in.
 
 ## The GEMM
 
@@ -223,34 +225,125 @@ backward follows the same curve, 154.5 ms at 512 to 146.2 at 8192.
 
 ## Correctness
 
-`tests/test_cross_entropy.py`, 47 tests, all pass on the card: the loss and both gradients
-of variants 0, 1 and 2 against torch autograd in fp32 on the same bf16 inputs, on four
+`tests/test_cross_entropy.py`, 59 tests, all pass on the card: the loss and both gradients
+of variants 0 to 3 against torch autograd in fp32 on the same bf16 inputs, on four
 shapes (T = 77 to 1000, two not a multiple of 64; D = 64 to 512; V = 384 to 4096) with 15%
 of the rows ignored, at a chunk of 64 rows (several chunks, a ragged last one) and of 4096
 (one chunk); "sum" with an upstream gradient of 0.37; a custom ignore_index with only h
 requiring a gradient; the no-grad forward; every row ignored (nan, as torch); the shape
-rules; variant 2's forward in STATS pieces of 128 rows. And the pieces on their own: the
+rules; variant 2's forward in STATS pieces of 128 rows; variant 3's band kernel on its
+own over two bands with 32 strips on its 16 slots, every slot handed back zeroed. And
+the pieces on their own: the
 row kernel against `F.cross_entropy` on bf16 logits at V up to 151936, the STATS
 epilogue's lse and loss and the GRAD epilogue against fp32 torch, the LOGITS epilogue
 against the fp32 product, two runs of a Stream-K shape bit for bit, and the padded
 transpose. The loss is within 2e-3 of fp32; the gradients within 2%
 of their largest entry, the same bound the attention backward uses.
 
-## What is left
+## Variant 3: the backward with no chunk
 
-**A v2 backward with no chunk.** Cut Cross-Entropy's backward recomputes a logits tile,
-turns it into the gradient tile in registers and feeds it straight into both products,
-`dh[t-tile] += G w[v-tile]` and `dw[v-tile] += G^T h[t-tile]`, so not even a chunk is
-stored. I did not build it. The arithmetic is why it is a project and not an epilogue: a
-block that owns a 128 x 128 tile of G contributes a `[128, D]` partial to dh and another to
-dw, so every element of dh receives one partial from each of the V/128 vocabulary tiles and
-every element of dw one from each of the T/128 token tiles: 33.6 G fp32 additions into each
-at T = 8192, V = 128256. Those only work as atomics that stay in L2, which means a tile
-order that keeps a vocabulary strip of dw (2 MB in fp32) resident while its token tiles run, and I
-have not measured this card's L2 atomic rate. Cut Cross-Entropy also skips the tiles whose
-softmax is below bf16's resolution everywhere, which for a trained model's peaked
-distribution is most of them. On the random weights these benches use the softmax is not
-sparse, so that filter cannot be judged here; it needs real activations and a real lm_head.
+Cut Cross-Entropy's backward recomputes a tile of the logits, turns it into the gradient
+tile in registers and feeds it straight into both products, so not even a chunk is stored.
+`ce_bwd_kernel` (the last section of `src/kernels/cross_entropy.cu`, `ce_backward` in the
+bindings, `LinearCrossEntropyTiled` in ops.py) is that, measured on this card.
+
+**The kernel.** A persistent block per SM walks the gradient in 128 x 128 tiles. Per tile
+the producer lane streams the h and w boxes (32 columns of D per stage, three stages) and
+the eight consumer warps recompute the logits exactly as `ce_gemm` does; the epilogue
+writes `bf16((exp(x - lse) - [col == y]) * scale)` into a 32 KB tile G in shared memory
+instead of global memory. Then the same boxes stream a second time and, per stage, every
+warp computes its 16 rows of `G @ w[v-tile][stage]` and of `G^T @ h[t-tile][stage]`: the
+first takes G as it lies, the second reads it through `ldmatrix.trans`, so the transpose
+that variant 1 pays a kernel for is free. Each warp writes its [16 x 32] fp32 partial to
+its own 2 KB staging box and adds it into global memory with one
+`cp.reduce.async.bulk.tensor`, waiting only on its own previous reduce; no block barrier is
+in the stage loop. Three GEMMs' worth of mma per tile, variant 1's count, plus the
+forward's STATS GEMM: four in all, like variant 2.
+
+**Where the sums go.** A block that owns a tile contributes a `[128, D]` partial to dh and
+another to dw, so every element of dh gets one partial per vocabulary tile and every
+element of dw one per token tile: 4 MB of fp32 adds per 402 MFLOP at D = 4096, 2.4 TB/s
+of adds to keep up with 240 TFLOPS. What the L2 can add, measured with a kernel that does
+nothing else (each block adds 128 x 64 fp32 tiles into a buffer of the given size):
+
+| working set | `red.f32` | `red.v2.f32` | `red.v4.f32` | ld + add + st | `cp.reduce.async.bulk` |
+|---|---|---|---|---|---|
+| 8 to 64 MB | 400 GB/s | 820 | 1,690 | 1,630 | **2,970** |
+| 128 MB | 370 | 680 | 1,150 | 1,630 | 1,710 |
+| 512 MB to 2 GB | 320 | 540 | 730 to 830 | 770 to 880 | 760 to 910 |
+
+The atomic unit is request bound (a scalar red is a quarter of a v4 per byte), the bulk
+reduce is 1.8x the best red, and everything halves again once the targets leave the L2.
+So the targets must stay in L2, and that is what the schedule is for:
+
+* dh is accumulated in fp32 one band of `chunk` rows at a time (32 MB at 2048), zeroed by
+  the caller and cast to bf16 after the band.
+* dw never exists in fp32 as a whole (that would be 2.1 GB, more than the chunk it
+  replaces). Tiles are walked t-fastest inside a vocabulary strip, so about 11 strips are
+  in flight, and each strip accumulates into one of 16 recycled fp32 strips of `[128, D]`.
+  The block that finishes a strip's last tile folds the slot into bf16 dw on the bulk copy
+  engine (a store on the first band, an add on the others: one rounding per band, as
+  variant 1 rounds per chunk), zeroes it and releases it; a block starting strip v waits
+  for strip v - 16 to be folded. 110 us per fold, 125 us of waiting per block per band.
+* Tiles are handed out from a global counter as blocks free up. With a static round-robin,
+  a block that folded or waited was late for every later tile, strips whose tiles it held
+  folded late, the strips that needed those slots waited in turn, and a 2048-row band spent
+  8 to 12 ms per block in that spin whatever the pool size.
+* The reduction targets and the zeroed slots carry an `evict_last` L2 policy, the fold's dw
+  traffic `evict_first`. The operand stream turns the 96 MB L2 over in about a millisecond,
+  and without the policies a slot's zeroed lines were gone by the time the strip that
+  reused it arrived: 56 ms per band against 31 with them.
+
+The reduces run through the L2 atomics in an order that depends on timing, so dh and dw
+are not bit for bit reproducible across runs; variants 1 and 2 are.
+
+**What it costs, piece by piece.** One 2048-row band at V = 128256, D = 4096, with pieces
+of the kernel switched off (a build with the knobs, not the committed one):
+
+| what runs | ms | note |
+|---|---|---|
+| the recompute alone (one GEMM) | 8.7 | 242 TFLOPS, `ce_gemm`'s rate: the 32-column stages cost nothing there |
+| the recompute and the folds | 9.7 | the fold protocol is 1 ms |
+| everything but the reduces | 28.3 | the second pass's two products run at 173 TFLOPS |
+| everything but the folds | 32.6 | the reduces cost 4 ms over the math |
+| everything, no L2 policies | 55.9 | the slots' zeroed lines miss |
+| **everything** | **31.4** | 205 TFLOPS counted as three GEMMs; 26.6 would be variant 1's rate |
+
+ncu on the committed kernel, one band under the profiler's clocks (32.45 ms): the L2 at
+96.7% of its peak throughput, 4.39 G sectors, 140 GB, of which 70 GB are the TMA re-reads
+of h and w (the recompute and the second pass each stream both boxes, 4 MB per tile) and
+70 GB the reduces (16,032 tiles x 4 MB), at a 97.2% hit rate; DRAM near idle; the hmma
+pipe at 45% of its peak; 168 registers, no spills. Per issued instruction the warps wait
+9.1 cycles on the tensor pipe, 3.7 on fixed-latency dependencies, 1.8 on global loads and
+0.3 on barriers. So the kernel is bound by L2 bandwidth, not by the atomics or the math:
+recomputing a tile and feeding both products from it moves twice the operand bytes of a
+GEMM through the L2 and adds the reductions on top, and this card's L2 sustains about
+4.3 TB/s of that. The lever left is traffic, not scheduling: a 256-wide tile would halve
+the reductions and a reuse of the recompute's boxes for the products would halve the
+re-reads, and neither fits in the 99 KB a block may take next to the gradient tile.
+
+**Measured.** The whole op on 2026-10-30, the same bench and budget as above, D = 4096,
+V = 128256, 5% of the targets ignored, medians of 50; variant 3's forward is variant 2's.
+
+| T | torch.compile | v1 | v2 | v3 |
+|---|---|---|---|---|
+| 2048 | 29.05 ms, 1.59 GB | **28.25 ms**, 1.66 GB | 36.59 ms, 1.66 GB | 40.75 ms, **1.14 GB** |
+| 8192 | 115.46 ms, 3.22 GB | **113.49 ms**, 1.71 GB | 147.12 ms, 1.71 GB | 164.83 ms, **1.19 GB** |
+| 16384 | 229.14 ms, 5.39 GB | **228.02 ms**, 1.78 GB | 295.25 ms, 1.78 GB | 329.53 ms, **1.25 GB** |
+
+Variant 3 is 1.44 to 1.45x variant 1 and 1.12x variant 2 on time, and holds 0.53 GB less
+than either at every T: the chunk of logits it does not have. Its peak is the two gradients
+plus 64 MB. The band kernel alone is 31.7 ms per 2048 rows, 204 TFLOPS counted as three
+GEMMs, against the 26.6 ms three `ce_gemm`-rate GEMMs would take; with the forward's STATS
+GEMM the op does four GEMMs' worth of mma like variant 2, so even at the GEMM rate it would
+be 1.25x variant 1. It is an opt-in rung (`variant=3`); `variant=-1` keeps taking 1.
+
+**What it does not do.** Cut Cross-Entropy also skips the tiles whose softmax is below
+bf16's resolution everywhere, which for a trained model's peaked distribution is most of
+them; on the random weights these benches use the softmax is not sparse, so that filter
+cannot be judged here and is not built.
+
+## What is left
 
 **hgemm with a transposed A.** dw goes through a transposed copy of the gradient because
 hgemm takes A only K-contiguous. A mode that loads the A tile from `[K, M]` (two 64-column
