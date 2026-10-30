@@ -12,10 +12,16 @@ which flex takes as a correction from its log-sum-exp. Decode at 128K cached key
 K and V of a decode step rotate through shifted copies so every launch reads its window from
 DRAM, as bench_attention does. Paged decode (`sk.paged_decode(window=W)`) against the same
 batch without a window: 16 sequences of 32K tokens and the ragged mix of
-docs/design/serving.md (one 32K sequence among fifty of 500).
+docs/design/serving.md (one 32K sequence among fifty of 500). The backward (`--only=bwd`,
+"attention_bwd_window" rows): `sk.attention_bwd(window=W)` at 8K and 32K tokens with windows
+of 128, 512 and 4096 against our own full causal backward, torch's full causal backward
+(flash, through SDPA) and `torch.autograd.grad` through the compiled flex_attention with the
+window's block mask; gpt-oss's heads with sinks against ours without them (flex's sink
+correction is on the output and has no backward of its own).
 
-    PYTHONPATH=python python scripts/bench_attention_window.py [--only=prefill|decode|sinks|paged]
-        [--s=4096,16384,32768] [--out=results/attention_window_torch.jsonl]
+    PYTHONPATH=python python scripts/bench_attention_window.py
+        [--only=prefill|decode|sinks|paged|bwd] [--s=4096,16384,32768]
+        [--out=results/attention_window_torch.jsonl]
 
 Appends one JSON object per row to --out and prints the rows. The file is .jsonl, not .json:
 scripts/make_results_table.py reads results/*.json as C++ bench rows, and these are not.
@@ -226,9 +232,78 @@ def paged(sk, add, lens, W, Hq=32, Hkv=8, D=128, page=16, sink=False):
              window_keys=keys, gbps=gb / (ours_ms * 1e-3)))
 
 
+def bwd(sk, add, S, windows, Hq=32, Hkv=8, D=128, sink=False):
+    """The backward alone, from the saved (out, lse): ours with the window against our own full
+    causal backward, torch's full causal backward (autograd.grad of the SDPA output, flash on
+    this card) and autograd.grad through flex_attention compiled with the window's block mask,
+    what loss.backward() runs with flex. The full rows at 32K tokens take 5 iterations (10 s
+    each). With sinks, ours only, against ours without them on the same window."""
+    global WIN, OFF
+    import torch._functorch.config
+
+    # the compiled backward is run repeatedly with retain_graph, which the donated buffers of
+    # the default compile refuse
+    torch._functorch.config.donated_buffer = False
+    torch.manual_seed(0)
+    q = torch.randn(1, Hq, S, D, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, Hkv, S, D, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, Hkv, S, D, device="cuda", dtype=torch.bfloat16)
+    do = torch.randn(1, Hq, S, D, device="cuda", dtype=torch.bfloat16)
+    sinks = (torch.rand(Hq, device="cuda") * 3) if sink else None
+    flex, block_mask = flex_setup()
+    WIN = torch.tensor(S, device="cuda", dtype=torch.int32)
+    OFF = torch.tensor(0, device="cuda", dtype=torch.int32)
+    full_iters, full_warmup = (5, 2) if S > 16384 else (ITERS, WARMUP)
+    out_f, lse_f = sk.attention_fwd(q, k, v, causal=True, sinks=sinks)
+    full_ms = time_ms(
+        lambda: sk.attention_bwd(q, k, v, out_f, do, lse_f, causal=True, sinks=sinks),
+        full_warmup, full_iters)
+    qr, kr, vr = (t.clone().requires_grad_() for t in (q, k, v))
+    flash_full_ms = None
+    if not sink:
+        o = F.scaled_dot_product_attention(qr, kr, vr, is_causal=True, enable_gqa=True)
+        flash_full_ms = time_ms(lambda: torch.autograd.grad(o, (qr, kr, vr), do, retain_graph=True),
+                                full_warmup, full_iters)
+        del o
+    for W in windows:
+        WIN.fill_(W)
+        out_w, lse_w = sk.attention_fwd(q, k, v, causal=True, window=W, sinks=sinks)
+
+        def ours(W=W, out=out_w, lse=lse_w):
+            return sk.attention_bwd(q, k, v, out, do, lse, causal=True, window=W, sinks=sinks)
+
+        flex_ms = err = None
+        nosink_ms = None
+        if sink:
+            out0, lse0 = sk.attention_fwd(q, k, v, causal=True, window=W)
+            nosink_ms = time_ms(lambda w=W, o=out0, ls=lse0: sk.attention_bwd(
+                q, k, v, o, do, ls, causal=True, window=w))
+            del out0, lse0
+        else:
+            bm = block_mask(Q_LEN=S, KV_LEN=S)
+            o = flex(qr, kr, vr, block_mask=bm, enable_gqa=True)
+
+            def theirs(o=o):
+                return torch.autograd.grad(o, (qr, kr, vr), do, retain_graph=True)
+
+            err = max(check(f"flex bwd S={S} W={W} {n}", g, r) for n, g, r in zip(
+                ("dq", "dk", "dv"), ours(), theirs(), strict=True))
+            flex_ms = time_ms(theirs)
+            del o, bm
+        ours_ms = time_ms(ours)
+        flops = 10.0 * Hq * pairs(S, S, W) * D
+        add(dict(kernel="attention_bwd_window", shape=f"b1_hq{Hq}_hkv{Hkv}_s{S}_d{D}_causal",
+                 window=W, sinks=sink, ours_ms=ours_ms, ours_full_ms=full_ms, flex_ms=flex_ms,
+                 flash_full_causal_ms=flash_full_ms, ours_nosink_ms=nosink_ms,
+                 tflops=flops / ours_ms / 1e9,
+                 flex_tflops=flops / flex_ms / 1e9 if flex_ms else None, max_err_vs_flex=err))
+        del out_w, lse_w
+        torch.cuda.empty_cache()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--only", choices=("prefill", "decode", "sinks", "paged"), default=None)
+    ap.add_argument("--only", choices=("prefill", "decode", "sinks", "paged", "bwd"), default=None)
     ap.add_argument("--s", default="4096,16384,32768", help="prefill lengths")
     ap.add_argument("--out", default=str(ROOT / "results" / "attention_window_torch.jsonl"))
     args = ap.parse_args()
@@ -257,6 +332,10 @@ def main() -> int:
             paged(sk, add, [32768] * 16, W)
         paged(sk, add, [32768] + [500] * 50, 4096)
         paged(sk, add, [32768] * 16, 128, Hq=64, Hkv=8, D=64, sink=True)
+    if args.only in (None, "bwd"):
+        for S in (8192, 32768):
+            bwd(sk, add, S, (128, 512, 4096))
+        bwd(sk, add, 8192, (128,), Hq=64, Hkv=8, D=64, sink=True)
     with open(args.out, "a") as f:
         for r in rows:
             f.write(json.dumps(r) + "\n")
