@@ -790,8 +790,8 @@ are in [the design note](docs/design/attention_bwd.md).
 
 Most models people run now mix local attention in. Mistral 7B and Gemma 2 limit layers to the
 last 4096 keys, Gemma 3 to 1024, and gpt-oss puts a 128-key window on every other layer plus a
-learned sink logit per head in every softmax denominator. The forward, the decode kernels and
-the varlen prefill take both, `window=` and `sinks=`. The window is causal and aligned to the
+learned sink logit per head in every softmax denominator. The forward, the decode kernels,
+the varlen prefill and the backward take both, `window=` and `sinks=`. The window is causal and aligned to the
 last key, so a decode step sees the last W keys of the cache. Every kernel starts its K/V
 tiles at the first one a row's window reaches, and variant 5's warps also skip the 16-key
 blocks outside their rows' windows, so the work follows the window and not the sequence.
@@ -815,6 +815,29 @@ reads only the windows too: 16 sequences of 32K tokens with W = 4096 take 176 us
 1,305 us. The kernels the headline rows above run compile to the same SASS as before, up to one
 swapped `FMNMX` operand at D = 64, and those rows did not move. The rest is in [the design
 note](docs/design/attention.md#sliding-window-and-sinks).
+
+The backward takes the same two: `attention_bwd(window=, sinks=)`, `attention_fwd` with
+them so its log-sum-exp includes the sink, and `attention_with_grad` end to end. The key-tile
+kernel walks only the query tiles a key tile's window reaches and its warps skip the 16-key
+blocks outside a tile's windows, so the backward's time follows the window too. The sink's
+gradient comes out as a fourth tensor: the sink is one more softmax entry with no value, so
+its dP is zero and d(sink) = -sum over the head's rows of p_sink (dO . O), summed from the
+preprocess rows by one small deterministic kernel.
+
+| backward, 32/8 heads, D = 128 | full causal | W = 4096 | W = 512 | W = 128 | flex_attention, W = 128 |
+|---|---|---|---|---|---|
+| 8K tokens | 6.35 ms | 4.91 | 1.14 | **0.644** | 1.12 |
+| 32K tokens | 95.6 ms | 24.0 | 4.57 | **2.61** | 4.32 |
+
+Variant 3 from `scripts/bench_attention_window.py --only=bwd`; flex is `torch.autograd.grad`
+through the compiled `flex_attention` with the window's block mask, 1.65 to 2.06x slower than
+ours on the six window rows (9.98 and 49.6 ms at W = 4096). At W = 4096 the window rows run
+at the full backward's rate, 214 TFLOPS on the window's pairs. At W = 128 they are bound by
+bytes: Q, O, dO, dQ, dK and dV move whatever the window, and the fp32 dQ accumulator's round
+trip is a third of the 32K row, where the deterministic mode, which has none, is 4% faster.
+The no-window rows did not move (0.1 to 1.4% within noise, old and new binary in one hold of
+the GPU). The numbers and what remains are in [the design
+note](docs/design/attention_bwd.md#sliding-window-and-sinks).
 
 ## a whole layer
 
