@@ -5,7 +5,8 @@ forward's inputs, its output O, the upstream gradient dO and the log-sum-exp L t
 saves per query row. Same shapes as the forward: `Q, O, dO, dQ = [B, H_q, S_q, D]`,
 `K, V, dK, dV = [B, H_kv, S_kv, D]`, bf16 in and out, fp32 for every score and accumulator,
 `D` in {64, 128}, optional causal mask (top-left, as `is_causal`), grouped-query attention with
-dK and dV summed over the `H_q / H_kv` query heads that read each K/V head. Source:
+dK and dV summed over the `H_q / H_kv` query heads that read each K/V head, and since
+2026-10-30 the forward's sliding window and sink logits (their section is near the end). Source:
 `src/kernels/attention_bwd.cu`; the forward's `lse` output is in `src/kernels/attention.cu`
 (the forward note has the details). Bench: `bench_attention_bwd` (validates every variant and
 both dQ modes against a CPU double-precision reference). The library comparison is torch
@@ -482,6 +483,118 @@ that needs it, which puts the load latency back into every tile. At `D = 64` the
 `RED.E.ADD.F32x2` per thread per tile against 160 `HMMA` per warp, each one covering eight
 full 32-byte sectors. So I did not build it.
 
+## Sliding window and sinks
+
+The forward, the decode kernels and the varlen prefill take a window and sink logits (the
+forward note, "Sliding window and sinks"); the backward did not, which left the training
+side of Mistral, Gemma and gpt-oss style layers on the full causal kernel. Now
+`attention_bwd_window_bf16` (Python: `attention_bwd(window=, sinks=)`, `attention_fwd` with
+the same two, `attention_with_grad` end to end) is the backward of
+`attention_window_bf16`, on every variant, in both dQ modes.
+
+**What it computes.** The same mask as the forward: query row `i` sits at key position
+`p = i + S_kv - S_q` and sees keys `p - W < j <= p`, causal whatever `causal` says, and a
+window of `S_kv` or more is no window. A sink is one more softmax entry per row with no
+value, so with the extended logit vector `[s_i1 .. s_iS, z_h]`:
+
+```
+L_i   = log(exp(z_h) + Σ_j exp(s_ij))          the forward's lse, which includes the sink
+P_ij  = exp(s_ij − L_i),   p_i = exp(z_h − L_i)
+O_i   = Σ_j P_ij V_j                            the sink adds no value
+```
+
+The softmax gradient over the extended vector is `dS = P ∘ (dP − Dv)` with `Dv_i` the sum
+over every entry of `P · dP`. The sink's `dP` is `dO_i · 0 = 0`, so `Dv_i = Σ_j P_ij dP_ij =
+dO_i · O_i` exactly as before, and the key gradients, formed from `P` and `Dv`, do not change
+at all: the kernels already take `L` from the forward. The sink's own gradient is its `dS`:
+
+```
+d z_h = Σ_{b, i} p_i (0 − Dv_i) = − Σ_{b, i} exp(z_h − L_i) (dO_i · O_i)
+```
+
+one number per query head. The preprocess already writes `{L_i log2(e), Dv_i}` per row, so a
+small kernel (`bwd_dsink_kernel`, one block per head, the rows in a fixed order, so it is
+deterministic) sums `−2^(z_h log2(e) − L2_i) Dv_i` from that buffer. It costs 15 µs at 8192
+tokens on gpt-oss's 64 heads (0.613 to 0.628 ms with the window of 128) and nothing without
+sinks. The derivation is checked by `tests/test_attention_bwd.py` against torch autograd
+through the softmax of the masked scores with the sink as one more column, on a tiny case
+and on the shapes below, and by the C++ bench against `−Σ exp(z_h − L_i) Dv_i` from the
+GPU's own `L` and `O`.
+
+**The window in the key-tile kernels.** A block owns keys `[k0, k0 + BN)`; the query tiles
+that see any of them are `[qt0, qt1)` from `q_tile_range`: under the mask from the tile
+holding row `k0 − off`, and under a window up to the tile holding row `k0 + BN − 2 − off +
+W`, the last row that sees the tile's last key. The same function feeds the schedule's
+simulation and its `min_iters` (under a window the lightest tile is not the last one, so it
+is the minimum over the tiles), so the split rule sees the window's nearly equal tiles.
+Inside a tile a warp skips it when its 16 keys all precede the first row's window, the way it
+skips a causal tile whose keys follow the last row, and the mask zeroes `P` where `key <=
+q + off − W` next to the causal and `S_kv` tests. The deterministic dQ pass starts its key
+tiles at `window_lo(q0 + off, W) / BN`. All of it sits behind a `WIN` template parameter;
+the plain instantiations compile to the kernels they were, and the persistent experiment
+(`SPARK_ATTN_BWD_PERSIST`) does not take a window.
+
+The no-window path, variant 3, medians of 30, the old and the new binary timed in one hold
+of the GPU:
+
+| shape | before ms | after ms |
+|---|---|---|
+| b1 h32 s1024 d128 causal | 0.1416 | 0.1397 |
+| b1 h32 s4096 d128 | 3.1293 | 3.1288 |
+| b1 h32 s4096 d128 causal | 1.6782 | 1.6758 |
+| b1 h32 s8192 d128 causal | 6.3525 | 6.3421 |
+| b1 hq32 hkv8 s4096 d128 causal | 1.7311 | 1.7249 |
+| b1 h32 s4096 d64 causal | 0.8063 | 0.8065 |
+
+**Measured.** `bench_attention_bwd --sweep=window`, variant 3, medians of 30 (5 for the
+32K full rows), every row checked against the CPU reference, d(sinks) included. TFLOPS count
+the five products over the (query, key) pairs the window leaves:
+
+| shape | full causal | W = 4096 | W = 512 | W = 128 |
+|---|---|---|---|---|
+| 32/8 heads, D = 128, 8K tokens | 6.382 ms | 4.834 / 210 TFLOPS | 1.132 / 146 | 0.640 / 66 |
+| 32/8 heads, D = 128, 32K tokens | 94.90 ms | 23.79 / 216 | 4.495 / 153 | 2.610 / 66 |
+| 64/8 heads, D = 64, 8K tokens (gpt-oss) | 6.209 ms | | | 0.613 / 70 |
+| the same with its sinks | | | | 0.628 / 68 |
+
+At `W = 4096` the window's tiles run at the full backward's rate (216 against 215 TFLOPS at
+8192 tokens full causal). At `W = 128` the rate is a third of that, for three reasons that
+all scale with the sequence and not with the window. A key tile of 128 keys sees eight
+32-row query tiles instead of 256, so the per-block start (64 KB of K and V, V's fragments,
+the barriers) is amortized over eight iterations. Two of the eight tiles sit on the window's
+edges with half their scores masked. And the bytes: the backward reads Q, O and dO and
+writes dQ, dK and dV whatever the window, and the atomic dQ mode also zeroes, adds into and
+reads back the fp32 accumulator, 512 MB at 32K tokens. At `W = 128` and 32K tokens that is
+about 2.8 GB of traffic in 2.61 ms, over 1 TB/s: the row is bound by bytes, and the
+deterministic mode, which has no accumulator (its dQ pass reads Q and dO once more and the
+few K/V tiles of each window), is faster there, 2.498 against 2.610 ms, where at `W = 512`
+it is slower as usual, 5.655 against 4.495 (the seven products). Variant 2, the cp.async
+rung, is 2 to 5% behind variant 3 on the window rows (0.674 and 2.674 ms at `W = 128`).
+
+Against torch, `scripts/bench_attention_window.py --only=bwd`: ours from the saved `(O, L)`,
+flex is `torch.autograd.grad` through `flex_attention` compiled with the window's block mask
+(what `loss.backward()` runs with flex), flash is torch's full causal backward through SDPA,
+all timed by CUDA events around the Python call, medians of 30 (5 for the 32K full rows).
+
+| 32/8 heads, D = 128 | ours full causal | flash full causal | W | ours | flex | flex / ours |
+|---|---|---|---|---|---|---|
+| 8K tokens | 6.35 ms | 6.77 ms | 4096 | 4.906 ms | 9.984 ms | 2.03x |
+| | | | 512 | 1.143 | 2.243 | 1.96x |
+| | | | 128 | 0.644 | 1.122 | 1.74x |
+| 32K tokens | 95.6 ms | 98.9 ms | 4096 | 24.05 | 49.57 | 2.06x |
+| | | | 512 | 4.565 | 8.901 | 1.95x |
+| | | | 128 | 2.613 | 4.325 | 1.65x |
+
+flex's backward runs its compiled Triton kernel at 38 to 104 TFLOPS on the window's pairs
+against our 66 to 214, and the gap is widest at the wide window, where ours runs at the full
+kernel's rate. The gradients agree with flex's to 3.1e-2 at most (the forward check's
+tolerance, 3% of the largest entry; bf16 outputs on both sides). On gpt-oss's heads (64/8,
+D = 64, W = 128) with the sinks, 0.636 ms against 0.623 without them, the sink's gradient
+included. What remains for the window is the per-block start and the dQ
+round trip, both of which the full causal shapes hide: a window-aware choice between the two
+dQ modes would take the deterministic pass at `W <= 128`, and the zeroing plus conversion of
+the accumulator, about 1 GB at 32K tokens, is a third of that row's time.
+
 ## What remains
 
 - **The dQ round trip.** The preprocess (46 µs at 4096 tokens, mostly the zeroing) and the
@@ -499,5 +612,6 @@ full 32-byte sectors. So I did not build it.
 - **A persistent grid**, the forward's variant 5: 1,024 blocks each load their K and V tile,
   read V's fragments and initialize their barriers before the first `mma`. The version above
   (`SPARK_ATTN_BWD_PERSIST`) lost 4 to 6%; a profile of why is the next step.
-- **Scope.** `D` in {64, 128}, no dropout, no attention bias, no sliding window, and sm_120
-  only as measured (the GB10 build compiles the same source and is untested).
+- **Scope.** `D` in {64, 128}, no dropout, no attention bias, and sm_120 only as measured
+  (the GB10 build compiles the same source and is untested). The sliding window and the
+  sinks are above; what they leave on the table is listed there.
