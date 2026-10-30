@@ -909,24 +909,33 @@ lm_head GEMM (grouped_gemm's kernel with one expert, since w is K-contiguous), o
 that writes the loss and the gradient row in place, and dh, dw by `hgemm`, all in the
 forward. Variant 2 never writes the logits in the forward: the GEMM's epilogue reduces each
 128 x 128 tile to a per-row max and sum of exponentials, and the backward recomputes a chunk
-with softmax minus one-hot folded into the epilogue.
+with softmax minus one-hot folded into the epilogue. Variant 3 is the backward with no
+chunk at all, the way Cut Cross-Entropy does it: one kernel recomputes each 128 x 128
+tile of the gradient and multiplies it straight into dh and dw through L2 reductions, with
+a 2048-row band of fp32 dh and sixteen recycled fp32 strips of dw as its only scratch.
 
-| D = 4096, forward + backward | torch | torch.compile | v1 | v2 |
-|---|---|---|---|---|
-| V = 128256, T = 2048 | 35.1 ms, 3.15 GB | 29.2 ms, 1.59 GB | **28.3 ms**, 1.66 GB | 36.7 ms, 1.66 GB |
-| V = 128256, T = 8192 | does not fit in 10 GB | 115.4 ms, 3.22 GB | **113.5 ms**, 1.71 GB | 146.9 ms, 1.71 GB |
-| V = 128256, T = 16384 | does not fit | 228.6 ms, 5.39 GB | **228.0 ms**, 1.78 GB | 295.4 ms, 1.78 GB |
-| V = 151936, T = 16384 | does not fit | does not fit | **269.8 ms**, 2.07 GB | 349.3 ms, 2.07 GB |
-| forward only, V = 128256, T = 8192 | does not fit | 37.9 ms, 2.10 GB | 36.7 ms, 0.53 GB | **35.8 ms**, 0.07 GB |
+| D = 4096, forward + backward | torch | torch.compile | v1 | v2 | v3 |
+|---|---|---|---|---|---|
+| V = 128256, T = 2048 | 35.1 ms, 3.15 GB | 29.2 ms, 1.59 GB | **28.3 ms**, 1.66 GB | 36.7 ms, 1.66 GB | 40.8 ms, **1.14 GB** |
+| V = 128256, T = 8192 | does not fit in 10 GB | 115.4 ms, 3.22 GB | **113.5 ms**, 1.71 GB | 146.9 ms, 1.71 GB | 164.8 ms, **1.19 GB** |
+| V = 128256, T = 16384 | does not fit | 228.6 ms, 5.39 GB | **228.0 ms**, 1.78 GB | 295.4 ms, 1.78 GB | 329.5 ms, **1.25 GB** |
+| V = 151936, T = 16384 | does not fit | does not fit | **269.8 ms**, 2.07 GB | 349.3 ms, 2.07 GB | not run |
+| forward only, V = 128256, T = 8192 | does not fit | 37.9 ms, 2.10 GB | 36.7 ms, 0.53 GB | **35.8 ms**, 0.07 GB | 35.8 ms, 0.07 GB |
 
 Peak memory above the inputs, gradients included (dw alone is 1.05 GB). The win is memory:
 ours stays flat in T, `torch.compile` grows with the logits it keeps. On time it is a tie
 with `torch.compile` (0.3% to 3% ahead, 0.1% behind at one shape), since all of them spend
 the step in the same three GEMMs. Variant 2's forward is the fastest one and holds almost
 nothing, which is what an eval loss wants, but its backward lost: four GEMMs to variant
-1's three, 1.29 to 1.30x slower at every shape. A backward with no chunk at all, the way Cut
-Cross-Entropy does it, is not built; [docs/design/cross_entropy.md](docs/design/cross_entropy.md)
-has why, the per-kernel numbers and the chunk sweep.
+1's three, 1.29 to 1.30x slower at every shape. Variant 3 holds the least of all, 0.53 GB
+under variants 1 and 2 at every length (the chunk of logits it never has) and a quarter of
+`torch.compile` at 16384 tokens, and it is the slowest: 1.45x variant 1. ncu puts its one
+kernel at 97% of the L2's peak throughput, since recomputing a tile and feeding both
+products from it moves twice the operand bytes of a GEMM through the L2 and adds the
+reductions on top. It is opt-in; the default stays variant 1.
+[docs/design/cross_entropy.md](docs/design/cross_entropy.md) has the design, what the L2
+can add per second by instruction, what each piece of the kernel costs, and the chunk
+sweep.
 
 ## serving a batch
 
