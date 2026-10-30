@@ -18,7 +18,7 @@
 //              (fp8gemm_tma_sk.cu); the shapes its route does not take run what the default
 //              ran before it, variant 2 where it takes the shape and variant 1 elsewhere.
 //
-// MX mode (fp8gemm_mx): the same three variants with a ue8m0 scale per row per 32 k on both
+// MX mode (fp8gemm_mx): the same four variants with a ue8m0 scale per row per 32 k on both
 // operands, sfa[M][K/32] and sfb[N][K/32], applied by the block-scaled mma itself
 // (fp8gemm_tile.cuh, MxFrag / MxChunk). Requires K % 256 == 0 so that a row's scales for
 // two 128-k stages are one aligned 8-byte chunk.
@@ -42,7 +42,8 @@ void fp8gemm_tma(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat16*
 // Variant 3 lives in fp8gemm_tma_sk.cu: false (nothing launched) when its route sends the shape
 // to the old one.
 bool fp8gemm_tma_sk(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat16* C, int M, int N,
-                    int K, const float* scale_a, const float* scale_b, cudaStream_t stream);
+                    int K, const float* scale_a, const float* scale_b, fp8gemm_tile::MxScales mx,
+                    cudaStream_t stream);
 
 namespace {
 
@@ -478,8 +479,8 @@ void run(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat16* C, int 
             fp8gemm_tma(A, Bt, C, M, N, K, scale_a, scale_b, mx, stream);
             break;
         case 3:
-            // MX mode and the shapes the route leaves alone: variant 2 or variant 1.
-            if (MX || !fp8gemm_tma_sk(A, Bt, C, M, N, K, scale_a, scale_b, stream)) {
+            // The shapes the route leaves alone: variant 2 or variant 1.
+            if (!fp8gemm_tma_sk(A, Bt, C, M, N, K, scale_a, scale_b, mx, stream)) {
                 if (fp8gemm_tma_supports(M, N, K))
                     fp8gemm_tma(A, Bt, C, M, N, K, scale_a, scale_b, mx, stream);
                 else if (MX)

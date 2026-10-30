@@ -1839,9 +1839,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("route"));
     m.def(
         "fp8gemm_v3_route_name",
-        [](int M, int N, int K) { return std::string(spark::fp8gemm_v3_route_name(M, N, K)); },
-        "what fp8gemm variant 3 runs for an M x N x K problem under the current route",
-        py::arg("M"), py::arg("N"), py::arg("K"));
+        [](int M, int N, int K, bool mx) {
+            return std::string(spark::fp8gemm_v3_route_name(M, N, K, mx));
+        },
+        "what fp8gemm variant 3 runs for an M x N x K problem under the current route, in "
+        "per-tensor mode or, with mx, with MXFP8 block scales",
+        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("mx") = false);
     m.def("fp8gemm_v3_num_tiles", &spark::fp8gemm_v3_num_tiles,
           "number of TMA tiles fp8gemm variant 3 can be forced to");
     m.def("fp4gemm", &fp4gemm,

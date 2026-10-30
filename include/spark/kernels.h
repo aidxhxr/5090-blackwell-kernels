@@ -247,10 +247,10 @@ int hgemm_v6_split();
 //            everything else steps down to variant 1
 // variant 3: variant 2's mainloop on hgemm's Stream-K schedule (persistent grid, grouped
 //            raster, K-ordered fixup, the same bits every run), with a TMA block tile picked
-//            per shape (128x256, 128x128, 128x64 or 64x128). Any shape variant 1 takes: decode
-//            shapes, K % 128 != 0, MX mode and the shapes the route leaves alone run variant
-//            2 where it takes them and variant 1 elsewhere, which is what the default ran
-//            before variant 3 (fp8gemm_v3_set_route below)
+//            per shape (128x256, 128x128, 128x64 or 64x128). Any shape variant 1 takes:
+//            decode shapes, K % 128 != 0, MX mode (a forced tile takes it) and the shapes the
+//            route leaves alone run variant 2 where it takes them and variant 1 elsewhere,
+//            which is what the default ran before variant 3 (fp8gemm_v3_set_route below)
 void fp8gemm(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat16* C, int M, int N, int K,
              const float* scale_a, const float* scale_b, int variant, cudaStream_t stream);
 int fp8gemm_num_variants();
@@ -276,12 +276,12 @@ bool fp8gemm_mx_available();
 // shape, else variant 1), n in [0, fp8gemm_v3_num_tiles()) forces TMA tile n where N and K
 // tile (the old route elsewhere). Process-wide, initial value from SPARK_FP8GEMM_V3_ROUTE;
 // M <= 64 always runs variant 1's decode kernels. fp8gemm_v3_route_name says what variant 3
-// runs for a shape under the current route.
+// runs for a shape under the current route, in per-tensor or MX mode (the rule differs).
 enum Fp8gemmV3Route { FP8GEMM_V3_ROUTE_DEFAULT = -1, FP8GEMM_V3_ROUTE_LEGACY = -2 };
 void fp8gemm_v3_set_route(int route);
 int fp8gemm_v3_route();
 int fp8gemm_v3_num_tiles();
-const char* fp8gemm_v3_route_name(int M, int N, int K);
+const char* fp8gemm_v3_route_name(int M, int N, int K, bool mx = false);
 
 // ---- FP4GEMM (e2m1 tensor cores, NVFP4 and MXFP4) ----------------------------------------
 // C = scale_a * scale_b * sum_k (sfa[m][k/V] A[m][k]) (sfb[n][k/V] Bt[n][k]), with A [M,K] and

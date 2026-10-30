@@ -496,7 +496,7 @@ bool run_models_weight(cudaStream_t stream, const spark::bench::ModelWeight& w,
                                     {"v2", 2, dflt},
                                     {"v3old", 3, spark::FP8GEMM_V3_ROUTE_LEGACY},
                                     {"v3", 3, dflt}};
-    if (tiles && !mx)
+    if (tiles)
         for (int t = 0; t < spark::fp8gemm_v3_num_tiles(); ++t)
             cands.push_back({"v3t" + std::to_string(t), 3, t});
     const int saved_route = spark::fp8gemm_v3_route();
@@ -536,9 +536,9 @@ bool run_models_weight(cudaStream_t stream, const spark::bench::ModelWeight& w,
                 // A forced tile that does not fit falls back to the old route, and a forced
                 // tile the rule picks anyway is the v3 row: skip both duplicates.
                 spark::fp8gemm_v3_set_route(dflt);
-                const std::string by_rule = spark::fp8gemm_v3_route_name(M, N, K);
+                const std::string by_rule = spark::fp8gemm_v3_route_name(M, N, K, mx);
                 spark::fp8gemm_v3_set_route(c.route);
-                const std::string forced = spark::fp8gemm_v3_route_name(M, N, K);
+                const std::string forced = spark::fp8gemm_v3_route_name(M, N, K, mx);
                 if (by_rule == forced || forced == "v1" || forced == "v2") continue;
             }
             spark::fp8gemm_v3_set_route(c.route);
@@ -577,7 +577,7 @@ bool run_models_weight(cudaStream_t stream, const spark::bench::ModelWeight& w,
             row.ok = ok;
             spark::bench::print_row(row);
             std::fprintf(stderr, "    %-8s %-34s %.1f%% of cuBLASLt\n", c.label.c_str(),
-                         c.variant == 3 && !mx ? spark::fp8gemm_v3_route_name(M, N, K) : "",
+                         c.variant == 3 ? spark::fp8gemm_v3_route_name(M, N, K, mx) : "",
                          100.0 * t_ref.median_ms / t.median_ms);
         }
     }
