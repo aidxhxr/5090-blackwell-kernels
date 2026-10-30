@@ -731,7 +731,7 @@ void attention_bwd_window_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K,
 //            chunks of 256 keys at fixed offsets, the chunks of the batch spread over the
 //            warps (never one chunk over two), and a sequence's chunks folded in order, so a
 //            row's bits depend on its own sequence only, and equal varlen variant 2's for the
-//            same row. bf16 caches only; opt-in (paged_decode_default_variant is 1)
+//            same row. bf16 and e4m3 caches; opt-in (paged_decode_default_variant is 1)
 void paged_decode_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* k_cache,
                        const __nv_bfloat16* v_cache, const int* block_table, const int* seq_lens,
                        __nv_bfloat16* O, int B, int H_q, int H_kv, int D, int page, int max_pages,
@@ -750,7 +750,7 @@ int paged_decode_default_variant();
 //            the block table and each block's (sequence, q tile) found on the device
 // variant 2: batch invariant: variant 1's tile with paged decode variant 2's arithmetic (16-key
 //            steps, chunks of 256 keys folded in order), so a query row has the same bits in
-//            any batch, any chunk of its prompt, and as a decode row. bf16 only; opt-in
+//            any batch, any chunk of its prompt, and as a decode row. Both caches; opt-in
 void attention_varlen_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* k_cache,
                            const __nv_bfloat16* v_cache, const int* cu_seqlens_q,
                            const int* seq_lens, const int* block_table, __nv_bfloat16* O, int B,
@@ -767,7 +767,9 @@ int attention_varlen_default_variant();
 // Decode variant 1 reads the slabs into registers in the mma fragment layouts, with the
 // head dimension permuted the same way for Q and K and undone when O is written, and keeps
 // 6 slabs per warp in its pipeline instead of 3 (the same 96 KB). Varlen variant 1 converts
-// each 64-key tile to bf16 in shared memory once for its 8 warps.
+// each 64-key tile to bf16 in shared memory once for its 8 warps. Variant 2 of both converts
+// each slab or tile to bf16 in shared memory and runs its bf16 arithmetic on it, the V scale
+// applied to the finished O / L, so the batch invariance holds on this cache too.
 void paged_decode_fp8(const __nv_bfloat16* Q, const __nv_fp8_e4m3* k_cache,
                       const __nv_fp8_e4m3* v_cache, const float* k_scale, const float* v_scale,
                       const int* block_table, const int* seq_lens, __nv_bfloat16* O, int B, int H_q,

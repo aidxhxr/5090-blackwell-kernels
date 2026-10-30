@@ -16,15 +16,13 @@ TOL = dict(atol=2e-2, rtol=2e-2)  # one bf16 rounding of an fp32 result, P in bf
 
 
 def _variants(name, fp8=False):
-    """Every variant of `name`; with fp8, the ones that take an e4m3 cache (variant 2 of both
-    ops, the batch-invariant one, is bf16 only)."""
+    """Every variant of `name`; every one takes the e4m3 cache too (fp8)."""
     try:
         import spark_kernels
 
-        vs = list(range(spark_kernels.num_variants(name)))
+        return list(range(spark_kernels.num_variants(name)))
     except Exception:
-        vs = [0, 1]
-    return [v for v in vs if v != 2] if fp8 else vs
+        return [0, 1]
 
 
 def _paged_cache(lens, H_kv, D, page, seed=0, spare_pages=3):

@@ -24,7 +24,7 @@
 //     variant 2: batch invariant (attention_invariant.cu): a sequence's keys in chunks of 256
 //                at fixed offsets, the chunks spread over the warps and folded in chunk order,
 //                so a row's bits do not depend on the batch; the same arithmetic as varlen
-//                variant 2. Opt-in, bf16 only.
+//                variant 2. Opt-in; bf16 and e4m3 caches.
 //
 //   varlen prefill (packed prompts, Q and O [T, H_q, D], cu_seqlens_q [B + 1]):
 //     variant 0: one warp per (token, query head), keys one at a time.
@@ -38,7 +38,7 @@
 //                and the right one for a chunk appended to an existing context.
 //     variant 2: batch invariant: variant 1's tile computing each row as decode variant 2
 //                does (16-key steps, chunks of 256 folded in order), so a row has the same
-//                bits as a prompt row, a chunk row or a decode row. Opt-in, bf16 only.
+//                bits as a prompt row, a chunk row or a decode row. Opt-in; both caches.
 //
 // Both ops also read an e4m3 cache (paged_decode_fp8, attention_varlen_fp8): the same
 // [num_pages, H_kv, page, D] layout at one byte per element, with a per-kv-head scale for K
@@ -65,16 +65,27 @@
 
 namespace spark {
 
-// Variant 2 of both ops, batch invariant (attention_invariant.cu); bf16 caches only.
+// Variant 2 of both ops, batch invariant (attention_invariant.cu), on either cache format.
 void paged_decode_invariant_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K,
                                  const __nv_bfloat16* V, const int* block_table,
                                  const int* seq_lens, __nv_bfloat16* O, int B, int H_q, int H_kv,
                                  int D, int shift, int max_pages, cudaStream_t stream);
+void paged_decode_invariant_fp8(const __nv_bfloat16* Q, const __nv_fp8_e4m3* K,
+                                const __nv_fp8_e4m3* V, const float* k_scale, const float* v_scale,
+                                const int* block_table, const int* seq_lens, __nv_bfloat16* O,
+                                int B, int H_q, int H_kv, int D, int shift, int max_pages,
+                                cudaStream_t stream);
 void attention_varlen_invariant_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K,
                                      const __nv_bfloat16* V, const int* cu_seqlens_q,
                                      const int* seq_lens, const int* block_table, __nv_bfloat16* O,
                                      int B, int T, int H_q, int H_kv, int D, int shift,
                                      int max_pages, bool causal, cudaStream_t stream);
+void attention_varlen_invariant_fp8(const __nv_bfloat16* Q, const __nv_fp8_e4m3* K,
+                                    const __nv_fp8_e4m3* V, const float* k_scale,
+                                    const float* v_scale, const int* cu_seqlens_q,
+                                    const int* seq_lens, const int* block_table, __nv_bfloat16* O,
+                                    int B, int T, int H_q, int H_kv, int D, int shift,
+                                    int max_pages, bool causal, cudaStream_t stream);
 
 namespace {
 
@@ -1365,12 +1376,17 @@ void decode_impl(const bf16* Q, const void* K, const void* V, const float* k_sca
         return;
     }
     if (variant == 2) {
-        SPARK_REQUIRE(!fp8, "paged_decode: variant 2 (batch invariant) takes a bf16 cache only");
         SPARK_REQUIRE(window == 0 && sinks == nullptr,
                       "paged_decode: variant 2 (batch invariant) takes no window or sinks");
-        paged_decode_invariant_bf16(Q, static_cast<const bf16*>(K), static_cast<const bf16*>(V),
-                                    block_table, seq_lens, O, B, H_q, H_kv, D, shift, max_pages,
-                                    stream);
+        if (fp8)
+            paged_decode_invariant_fp8(Q, static_cast<const __nv_fp8_e4m3*>(K),
+                                       static_cast<const __nv_fp8_e4m3*>(V), k_scale, v_scale,
+                                       block_table, seq_lens, O, B, H_q, H_kv, D, shift, max_pages,
+                                       stream);
+        else
+            paged_decode_invariant_bf16(Q, static_cast<const bf16*>(K), static_cast<const bf16*>(V),
+                                        block_table, seq_lens, O, B, H_q, H_kv, D, shift, max_pages,
+                                        stream);
         return;
     }
     SPARK_REQUIRE(H_q / H_kv <= dec::ROWS,
@@ -1445,13 +1461,17 @@ void varlen_impl(const bf16* Q, const void* K, const void* V, const float* k_sca
         return;
     }
     if (variant == 2) {
-        SPARK_REQUIRE(!fp8,
-                      "attention_varlen: variant 2 (batch invariant) takes a bf16 cache only");
         SPARK_REQUIRE(window == 0 && sinks == nullptr,
                       "attention_varlen: variant 2 (batch invariant) takes no window or sinks");
-        attention_varlen_invariant_bf16(Q, static_cast<const bf16*>(K), static_cast<const bf16*>(V),
-                                        cu_seqlens_q, seq_lens, block_table, O, B, T, H_q, H_kv, D,
-                                        shift, max_pages, causal, stream);
+        if (fp8)
+            attention_varlen_invariant_fp8(Q, static_cast<const __nv_fp8_e4m3*>(K),
+                                           static_cast<const __nv_fp8_e4m3*>(V), k_scale, v_scale,
+                                           cu_seqlens_q, seq_lens, block_table, O, B, T, H_q, H_kv,
+                                           D, shift, max_pages, causal, stream);
+        else
+            attention_varlen_invariant_bf16(
+                Q, static_cast<const bf16*>(K), static_cast<const bf16*>(V), cu_seqlens_q, seq_lens,
+                block_table, O, B, T, H_q, H_kv, D, shift, max_pages, causal, stream);
         return;
     }
     vl::Params p{};
