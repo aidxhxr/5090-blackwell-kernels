@@ -26,8 +26,8 @@
 // MX mode (a ue8m0 scale per row per 32 k on both operands) runs the same kernel with the
 // consumer warps fetching their scale chunks a group of stages ahead, as variants 1 and 2 do
 // (fp8gemm_tile.cuh, MxChunk): the plan then counts chunk groups instead of stages, so every
-// piece starts and ends on a group boundary and the fixup is unchanged. A forced tile takes
-// MX mode; the default route in MX mode is still the one before variant 3.
+// piece starts and ends on a group boundary and the fixup is unchanged. Its route is
+// route_rule_mx, from the same sweep in MX mode.
 
 #include <algorithm>
 #include <atomic>
@@ -597,6 +597,28 @@ Route route_rule(int M, int N, int K) {
     return {Route::TILE, small};
 }
 
+// The MX rule, from the same sweep in MX mode (docs/design/fp8gemm.md, "MX mode" under
+// "Model shapes"): the per-tensor rule with 128x128 wherever it would run 128x256. The
+// 128x256 tile's 128 accumulators per lane leave no room for the scale chunks at the 168
+// registers a 288-thread block gets, and it spills (312 to 448 bytes of stack, 38 to 98% of
+// cuBLASLt MXFP8 where 128x128 runs 88 to 152%). The 64-wide tiles and 128x128 hold the
+// chunks in registers without spilling (126 to 168 registers, 8 bytes of stack).
+Route route_rule_mx(int M, int N, int K) {
+    const Knobs& k = knobs();
+    if (M <= 64 || K % 128 != 0) return {Route::OLD, 0};
+    const int wave = TILES[kTile128].resident();
+    auto tiles = [&](const TileConfig& t) { return cdiv(M, t.bm) * (N / t.bn); };
+    const TileConfig& big = TILES[kTile128];
+    if (M > 128 && tile_fits(big, N, K) && 4 * tiles(big) >= wave) {
+        const long long share = static_cast<long long>(tiles(big)) * (K / big.bk) / wave;
+        if (share >= k.min_share_128 || 4 * tiles(big) >= 3 * wave) return {Route::TILE, kTile128};
+    }
+    const int small =
+        (N % 128 != 0 || cdiv(M, 128) * 128 <= cdiv(M, 64) * 64) ? kTile128x64 : kTile64x128;
+    if (!tile_fits(TILES[small], N, K)) return {Route::OLD, 0};
+    return {Route::TILE, small};
+}
+
 Route choose(int M, int N, int K, bool mx) {
     const int r = route_slot().load(std::memory_order_relaxed);
     if (r == FP8GEMM_V3_ROUTE_LEGACY || M <= 64) return {Route::OLD, 0};
@@ -604,8 +626,7 @@ Route choose(int M, int N, int K, bool mx) {
         if (tile_fits(TILES[r], N, K)) return {Route::TILE, r};
         return {Route::OLD, 0};
     }
-    if (mx) return {Route::OLD, 0};  // the MX rule comes with its sweep
-    return route_rule(M, N, K);
+    return mx ? route_rule_mx(M, N, K) : route_rule(M, N, K);
 }
 
 }  // namespace v3

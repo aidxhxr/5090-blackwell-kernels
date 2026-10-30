@@ -279,24 +279,36 @@ def test_fp8gemm_mx_variant2(sk, shape):
     _mx_case(sk, shape, 2)
 
 
-@pytest.mark.parametrize("shape", [(256, 4096, 4096), (2048, 2048, 2048), (33, 1024, 768)],
-                         ids=lambda s: f"M{s[0]}_N{s[1]}_K{s[2]}")
-def test_fp8gemm_mx_variant3(sk, shape):
-    # MX mode on variant 3 runs variant 2 where it takes the shape and variant 1 elsewhere.
-    if 3 not in _variants("fp8gemm"):
-        pytest.skip("variant 3 not built")
-    _mx_supported(sk)
-    _mx_case(sk, shape, 3)
-
-
-# Variant 3's tiles forced in MX mode: the Stream-K pieces cut on scale-chunk groups, both
-# chunk widths (K % 512 == 0 fetches 16-byte chunks, four stages a group; K = 768, 2304 and
-# 11008 the 8-byte ones, two a group), group counts that do not divide into the ring or the
-# grid (9 groups at K = 2304, 43 at 11008), and rows past M.
+# Variant 3 in MX mode: the same TMA tiles with the Stream-K pieces cut on scale-chunk
+# groups. Both chunk widths (K % 512 == 0 fetches 16-byte chunks, four stages a group; K =
+# 768, 2304 and 11008 the 8-byte ones, two a group), group counts that do not divide into the
+# ring or the grid (9 groups at K = 2304, 43 at 11008), ragged M, and the shapes the rule
+# leaves to the old route (decode).
+MX_SHAPES_V3 = [(128, 4096, 4096), (100, 1024, 768), (320, 1024, 1024), (256, 4096, 4096),
+                (1000, 2048, 1024), (512, 8192, 2048), (256, 5120, 2304), (2048, 768, 2048),
+                (384, 2048, 11008), (16, 4096, 4096)]
+MX_V3_ROUTES = {(128, 4096, 4096): "tma 128x64 bk128 s4",
+                (100, 1024, 768): "tma 128x64 bk128 s4",
+                (320, 1024, 1024): "tma 64x128 bk128 s4",
+                (256, 4096, 4096): "tma 128x128 bk128 s3",
+                (1000, 2048, 1024): "tma 128x128 bk128 s3",
+                (512, 8192, 2048): "tma 128x128 bk128 s3",
+                (256, 5120, 2304): "tma 128x64 bk128 s4",
+                (2048, 768, 2048): "tma 128x128 bk128 s3",
+                (384, 2048, 11008): "tma 128x128 bk128 s3",
+                (16, 4096, 4096): "v1 decode"}
 # Every tile forced: one piece per tile, static ranges that split a tile over several
 # blocks on group boundaries, rows past M, the queue with K-passes, and the 8-byte chunks.
 MX_SHAPES_V3_FORCED = [(128, 2048, 512), (200, 1024, 4096), (777, 2560, 2304), (256, 81920, 1024),
                        (300, 1024, 768)]
+
+
+@pytest.mark.parametrize("shape", MX_SHAPES_V3, ids=lambda s: f"M{s[0]}_N{s[1]}_K{s[2]}")
+def test_fp8gemm_mx_variant3_routes(sk, v3_route, shape):
+    _mx_supported(sk)
+    assert sk._C.fp8gemm_v3_route_name(*shape, mx=True) == MX_V3_ROUTES[shape]
+    _mx_case(sk, shape, 3)
+    _mx_case(sk, shape, 3)  # the workspace, the flags' epoch and the queue are reused
 
 
 @pytest.mark.parametrize("shape", MX_SHAPES_V3_FORCED, ids=lambda s: f"M{s[0]}_N{s[1]}_K{s[2]}")
@@ -338,7 +350,7 @@ def test_fp8gemm_mx_variant3_same_bits_every_run(sk, v3_route):
     # makes the bits independent of which block computed which piece, on every tile.
     _mx_supported(sk)
     a, sfa, b_t, sfb = _mx_inputs(384, 2048, 8192, seed=5)
-    for tile in range(sk._C.fp8gemm_v3_num_tiles()):
+    for tile in [-1] + list(range(sk._C.fp8gemm_v3_num_tiles())):
         v3_route(tile)
         first = sk.fp8gemm(a, b_t, variant=3, sfa=sfa, sfb=sfb)
         for _ in range(3):
