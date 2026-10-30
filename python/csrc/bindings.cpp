@@ -381,7 +381,8 @@ Tensor fp8gemm(const Tensor& a, const Tensor& b_t, const std::optional<Tensor>& 
     }
     const c10::cuda::CUDAGuard guard(a.device());
     Tensor c = at::empty({M, N}, a.options().dtype(at::kBFloat16));
-    int v = resolve_variant(variant, spark::fp8gemm_num_variants());
+    int v = variant < 0 ? spark::fp8gemm_default_variant()
+                        : resolve_variant(variant, spark::fp8gemm_num_variants());
     const auto supports = [&](int vv) {
         return mx ? spark::fp8gemm_mx_supports(M, N, K, vv) : spark::fp8gemm_supports(M, N, K, vv);
     };
@@ -1911,6 +1912,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("M"), py::arg("N"), py::arg("K"), py::arg("mx") = false);
     m.def("fp8gemm_v3_num_tiles", &spark::fp8gemm_v3_num_tiles,
           "number of TMA tiles fp8gemm variant 3 can be forced to");
+    m.def(
+        "fp8gemm_v4_route_name",
+        [](int M, int N, int K) { return std::string(spark::fp8gemm_v4_route_name(M, N, K)); },
+        "what fp8gemm variant 4 (batch invariant) runs for an M x N x K problem", py::arg("M"),
+        py::arg("N"), py::arg("K"));
     m.def("fp4gemm", &fp4gemm,
           "fp4 (e2m1) block-scaled GEMM, NVFP4 or MXFP4: scale_a * scale_b * a @ b_t^T with a "
           "[M, K/2] and b_t [N, K/2] packed e2m1 and block scales in the blocked layout, bf16 out",

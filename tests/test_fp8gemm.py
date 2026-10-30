@@ -128,7 +128,7 @@ def test_fp8gemm_rejects_bad_inputs(sk):
 
 
 def test_fp8gemm_num_variants(sk):
-    assert sk.num_variants("fp8gemm") == 4
+    assert sk.num_variants("fp8gemm") == 5
 
 
 # ---- variant 3: the TMA tiles on the Stream-K schedule, routed per shape ------------------

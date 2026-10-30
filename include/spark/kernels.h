@@ -251,9 +251,16 @@ int hgemm_v6_split();
 //            shape variant 1 takes: decode shapes, K % 128 != 0 and the shapes the route
 //            leaves alone run variant 2 where it takes them and variant 1 elsewhere, which is
 //            what the default ran before variant 3 (fp8gemm_v3_set_route below)
+// variant 4: batch invariant (docs/design/batch_invariant.md): no route splits K, so row i
+//            of C has the same bits whatever M is, which kernel M picks and whatever the
+//            other rows hold. M <= 64 runs variant 1's decode tiles with K unsplit, above
+//            that one of variant 3's TMA tiles with every output tile computed whole by one
+//            block; MX mode and K % 128 != 0 run variant 1's tiles with no split-K tail. Any
+//            shape variant 1 takes. Opt-in: variant -1 is still 3 (fp8gemm_default_variant)
 void fp8gemm(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat16* C, int M, int N, int K,
              const float* scale_a, const float* scale_b, int variant, cudaStream_t stream);
 int fp8gemm_num_variants();
+int fp8gemm_default_variant();
 // True if `variant` accepts this shape (the rules above); fp8gemm throws when it is false.
 bool fp8gemm_supports(int M, int N, int K, int variant);
 // MX mode (MXFP8): C = scale_a * scale_b * sum_k 2^(sfa[m][k/32] - 127) A[m][k]
@@ -282,6 +289,9 @@ void fp8gemm_v3_set_route(int route);
 int fp8gemm_v3_route();
 int fp8gemm_v3_num_tiles();
 const char* fp8gemm_v3_route_name(int M, int N, int K, bool mx = false);
+// What variant 4 runs for a shape: the unsplit decode tiles, a TMA tile with whole tiles, or
+// variant 1's tiles without their split-K tail.
+const char* fp8gemm_v4_route_name(int M, int N, int K);
 
 // ---- FP4GEMM (e2m1 tensor cores, NVFP4 and MXFP4) ----------------------------------------
 // C = scale_a * scale_b * sum_k (sfa[m][k/V] A[m][k]) (sfb[n][k/V] Bt[n][k]), with A [M,K] and

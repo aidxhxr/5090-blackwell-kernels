@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 
 #include "fp8gemm_tile.cuh"
@@ -346,6 +347,10 @@ struct Knobs {
     int min_pass = 4;       // queue mode: no K-pass shorter than this
     int static_waves = 2;   // static ranges up to this many waves (always when in L2)
     int group = -1;         // raster group: > 0 fixed, -1 the L2-footprint rule
+    // Every tile whole, never a K split (variant 4, batch invariant, hgemm_sk::Knobs's flag
+    // of the same name): one block per tile when they fit in one wave, else whole tiles from
+    // the queue. An output element is then one chain of k32 steps from k = 0 to K.
+    bool whole_tiles = false;
 };
 
 // Sweep overrides, read once: SPARK_FP8GEMM_V3_MIN_SHARE, _MIN_SHARE_128, _MIN_PASS,
@@ -415,7 +420,13 @@ void plan(Params& p, hgemm_sk::Workspace& w, int M, int N, int K, int BM, int BN
     const bool in_l2 = operands <= hgemm_sk::kL2Share * static_cast<double>(hgemm_sk::l2_bytes());
     const bool use_static = in_l2 || p.tiles <= static_cast<long long>(resident) * k.static_waves;
     int sk_tiles;
-    if (use_static) {
+    if (k.whole_tiles) {
+        p.dp_tiles = p.tiles <= resident ? 0 : p.tiles;
+        p.passes = p.tiles <= resident ? 0 : 1;  // static: block c owns [c KT, (c + 1) KT)
+        p.grid = std::min(resident, p.tiles);
+        p.sk_iters = p.tiles <= resident ? p.tiles * p.KT : 0;
+        sk_tiles = 0;
+    } else if (use_static) {
         p.grid = static_cast<int>(
             std::min<long long>(resident, std::max<long long>(p.tiles, total / k.min_share)));
         if (p.tiles < resident) {
@@ -491,7 +502,7 @@ int resident_blocks() {
 template <int BM, int BN, int BK, int STAGES, int WM, int WN, int MIN_BLOCKS, bool MX, int SFW>
 void launch_mode(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout, int M, int N,
                  int K, const float* scale_a, const float* scale_b, fp8gemm_tile::MxScales mx,
-                 cudaStream_t stream) {
+                 cudaStream_t stream, const Knobs& k) {
     using C = fp8gemm_tile::Cfg<BM, BN, BK, STAGES, WM, WN>;
     constexpr int bytes = smem_bytes<C>();
     constexpr int threads = (WM * WN + 1) * 32;
@@ -503,7 +514,7 @@ void launch_mode(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16*
     static hgemm_sk::Workspace w;  // one per tile configuration and mode
     Params p;
     plan(p, w, M, N, K, BM, BN, BK, SPC,
-         resident_blocks<BM, BN, BK, STAGES, WM, WN, MIN_BLOCKS, MX, SFW>(), knobs());
+         resident_blocks<BM, BN, BK, STAGES, WM, WN, MIN_BLOCKS, MX, SFW>(), k);
     fp8gemm_v3_kernel<BM, BN, BK, STAGES, WM, WN, MIN_BLOCKS, MX, SFW>
         <<<p.grid, threads, bytes, stream>>>(tmA, tmB, Cout, M, N, K, scale_a, scale_b, mx, p);
 }
@@ -513,20 +524,21 @@ void launch_mode(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16*
 template <int BM, int BN, int BK, int STAGES, int WM, int WN, int MIN_BLOCKS>
 void launch(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout, int M, int N,
             int K, const float* scale_a, const float* scale_b, fp8gemm_tile::MxScales mx,
-            cudaStream_t stream) {
+            cudaStream_t stream, const Knobs& k) {
     if (mx.a == nullptr)
         launch_mode<BM, BN, BK, STAGES, WM, WN, MIN_BLOCKS, false, 2>(A, Bt, Cout, M, N, K, scale_a,
-                                                                      scale_b, mx, stream);
+                                                                      scale_b, mx, stream, k);
     else if (K % 512 == 0)
         launch_mode<BM, BN, BK, STAGES, WM, WN, MIN_BLOCKS, true, 4>(A, Bt, Cout, M, N, K, scale_a,
-                                                                     scale_b, mx, stream);
+                                                                     scale_b, mx, stream, k);
     else
         launch_mode<BM, BN, BK, STAGES, WM, WN, MIN_BLOCKS, true, 2>(A, Bt, Cout, M, N, K, scale_a,
-                                                                     scale_b, mx, stream);
+                                                                     scale_b, mx, stream, k);
 }
 
 using LaunchFn = void (*)(const unsigned char*, const unsigned char*, __nv_bfloat16*, int, int, int,
-                          const float*, const float*, fp8gemm_tile::MxScales, cudaStream_t);
+                          const float*, const float*, fp8gemm_tile::MxScales, cudaStream_t,
+                          const Knobs&);
 
 struct TileConfig {
     const char* name;
@@ -619,6 +631,32 @@ Route route_rule_mx(int M, int N, int K) {
     return {Route::TILE, small};
 }
 
+// Variant 4's tile: every output tile whole, so the one that finishes first by a simple count
+// (hgemm variant 7's rule): waves of whole tiles times the tile's area, the 64-wide tiles
+// taken at 0.9 of the 128x128 tile's rate. -1 when no tile divides N and K.
+int invariant_tile(int M, int N, int K) {
+    struct Cand {
+        int tile;
+        double rate;
+    };
+    const Cand cands[] = {{kTile128, 1.0}, {kTile128x64, 0.9}, {kTile64x128, 0.9}};
+    int best = -1;
+    double best_t = 0.0;
+    for (const Cand& c : cands) {
+        const TileConfig& t = TILES[c.tile];
+        if (!tile_fits(t, N, K)) continue;
+        const long long tiles = static_cast<long long>(cdiv(M, t.bm)) * (N / t.bn);
+        const int resident = t.resident();
+        const long long waves = (tiles + resident - 1) / resident;
+        const double cost = static_cast<double>(waves) * t.bm * t.bn / c.rate;
+        if (best < 0 || cost < best_t) {
+            best = c.tile;
+            best_t = cost;
+        }
+    }
+    return best;
+}
+
 Route choose(int M, int N, int K, bool mx) {
     const int r = route_slot().load(std::memory_order_relaxed);
     if (r == FP8GEMM_V3_ROUTE_LEGACY || M <= 64) return {Route::OLD, 0};
@@ -640,8 +678,32 @@ bool fp8gemm_tma_sk(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat
     if (r.kind == v3::Route::OLD) return false;
     v3::TILES[r.tile].launch(reinterpret_cast<const unsigned char*>(A),
                              reinterpret_cast<const unsigned char*>(Bt), C, M, N, K, scale_a,
-                             scale_b, mx, stream);
+                             scale_b, mx, stream, v3::knobs());
     return true;
+}
+
+bool fp8gemm_tma_sk_invariant(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat16* C,
+                              int M, int N, int K, const float* scale_a, const float* scale_b,
+                              cudaStream_t stream) {
+    if (M <= 64) return false;
+    const int t = v3::invariant_tile(M, N, K);
+    if (t < 0) return false;
+    v3::Knobs k = v3::knobs();
+    k.whole_tiles = true;
+    v3::TILES[t].launch(reinterpret_cast<const unsigned char*>(A),
+                        reinterpret_cast<const unsigned char*>(Bt), C, M, N, K, scale_a, scale_b,
+                        fp8gemm_tile::MxScales{}, stream, k);
+    return true;
+}
+
+const char* fp8gemm_v4_route_name(int M, int N, int K) {
+    if (M <= 0 || N % 64 != 0 || K % 64 != 0) return "unsupported";
+    if (M <= 64) return "v1 decode, K unsplit";
+    const int t = v3::invariant_tile(M, N, K);
+    if (t < 0) return "v1 tiles, no split-K";
+    static thread_local char name[64];
+    std::snprintf(name, sizeof(name), "%s, whole tiles", v3::TILES[t].name);
+    return name;
 }
 
 void fp8gemm_v3_set_route(int route) {

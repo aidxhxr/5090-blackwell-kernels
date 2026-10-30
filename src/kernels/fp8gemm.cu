@@ -17,6 +17,10 @@
 //   variant 3: variant 2's mainloop on hgemm's Stream-K schedule with a block tile per shape
 //              (fp8gemm_tma_sk.cu); the shapes its route does not take run what the default
 //              ran before it, variant 2 where it takes the shape and variant 1 elsewhere.
+//   variant 4: batch invariant and opt-in (docs/design/batch_invariant.md): no route splits
+//              K, so row i of C has the same bits at every M. M <= 64 and MX mode run variant
+//              1's tiles unsplit; above that one TMA tile of variant 3 with every output tile
+//              whole (fp8gemm_tma_sk_invariant).
 //
 // MX mode (fp8gemm_mx): the same four variants with a ue8m0 scale per row per 32 k on both
 // operands, sfa[M][K/32] and sfb[N][K/32], applied by the block-scaled mma itself
@@ -44,6 +48,11 @@ void fp8gemm_tma(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat16*
 bool fp8gemm_tma_sk(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat16* C, int M, int N,
                     int K, const float* scale_a, const float* scale_b, fp8gemm_tile::MxScales mx,
                     cudaStream_t stream);
+// Variant 4's tile route (fp8gemm_tma_sk.cu): a TMA tile with every output tile computed
+// whole by one block; false (nothing launched) at M <= 64 or when no tile divides N and K.
+bool fp8gemm_tma_sk_invariant(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat16* C,
+                              int M, int N, int K, const float* scale_a, const float* scale_b,
+                              cudaStream_t stream);
 
 namespace {
 
@@ -292,14 +301,15 @@ void launch(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout
 
 // Wave quantization (hgemm variant 3's rule): the tiles past the last full wave of resident
 // blocks are split along K over the otherwise idle blocks, `split = min(KT, resident / tail)`.
+// `unsplit` (variant 4, batch invariant) runs every tile whole instead.
 template <class C, bool MX, int SFW>
 void launch_tiles_sfw(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout, int M,
                       int N, int K, const float* scale_a, const float* scale_b, MxScales mx,
-                      cudaStream_t stream) {
+                      cudaStream_t stream, bool unsplit) {
     const int resident = resident_blocks<C, MX, SFW>();
     const int tiles = cdiv(M, C::BM) * (N / C::BN);
     const int KT = K / C::BK;
-    const int tail = tiles % resident;
+    const int tail = unsplit ? 0 : tiles % resident;
     const int split = tail > 0 ? std::min(max_split<C, MX, SFW>(KT), resident / tail) : 1;
     launch<C, MX, SFW>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, tail, split, stream);
 }
@@ -308,11 +318,11 @@ void launch_tiles_sfw(const unsigned char* A, const unsigned char* Bt, __nv_bflo
 template <class C, bool MX>
 void launch_tiles(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout, int M,
                   int N, int K, const float* scale_a, const float* scale_b, MxScales mx,
-                  cudaStream_t stream) {
+                  cudaStream_t stream, bool unsplit = false) {
     if (MX && sfw_for(K) == 4)
-        launch_tiles_sfw<C, MX, 4>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
+        launch_tiles_sfw<C, MX, 4>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream, unsplit);
     else
-        launch_tiles_sfw<C, MX, 2>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
+        launch_tiles_sfw<C, MX, 2>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream, unsplit);
 }
 
 // Decode shapes (M <= 64): one CTA per BN-row strip of Bt, no split-K unless a narrow N
@@ -330,10 +340,11 @@ bool fits(int N) {
 template <class C, bool MX, int SFW>
 void launch_decode_sfw(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout, int M,
                        int N, int K, const float* scale_a, const float* scale_b, MxScales mx,
-                       cudaStream_t stream) {
+                       cudaStream_t stream, bool unsplit) {
     const int strips = N / C::BN;
     const int KT = K / C::BK;
-    const int split = std::min(max_split<C, MX, SFW>(KT), std::max(1, cdiv(kMinCtas, strips)));
+    const int split =
+        unsplit ? 1 : std::min(max_split<C, MX, SFW>(KT), std::max(1, cdiv(kMinCtas, strips)));
     launch<C, MX, SFW>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, split > 1 ? strips : 0, split,
                        stream);
 }
@@ -341,11 +352,11 @@ void launch_decode_sfw(const unsigned char* A, const unsigned char* Bt, __nv_bfl
 template <class C, bool MX>
 void launch_decode(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout, int M,
                    int N, int K, const float* scale_a, const float* scale_b, MxScales mx,
-                   cudaStream_t stream) {
+                   cudaStream_t stream, bool unsplit) {
     if (MX && sfw_for(K) == 4)
-        launch_decode_sfw<C, MX, 4>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
+        launch_decode_sfw<C, MX, 4>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream, unsplit);
     else
-        launch_decode_sfw<C, MX, 2>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
+        launch_decode_sfw<C, MX, 2>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream, unsplit);
 }
 
 // Large shapes: the 128x128 tile when its grid is at least one wave, else 64x128, else 64x64
@@ -362,7 +373,7 @@ using Small64 = Cfg<64, 64, 64, 3, 2, 4>;  // 24 KB, for K % 128 != 0
 // Alternatives for the 128x128 tile, for a re-sweep: SPARK_FP8GEMM_V1_CONFIG=<index> forces
 // one (the sweep is in docs/design/fp8gemm.md). Index 0 is the shipped `Big`.
 using BigFn = void (*)(const unsigned char*, const unsigned char*, __nv_bfloat16*, int, int, int,
-                       const float*, const float*, MxScales, cudaStream_t);
+                       const float*, const float*, MxScales, cudaStream_t, bool);
 template <bool MX>
 constexpr BigFn BIG_CONFIGS[] = {
     launch_tiles<Big, MX>,                          // 0: BK 64, 3 stages, 2x2 warps of 64x64, 48 KB
@@ -392,7 +403,7 @@ int forced_big_config() {
 template <int BK, bool MX>
 void launch_decode_auto(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout, int M,
                         int N, int K, const float* scale_a, const float* scale_b, MxScales mx,
-                        cudaStream_t stream) {
+                        cudaStream_t stream, bool unsplit) {
     using D16a = Cfg<16, 64, BK, 4, 1, 4>;  // BK 128: 40 KB, 2 per SM, 340 slots
     using D16b = Cfg<16, 32, BK, 4, 1, 2>;  // 24 KB, 4 per SM, 680 slots
     using D32a = Cfg<32, 32, BK, 4, 2, 2>;  // 32 KB, 3 per SM, 510 slots
@@ -401,42 +412,49 @@ void launch_decode_auto(const unsigned char* A, const unsigned char* Bt, __nv_bf
     using D64b = Cfg<64, 64, BK, 3, 2, 4>;  // 48 KB, 2 per SM, 340 slots
     if (M <= 16) {
         if (fits<D16a, MX>(N))
-            launch_decode<D16a, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
+            launch_decode<D16a, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream, unsplit);
         else
-            launch_decode<D16b, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
+            launch_decode<D16b, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream, unsplit);
     } else if (M <= 32) {
         if (fits<D32a, MX>(N))
-            launch_decode<D32a, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
+            launch_decode<D32a, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream, unsplit);
         else
-            launch_decode<D32b, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
+            launch_decode<D32b, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream, unsplit);
     } else {
         if (fits<D64a, MX>(N))
-            launch_decode<D64a, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
+            launch_decode<D64a, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream, unsplit);
         else
-            launch_decode<D64b, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
+            launch_decode<D64b, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream, unsplit);
     }
 }
 
 // MX mode requires K % 256 == 0 (fp8gemm_mx_supports), so the tiles that only serve
-// K % 128 != 0 (Small64, the BK = 64 decode set) are not instantiated for it.
+// K % 128 != 0 (Small64, the BK = 64 decode set) are not instantiated for it. `unsplit`
+// (variant 4) keeps the same tiles and runs every one of them whole: no K split at M <= 64, no
+// split-K tail above, so an output element is one mma chain from k = 0 to K at every M.
 template <bool MX>
 void launch_auto(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout, int M, int N,
                  int K, const float* scale_a, const float* scale_b, MxScales mx,
-                 cudaStream_t stream) {
+                 cudaStream_t stream, bool unsplit = false) {
     auto tiles = [&](int bm, int bn) { return cdiv(M, bm) * (N / bn); };
     if (M <= 64) {
         if (K % 128 == 0)
-            launch_decode_auto<128, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
+            launch_decode_auto<128, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream,
+                                        unsplit);
         else if constexpr (!MX)
-            launch_decode_auto<64, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
+            launch_decode_auto<64, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream, unsplit);
     } else if (N % 128 == 0 && tiles(128, 128) >= resident_blocks<Big, MX, 2>()) {
-        BIG_CONFIGS<MX>[forced_big_config()](A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
+        if (unsplit)
+            launch_tiles<Big, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream, true);
+        else
+            BIG_CONFIGS<MX>[forced_big_config()](A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream,
+                                                 false);
     } else if (N % 128 == 0 && tiles(64, 128) >= resident_blocks<Half, MX, 2>()) {
-        launch_tiles<Half, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
+        launch_tiles<Half, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream, unsplit);
     } else if (K % 128 == 0) {
-        launch_tiles<Small, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
+        launch_tiles<Small, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream, unsplit);
     } else if constexpr (!MX) {
-        launch_tiles<Small64, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream);
+        launch_tiles<Small64, MX>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream, unsplit);
     }
 }
 
@@ -489,6 +507,17 @@ void run(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat16* C, int 
                     v1::launch_auto<false>(a, b, C, M, N, K, scale_a, scale_b, mx, stream);
             }
             break;
+        case 4:
+            // Batch invariant: no route splits K. Per-tensor mode above M = 64 runs one TMA
+            // tile with every output tile whole (fp8gemm_tma_sk_invariant); the decode shapes,
+            // K % 128 != 0 and MX mode run variant 1's tiles unsplit.
+            if (MX || !fp8gemm_tma_sk_invariant(A, Bt, C, M, N, K, scale_a, scale_b, stream)) {
+                if (MX)
+                    v1::launch_auto<true>(a, b, C, M, N, K, scale_a, scale_b, mx, stream, true);
+                else
+                    v1::launch_auto<false>(a, b, C, M, N, K, scale_a, scale_b, mx, stream, true);
+            }
+            break;
         default:
             break;
     }
@@ -498,7 +527,11 @@ void run(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat16* C, int 
 }  // namespace
 
 int fp8gemm_num_variants() {
-    return 4;
+    return 5;
+}
+
+int fp8gemm_default_variant() {
+    return 3;  // 4 is batch invariant and opt-in, as hgemm variant 7 is
 }
 
 bool fp8gemm_supports(int M, int N, int K, int variant) {
