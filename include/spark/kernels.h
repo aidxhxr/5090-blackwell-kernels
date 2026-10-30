@@ -671,6 +671,20 @@ void attention_bwd_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __
 int attention_bwd_num_variants();
 bool attention_bwd_supports(int S_q, int S_kv, int D, int variant);
 
+// The backward of attention_window_bf16 (below): the same gradients under a window of
+// `window` keys (0: none; causal and aligned to the last key, query i at key position
+// i + S_kv - S_q, S_q <= S_kv) and with the sink logits `sinks` (fp32 [H_q], or null). `lse`
+// must be the forward's, which includes the sink. With sinks, `dsinks` (fp32 [H_q]) receives
+// their gradient, -sum over the head's rows of exp(sink_h - lse_i) * (dO_i . O_i). Every
+// variant takes both; with window = 0 and no sinks this is attention_bwd_bf16.
+void attention_bwd_window_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K,
+                               const __nv_bfloat16* V, const __nv_bfloat16* O,
+                               const __nv_bfloat16* dO, const float* lse, __nv_bfloat16* dQ,
+                               __nv_bfloat16* dK, __nv_bfloat16* dV, int B, int H_q, int H_kv,
+                               int S_q, int S_kv, int D, bool causal, int window,
+                               const float* sinks, float* dsinks, bool deterministic, int variant,
+                               cudaStream_t stream);
+
 // ---- Attention over a paged K/V cache (src/kernels/attention_paged.cu) ------------------
 // The cache is k_cache, v_cache = [num_pages, H_kv, page, D] bf16, page a power of two >= 16.
 // Sequence b owns pages block_table[b][0..], block_table [B, max_pages] int32 row-major, and
