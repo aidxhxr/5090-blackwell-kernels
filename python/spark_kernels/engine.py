@@ -56,12 +56,14 @@ another schedule rounds them differently. Greedy and sampled tokens alike can ch
 near tie (top logits one bf16 ulp apart), and the run goes on from there; the same schedule
 gives the same tokens every time. With `batch_invariant` (SparkModel, Engine, or
 SPARK_BATCH_INVARIANT=1) the model runs kernels whose bits for a row do not depend on the
-batch: hgemm variant 7 (no K split at any M) and variant 2 of paged_decode and
-attention_varlen (a sequence's keys in fixed 256-key chunks folded in order, the same
-arithmetic in both). A request's logits are then the same bits in any schedule: alone or in
-a full batch, in any slot or graph bucket, with its prompt chunked or its prefix cached,
-preempted and resumed, or verified by speculative decoding. bf16 weights and cache only;
-docs/design/batch_invariant.md has what it costs.
+batch: hgemm variant 7, fp8gemm variant 4 and w4gemm variant 3 (no K split by M) and
+variant 2 of paged_decode and attention_varlen (a sequence's keys in fixed 256-key chunks
+folded in order, the same arithmetic in both, on either cache format). A request's logits
+are then the same bits in any schedule: alone or in a full batch, in any slot or graph
+bucket, with its prompt chunked or its prefix cached, preempted and resumed, or verified by
+speculative decoding. bf16, int4, fp8-tok and mxfp8 weights; fp8 (one activation scale
+over the batch) and the fp4 formats are refused. docs/design/batch_invariant.md has what
+it costs.
 
 Weights: `ModelWeights.random()` draws every matrix on the GPU. w_gate_up is stored in the
 interleaved layout of `interleave_gate_up` (gate_j at column 2j, up_j at 2j + 1), the layout

@@ -995,8 +995,33 @@ speculative decoding. On 8 of the 32 layers:
 
 Decode costs under 2%: the decode GEMMs are the same kernels, and the invariant attention is
 0 to 8% slower on its own. Prefill pays for the waves Stream-K used to fill, 1 to 9% here and
-up to 1.6x on a 128-token GEMM. Quantized weights and the fp8 cache are not covered. Details
-in [docs/design/batch_invariant.md](docs/design/batch_invariant.md).
+up to 1.6x on a 128-token GEMM.
+
+The quantized engines are covered too: `fp8gemm` variant 4 and `w4gemm` variant 3 never
+split K by M (the int4 rung keeps four warps along K at every M and sums them in a fixed
+order), and variant 2 of both attention ops reads the e4m3 cache, each slab converted to
+bf16 in shared memory before the same arithmetic. `scripts/check_invariance.py` runs every
+op alone and in batches of 1, 8, 32 and 256 and reports which agree bit for bit; it is also
+what shows that `fp8` with one activation scale over the batch cannot be made invariant (a
+row's e4m3 bytes depend on the other rows), so that format and the fp4 ones are refused and
+`fp8-tok` and `mxfp8` take their place. The same 8 layers, decode ms/step and prefill tok/s,
+default / invariant:
+
+| engine | batch 1 | 8 | 32 | 64 |
+|---|---|---|---|---|
+| int4, decode | 1.426 / 1.490 | 1.586 / 1.578 | 2.073 / 2.400 | 3.129 / 3.861 |
+| int4, prefill | 49,789 / 38,138 | 51,733 / 36,062 | 50,344 / 29,822 | 49,745 / 30,207 |
+| fp8-tok + fp8 cache, decode | 2.052 / 2.133 | 2.154 / 2.177 | 2.278 / 2.352 | 2.587 / 2.655 |
+| fp8-tok + fp8 cache, prefill | 119,043 / 109,296 | 132,887 / 128,068 | 131,896 / 125,809 | 129,759 / 123,762 |
+| bf16 + fp8 cache, decode | 2.901 / 2.985 | 2.999 / 3.021 | 3.158 / 3.235 | 3.595 / 3.667 |
+| bf16 + fp8 cache, prefill | 60,489 / 56,490 | 65,638 / 63,240 | 65,605 / 64,663 | 65,107 / 64,079 |
+
+fp8-tok and the fp8 cache cost what bf16 did, 1 to 4% at decode and 4 to 8% at prefill.
+int4 pays more: its default splits K across blocks from 32 rows and runs Stream-K at
+prefill, and the fixed four-warp shapes are 1.2 to 1.7x on the decode GEMMs at 32 to 64
+rows and 1.3 to 1.5x at prefill, which is 16 to 28% of a decode step at 32 and 64 slots and
+23 to 41% of the prefill. Details in
+[docs/design/batch_invariant.md](docs/design/batch_invariant.md).
 
 ## real models
 

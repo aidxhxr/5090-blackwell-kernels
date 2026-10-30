@@ -13,18 +13,20 @@ This note covers `Engine(batch_invariant=True)` (or `SPARK_BATCH_INVARIANT=1`): 
 which a request's logits are the same bits whatever shares its steps, how many slots the
 decode graph has, how its prompt is chunked, whether it is preempted and resumed, which slot
 it lands in, whether its prefix came from the cache, and whether speculative decoding
-verified its tokens. It is three kernel rungs and a flag:
+verified its tokens. It is five kernel rungs and a flag:
 
-- `hgemm` variant 7: no route splits K;
+- `hgemm` variant 7, `fp8gemm` variant 4 and `w4gemm` variant 3: no route splits K by M;
 - `paged_decode` variant 2 and `attention_varlen` variant 2: one arithmetic per query row,
-  fixed by the row's own sequence, in both ops;
-- `SparkModel(batch_invariant=...)` / `Engine(batch_invariant=...)`, which picks them.
+  fixed by the row's own sequence, in both ops, on a bf16 or an e4m3 cache;
+- `SparkModel(batch_invariant=...)` / `Engine(batch_invariant=...)`, which picks them, for
+  bf16, int4, fp8-tok and mxfp8 weights (the second section below says why not fp8).
 
 The default mode is untouched: the new rungs are opt-in, `-1` never picks them, and the
 default engine runs the same kernels as before.
 
 Tests: `tests/test_batch_invariant.py`. Bench: `scripts/bench_invariant.py`, rows in
-`results/batch_invariant.jsonl`.
+`results/batch_invariant.jsonl`. `scripts/check_invariance.py` runs every op alone and in a
+batch and says which are invariant.
 
 ## What varied
 
@@ -229,15 +231,190 @@ tile instead of one and the fold every fourth tile. Both kernels skip the O resc
 row's max moved (a vote per step; a multiply by exactly 1 changes no bit); I did not time
 them without it.
 
+## Quantized weights and the fp8 cache
+
+The first version covered bf16 weights with a bf16 cache. `scripts/check_invariance.py`
+runs every op the engine uses on the same rows alone and in batches of 1, 8, 32 and 256
+(the paged ops on the same sequence alone and next to 7 or 31 others, pages shuffled) and
+compares the common rows with `torch.equal`. On the default kernels, with an outlier row in
+the batch (64x the others, as a residual stream has), three projections (o 4096 x 4096, a
+narrow 4096 x 1024, down 14336 x 4096):
+
+| op | default | result | why |
+|---|---|---|---|
+| fp8_quantize "tensor" | | differs from 256 rows on | one power-of-two scale over the batch: the outlier row moves its exponent for every row |
+| fp8_quantize "row", "mx" | | same | a scale per row, per 32 k of a row |
+| fp8gemm | 3 | differs at 256 rows on o and down | the Stream-K fixup; the decode tiles below M = 64 split K only when a narrow N leaves under 64 strips |
+| fp8gemm, MX mode | 3 | differs between 8 and 256 rows on the narrow N | the decode route's split by strips |
+| w4gemm, sym and asym | 2 | differs between 1 and 32 rows everywhere | the K split across warps and blocks is picked by M and N |
+| fp4_quantize nvfp4 | | differs | the per-tensor second-level scale |
+| fp4_quantize mxfp4 | | same | a scale per 32 values |
+| paged_decode, e4m3 cache | 1 | differs between 1 and 8 sequences | the flat split of the batch's slabs |
+| attention_varlen, e4m3 cache | 1 | same across batches | one tile per row; its arithmetic is not the decode kernel's |
+| rmsnorm, add_rmsnorm_, swiglu | | same | per row, per element |
+
+So three things were missing: a GEMM rung for e4m3 and for int4 weights, the e4m3 cache in
+the invariant attention, and the activation quantizer. The last one is a format question,
+not a kernel one: `fp8` scales the activation over the whole [M, K], a row's e4m3 bytes
+depend on the other rows before any GEMM runs, and no kernel can undo that. The engine
+refuses it in this mode and names `fp8-tok` (a scale per row); `mxfp8` (a scale per 32 k of
+a row) is fine as it is. The fp4 formats stay out: `fp4gemm` has no such rung, and nvfp4's
+activation scale is per tensor too.
+
+### fp8gemm variant 4
+
+Variant 3 with the K splits taken out, as hgemm 7 is to hgemm 6. The mma is
+`mma.sync.m16n8k32` on e4m3 with an fp32 accumulator, every tile walks K from 0 in order,
+and the scale is applied once in the same epilogue on every route, so again only the split
+matters. M <= 64 runs variant 1's decode tiles (16, 32 or 64 rows by 32 or 64 columns) with
+`split = 1` instead of `cdiv(64, strips)`: the tile the default picks, so the same time and
+bits on the Llama projections (the default never split there) and the same bits on a narrow
+N where it did. Above 64 one of variant 3's TMA tiles (128 x 128, 128 x 64 or 64 x 128, the
+one with the fewest waves times area, the 64-wide ones at 0.9 of the rate) on the Stream-K
+kernel with `whole_tiles` in its plan: one block per tile while they fit in a wave, whole
+tiles from the queue above, never a piece and never the fixup. MX mode (a Stream-K piece
+cannot start inside a scale chunk) and K % 128 != 0 run variant 1's tiles with no split-K
+tail. `fp8gemm_v4_route_name` says what a shape runs; -1 is still variant 3.
+
+### w4gemm variant 3
+
+Variant 2 splits K twice: across the warps of a block (WK of them, warp w on every WK-th
+128-k group, the partials summed in shared memory at the end) and across blocks (atomics
+into a workspace, the last block converting), with WK and the block split picked by M and
+N. The second split has to go; the first can stay if it is the same at every M. Variant 3
+runs the shapes with four warps along K at every M, with the block split at 1: the pipelined
+kernel with one token row staged at M = 1 (entry 5, what the default runs there), the
+register kernel with 8 tokens up to M = 8 and 16 tokens up to M = 32 (entries 0 and 1), and
+two new pipelined shapes with four warps along K and four along N above that, 64 x 16 up to
+M = 64 and 64 x 32 beyond (entries 14 and 13). In every one of them warp w accumulates the
+groups w, w + 4, w + 8, ... in order from zero and the block adds the four partials in warp
+order, ((p0 + p1) + p2) + p3, so an output element is the same chain of k16 steps and three
+adds whichever shape M picks. `SPARK_W4_CFG="entry,1"` on variant 2 reproduces any of them
+and gives the same bits.
+
+One warp per strip (entries 3 and 4, no K split at all, what the default runs on a wide N)
+was the first try: the same time as the default on gate_up and lm_head, 2 to 3x on the
+narrow projections at M <= 16 (o 7.8 to 19 us, down 21 to 65 us), and a ring of 8 or 16
+groups of weights per warp instead of 4 did not move it (17 and 64 us): 256 one-warp
+blocks leave most SMs with one warp to issue from, and the time is latency, not bytes in
+flight.
+
+### The e4m3 cache in variant 2
+
+Decode variant 1 on an e4m3 cache reads the slabs into fragments with D permuted; varlen
+variant 1 converts a tile to bf16 in shared memory. Variant 2 does the second in both ops:
+a 16-key slab (decode, per warp, from three 4 KB e4m3 stages into one 8 KB bf16 slab, 80 KB
+per block instead of 96) or a 64-key tile (varlen, once per block for its 8 warps, 80 KB as
+variant 1's) lands as e4m3 bytes and is converted to bf16 in the bf16 slab's layout,
+exactly, and `step16` runs on it unchanged. K's scale multiplies the softmax scale once per
+(b, kv head) by one `__fmul_rn`, V's scale the finished O / L once per element, in the
+decode kernel, the combine kernel and the varlen kernel alike. `tests/test_paged.py` runs
+variant 2 of both ops on the e4m3 cases against SDPA on the dequantized bytes.
+
+### The engine
+
+Each quantized projection (`quant.py`) has `set_batch_invariant`, which switches its GEMM
+to the invariant rung (w4gemm 3, fp8gemm 4) or raises: `FP8Linear` with the per-tensor
+scale names fp8-tok, `FP4Linear` says fp4gemm has no rung. `SparkModel` checks
+`weights_format` and `head_format` against `quant.INVARIANT_FORMATS` (bf16, int4,
+int4-asym, fp8-tok, mxfp8) up front and switches every projection with the attention rung;
+`Engine(kv_format="fp8", batch_invariant=True)` is accepted.
+
+`test_quantized_engine_logits_are_batch_invariant` runs the ten requests of the bf16 test
+alone, in 8 slots, in 32 slots and through the 4-slot chunked schedule on the 2-layer model
+with int4 + bf16 cache, int4-asym + fp8 cache, fp8-tok + fp8 cache, mxfp8 + bf16 cache and
+bf16 + fp8 cache: every request's logits are `torch.equal` to the alone run's, token by
+token. `test_default_quantized_engine_is_not_batch_invariant` shows the default int4 + fp8
+engine is not.
+
+### What it costs
+
+The same setup as above (the RTX 5090, the lock held, `scripts/bench_invariant.py --part
+quant` and `--part engine --weights-format ... --kv-format ...`). The engines, 8 layers,
+decode ms/step and prefill tok/s, default / invariant:
+
+| engine | batch 1 | 8 | 32 | 64 |
+|---|---|---|---|---|
+| int4 + bf16 cache, decode | 1.426 / 1.490 | 1.586 / 1.578 | 2.073 / 2.400 | 3.129 / 3.861 |
+| int4 + bf16 cache, prefill | 49,789 / 38,138 | 51,733 / 36,062 | 50,344 / 29,822 | 49,745 / 30,207 |
+| int4 + fp8 cache, decode | 1.426 / 1.523 | 1.539 / 1.582 | 1.912 / 2.280 | 2.771 / 3.545 |
+| int4 + fp8 cache, prefill | 49,452 / 37,980 | 51,745 / 35,977 | 50,279 / 29,783 | 49,746 / 30,174 |
+| fp8-tok + fp8 cache, decode | 2.052 / 2.133 | 2.154 / 2.177 | 2.278 / 2.352 | 2.587 / 2.655 |
+| fp8-tok + fp8 cache, prefill | 119,043 / 109,296 | 132,887 / 128,068 | 131,896 / 125,809 | 129,759 / 123,762 |
+| bf16 + fp8 cache, decode | 2.901 / 2.985 | 2.999 / 3.021 | 3.158 / 3.235 | 3.595 / 3.667 |
+| bf16 + fp8 cache, prefill | 60,489 / 56,490 | 65,638 / 63,240 | 65,605 / 64,663 | 65,107 / 64,079 |
+
+fp8-tok and the fp8 cache cost what the bf16 engine paid: 1 to 4% at decode, 4 to 8% at
+prefill. int4 is the expensive one: 0 to 5% at decode up to 8 slots, 16 to 28% at 32 and 64,
+and 23 to 41% at prefill. The kernels say where:
+
+**fp8gemm**, variant 3 against 4, us per call (ten launches between events, median of 50
+samples at M <= 64, 10 above; B rotated past L2 at M <= 64):
+
+| M | qkv 4096 x 6144 | o 4096 x 4096 | gate_up 4096 x 28672 | down 14336 x 4096 | lm_head 4096 x 128256 |
+|---|---|---|---|---|---|
+| 1 | 16.9 / 16.8 | 12.0 / 12.0 | 71.6 / 71.5 | 40.8 / 40.8 | 310.6 / 310.5 |
+| 64 | 18.0 / 18.0 | 12.3 / 12.3 | 76.1 / 76.1 | 41.7 / 41.7 | 322.4 / 322.4 |
+| 128 | 16.7 / 15.9 | 12.4 / 14.7 | 83.3 / 80.0 | 34.0 / 43.5 | 360.4 / 340.9 |
+| 512 | 41.3 / 56.7 | 29.5 / 29.9 | 202.4 / 204.9 | 85.9 / 93.3 | 864.1 / 895.4 |
+| 2048 | 136.1 / 145.9 | 98.2 / 131.6 | 714.1 / 761.1 | 317.5 / 437.3 | 3,155 / 3,364 |
+| 4096 | 275.1 / 310.2 | 193.7 / 211.8 | 1,383 / 1,482 | 681.2 / 793.1 | |
+
+The same bits and time at M = 1 to 64 (the default never split there); above, the last
+partial wave Stream-K filled, up to 1.38x on down at 2048 and 1.37x on qkv at 512, as for
+hgemm 7.
+
+**w4gemm**, variant 2 against 3:
+
+| M | qkv | o | gate_up | down | lm_head |
+|---|---|---|---|---|---|
+| 1 | 10.5 / 10.4 | 7.8 / 7.8 | 38.2 / 40.1 | 21.2 / 21.1 | 158.2 / 163.7 |
+| 8 | 10.7 / 10.6 | 8.1 / 8.2 | 38.1 / 38.6 | 23.6 / 23.7 | 158.3 / 159.3 |
+| 32 | 16.9 / 17.3 | 13.2 / 14.3 | 51.8 / 71.2 | 29.1 / 47.7 | 214.9 / 322.9 |
+| 64 | 26.1 / 37.6 | 20.8 / 25.5 | 89.6 / 139.8 | 48.6 / 80.9 | 377.3 / 615.6 |
+| 128 | 40.2 / 59.3 | 29.6 / 40.5 | 159.4 / 215.6 | 82.5 / 130.2 | 731.2 / 948.3 |
+| 512 | 136.4 / 193.7 | 94.5 / 135.9 | 621.6 / 830.1 | 305.8 / 450.0 | 2,880 / 3,716 |
+| 2048 | 532.9 / 713.8 | 354.6 / 483.1 | 2,456 / 3,310 | 1,207 / 1,608 | 11,661 / 14,784 |
+| 4096 | 1,040 / 1,416 | 711.0 / 945.6 | 5,001 / 6,610 | 2,523 / 3,527 | |
+
+The same bits and time at M = 1 and 8 (the default runs the same four-warp shapes unsplit
+there). From 32 up the default splits K across blocks or runs Stream-K; the fixed family
+costs 1.0 to 1.4x at 32, 1.2 to 1.7x at 64 and 1.27 to 1.47x from 128 up, the 64 x 32 tile
+keeping a quarter of its warps along N where Stream-K's 128 x 32 tile keeps all of them. A
+four-warp tile that is wider in N does not fit the 99 KB of shared memory a block may take
+with the staged activations of 32 rows; the shapes are in w4gemm.cu's `kEntries` for the
+next try.
+
+**Attention on the e4m3 cache**, variant 1 against 2, the pool rotated past L2:
+
+| decode batch | K+V MB | v1 us | v2 us | cost |
+|---|---|---|---|---|
+| 1 x 4096 | 8.4 | 13.4 | 21.1 | 1.58x |
+| 1 x 32768 | 67.1 | 50.8 | 57.0 | 12% |
+| 8 x 4096 | 67.1 | 51.5 | 51.1 | -1% |
+| 32 x 2048 | 134.2 | 96.1 | 104.6 | 9% |
+| 64 x 1024 | 134.2 | 95.1 | 105.0 | 10% |
+| 64 x 512 | 67.1 | 51.5 | 51.2 | -1% |
+| 1 x 32768 + 50 x 500 | 118.3 | 85.7 | 91.3 | 7% |
+
+| prefill | v1 us | TFLOPS | v2 us | TFLOPS | cost |
+|---|---|---|---|---|---|
+| 1 x 4096 | 682.9 | 201 | 770.0 | 178 | 13% |
+| 4 x 2048 | 733.7 | 187 | 819.4 | 168 | 12% |
+| 16 x U(64, 1024) | 355.3 | 135 | 392.9 | 122 | 11% |
+
+A little more than on the bf16 cache (4 to 8%): the conversion pass per slab, which variant
+1's register path does not have, and the one 4096-key sequence has 16 chunks of 256 keys
+for 680 warps where variant 1 cuts it into 16-key slabs.
+
 ## What is still not invariant
 
-- **Quantized weights.** I did not check the fp8, MXFP8, int4, NVFP4 or MXFP4 GEMMs. The
-  fp8 GEMM picks its tile and schedule by M the way hgemm does, so I assume none of them is
-  invariant, and the engine refuses `batch_invariant` with a quantized format rather than
-  half-doing it. Each would need its own whole-K route and a test like hgemm's.
-- **The fp8 K/V cache.** The e4m3 decode path permutes D in its fragments and the varlen path
-  converts tiles to bf16 in shared memory, so the two compute S in different orders. Variant 2
-  is bf16 only and the engine refuses `kv_format="fp8"` in this mode.
+- **fp8 with a per-tensor activation scale.** The scale is max|a| over the whole batch, so
+  the quantized bytes of a row move with the other rows; `fp8-tok` is the same format with a
+  scale per row and is covered. A calibrated static scale would be invariant too; there is
+  none.
+- **The fp4 formats.** `fp4gemm` picks its tile and K split from M and has no whole-K rung,
+  and nvfp4's activation scale is per tensor. Refused in this mode.
 - **`prefill_variant`.** The invariant GEMM runs the TMA tiles at prefill; the variant-4
   escape hatch for the TMA kernels' first-launch memory (llm_models.md) is not used.
 - **TorchModel** has no such mode (cuBLAS and SDPA pick their kernels by shape).
