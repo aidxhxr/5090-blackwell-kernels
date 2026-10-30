@@ -61,11 +61,14 @@ about once.
 with G resident blocks, the last partial wave plus one full wave (`tiles % G + G` tiles) are
 cut into G equal ranges of (tile, k-step) work, and every tile before them is whole and goes
 to block `tile % G`. A Stream-K tile's pieces are summed through hgemm_sk's chain fixup: one
-fp32 slot and one epoch-tagged flag per Stream-K tile, each piece waiting for the flag to
-say everything before its first k-step is in the slot, so the output is the same bits every
-run and nothing is memset per call (the flags are zeroed once at allocation and the epoch
-moves on). The ranges are walked from the top, the piece that starts a tile first, as in
-variant 6. When there are fewer tiles than blocks, the number of ranges is capped at one
+fp32 slot and one flag per Stream-K tile, each piece waiting for the flag to say everything
+before its first k-step is in the slot, so the output is the same bits every run and nothing
+is memset per call. hgemm tags the flag with an epoch the host bumps per launch; here the
+flag counts k-steps and the piece that finishes a tile, the last to read its flag, writes 0
+back, so every launch starts from zeroed flags with no parameter that changes from one call
+to the next, which is what a CUDA graph replay needs (the epoch was the one thing that kept
+the kernel out of a graph: a replay runs the captured epoch again). The ranges are walked
+from the top, the piece that starts a tile first, as in variant 6. When there are fewer tiles than blocks, the number of ranges is capped at one
 per 32 k-steps (hgemm_sk's `kMinShare`) but never below the tile count.
 
 The point for MoE: the work is counted in k-steps of 128-row tiles, so a 3-row expert costs
@@ -211,3 +214,15 @@ fp8, which keeps 128. The line above about a 64-row tile not being worth it held
 at 512 tokens, which runs at the copy rate; it did not hold at 32 to 512 rows per expert.
 `bench_grouped_gemm` (the C++ bench against cuBLAS grouped) was not rerun.
 
+## Later: the row table
+
+The MoE layer's permute, the copy of each token's row into expert order that the A map read
+through TMA, is now optional for bf16: `grouped_gemm_bf16(..., rows)` takes a row table (the
+routing's inverse permutation, `moe_route_rows`) and the producer warp loads the A tile with
+cp.async through it, 8 lanes per 128-byte row segment, into the same swizzled layout the TMA
+box lands in, each lane's copies arriving on the stage's barrier through
+`cp.async.mbarrier.arrive.noinc`; the weight box stays TMA. The gathered GEMM is 1.5 to 4%
+slower than the TMA one on the 64- and 128-row tiles and level on the 16-row tile, and what
+it saves is the permute, so the layer's rule for when to use it, the sweep behind it and the
+whole-layer numbers are in [moe_layer.md](moe_layer.md). The output is the same bits either
+way: the stage holds the same bytes and the mma order does not change.
