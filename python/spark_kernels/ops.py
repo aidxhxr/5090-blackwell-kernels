@@ -1034,6 +1034,38 @@ class LinearCrossEntropyFused(torch.autograd.Function):
         return dh, dw, None, None, None, None, None
 
 
+class LinearCrossEntropyTiled(LinearCrossEntropyFused):
+    """Variant 3: variant 2's forward, and a backward with no chunk at all. Per band of
+    `chunk` rows one kernel (`ce_backward`) recomputes each 128 x 128 tile of d loss /
+    d logits and adds its two products straight into an fp32 dh for the band and, per
+    vocabulary strip, into a recycled fp32 strip that is folded into bf16 dw when the strip
+    completes. dw rounds to bf16 once per band, as variant 1 does per chunk; the fp32 sums
+    run through L2 reductions whose order varies, so the gradients are not bit for bit
+    reproducible (docs/design/cross_entropy.md)."""
+
+    @staticmethod
+    def backward(ctx, grad):
+        h, w, targets, lse = ctx.saved_tensors
+        T, D = h.shape
+        V = w.shape[0]
+        scale = _ce_scale(targets, ctx.ignore_index, ctx.reduction) * grad.float().reshape(1)
+        dh = torch.empty_like(h)
+        dw = torch.empty_like(w)
+        rows = min(ctx.chunk, T)
+        f32 = dict(device=h.device, dtype=torch.float32)
+        dh_f32 = torch.zeros((rows + 127) // 128 * 128, D, **f32)
+        slots = torch.zeros(_C.ce_backward_slots() * 128, D, **f32)
+        flags = torch.zeros(2 * (V // 128) + 1, device=h.device, dtype=torch.int32)
+        for i, (t0, t1) in enumerate(_ce_chunks(T, ctx.chunk)):
+            if i:
+                dh_f32.zero_()
+                flags.zero_()
+            _C.ce_backward(h[t0:t1], w, targets[t0:t1], lse[t0:t1], scale, ctx.ignore_index,
+                           dh_f32, slots, flags, dw, i == 0)
+            dh[t0:t1].copy_(dh_f32[: t1 - t0])
+        return dh, dw, None, None, None, None, None
+
+
 def linear_cross_entropy(
     h: torch.Tensor,
     w: torch.Tensor,
@@ -1056,9 +1088,12 @@ def linear_cross_entropy(
       2  the forward with no logits (the GEMM's epilogue keeps a per-row max and sum per
          128-column tile), the backward recomputing a chunk of logits with softmax minus
          one-hot in the GEMM's epilogue; between the two passes it holds only a [T] lse
+      3  variant 2's forward and a backward with no chunk: one kernel recomputes each
+         128 x 128 tile of the gradient and multiplies it straight into dh and dw through
+         L2 reductions, `chunk` rows of fp32 dh at a time; holds no [rows, V] tensor at all
 
     -1 picks 1 when a gradient is needed (three GEMMs against variant 2's four) and 2 when
-    not. Variants 1 and 2 need V a multiple of 128 and D a multiple of 64; -1 falls back to
+    not. Variants 1 to 3 need V a multiple of 128 and D a multiple of 64; -1 falls back to
     0 otherwise. dw is accumulated in bf16 across chunks (one rounding per chunk).
     """
     if reduction not in ("mean", "sum"):
@@ -1070,15 +1105,16 @@ def linear_cross_entropy(
         variant = 0 if not fits else 1 if need_grad else 2
     if variant == 0:
         return _ce_reference(h, w, targets, ignore_index, reduction)
-    if variant not in (1, 2):
-        raise ValueError(f"linear_cross_entropy: variant must be -1, 0, 1 or 2, got {variant}")
+    if variant not in (1, 2, 3):
+        raise ValueError(f"linear_cross_entropy: variant must be -1, 0, 1, 2 or 3, got {variant}")
     if not fits:
         raise ValueError(f"linear_cross_entropy variant {variant} needs V % 128 == 0 and "
                          f"D % 64 == 0, got V = {V}, D = {D}")
     chunk = CE_CHUNK if chunk is None else int(chunk)
     if chunk < 1:
         raise ValueError(f"chunk must be positive, got {chunk}")
-    fn = LinearCrossEntropyChunked if variant == 1 else LinearCrossEntropyFused
+    fn = {1: LinearCrossEntropyChunked, 2: LinearCrossEntropyFused,
+          3: LinearCrossEntropyTiled}[variant]
     return fn.apply(h, w, targets, ignore_index, reduction, chunk, need_grad)
 
 
