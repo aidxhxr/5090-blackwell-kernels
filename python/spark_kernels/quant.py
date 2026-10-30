@@ -21,6 +21,13 @@ is transposed once here. Activations are quantized per call by `fp8_quantize` (p
 scales per tensor or per token, or MX scales; one or two launches) and `fp4_quantize`.
 fp8-tok cannot hand fp8gemm a per-row scale (its scales are per tensor), so it multiplies
 the bf16 output by the row scales afterwards: one more launch, and one more bf16 rounding.
+
+`set_batch_invariant(True)` switches a projection to the GEMM rung whose bits for a row do
+not depend on M (docs/design/batch_invariant.md): w4gemm variant 3 for int4, fp8gemm
+variant 4 for fp8-tok and mxfp8, whose activation scales are per row or per 32-k block. It
+raises for fp8 (one activation scale over the whole batch: a row's e4m3 bytes move with the
+other rows before any GEMM runs) and for the fp4 formats (fp4gemm has no such rung; nvfp4's
+activation scale is per tensor as well).
 """
 
 from __future__ import annotations
@@ -31,6 +38,8 @@ from . import ops as sk
 from . import reference as ref
 
 FORMATS = ("bf16", "int4", "int4-asym", "fp8", "fp8-tok", "mxfp8", "nvfp4", "mxfp4")
+# the formats with a batch-invariant GEMM rung and a per-row activation quantizer
+INVARIANT_FORMATS = ("bf16", "int4", "int4-asym", "fp8-tok", "mxfp8")
 E4M3_MAX = 448.0
 TINY = torch.finfo(torch.float32).tiny
 
@@ -40,11 +49,17 @@ def _nbytes(*ts: torch.Tensor | None) -> int:
 
 
 class BF16Linear:
+    invariant_variant = 7
+
     def __init__(self, w: torch.Tensor):
         self.w = w
+        self.variant = -1
+
+    def set_batch_invariant(self, on: bool) -> None:
+        self.variant = self.invariant_variant if on else -1
 
     def __call__(self, a: torch.Tensor) -> torch.Tensor:
-        return sk.hgemm(a, self.w)
+        return sk.hgemm(a, self.w, self.variant)
 
     def nbytes(self) -> int:
         return _nbytes(self.w)
@@ -57,11 +72,17 @@ class Int4Linear:
     """W4A16: int4 weights with a bf16 scale (and with asym a zero point) per 128 k of a
     column, round to nearest, multiplied by `w4gemm` against bf16 activations."""
 
+    invariant_variant = 3
+
     def __init__(self, w: torch.Tensor, asym: bool = False):
         self.w4 = sk.W4Weight.quantize(w, asym)
+        self.variant = -1
+
+    def set_batch_invariant(self, on: bool) -> None:
+        self.variant = self.invariant_variant if on else -1
 
     def __call__(self, a: torch.Tensor) -> torch.Tensor:
-        return sk.w4gemm(a, self.w4)
+        return sk.w4gemm(a, self.w4, variant=self.variant)
 
     def nbytes(self) -> int:
         return self.w4.nbytes()
@@ -83,17 +104,27 @@ class FP8Linear:
     scale per call (max|a| / 448 over the whole [M, K]). `per_token=True`: one per row,
     applied to the output rows after the GEMM."""
 
+    invariant_variant = 4
+
     def __init__(self, w: torch.Tensor, per_token: bool = False):
         self.wt, self.sw = _fp8_weight(w)
         self.per_token = per_token
         self.one = torch.ones(1, device=w.device, dtype=torch.float32)
+        self.variant = -1
+
+    def set_batch_invariant(self, on: bool) -> None:
+        if on and not self.per_token:
+            raise ValueError("batch_invariant: fp8 takes one activation scale over the whole "
+                             "batch, so a row's e4m3 bytes depend on the other rows; use "
+                             "fp8-tok (a scale per row)")
+        self.variant = self.invariant_variant if on else -1
 
     def __call__(self, a: torch.Tensor) -> torch.Tensor:
         if self.per_token:
             q, s = sk.fp8_quantize(a, "row")
-            return sk.fp8gemm(q, self.wt, self.one, self.sw).mul_(s)
+            return sk.fp8gemm(q, self.wt, self.one, self.sw, self.variant).mul_(s)
         q, s = sk.fp8_quantize(a, "tensor")
-        return sk.fp8gemm(q, self.wt, s, self.sw)
+        return sk.fp8gemm(q, self.wt, s, self.sw, self.variant)
 
     def nbytes(self) -> int:
         return _nbytes(self.wt, self.sw)
@@ -106,12 +137,18 @@ class MXFP8Linear:
     """W8A8 MXFP8: e4m3 with a power-of-two scale per 32 k on both operands, applied inside
     the block-scaled mma. K must be a multiple of 256."""
 
+    invariant_variant = 4
+
     def __init__(self, w: torch.Tensor):
         self.wt, self.sfb = ref.quantize_mx(w.t().contiguous())
+        self.variant = -1
+
+    def set_batch_invariant(self, on: bool) -> None:
+        self.variant = self.invariant_variant if on else -1
 
     def __call__(self, a: torch.Tensor) -> torch.Tensor:
         q, sfa = sk.fp8_quantize(a, "mx")
-        return sk.fp8gemm(q, self.wt, sfa=sfa, sfb=self.sfb)
+        return sk.fp8gemm(q, self.wt, sfa=sfa, sfb=self.sfb, variant=self.variant)
 
     def nbytes(self) -> int:
         return _nbytes(self.wt, self.sfb)
@@ -129,6 +166,12 @@ class FP4Linear:
         self.fmt = fmt
         self.wt, self.sfb, self.sw = sk.fp4_quantize(w.t().contiguous(), fmt)
         self.n = w.shape[1]
+
+    def set_batch_invariant(self, on: bool) -> None:
+        if on:
+            raise ValueError(f"batch_invariant does not cover {self.fmt}: fp4gemm picks its "
+                             "tile and K split from M, and nvfp4's activation scale is per "
+                             "tensor")
 
     def __call__(self, a: torch.Tensor) -> torch.Tensor:
         q, sfa, s = sk.fp4_quantize(a, self.fmt)

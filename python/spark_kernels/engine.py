@@ -284,10 +284,13 @@ class SparkModel:
 
     `batch_invariant` (default: the SPARK_BATCH_INVARIANT environment variable, off) runs
     the kernels whose bits for a row do not depend on the batch: hgemm variant 7 for every
-    GEMM (no K split at any M), paged_decode and attention_varlen variant 2 (a sequence's
-    keys in fixed chunks, folded in order, the same arithmetic in both). A token's logits
-    are then the same whatever else is in its forward. bf16 weights and a bf16 cache only;
-    `prefill_variant` is not used in this mode (docs/design/batch_invariant.md)."""
+    bf16 GEMM (no K split at any M), w4gemm variant 3 and fp8gemm variant 4 for the int4,
+    fp8-tok and mxfp8 projections (`quant.INVARIANT_FORMATS`), paged_decode and
+    attention_varlen variant 2 (a sequence's keys in fixed chunks, folded in order, the same
+    arithmetic in both, on a bf16 or an fp8 cache). A token's logits are then the same
+    whatever else is in its forward. fp8 (one activation scale over the batch) and the fp4
+    formats are refused; `prefill_variant` is not used in this mode
+    (docs/design/batch_invariant.md)."""
 
     context_prefill = True  # prefill rows may continue a cached context (attention_varlen)
 
@@ -296,9 +299,14 @@ class SparkModel:
                  batch_invariant: bool | None = None):
         if batch_invariant is None:
             batch_invariant = os.environ.get("SPARK_BATCH_INVARIANT", "0") not in ("", "0")
-        if batch_invariant and (weights_format != "bf16" or head_format != "bf16"):
-            raise ValueError("batch_invariant covers bf16 weights only (the quantized GEMMs "
-                             "pick their kernels from M)")
+        if batch_invariant:
+            from .quant import INVARIANT_FORMATS
+
+            for fmt in (weights_format, head_format):
+                if fmt not in INVARIANT_FORMATS:
+                    raise ValueError(f"batch_invariant does not cover {fmt!r}: it takes one of "
+                                     f"{INVARIANT_FORMATS} (fp8 scales the activations over "
+                                     "the whole batch, and fp4gemm has no invariant rung)")
         self.batch_invariant = bool(batch_invariant)
         self.w = weights
         self.rope = rope
@@ -330,6 +338,8 @@ class SparkModel:
                 if not keep_bf16:
                     lw.w_qkv = lw.w_o = lw.w_gate_up = lw.w_down = None
             torch.cuda.empty_cache()
+        if self.batch_invariant:
+            self._set_quant_invariant(True)
 
     def weight_bytes(self) -> int:
         """Bytes of every weight the model holds: the projections in their format, plus the
@@ -361,10 +371,20 @@ class SparkModel:
         return ModelWeights(embed=self.w.embed, layers=layers, final_norm=self.w.final_norm,
                             lm_head=head)
 
+    def _quant_linears(self):
+        if self.lin is not None:
+            for d in self.lin:
+                yield from d.values()
+        if self.head is not None:
+            yield self.head
+
+    def _set_quant_invariant(self, on: bool) -> None:
+        for m in self._quant_linears():
+            m.set_batch_invariant(on)  # raises for a format without an invariant rung
+
     def set_batch_invariant(self, on: bool) -> None:
         """Switches the batch-invariant kernels on or off (see the class docstring)."""
-        if on and (self.lin is not None or self.head is not None):
-            raise ValueError("batch_invariant covers bf16 weights only")
+        self._set_quant_invariant(bool(on))
         self.batch_invariant = bool(on)
 
     def _gemm_variant(self, decode: bool) -> int:
@@ -374,8 +394,6 @@ class SparkModel:
 
     def _attention(self, qkv, x, b: Batch, cache: PagedKVCache, layer: int, decode: bool):
         kc, vc, sc = cache.k[layer], cache.v[layer], cache.scales(layer)
-        if self.batch_invariant and sc:
-            raise ValueError("batch_invariant covers a bf16 cache only")
         av = 2 if self.batch_invariant else -1  # the paged ops' batch-invariant rung
         q = sk.rope_append_paged_(qkv, self.rope.cos, self.rope.sin, b.positions, b.slots,
                                   kc, vc, N_HEADS, N_KV_HEADS, **sc)
@@ -447,13 +465,24 @@ class SparkModel:
         size for every M a graphed decode step (and any prefill of <= 64 tokens) runs."""
         w = self.w.layers[0]
         v = self._gemm_variant(True)
+        dev = self.w.embed.device
         for m in range(max_m, 0, -1):
-            x = torch.zeros(m, HIDDEN, device=w.w_qkv.device, dtype=torch.bfloat16)
-            sk.hgemm(x, w.w_qkv, v)
-            sk.hgemm(x.new_zeros(m, Q_WIDTH), w.w_o, v, residual=x, out=x.clone())
-            sk.hgemm_swiglu(x, w.w_gate_up, v)
-            sk.hgemm(x.new_zeros(m, INTERMEDIATE), w.w_down, v, residual=x, out=x.clone())
-            sk.hgemm(x, self.w.lm_head, v)
+            x = torch.zeros(m, HIDDEN, device=dev, dtype=torch.bfloat16)
+            if self.lin is not None:  # the quantized projections keep their own workspaces
+                lin = self.lin[0]
+                lin["qkv"](x)
+                lin["o"](x.new_zeros(m, Q_WIDTH))
+                lin["gate_up"](x)
+                lin["down"](x.new_zeros(m, INTERMEDIATE))
+            else:
+                sk.hgemm(x, w.w_qkv, v)
+                sk.hgemm(x.new_zeros(m, Q_WIDTH), w.w_o, v, residual=x, out=x.clone())
+                sk.hgemm_swiglu(x, w.w_gate_up, v)
+                sk.hgemm(x.new_zeros(m, INTERMEDIATE), w.w_down, v, residual=x, out=x.clone())
+            if self.head is not None:
+                self.head(x)
+            else:
+                sk.hgemm(x, self.w.lm_head, v)
 
     def prefill(self, b: Batch, cache: PagedKVCache, all_logits: bool = False) -> torch.Tensor:
         """Logits [B, V] of each prompt's last token, or [T, V] of every packed token with
@@ -696,7 +725,8 @@ class Engine:
     SPARK_BATCH_INVARIANT). In that mode a request's logits, token by token, are the same
     bits whatever else shares its steps: with any batch, slot or bucket, a chunked prompt, a
     prefix taken from the cache, after a preemption, and in a verify forward of speculative
-    decoding. It needs SparkModel with bf16 weights and a bf16 cache. `log_logits` keeps
+    decoding. It needs SparkModel (bf16, int4, fp8-tok or mxfp8 weights, either cache
+    format). `log_logits` keeps
     every generated token's logits row, per sequence id in `logit_log` (a test hook: a long
     run keeps them all)."""
 
@@ -717,8 +747,6 @@ class Engine:
                     raise ValueError("batch_invariant needs a SparkModel")
             else:
                 model.set_batch_invariant(batch_invariant)
-        if getattr(model, "batch_invariant", False) and kv_format != "bf16":
-            raise ValueError("batch_invariant covers a bf16 cache only")
         # a decode step runs a whole bucket, so the per-slot buffers are bucket sized
         max_batch = next(x for x in BUCKETS if x >= max_batch)
         if num_pages is None:
