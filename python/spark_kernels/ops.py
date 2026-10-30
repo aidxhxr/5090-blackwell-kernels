@@ -774,7 +774,8 @@ def attention_fp8(
 
 
 def attention_fwd(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool = False, variant: int = -1
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool = False, variant: int = -1,
+    window: int = 0, sinks: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The attention forward for training: returns (out, lse).
 
@@ -782,9 +783,11 @@ def attention_fwd(
     log-sum-exp of each row of scaled scores, log(sum_j exp(q_i . k_j / sqrt(D))) over the keys
     row i sees: torch's `logsumexp` convention, and what `attention_bwd` recomputes the softmax
     from. Same inputs and variants as `attention`; a decode shape runs the forward's 64-row
-    tile instead of the flash-decoding kernel, which has no lse output.
+    tile instead of the flash-decoding kernel, which has no lse output. `window` and `sinks`
+    are `attention`'s: with sinks the lse includes the sink logit, log(exp(sinks[h]) + sum_j
+    exp(s_ij)), which is what the backward needs.
     """
-    return _C.attention_fwd(q, k, v, causal, variant)
+    return _C.attention_fwd(q, k, v, causal, variant, window, sinks)
 
 
 def attention_bwd(
@@ -797,7 +800,9 @@ def attention_bwd(
     causal: bool = False,
     variant: int = -1,
     deterministic: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    window: int = 0,
+    sinks: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, ...]:
     """Gradients (dq, dk, dv) of out = attention(q, k, v, causal) for the upstream d_out.
 
     q, k, v, out, d_out are the forward's bfloat16 tensors, lse its float32 log-sum-exp (from
@@ -809,8 +814,17 @@ def attention_bwd(
     to 3 add dq with fp32 atomics, so the last bits of dq can differ between runs;
     `deterministic=True` computes dq in a separate pass instead (about 40% more tensor work),
     and then two runs agree bit for bit.
+
+    `window` and `sinks` are `attention`'s, and must be what the forward ran with (its lse
+    includes the sink). The key-tile kernels walk only the query tiles a key tile's window
+    reaches, so the backward's time follows the window as the forward's does. With `sinks` the
+    result has a fourth tensor, dsinks (float32 [H_q]), the gradient of the sink logits:
+    -sum over the head's rows of p_sink * (d_out . out), the sink's softmax probability times
+    its dS with no value.
     """
-    return _C.attention_bwd(q, k, v, out, d_out, lse, causal, variant, deterministic)
+    dq, dk, dv, dsinks = _C.attention_bwd(q, k, v, out, d_out, lse, causal, variant,
+                                          deterministic, window, sinks)
+    return (dq, dk, dv) if sinks is None else (dq, dk, dv, dsinks)
 
 
 class AttentionFunction(torch.autograd.Function):
@@ -821,18 +835,20 @@ class AttentionFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, q, k, v, causal, variant, bwd_variant, deterministic):
-        out, lse = attention_fwd(q, k, v, causal, variant)
-        ctx.save_for_backward(q, k, v, out, lse)
+    def forward(ctx, q, k, v, sinks, causal, variant, bwd_variant, deterministic, window):
+        out, lse = attention_fwd(q, k, v, causal, variant, window, sinks)
+        ctx.save_for_backward(q, k, v, out, lse, sinks)
         ctx.causal, ctx.bwd_variant, ctx.deterministic = causal, bwd_variant, deterministic
+        ctx.window = window
         return out
 
     @staticmethod
     def backward(ctx, d_out):
-        q, k, v, out, lse = ctx.saved_tensors
-        dq, dk, dv = attention_bwd(q, k, v, out, d_out.contiguous(), lse, ctx.causal,
-                                   ctx.bwd_variant, ctx.deterministic)
-        return dq, dk, dv, None, None, None, None
+        q, k, v, out, lse, sinks = ctx.saved_tensors
+        grads = attention_bwd(q, k, v, out, d_out.contiguous(), lse, ctx.causal,
+                              ctx.bwd_variant, ctx.deterministic, ctx.window, sinks)
+        dsinks = grads[3] if sinks is not None else None
+        return grads[0], grads[1], grads[2], dsinks, None, None, None, None, None
 
 
 def attention_with_grad(
@@ -843,13 +859,18 @@ def attention_with_grad(
     variant: int = -1,
     bwd_variant: int = -1,
     deterministic: bool = False,
+    window: int = 0,
+    sinks: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Differentiable `attention`: same forward, and `.backward()` runs `attention_bwd`.
 
     The drop-in for `F.scaled_dot_product_attention(q, k, v, is_causal=causal,
     enable_gqa=True)` in training code, for bfloat16 [B, H, S, D] tensors with D 64 or 128.
+    `window` and `sinks` as in `attention`; a `sinks` tensor with requires_grad gets its
+    gradient.
     """
-    return AttentionFunction.apply(q, k, v, causal, variant, bwd_variant, deterministic)
+    return AttentionFunction.apply(q, k, v, sinks, causal, variant, bwd_variant, deterministic,
+                                   window)
 
 
 # ---------------------------------------------------------------------------

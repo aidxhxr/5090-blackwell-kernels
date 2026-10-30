@@ -1223,23 +1223,45 @@ Tensor attention(const Tensor& q, const Tensor& k, const Tensor& v, bool causal,
     return out;
 }
 
+int window_arg(int64_t window);
+const float* sinks_ptr(const std::optional<Tensor>& sinks, const Tensor& q, int64_t H_q);
+
 // The forward for training: (O, lse) with lse fp32 [B, H_q, S_q], what attention_bwd takes.
+// With a window or sinks (attention_window's options) the lse includes the sink.
 std::tuple<Tensor, Tensor> attention_fwd(const Tensor& q, const Tensor& k, const Tensor& v,
-                                         bool causal, int variant) {
+                                         bool causal, int variant, int64_t window,
+                                         const std::optional<Tensor>& sinks) {
     check_attention_inputs(q, k, v, /*cache_kv=*/true);
     Tensor out = at::empty_like(q);
     Tensor lse = at::empty({q.size(0), q.size(1), q.size(2)}, q.options().dtype(at::kFloat));
-    run_attention(q, k, v, out, causal, variant, lse.data_ptr<float>());
+    const int w = window_arg(window);
+    if (w == 0 && !sinks.has_value()) {
+        run_attention(q, k, v, out, causal, variant, lse.data_ptr<float>());
+        return {out, lse};
+    }
+    TORCH_CHECK(w == 0 || q.size(2) <= k.size(2),
+                "a window needs S_q <= S_kv (the queries are the last S_q positions), got S_q = ",
+                q.size(2), ", S_kv = ", k.size(2));
+    const float* sp = sinks_ptr(sinks, q, q.size(1));
+    const c10::cuda::CUDAGuard guard(q.device());
+    spark::attention_window_bf16(bf16_ptr(q), bf16_ptr(k), bf16_ptr(v), bf16_ptr_mut(out),
+                                 static_cast<int>(q.size(0)), static_cast<int>(q.size(1)),
+                                 static_cast<int>(k.size(1)), static_cast<int>(q.size(2)),
+                                 static_cast<int>(k.size(2)), static_cast<int>(q.size(3)), causal,
+                                 w, sp, attention_variant(q, k, variant), current_stream(q),
+                                 lse.data_ptr<float>(), static_cast<int>(kv_capacity(k, v)));
     return {out, lse};
 }
 
-// (dq, dk, dv) of O = attention(q, k, v) for the upstream gradient d_out, from the forward's
-// output `out` and log-sum-exp `lse`. dk and dv have k's shape: under GQA they are summed over
-// the query heads of each group.
-std::tuple<Tensor, Tensor, Tensor> attention_bwd(const Tensor& q, const Tensor& k, const Tensor& v,
-                                                 const Tensor& out, const Tensor& d_out,
-                                                 const Tensor& lse, bool causal, int variant,
-                                                 bool deterministic) {
+// (dq, dk, dv, dsinks) of O = attention(q, k, v) for the upstream gradient d_out, from the
+// forward's output `out` and log-sum-exp `lse`. dk and dv have k's shape: under GQA they are
+// summed over the query heads of each group. With `window` or `sinks` (attention_window's
+// options, and the lse must come from the forward with the same ones) dsinks is float32
+// [H_q], the gradient of the sink logits; without sinks it is None.
+std::tuple<Tensor, Tensor, Tensor, std::optional<Tensor>> attention_bwd(
+    const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& out, const Tensor& d_out,
+    const Tensor& lse, bool causal, int variant, bool deterministic, int64_t window,
+    const std::optional<Tensor>& sinks) {
     check_attention_inputs(q, k, v);
     check_cuda_contig(out, "out");
     check_cuda_contig(d_out, "d_out");
@@ -1253,15 +1275,26 @@ std::tuple<Tensor, Tensor, Tensor> attention_bwd(const Tensor& q, const Tensor& 
                 "lse must be float32 [B, H_q, S_q]");
     TORCH_CHECK(aligned16(out) && aligned16(d_out), "attention_bwd needs 16-byte aligned storage");
     const int var = resolve_variant(variant, spark::attention_bwd_num_variants());
+    const int w = window_arg(window);
+    TORCH_CHECK(w == 0 || q.size(2) <= k.size(2),
+                "a window needs S_q <= S_kv (the queries are the last S_q positions), got S_q = ",
+                q.size(2), ", S_kv = ", k.size(2));
+    const float* sp = sinks_ptr(sinks, q, q.size(1));
     const c10::cuda::CUDAGuard guard(q.device());
     Tensor dq = at::empty_like(q), dk = at::empty_like(k), dv = at::empty_like(v);
-    spark::attention_bwd_bf16(
+    std::optional<Tensor> dsinks;
+    float* dsp = nullptr;
+    if (sp != nullptr) {
+        dsinks = at::empty({q.size(1)}, q.options().dtype(at::kFloat));
+        dsp = dsinks->data_ptr<float>();
+    }
+    spark::attention_bwd_window_bf16(
         bf16_ptr(q), bf16_ptr(k), bf16_ptr(v), bf16_ptr(out), bf16_ptr(d_out),
         lse.data_ptr<float>(), bf16_ptr_mut(dq), bf16_ptr_mut(dk), bf16_ptr_mut(dv),
         static_cast<int>(q.size(0)), static_cast<int>(q.size(1)), static_cast<int>(k.size(1)),
         static_cast<int>(q.size(2)), static_cast<int>(k.size(2)), static_cast<int>(q.size(3)),
-        causal, deterministic, var, current_stream(q));
-    return {dq, dk, dv};
+        causal, w, sp, dsp, deterministic, var, current_stream(q));
+    return {dq, dk, dv, dsinks};
 }
 
 // The fp8 forward: q = [B, H_q, S_q, D], k, v = [B, H_kv, S_kv, D] float8_e4m3fn, with fp32
@@ -1936,15 +1969,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("v_scale"), py::arg("causal") = false, py::arg("variant") = -1);
     m.def("attention_fwd", &attention_fwd,
           "attention forward for training: (out, lse), lse the fp32 [B, H_q, S_q] log-sum-exp of "
-          "each row of scaled scores",
+          "each row of scaled scores (the sink included); window and sinks as attention_window",
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("causal") = false,
-          py::arg("variant") = -1);
+          py::arg("variant") = -1, py::arg("window") = 0, py::arg("sinks") = py::none());
     m.def("attention_bwd", &attention_bwd,
-          "attention backward: (dq, dk, dv) from q, k, v, the forward's out and lse and d_out; "
-          "dk and dv are summed over each K/V head's query heads",
+          "attention backward: (dq, dk, dv, dsinks) from q, k, v, the forward's out and lse and "
+          "d_out; dk and dv are summed over each K/V head's query heads; window and sinks as "
+          "attention_window, dsinks float32 [H_q] with sinks and None without",
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("out"), py::arg("d_out"),
           py::arg("lse"), py::arg("causal") = false, py::arg("variant") = -1,
-          py::arg("deterministic") = false);
+          py::arg("deterministic") = false, py::arg("window") = 0, py::arg("sinks") = py::none());
     m.def("rope_append_", &rope_append_,
           "RoPE on the q and k columns of a fused qkv projection, k and v appended to the caches "
           "in place; returns q as [B, H_q, S, D]",

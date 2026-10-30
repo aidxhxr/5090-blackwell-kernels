@@ -37,10 +37,13 @@ Ops (all run on the current CUDA stream, all accept float32 or bfloat16 unless n
     attention_fp8(q, k, v, q_scale, k_scale, v_scale, causal=False, variant=-1)
                                              the same over e4m3 q, k, v with descale factors,
                                              bf16 out; quantize_fp8(x, per_head=False) makes them
-    attention_fwd(q, k, v, causal=False)     (out, lse): the forward plus its log-sum-exp
-    attention_bwd(q, k, v, out, d_out, lse, causal=False, deterministic=False)
-                                             (dq, dk, dv), the backward pass
-    attention_with_grad(q, k, v, causal=False)  attention as a torch.autograd.Function
+    attention_fwd(q, k, v, causal=False, window=0, sinks=None)
+                                             (out, lse): the forward plus its log-sum-exp
+    attention_bwd(q, k, v, out, d_out, lse, causal=False, deterministic=False, window=0,
+                  sinks=None)                (dq, dk, dv), the backward pass; with sinks also
+                                             dsinks, the sink logits' gradient
+    attention_with_grad(q, k, v, causal=False, window=0, sinks=None)
+                                             attention as a torch.autograd.Function
     linear_cross_entropy(h, w, targets, ignore_index=-100, reduction="mean", variant=-1)
                                              F.cross_entropy(h @ w.T, targets) for an lm_head
                                              without the [T, V] logits, differentiable
