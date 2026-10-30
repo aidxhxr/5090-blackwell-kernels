@@ -244,6 +244,23 @@ def test_moe_layer(sk, cfg, T):
                        logits.gather(1, want_ids).sort(-1).values)
 
 
+@pytest.mark.parametrize("cfg", [SMALL_QWEN, ml.QWEN3_30B_A3B], ids=lambda c: c.name)
+@pytest.mark.parametrize("T", [1, 16, 64, 300])
+def test_moe_graph_replays_the_eager_bits(sk, cfg, T):
+    """The forward captured in a CUDA graph at T tokens and replayed on inputs that route
+    differently gives the eager forward's bits, also after a larger eager call in between
+    (nothing the graph holds is reallocated)."""
+    wts = ml.MoEWeights.random(cfg, seed=7)
+    g = torch.Generator(device="cuda").manual_seed(T)
+    layer = ml.MoELayer(wts)
+    graph = ml.MoEGraph(layer, T)
+    for i in range(6):
+        x = torch.randn(T, cfg.hidden, device="cuda", generator=g).to(torch.bfloat16)
+        if i == 3:
+            layer(torch.randn(4096, cfg.hidden, device="cuda", generator=g).to(torch.bfloat16))
+        assert torch.equal(graph(x).clone(), layer(x)), i
+
+
 def test_torch_grouped_moe(sk):
     cfg = SMALL_QWEN
     wts = ml.MoEWeights.random(cfg, seed=2)

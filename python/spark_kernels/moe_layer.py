@@ -16,6 +16,10 @@ two configurations the bench runs (docs/design/moe_layer.md).
     moe_combine(y, pos, weights)           each token's k rows times their weights, fp32, in
                                            slot order
 
+Every launch runs a fixed grid whose schedule is built on the device from the offsets, so
+the whole forward can be captured in a CUDA graph: `MoEGraph` captures it for one token
+count and replays it (docs/design/moe_layer.md).
+
 Two torch layers sit next to it, for the tests and the bench, both on the same `MoEWeights`:
 
     torch_moe          transformers' eager MoE block (the Mixtral / Qwen3-MoE experts loop):
@@ -175,7 +179,8 @@ class MoELayer:
         return sk.moe_route(logits, self.cfg.top_k, self.cfg.renormalize)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """[T, D] bf16 -> [T, D] bf16, the layer's output (not added to the residual)."""
+        """[T, D] bf16 -> [T, D] bf16, the layer's output (not added to the residual). No
+        host sync, no shape that depends on the routing: capturable in a CUDA graph."""
         from spark_kernels import ops as sk
 
         cfg = self.cfg
@@ -190,3 +195,30 @@ class MoELayer:
         return sk.moe_combine(y, pos, w)
 
     __call__ = forward
+
+
+class MoEGraph:
+    """`layer.forward` captured in a CUDA graph for T tokens: `__call__(x)` copies x into the
+    static input, replays, and returns the static output (overwritten by the next call).
+    The layer is run twice on a side stream first, so every per-process workspace (the
+    routing's, the grouped GEMM's Stream-K slots) exists before the capture, the way the
+    engine warms its buckets (engine.py, _capture_all)."""
+
+    def __init__(self, layer: MoELayer, T: int, pool=None):
+        x = torch.zeros(T, layer.cfg.hidden, device=layer.router.device, dtype=torch.bfloat16)
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(2):
+                layer(x)
+        torch.cuda.current_stream().wait_stream(side)
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph, pool=pool):
+            self.out = layer(x)
+        self.x = x
+        self.T = T
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        self.x.copy_(x)
+        self.graph.replay()
+        return self.out
