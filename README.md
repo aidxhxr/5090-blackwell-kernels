@@ -21,7 +21,8 @@ cache, the kernels run the whole 32-layer Llama-3-8B for a batch of mixed-length
 and a decode step at 64 sequences is 3.5 times `torch.compile`'s. On real Llama-3-8B
 weights that engine is closer to an fp32 reference than transformers is, and it matches or
 beats vLLM on every static batch, decode and prefill row I measured. Over 120 real
-projection shapes the bf16 GEMM averages 112% of cuBLAS and the fp8 GEMM 129% of cuBLASLt. A
+projection shapes the bf16 GEMM averages 112% of cuBLAS and the fp8 GEMM 129% of cuBLASLt,
+112% of its MXFP8 kernel with block scales. A
 whole MoE layer on these kernels is ahead of vLLM's `fused_moe` on 11 of the 12 rows I ran, and
 a batch-invariant mode gives a request the same logits bit for bit whatever else is in its
 batch, for under 2% on a decode step. And four things about
@@ -367,9 +368,34 @@ old route back.
 129.1%, and from 104.0% to 123.9% at 128 tokens. 15 shapes are still below cuBLASLt: the
 lm_head at 256 tokens (85.9%), the other lm_head rows and the widest gate/up weights from 512
 tokens up at 95 to 98%, and a few at 98 to 99.6%. Two got slower, 2048 x 5120 x 25600 from
-132.9% to 115.0% and one by 3%. 4096³ runs 769 TFLOPS on variant 3. MX mode keeps the old
-route for now; on 24 of these shapes it runs 60 to 147% of cuBLASLt's MXFP8 kernel. Details in
-[fp8gemm.md, "Model shapes"](docs/design/fp8gemm.md), rows in `results/fp8gemm_models.json`.
+132.9% to 115.0% and one by 3%. 4096³ runs 769 TFLOPS on variant 3.
+
+The same shapes in MX mode, against cuBLASLt's MXFP8 kernel. Variant 3 takes the block
+scales now: its Stream-K plan counts scale-chunk groups instead of k-steps, so every piece of
+a tile starts on a group boundary and the consumer warps fetch the chunks a group ahead as
+variant 2 does. The 128x256 tile sits this one out, its 128 accumulators per lane leave no
+registers for the chunks and it spills, so 128x128 runs where per-tensor mode runs 128x256.
+
+| M x N x K | what it is | cuBLASLt MXFP8 | before | after |
+|---|---|---|---|---|
+| 128 x 4096 x 4096 | Llama 3 8B q_proj, 128 tokens | 25.8 us | 109.6% | 147.3% |
+| 256 x 4096 x 4096 | same, 256 tokens | 33.7 us | 121.1% | 155.6% |
+| 512 x 1024 x 4096 | k/v proj | 21.7 us | 92.2% | 145.8% |
+| 512 x 4096 x 14336 | down, 512 tokens | 105.4 us | 57.2% | 105.2% |
+| 4096 x 128256 x 4096 | Llama 3 8B lm_head | 7.42 ms | 65.7% | 99.5% |
+| 2048 x 28672 x 8192 | Llama 3 70B gate/up | 1.59 ms | 65.9% | 97.4% |
+| 512 x 768 x 2048 | Qwen 3 30B-A3B expert | 25.1 us | 132.9% | 196.7% |
+| 128 x 5120 x 2304 | DeepSeek expert down | 28.9 us | 120.4% | 181.2% |
+| 4096 x 4096 x 4096 | | 205.8 us | 92.7% | 95.3% |
+
+% of cuBLASLt MXFP8, one session; "before" is the old route, variant 2 where it takes the
+shape and variant 1 elsewhere. Over all 120 shapes the geometric mean goes from 91.6% to
+111.8%, and from 111.8% to 133.0% at 128 tokens, where nothing is below cuBLASLt any more.
+47 shapes still are, all at 256 tokens and up and 31 of them at 95% or better: the MX
+kernel's own 8 to 10% over the per-tensor one, on shapes where the per-tensor variant 3 is
+at 95 to 113%. Five got slower, 512 x 2048 x 768 from 154.6% to 129.5% and four deep-K
+shapes by 3 to 7%. Details in [fp8gemm.md, "Model shapes"](docs/design/fp8gemm.md), rows in
+`results/fp8gemm_models.json`.
 
 ## the fp4 GEMM
 
