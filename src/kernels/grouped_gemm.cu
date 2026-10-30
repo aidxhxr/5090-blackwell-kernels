@@ -43,6 +43,15 @@
 // which at small T bounds the GEMM before the weight stream does), and a SwiGLU epilogue for a
 // weight whose rows alternate gate and up, which writes silu(gate) * up, N / 2 columns.
 //
+// A third addition, the gather (GATHER, bf16 only): A is any [*, K] matrix and a row table
+// rows[T] int32 says which of its rows is row r of expert order (-1: zeros), so an MoE layer
+// hands the GEMM its tokens and the routing's inverse permutation instead of a permuted
+// copy. TMA boxes cannot gather, so the producer warp loads the A tile with cp.async: the
+// 32 lanes take 8 consecutive 16-byte chunks of a row each pass (one 128-byte request per
+// row), into the same swizzled layout the TMA box lands in, and each lane's loads arrive on
+// the stage's barrier through cp.async.mbarrier.arrive.noinc (the barrier expects 33
+// arrivals: the 32 lanes and lane 0's expect_tx for the weight box, which stays TMA).
+//
 // Host rules: N % 128 == 0, K % 64 == 0 (bf16) or K % 128 == 0 (fp8), 1 <= E <= 512,
 // 16-byte aligned A and W.
 
@@ -103,14 +112,25 @@ static_assert(smem_bytes<16, 128, 4>() <= 101376, "four 18 KB stages and the pre
 struct Params {
     const int32_t* offsets;
     int E, N;
-    int tiles_n;                // N / BN
-    int KT;                     // k-steps per tile
-    int grid;                   // resident blocks in the launch
-    float* slots;               // 2 * grid Stream-K tiles of BM x BN fp32
-    unsigned long long* flags;  // per Stream-K tile: k-steps accumulated, 0 between launches
-    const float* scale_a;       // fp8: [1] or null (1)
-    const float* scale_b;       // fp8: [E] or null (1)
+    int tiles_n;                    // N / BN
+    int KT;                         // k-steps per tile
+    int grid;                       // resident blocks in the launch
+    float* slots;                   // 2 * grid Stream-K tiles of BM x BN fp32
+    unsigned long long* flags;      // per Stream-K tile: k-steps accumulated, 0 between launches
+    const float* scale_a;           // fp8: [1] or null (1)
+    const float* scale_b;           // fp8: [E] or null (1)
+    const unsigned char* a_gather;  // GATHER: A's bytes, rows of a_ld bytes
+    const int32_t* rows;            // GATHER: [rows_n] the A row of each row of expert order
+    int rows_n;
+    size_t a_ld;
 };
+
+// The arrive-on of all the executing thread's earlier cp.async copies, counted as one of the
+// barrier's expected arrivals (noinc: the phase was initialized to expect it).
+__device__ __forceinline__ void cp_async_mbar_arrive_noinc(uint64_t* bar) {
+    asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n" ::"r"(smem_u32(bar))
+                 : "memory");
+}
 
 // The work split every block derives from the tile count: tiles [0, dp) are whole and
 // belong to block tile % grid; the sk tiles after them are cut into `ranges` equal spans of
@@ -234,12 +254,13 @@ __device__ __forceinline__ void store_swiglu(const typename C::Acc& acc, float s
     }
 }
 
-template <bool FP8, int BM, int BKB, int STAGES, bool SWIGLU>
+template <bool FP8, int BM, int BKB, int STAGES, bool SWIGLU, bool GATHER>
 __global__ void __launch_bounds__(THREADS, 1)
     grouped_kernel(const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMap tmW,
                    __nv_bfloat16* __restrict__ Cout, Params p) {
     using C = TileCfg<BM, BKB, STAGES>;
     static_assert(BKB == 64 || BKB == 128, "the TMA swizzles cover 64 B and 128 B rows");
+    static_assert(!GATHER || (!FP8 && BKB == 128), "the gather is bf16 on 128-byte stages");
     constexpr int A_STAGE = C::A_STAGE, STAGE_BYTES = C::STAGE;
     constexpr int MT = C::MT, NT = C::NT, WROWS = C::WROWS;
 
@@ -260,7 +281,7 @@ __global__ void __launch_bounds__(THREADS, 1)
     if (tid == 0) {
 #pragma unroll
         for (int s = 0; s < STAGES; ++s) {
-            mbar_init(&full_bar[s], 1);
+            mbar_init(&full_bar[s], GATHER ? 33 : 1);
             mbar_init(&empty_bar[s], CONSUMER_WARPS);
         }
 #pragma unroll
@@ -294,34 +315,68 @@ __global__ void __launch_bounds__(THREADS, 1)
     const int sk_iters = sp.sk * p.KT;
 
     if (warp == CONSUMER_WARPS) {
-        // Producer warp: lane 0 owns the schedule and the loads.
-        if (lane == 0) {
-            prefetch_tensormap(&tmA);
-            prefetch_tensormap(&tmW);
-            unsigned g_kt = 0;   // k-tiles issued so far, across pieces
-            unsigned n_pub = 0;  // pieces published so far
+        // Producer warp: lane 0 owns the schedule, the item ring and the TMA loads. With
+        // GATHER the whole warp walks the schedule with it and every lane issues the cp.async
+        // loads of its share of the A tile: CPR lanes per row, RPP rows per pass.
+        if (GATHER || lane == 0) {
+            if (lane == 0) {
+                if constexpr (!GATHER) prefetch_tensormap(&tmA);
+                prefetch_tensormap(&tmW);
+            }
+            constexpr int CPR = BKB / 16;
+            constexpr int RPP = 32 / CPR;
+            constexpr int PASSES = GATHER ? BM / RPP : 1;
+            [[maybe_unused]] int tok[PASSES];  // GATHER: the A row of this lane's tile rows
+            unsigned g_kt = 0;                 // k-tiles issued so far, across pieces
+            unsigned n_pub = 0;                // pieces published so far
             auto piece = [&](int tile, int kb, int ke) {
                 int e = 0;
                 if (tile >= 0) e = tile_expert(tp, E, p.tiles_n, tile);
                 const int r = n_pub % ITEM_DEPTH;
                 const unsigned use = n_pub / ITEM_DEPTH;
-                if (n_pub >= ITEM_DEPTH) mbar_wait(&item_empty[r], (use - 1) & 1);
-                items[r] = make_int4(tile, kb, ke, e);
-                mbar_arrive(&item_full[r]);
+                if (lane == 0) {
+                    if (n_pub >= ITEM_DEPTH) mbar_wait(&item_empty[r], (use - 1) & 1);
+                    items[r] = make_int4(tile, kb, ke, e);
+                    mbar_arrive(&item_full[r]);
+                }
                 ++n_pub;
                 if (tile < 0) return;
                 int mt, nt;
                 tile_coords(tp, p.tiles_n, tile, e, mt, nt);
                 const int row0 = __ldg(p.offsets + e) + mt * BM;
                 const int bn = nt * BN;
+                if constexpr (GATHER) {
+#pragma unroll
+                    for (int i = 0; i < PASSES; ++i) {
+                        const int rr = row0 + i * RPP + lane / CPR;
+                        tok[i] = rr < p.rows_n ? __ldg(p.rows + rr) : -1;
+                    }
+                }
                 for (int kt = kb; kt < ke; ++kt, ++g_kt) {
                     const int s = g_kt % STAGES;
                     const unsigned use_s = g_kt / STAGES;
                     if (g_kt >= STAGES) mbar_wait(&empty_bar[s], (use_s - 1) & 1);
-                    mbar_arrive_expect_tx(&full_bar[s], STAGE_BYTES);
                     unsigned char* as = smem + s * STAGE_BYTES;
-                    tma_load_2d(as, &tmA, &full_bar[s], kt * BKB, row0);  // BM rows x BKB
-                    tma_load_3d(as + A_STAGE, &tmW, &full_bar[s], kt * BKB, bn, e);
+                    if (lane == 0) {
+                        mbar_arrive_expect_tx(&full_bar[s], GATHER ? C::B_STAGE : STAGE_BYTES);
+                        if constexpr (!GATHER)
+                            tma_load_2d(as, &tmA, &full_bar[s], kt * BKB, row0);  // BM x BKB
+                        tma_load_3d(as + A_STAGE, &tmW, &full_bar[s], kt * BKB, bn, e);
+                    }
+                    if constexpr (GATHER) {
+                        const int ch = lane % CPR;
+                        const unsigned char* src0 = p.a_gather + kt * BKB + ch * 16;
+#pragma unroll
+                        for (int i = 0; i < PASSES; ++i) {
+                            const int rr = i * RPP + lane / CPR;
+                            const bool ok = tok[i] >= 0;
+                            const unsigned char* src =
+                                src0 + (ok ? static_cast<size_t>(tok[i]) * p.a_ld : 0);
+                            cp_async_16_zfill(as + rr * BKB + fp8gemm_tile::swz<BKB>(rr, ch) * 16,
+                                              src, ok);
+                        }
+                        cp_async_mbar_arrive_noinc(&full_bar[s]);
+                    }
                 }
             };
             for (int t = blockIdx.x; t < sp.dp; t += p.grid) piece(t, 0, p.KT);
@@ -454,33 +509,35 @@ struct Workspace {
     size_t tiles = 0;
 };
 
-template <bool FP8, int BM, int BKB, int STAGES, bool SWIGLU>
+template <bool FP8, int BM, int BKB, int STAGES, bool SWIGLU, bool GATHER>
 int resident_blocks() {
     constexpr int bytes = smem_bytes<BM, BKB, STAGES>();
     static int resident = 0;
     if (resident == 0) {
-        SPARK_CUDA_CHECK(cudaFuncSetAttribute(grouped_kernel<FP8, BM, BKB, STAGES, SWIGLU>,
+        SPARK_CUDA_CHECK(cudaFuncSetAttribute(grouped_kernel<FP8, BM, BKB, STAGES, SWIGLU, GATHER>,
                                               cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
         int per_sm = 0;
         SPARK_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &per_sm, grouped_kernel<FP8, BM, BKB, STAGES, SWIGLU>, THREADS, bytes));
+            &per_sm, grouped_kernel<FP8, BM, BKB, STAGES, SWIGLU, GATHER>, THREADS, bytes));
         resident = (per_sm > 0 ? per_sm : 1) * num_sms();
     }
     return resident;
 }
 
-template <bool FP8, int BKB, int STAGES, bool SWIGLU = false, int BM = 128>
+template <bool FP8, int BKB, int STAGES, bool SWIGLU = false, int BM = 128, bool GATHER = false>
 void launch(const void* A, const void* W, const int32_t* offsets, __nv_bfloat16* Cout, int T, int E,
-            int N, int K, const float* scale_a, const float* scale_b, cudaStream_t stream) {
+            int N, int K, const float* scale_a, const float* scale_b, const int32_t* rows,
+            cudaStream_t stream) {
     constexpr int bytes = smem_bytes<BM, BKB, STAGES>();
-    const int grid = resident_blocks<FP8, BM, BKB, STAGES, SWIGLU>();
+    const int grid = resident_blocks<FP8, BM, BKB, STAGES, SWIGLU, GATHER>();
     const int kbytes = K * (FP8 ? 1 : 2);
     constexpr CUtensorMapSwizzle swz =
         BKB == 64 ? CU_TENSOR_MAP_SWIZZLE_64B : CU_TENSOR_MAP_SWIZZLE_128B;
     // Both maps move raw bytes: a bf16 row of K values is 2K bytes, and the swizzle is
-    // defined on bytes. W's map is [E][N][2K or K] with a box of 128 rows of one expert.
-    const CUtensorMap tmA = make_tensor_map_2d_u8(A, T, kbytes, BM, BKB, swz);
+    // defined on bytes. W's map is [E][N][2K or K] with a box of 128 rows of one expert. The
+    // gather reads A through its row table and has no map for it (W's stands in).
     const CUtensorMap tmW = make_tensor_map_3d_u8(W, kbytes, N, E, BKB, BN, swz);
+    const CUtensorMap tmA = GATHER ? tmW : make_tensor_map_2d_u8(A, T, kbytes, BM, BKB, swz);
 
     // The Stream-K region is at most the last partial wave plus one wave: 2 * grid tiles.
     static Workspace w;
@@ -505,7 +562,11 @@ void launch(const void* A, const void* W, const int32_t* offsets, __nv_bfloat16*
     p.flags = w.flags;
     p.scale_a = scale_a;
     p.scale_b = scale_b;
-    grouped_kernel<FP8, BM, BKB, STAGES, SWIGLU>
+    p.a_gather = static_cast<const unsigned char*>(A);
+    p.rows = rows;
+    p.rows_n = T;
+    p.a_ld = static_cast<size_t>(kbytes);
+    grouped_kernel<FP8, BM, BKB, STAGES, SWIGLU, GATHER>
         <<<grid, THREADS, bytes, stream>>>(tmA, tmW, Cout, p);
     SPARK_CHECK_LAUNCH();
 }
@@ -514,7 +575,7 @@ void launch(const void* A, const void* W, const int32_t* offsets, __nv_bfloat16*
 // forces one. The defaults are what the plain GEMMs settled on: hgemm variant 6's two 64-k
 // bf16 stages and fp8gemm variant 2's three 128-byte stages for many waves.
 using LaunchFn = void (*)(const void*, const void*, const int32_t*, __nv_bfloat16*, int, int, int,
-                          int, const float*, const float*, cudaStream_t);
+                          int, const float*, const float*, const int32_t*, cudaStream_t);
 template <bool FP8>
 constexpr LaunchFn CONFIGS[] = {
     launch<FP8, 128, 2>,  // 0: 64 KB
@@ -563,21 +624,41 @@ int pick_bm(int T, int E, bool fp8) {
 }
 
 // One call: the tile height, then the pipeline (the 16-row tile streams 16 KB of weight per
-// 18 KB stage and keeps four in flight, the 64-row tile three stages of 24 KB).
+// 18 KB stage and keeps four in flight, the 64-row tile three stages of 24 KB). With a row
+// table (bf16 only) the gather form of the same three pipelines runs.
 template <bool FP8, bool SWIGLU>
 void run(const void* A, const void* W, const int32_t* offsets, __nv_bfloat16* C, int T, int E,
-         int N, int K, const float* scale_a, const float* scale_b, cudaStream_t stream) {
+         int N, int K, const float* scale_a, const float* scale_b, const int32_t* rows,
+         cudaStream_t stream) {
     const int bm = pick_bm(T, E, FP8);
+    if (rows) {
+        if constexpr (FP8) {
+            SPARK_REQUIRE(false, "grouped_gemm: the row table (gather) is bf16 only");
+        } else if (bm == 16) {
+            launch<false, 128, 4, SWIGLU, 16, true>(A, W, offsets, C, T, E, N, K, nullptr, nullptr,
+                                                    rows, stream);
+        } else if (bm == 64) {
+            launch<false, 128, 3, SWIGLU, 64, true>(A, W, offsets, C, T, E, N, K, nullptr, nullptr,
+                                                    rows, stream);
+        } else {
+            launch<false, 128, 2, SWIGLU, 128, true>(A, W, offsets, C, T, E, N, K, nullptr, nullptr,
+                                                     rows, stream);
+        }
+        return;
+    }
     if (bm == 16) {
-        launch<FP8, 128, 4, SWIGLU, 16>(A, W, offsets, C, T, E, N, K, scale_a, scale_b, stream);
+        launch<FP8, 128, 4, SWIGLU, 16>(A, W, offsets, C, T, E, N, K, scale_a, scale_b, nullptr,
+                                        stream);
     } else if (bm == 64) {
-        launch<FP8, 128, 3, SWIGLU, 64>(A, W, offsets, C, T, E, N, K, scale_a, scale_b, stream);
+        launch<FP8, 128, 3, SWIGLU, 64>(A, W, offsets, C, T, E, N, K, scale_a, scale_b, nullptr,
+                                        stream);
     } else if constexpr (SWIGLU) {
-        launch<FP8, 128, FP8 ? 3 : 2, true>(A, W, offsets, C, T, E, N, K, scale_a, scale_b, stream);
+        launch<FP8, 128, FP8 ? 3 : 2, true>(A, W, offsets, C, T, E, N, K, scale_a, scale_b, nullptr,
+                                            stream);
     } else {
         int cfg = forced_config();
         if (cfg < 0) cfg = FP8 ? CONFIG_FP8 : CONFIG_BF16;
-        CONFIGS<FP8>[cfg](A, W, offsets, C, T, E, N, K, scale_a, scale_b, stream);
+        CONFIGS<FP8>[cfg](A, W, offsets, C, T, E, N, K, scale_a, scale_b, nullptr, stream);
     }
 }
 
@@ -591,14 +672,16 @@ bool grouped_gemm_supports(int E, int N, int K, bool fp8) {
 }
 
 void grouped_gemm_bf16(const __nv_bfloat16* A, const __nv_bfloat16* W, const int32_t* offsets,
-                       __nv_bfloat16* C, int T, int E, int N, int K, cudaStream_t stream) {
+                       __nv_bfloat16* C, int T, int E, int N, int K, cudaStream_t stream,
+                       const int32_t* rows) {
     SPARK_REQUIRE(grouped_gemm_supports(E, N, K, false),
                   "grouped_gemm (bf16): requires 1 <= E <= 512, N % 128 == 0 and K % 64 == 0");
     SPARK_REQUIRE(A && W && offsets && C, "grouped_gemm: null pointer");
     SPARK_REQUIRE(is_aligned16(A) && is_aligned16(W),
                   "grouped_gemm: A and W must be 16-byte aligned");
+    SPARK_REQUIRE(!rows || K % 64 == 0, "grouped_gemm: the gather needs K % 64 == 0");
     if (T <= 0) return;
-    gg::run<false, false>(A, W, offsets, C, T, E, N, K, nullptr, nullptr, stream);
+    gg::run<false, false>(A, W, offsets, C, T, E, N, K, nullptr, nullptr, rows, stream);
 }
 
 void grouped_gemm_fp8(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* W, const int32_t* offsets,
@@ -610,7 +693,7 @@ void grouped_gemm_fp8(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* W, const int3
     SPARK_REQUIRE(is_aligned16(A) && is_aligned16(W),
                   "grouped_gemm: A and W must be 16-byte aligned");
     if (T <= 0) return;
-    gg::run<true, false>(A, W, offsets, C, T, E, N, K, scale_a, scale_b, stream);
+    gg::run<true, false>(A, W, offsets, C, T, E, N, K, scale_a, scale_b, nullptr, stream);
 }
 
 // The SwiGLU form runs the default pipeline of each type at every tile height
@@ -619,14 +702,14 @@ void grouped_gemm_fp8(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* W, const int3
 // activation.
 void grouped_gemm_swiglu_bf16(const __nv_bfloat16* A, const __nv_bfloat16* W,
                               const int32_t* offsets, __nv_bfloat16* C, int T, int E, int N, int K,
-                              cudaStream_t stream) {
+                              cudaStream_t stream, const int32_t* rows) {
     SPARK_REQUIRE(grouped_gemm_supports(E, N, K, false),
                   "grouped_gemm (bf16): requires 1 <= E <= 512, N % 128 == 0 and K % 64 == 0");
     SPARK_REQUIRE(A && W && offsets && C, "grouped_gemm: null pointer");
     SPARK_REQUIRE(is_aligned16(A) && is_aligned16(W),
                   "grouped_gemm: A and W must be 16-byte aligned");
     if (T <= 0) return;
-    gg::run<false, true>(A, W, offsets, C, T, E, N, K, nullptr, nullptr, stream);
+    gg::run<false, true>(A, W, offsets, C, T, E, N, K, nullptr, nullptr, rows, stream);
 }
 
 void grouped_gemm_swiglu_fp8(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* W, const int32_t* offsets,
@@ -638,7 +721,7 @@ void grouped_gemm_swiglu_fp8(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* W, con
     SPARK_REQUIRE(is_aligned16(A) && is_aligned16(W),
                   "grouped_gemm: A and W must be 16-byte aligned");
     if (T <= 0) return;
-    gg::run<true, true>(A, W, offsets, C, T, E, N, K, scale_a, scale_b, stream);
+    gg::run<true, true>(A, W, offsets, C, T, E, N, K, scale_a, scale_b, nullptr, stream);
 }
 
 }  // namespace spark

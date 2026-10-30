@@ -266,12 +266,16 @@ __global__ void __launch_bounds__(THREADS) route_kernel(const LT* __restrict__ l
     if (tid == 0) *p.counter = 0u;  // ready for the next launch
 }
 
-// pos[i] = base[block of token i / k][ids[i]] + rank[i], in place over rank.
+// pos[i] = base[block of token i / k][ids[i]] + rank[i], in place over rank, and with `rows`
+// the inverse, rows[pos[i]] = i / k: the token of each row of expert order.
 __global__ void positions_kernel(const int32_t* __restrict__ ids, int32_t* __restrict__ pos,
-                                 const int32_t* __restrict__ base, int n, int k, int E, int tb) {
+                                 const int32_t* __restrict__ base, int32_t* __restrict__ rows,
+                                 int n, int k, int E, int tb) {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
         const int b = (i / k) / tb;
-        pos[i] += base[static_cast<size_t>(b) * E + ids[i]];
+        const int p = pos[i] + base[static_cast<size_t>(b) * E + ids[i]];
+        pos[i] = p;
+        if (rows) rows[p] = i / k;
     }
 }
 
@@ -351,12 +355,12 @@ MoeRoutePlan moe_route(const void* logits, bool logits_fp32, int T, int E, int k
 }
 
 void moe_positions(const int32_t* ids, int32_t* pos, const MoeRoutePlan& plan, int T, int E, int k,
-                   cudaStream_t stream) {
+                   cudaStream_t stream, int32_t* rows) {
     const int n = T * k;
     if (n <= 0) return;
     const int threads = 256;
     const int grid = std::min(cdiv(n, threads), 4 * num_sms());
-    mr::positions_kernel<<<grid, threads, 0, stream>>>(ids, pos, plan.base, n, k, E, plan.tb);
+    mr::positions_kernel<<<grid, threads, 0, stream>>>(ids, pos, plan.base, rows, n, k, E, plan.tb);
     SPARK_CHECK_LAUNCH();
 }
 

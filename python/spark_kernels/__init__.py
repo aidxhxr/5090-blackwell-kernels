@@ -202,7 +202,8 @@ from .ops import (  # noqa: E402
     moe_combine,
     moe_dispatch,
     moe_route,
+    moe_route_rows,
 )
 
 __all__ += ["grouped_gemm_swiglu", "interleave_experts", "moe_combine", "moe_dispatch",
-            "moe_route"]
+            "moe_route", "moe_route_rows"]

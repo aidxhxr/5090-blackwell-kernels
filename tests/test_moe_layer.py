@@ -129,6 +129,19 @@ def test_moe_route_is_deterministic(sk):
         assert torch.equal(x, y)
 
 
+@pytest.mark.parametrize("T,E,k", [(1, 8, 2), (37, 128, 8), (5000, 128, 8)])
+def test_moe_route_rows_is_the_inverse_of_pos(sk, T, E, k):
+    g = torch.Generator(device="cuda").manual_seed(T)
+    logits = torch.randn(T, E, device="cuda", generator=g)
+    ids, w, offsets, pos, rows = sk.moe_route_rows(logits, k)
+    r_ids, r_w, r_off, r_pos = _check_route(sk, logits, k)
+    for a, b in ((ids, r_ids), (w, r_w), (offsets, r_off), (pos, r_pos)):
+        assert torch.equal(a, b)
+    assert rows.shape == (T * k,) and rows.dtype == torch.int32
+    tok = torch.arange(T, device="cuda", dtype=torch.int32).repeat_interleave(k)
+    assert torch.equal(rows[pos.reshape(-1).long()], tok)
+
+
 # ---- GPU: permute and combine -------------------------------------------------------------
 @pytest.mark.parametrize("T,E,k,D", [(1, 8, 2, 4096), (37, 128, 8, 2048), (1000, 8, 2, 512),
                                      (5, 16, 16, 8192), (300, 40, 4, 136)])
@@ -199,6 +212,32 @@ def test_grouped_gemm_swiglu_bf16(sk, case):
     assert torch.equal(got, sk.grouped_gemm_swiglu(a, w13, offsets))
 
 
+# The gather: the same GEMM on a shuffled a with the row table, the same bits as the TMA
+# path on the sorted copy (identical stage data, identical mma order), a negative row reads
+# zeros, and the plain form takes the table too.
+@pytest.mark.parametrize("case", SWIGLU_CASES, ids=lambda c: f"E{len(c[0])}-N{c[1]}-K{c[2]}")
+def test_grouped_gemm_gather_matches_the_copy(sk, case):
+    counts, N, K = case
+    E, T = len(counts), sum(counts)
+    g = torch.Generator(device="cuda").manual_seed(T)
+    offsets = _offsets(counts)
+    x = torch.randn(T + 3, K, device="cuda", generator=g).to(torch.bfloat16)  # 3 spare rows
+    rows = torch.randperm(T + 3, device="cuda", generator=g)[:T].to(torch.int32)
+    w13 = (torch.randn(E, N, K, device="cuda", generator=g) / K**0.5).to(torch.bfloat16)
+    xs = x[rows.long()]
+    assert torch.equal(sk.grouped_gemm_swiglu(x, w13, offsets, rows=rows),
+                       sk.grouped_gemm_swiglu(xs, w13, offsets))
+    assert torch.equal(sk.grouped_gemm(x, w13, offsets, rows=rows),
+                       sk.grouped_gemm(xs, w13, offsets))
+    rows[T // 2] = -1
+    xs[T // 2] = 0
+    assert torch.equal(sk.grouped_gemm(x, w13, offsets, rows=rows),
+                       sk.grouped_gemm(xs, w13, offsets))
+    with pytest.raises(RuntimeError):
+        sk.grouped_gemm(x.to(torch.float8_e4m3fn), w13.to(torch.float8_e4m3fn), offsets,
+                        rows=rows)
+
+
 @pytest.mark.parametrize("case", [c for c in SWIGLU_CASES if c[2] % 128 == 0],
                          ids=lambda c: f"E{len(c[0])}-N{c[1]}-K{c[2]}")
 def test_grouped_gemm_swiglu_fp8(sk, case):
@@ -234,6 +273,12 @@ def test_moe_layer(sk, cfg, T):
     assert _rel_err(got, want) < 1e-2
     assert torch.equal(got, layer(x))  # the same bits every run
     assert _rel_err(ml.MoELayer(wts, fuse_swiglu=False)(x), want) < 1e-2
+    # The gathered gate/up loads and the permuted copy are the same bits.
+    assert torch.equal(ml.MoELayer(wts, gather=True)(x), ml.MoELayer(wts, gather=False)(x))
+    assert layer.gathers(T) == (cfg.inter <= ml.GATHER_MAX_INTER
+                                or -(-T * cfg.top_k // cfg.experts) <= ml.GATHER_SMALL_ROWS)
+    assert torch.equal(ml.MoELayer(wts, fuse_swiglu=False, gather=True)(x),
+                       ml.MoELayer(wts, fuse_swiglu=False, gather=False)(x))
     assert _rel_err(ml.torch_moe(x, wts), want) < 2e-2  # the bf16 torch layer, for scale
     # The routing kernel picks torch's experts on the same logits (ties in the bf16 logits
     # aside, so the picked values are compared).
@@ -248,17 +293,18 @@ def test_moe_layer(sk, cfg, T):
 @pytest.mark.parametrize("T", [1, 16, 64, 300])
 def test_moe_graph_replays_the_eager_bits(sk, cfg, T):
     """The forward captured in a CUDA graph at T tokens and replayed on inputs that route
-    differently gives the eager forward's bits, also after a larger eager call in between
-    (nothing the graph holds is reallocated)."""
+    differently gives the eager forward's bits, on both the gathered and the copied path, and
+    after a larger eager call in between (nothing the graph holds is reallocated)."""
     wts = ml.MoEWeights.random(cfg, seed=7)
     g = torch.Generator(device="cuda").manual_seed(T)
-    layer = ml.MoELayer(wts)
-    graph = ml.MoEGraph(layer, T)
-    for i in range(6):
-        x = torch.randn(T, cfg.hidden, device="cuda", generator=g).to(torch.bfloat16)
-        if i == 3:
-            layer(torch.randn(4096, cfg.hidden, device="cuda", generator=g).to(torch.bfloat16))
-        assert torch.equal(graph(x).clone(), layer(x)), i
+    for gather in (True, False):
+        layer = ml.MoELayer(wts, gather=gather)
+        graph = ml.MoEGraph(layer, T)
+        for i in range(6):
+            x = torch.randn(T, cfg.hidden, device="cuda", generator=g).to(torch.bfloat16)
+            if i == 3:
+                layer(torch.randn(4096, cfg.hidden, device="cuda", generator=g).to(torch.bfloat16))
+            assert torch.equal(graph(x).clone(), layer(x)), (gather, i)
 
 
 def test_torch_grouped_moe(sk):

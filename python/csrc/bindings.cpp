@@ -760,8 +760,21 @@ Tensor w1gemm_moe(const Tensor& a, const Tensor& packed, const Tensor& scales,
 // expert's weight as nn.Linear stores it) -> [T, N] bf16, row t = a[t] @ w[e].T. bf16 a and
 // w, or float8_e4m3fn a and w with scale_a (one element) and scale_b (one per expert, or
 // one for all) float32 on the device, either optional (1.0).
+// With `rows` (int32 [T], bf16 only) a is any [*, K] matrix and row r of the GEMM is
+// a[rows[r]], gathered by the kernel: no permuted copy of a.
+const int32_t* check_rows(const Tensor& a, const std::optional<Tensor>& rows, const char* name) {
+    if (!rows.has_value()) return nullptr;
+    check_cuda_contig(*rows, "rows");
+    TORCH_CHECK(rows->scalar_type() == at::kInt && rows->dim() == 1, name,
+                ": rows must be int32 [T]");
+    TORCH_CHECK(a.scalar_type() == at::kBFloat16, name, ": the row table is for bfloat16 a");
+    TORCH_CHECK(rows->device() == a.device(), name, ": rows must be on a's device");
+    return rows->data_ptr<int32_t>();
+}
+
 Tensor grouped_gemm(const Tensor& a, const Tensor& w, const Tensor& offsets,
-                    const std::optional<Tensor>& scale_a, const std::optional<Tensor>& scale_b) {
+                    const std::optional<Tensor>& scale_a, const std::optional<Tensor>& scale_b,
+                    const std::optional<Tensor>& rows) {
     check_cuda_contig(a, "a");
     check_cuda_contig(w, "w");
     check_cuda_contig(offsets, "offsets");
@@ -771,7 +784,9 @@ Tensor grouped_gemm(const Tensor& a, const Tensor& w, const Tensor& offsets,
                 "grouped_gemm expects a and w both bfloat16 or both float8_e4m3fn, got ",
                 a.scalar_type(), " and ", w.scalar_type());
     TORCH_CHECK(a.dim() == 2 && w.dim() == 3, "grouped_gemm expects a [T, K] and w [E, N, K]");
-    const int64_t T = a.size(0), K = a.size(1), E = w.size(0), N = w.size(1);
+    const int32_t* rows_p = check_rows(a, rows, "grouped_gemm");
+    const int64_t T = rows_p ? rows->numel() : a.size(0);
+    const int64_t K = a.size(1), E = w.size(0), N = w.size(1);
     TORCH_CHECK(w.size(2) == K, "w is ", w.sizes(), ", expected [E, N, ", K, "]");
     TORCH_CHECK(offsets.scalar_type() == at::kInt && offsets.dim() == 1 && offsets.size(0) == E + 1,
                 "offsets must be int32 [E + 1] = [", E + 1, "], got ", offsets.scalar_type(), " ",
@@ -818,7 +833,8 @@ Tensor grouped_gemm(const Tensor& a, const Tensor& w, const Tensor& offsets,
     } else {
         spark::grouped_gemm_bf16(bf16_ptr(a), bf16_ptr(w), offsets.data_ptr<int32_t>(),
                                  bf16_ptr_mut(c), static_cast<int>(T), static_cast<int>(E),
-                                 static_cast<int>(N), static_cast<int>(K), current_stream(a));
+                                 static_cast<int>(N), static_cast<int>(K), current_stream(a),
+                                 rows_p);
     }
     return c;
 }
@@ -978,7 +994,8 @@ Tensor ce_transpose(const Tensor& x, int64_t c0, int64_t c1, int64_t ld, const T
 // up (interleave_experts) -> [T, I] bf16, silu(a w_gate^T) * (a w_up^T) from fp32 sums.
 Tensor grouped_gemm_swiglu(const Tensor& a, const Tensor& w, const Tensor& offsets,
                            const std::optional<Tensor>& scale_a,
-                           const std::optional<Tensor>& scale_b) {
+                           const std::optional<Tensor>& scale_b,
+                           const std::optional<Tensor>& rows) {
     check_cuda_contig(a, "a");
     check_cuda_contig(w, "w");
     check_cuda_contig(offsets, "offsets");
@@ -988,7 +1005,9 @@ Tensor grouped_gemm_swiglu(const Tensor& a, const Tensor& w, const Tensor& offse
                 "grouped_gemm_swiglu expects a and w both bfloat16 or both float8_e4m3fn");
     TORCH_CHECK(a.dim() == 2 && w.dim() == 3,
                 "grouped_gemm_swiglu expects a [T, K] and w [E, 2I, K]");
-    const int64_t T = a.size(0), K = a.size(1), E = w.size(0), N = w.size(1);
+    const int32_t* rows_p = check_rows(a, rows, "grouped_gemm_swiglu");
+    const int64_t T = rows_p ? rows->numel() : a.size(0);
+    const int64_t K = a.size(1), E = w.size(0), N = w.size(1);
     TORCH_CHECK(w.size(2) == K, "w is ", w.sizes(), ", expected [E, 2I, ", K, "]");
     TORCH_CHECK(offsets.scalar_type() == at::kInt && offsets.dim() == 1 && offsets.size(0) == E + 1,
                 "offsets must be int32 [E + 1]");
@@ -1034,8 +1053,8 @@ Tensor grouped_gemm_swiglu(const Tensor& a, const Tensor& w, const Tensor& offse
     } else {
         spark::grouped_gemm_swiglu_bf16(bf16_ptr(a), bf16_ptr(w), offsets.data_ptr<int32_t>(),
                                         bf16_ptr_mut(c), static_cast<int>(T), static_cast<int>(E),
-                                        static_cast<int>(N), static_cast<int>(K),
-                                        current_stream(a));
+                                        static_cast<int>(N), static_cast<int>(K), current_stream(a),
+                                        rows_p);
     }
     return c;
 }
@@ -1083,6 +1102,18 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> moe_route(const Tensor& logits, int64
     spark::moe_positions(r.ids.data_ptr<int32_t>(), r.pos.data_ptr<int32_t>(), r.plan, r.T, r.E,
                          r.k, current_stream(logits));
     return {r.ids, r.weights, r.offsets, r.pos};
+}
+
+// moe_route plus the inverse permutation: (ids, weights, offsets, pos, rows), rows [T * k]
+// int32 with rows[pos[t, s]] = t, the token of each row of expert order, which is the row
+// table grouped_gemm's gather takes in place of the permuted copy. Two launches.
+std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> moe_route_rows(const Tensor& logits,
+                                                                  int64_t top_k, bool renormalize) {
+    MoeRouting r = run_moe_route(logits, top_k, renormalize);
+    Tensor rows = at::empty({static_cast<int64_t>(r.T) * r.k}, r.ids.options());
+    spark::moe_positions(r.ids.data_ptr<int32_t>(), r.pos.data_ptr<int32_t>(), r.plan, r.T, r.E,
+                         r.k, current_stream(logits), rows.data_ptr<int32_t>());
+    return {r.ids, r.weights, r.offsets, r.pos, rows};
 }
 
 // The routing and the rows in expert order: (xs [T * k, D], ids, weights, offsets, pos), two
@@ -1922,7 +1953,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "w [E, N, K] -> [T, N] bf16, one launch; bf16, or e4m3 with scale_a [1] and scale_b "
           "[E] or [1]",
           py::arg("a"), py::arg("w"), py::arg("offsets"), py::arg("scale_a") = py::none(),
-          py::arg("scale_b") = py::none());
+          py::arg("scale_b") = py::none(), py::arg("rows") = py::none());
     m.def("ce_logits", &ce_logits, "logits = h @ w.T, h [T, D] and w [V, D] bf16 -> [T, V] bf16",
           py::arg("h"), py::arg("w"), py::arg("out") = py::none());
     m.def("ce_stats", &ce_stats,
@@ -1946,10 +1977,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "grouped_gemm with the SwiGLU in the epilogue: w [E, 2I, K] with rows alternating gate "
           "and up -> [T, I] bf16",
           py::arg("a"), py::arg("w"), py::arg("offsets"), py::arg("scale_a") = py::none(),
-          py::arg("scale_b") = py::none());
+          py::arg("scale_b") = py::none(), py::arg("rows") = py::none());
     m.def("moe_route", &moe_route,
           "softmax top-k routing of logits [T, E]: (ids [T, k] int32, weights [T, k] fp32, "
           "offsets [E + 1] int32, pos [T, k] int32, the row of expert order)",
+          py::arg("logits"), py::arg("top_k"), py::arg("renormalize") = true);
+    m.def("moe_route_rows", &moe_route_rows,
+          "moe_route plus rows [T * k] int32, the token of each row of expert order",
           py::arg("logits"), py::arg("top_k"), py::arg("renormalize") = true);
     m.def("moe_dispatch", &moe_dispatch,
           "moe_route plus the rows of x [T, D] in expert order: (xs [T * k, D], ids, weights, "

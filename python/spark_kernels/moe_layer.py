@@ -16,8 +16,11 @@ two configurations the bench runs (docs/design/moe_layer.md).
     moe_combine(y, pos, weights)           each token's k rows times their weights, fp32, in
                                            slot order
 
-Every launch runs a fixed grid whose schedule is built on the device from the offsets, so
-the whole forward can be captured in a CUDA graph: `MoEGraph` captures it for one token
+or, where it measured faster (`gather`, the rule below), the permute is replaced by the
+routing's inverse permutation (`moe_route_rows`, a small kernel in the permute's place) and
+the gate/up GEMM gathers x's rows through it in its loads, so the permuted copy is never
+written. Both paths run a fixed grid whose schedule is built on the device from the offsets,
+so the whole forward can be captured in a CUDA graph: `MoEGraph` captures it for one token
 count and replays it (docs/design/moe_layer.md).
 
 Two torch layers sit next to it, for the tests and the bench, both on the same `MoEWeights`:
@@ -152,11 +155,23 @@ def torch_grouped_moe(x: torch.Tensor, wts: MoEWeights) -> torch.Tensor:
     return (rows * w.unsqueeze(-1)).sum(1).to(x.dtype)
 
 
+# When the gate/up GEMM gathers x through the row table instead of reading a permuted copy.
+# The gathered GEMM is 1.5 to 4% slower than the TMA one on the 64- and 128-row tiles, and
+# what it saves is the permute, so it wins where the permute is a large share of the GEMM:
+# experts of up to 2048 inter columns (2I <= 4096) at every token count, and any width while
+# the GEMM runs its 16-row tile, up to 24 rows per expert on average (grouped_gemm.cu,
+# SMALL_ROWS; measured on the 5090, docs/design/moe_layer.md).
+GATHER_MAX_INTER = 2048
+GATHER_SMALL_ROWS = 24
+
+
 class MoELayer:
     """The layer on the kernels. `fuse_swiglu=False` runs the gate/up GEMM plain on the
-    concatenated w13 and the swiglu kernel after it (the ablation of the fused epilogue)."""
+    concatenated w13 and the swiglu kernel after it (the ablation of the fused epilogue).
+    `gather` picks the gathered gate/up loads over the permuted copy: None applies the rule
+    above (GATHER_MAX_INTER, GATHER_SMALL_ROWS), True or False forces one."""
 
-    def __init__(self, wts: MoEWeights, fuse_swiglu: bool = True):
+    def __init__(self, wts: MoEWeights, fuse_swiglu: bool = True, gather: bool | None = None):
         from spark_kernels import ops as sk
 
         cfg = wts.cfg
@@ -164,6 +179,7 @@ class MoELayer:
         self.router = wts.router
         self.w2 = wts.w2
         self.fuse_swiglu = fuse_swiglu
+        self.gather = gather
         if fuse_swiglu:
             inter = cfg.inter
             self.w13 = sk.interleave_experts(wts.w13[:, :inter], wts.w13[:, inter:])
@@ -178,6 +194,14 @@ class MoELayer:
         logits = F.linear(x, self.router)
         return sk.moe_route(logits, self.cfg.top_k, self.cfg.renormalize)
 
+    def gathers(self, T: int) -> bool:
+        """Whether a forward of T tokens gathers x in the gate/up GEMM's loads."""
+        if self.gather is not None:
+            return self.gather
+        cfg = self.cfg
+        rows_per_expert = -(-T * cfg.top_k // cfg.experts)
+        return cfg.inter <= GATHER_MAX_INTER or rows_per_expert <= GATHER_SMALL_ROWS
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """[T, D] bf16 -> [T, D] bf16, the layer's output (not added to the residual). No
         host sync, no shape that depends on the routing: capturable in a CUDA graph."""
@@ -185,11 +209,16 @@ class MoELayer:
 
         cfg = self.cfg
         logits = F.linear(x, self.router)
-        xs, _, w, offsets, pos = sk.moe_dispatch(x, logits, cfg.top_k, cfg.renormalize)
-        if self.fuse_swiglu:
-            h = sk.grouped_gemm_swiglu(xs, self.w13, offsets)
+        if self.gathers(x.shape[0]):
+            _, w, offsets, pos, rows = sk.moe_route_rows(logits, cfg.top_k, cfg.renormalize)
+            xs = x
         else:
-            gu = sk.grouped_gemm(xs, self.w13, offsets)
+            xs, _, w, offsets, pos = sk.moe_dispatch(x, logits, cfg.top_k, cfg.renormalize)
+            rows = None
+        if self.fuse_swiglu:
+            h = sk.grouped_gemm_swiglu(xs, self.w13, offsets, rows=rows)
+        else:
+            gu = sk.grouped_gemm(xs, self.w13, offsets, rows=rows)
             h = sk.swiglu(gu[:, :cfg.inter], gu[:, cfg.inter:])
         y = sk.grouped_gemm(h, self.w2, offsets)
         return sk.moe_combine(y, pos, w)

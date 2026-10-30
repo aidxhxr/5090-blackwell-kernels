@@ -453,9 +453,13 @@ void w1gemm_moe_bf16(const __nv_bfloat16* A, const uint32_t* packed, const __nv_
 // 0 (bf16) or K % 128 == 0 (fp8), 16-byte aligned A and W. Stream-K tiles are summed in a
 // fixed order, so the output is the same bits every run. Not safe to run concurrently on
 // two streams (one workspace per configuration); safe to capture in a CUDA graph (nothing
-// in a launch's parameters changes from one call to the next).
+// in a launch's parameters changes from one call to the next). bf16 takes an optional row
+// table `rows` [T] int32: A is then any [*, K] matrix and row r of the GEMM is A[rows[r]]
+// (rows[r] < 0 reads zeros), gathered by cp.async instead of a TMA box, so an MoE layer
+// skips the permuted copy of its tokens (docs/design/moe_layer.md).
 void grouped_gemm_bf16(const __nv_bfloat16* A, const __nv_bfloat16* W, const int32_t* offsets,
-                       __nv_bfloat16* C, int T, int E, int N, int K, cudaStream_t stream);
+                       __nv_bfloat16* C, int T, int E, int N, int K, cudaStream_t stream,
+                       const int32_t* rows = nullptr);
 void grouped_gemm_fp8(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* W, const int32_t* offsets,
                       __nv_bfloat16* C, int T, int E, int N, int K, const float* scale_a,
                       const float* scale_b, cudaStream_t stream);
@@ -468,7 +472,7 @@ bool grouped_gemm_supports(int E, int N, int K, bool fp8);
 // default pipeline of each type (SPARK_GROUPED_CONFIG does not apply).
 void grouped_gemm_swiglu_bf16(const __nv_bfloat16* A, const __nv_bfloat16* W,
                               const int32_t* offsets, __nv_bfloat16* C, int T, int E, int N, int K,
-                              cudaStream_t stream);
+                              cudaStream_t stream, const int32_t* rows = nullptr);
 void grouped_gemm_swiglu_fp8(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* W, const int32_t* offsets,
                              __nv_bfloat16* C, int T, int E, int N, int K, const float* scale_a,
                              const float* scale_b, cudaStream_t stream);
@@ -528,10 +532,12 @@ void ce_combine(const float* partials, const float* target_logit, const int64_t*
 // index among its route block's assignments to the same expert. One launch. A (token, slot)'s
 // row in expert order is plan.base[(t / plan.tb) * E + e] + rank; rows are sorted by expert,
 // then token, then slot (the stable sort of the flat ids). moe_positions adds that base in
-// place (rank -> pos); moe_permute does it while moving the rows. The plan points into a
-// per-process workspace, allocated once at its largest, that the next moe_route call
-// overwrites; like grouped_gemm the routing is not safe on two streams at once and is safe
-// to capture in a CUDA graph. Requires 1 <= k <= min(E, 16), E <= 512.
+// place (rank -> pos) and, given `rows` [T * k], writes the inverse too: rows[pos[t, s]] = t,
+// the token of each row of expert order (grouped_gemm's row table); moe_permute does the
+// addition while moving the rows. The plan points into a per-process workspace, allocated
+// once at its largest, that the next moe_route call overwrites; like grouped_gemm the
+// routing is not safe on two streams at once and is safe to capture in a CUDA graph.
+// Requires 1 <= k <= min(E, 16), E <= 512.
 struct MoeRoutePlan {
     const int32_t* base;  // [nb, E]
     int tb;               // tokens per route block
@@ -542,7 +548,7 @@ MoeRoutePlan moe_route(const void* logits, bool logits_fp32, int T, int E, int k
                        int32_t* ids, float* weights, int32_t* rank, int32_t* offsets,
                        cudaStream_t stream);
 void moe_positions(const int32_t* ids, int32_t* pos, const MoeRoutePlan& plan, int T, int E, int k,
-                   cudaStream_t stream);
+                   cudaStream_t stream, int32_t* rows = nullptr);
 // moe_permute: pos (in: the rank from moe_route, out: the row in expert order) and xs [T * k,
 // D] with xs[pos[t, s]] = x[t]. moe_combine: out [T, D] = sum over s of weights[t, s] *
 // y[pos[t, s]], fp32 in slot order, one rounding, no atomics. bf16, D % 8 == 0, D <= 8192,

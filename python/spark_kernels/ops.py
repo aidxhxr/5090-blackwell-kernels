@@ -468,7 +468,8 @@ def w1gemm_moe(a: torch.Tensor, w: W1ExpertWeights, offsets: torch.Tensor,
 
 def grouped_gemm(a: torch.Tensor, w: torch.Tensor, offsets: torch.Tensor,
                  scale_a: torch.Tensor | None = None,
-                 scale_b: torch.Tensor | None = None) -> torch.Tensor:
+                 scale_b: torch.Tensor | None = None,
+                 rows: torch.Tensor | None = None) -> torch.Tensor:
     """Every expert's GEMM of an MoE layer in one launch: a [T, K] with its rows sorted by
     expert, expert e owning rows offsets[e]..offsets[e+1]-1, times w [E, N, K] (each expert's
     weight as nn.Linear stores it) -> [T, N] bfloat16, row t = a[t] @ w[e].T, fp32 accumulate.
@@ -478,8 +479,12 @@ def grouped_gemm(a: torch.Tensor, w: torch.Tensor, offsets: torch.Tensor,
     both bfloat16, or both float8_e4m3fn with optional float32 scales: scale_a (one element)
     and scale_b (one per expert, or one), row t then being scale_a * scale_b[e] * (a[t] @
     w[e].T). Needs E <= 512, N a multiple of 128, K a multiple of 64 (bf16) or 128 (fp8).
+
+    With `rows` (int32 [T], bf16 only) a is any [*, K] matrix and row r of the GEMM is
+    a[rows[r]] (a negative entry reads zeros), gathered in the kernel's loads: an MoE layer
+    passes its tokens and `moe_route_rows`'s table instead of `moe_dispatch`'s permuted copy.
     """
-    return _C.grouped_gemm(a, w, offsets, scale_a, scale_b)
+    return _C.grouped_gemm(a, w, offsets, scale_a, scale_b, rows)
 
 
 def moe_offsets(expert_ids: torch.Tensor, num_experts: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -511,12 +516,13 @@ def interleave_experts(w_gate: torch.Tensor, w_up: torch.Tensor) -> torch.Tensor
 
 def grouped_gemm_swiglu(a: torch.Tensor, w13: torch.Tensor, offsets: torch.Tensor,
                         scale_a: torch.Tensor | None = None,
-                        scale_b: torch.Tensor | None = None) -> torch.Tensor:
+                        scale_b: torch.Tensor | None = None,
+                        rows: torch.Tensor | None = None) -> torch.Tensor:
     """`grouped_gemm` with an MoE expert's SwiGLU in the epilogue: a [T, K] sorted by expert,
     w13 [E, 2I, K] from `interleave_experts` -> [T, I] bf16, silu(a @ w_gate.T) * (a @ w_up.T)
-    with both products from the fp32 sums and one rounding. Same types, scales and shape rules
-    as grouped_gemm with N = 2I."""
-    return _C.grouped_gemm_swiglu(a, w13, offsets, scale_a, scale_b)
+    with both products from the fp32 sums and one rounding. Same types, scales, shape rules
+    and row table (`rows`) as grouped_gemm with N = 2I."""
+    return _C.grouped_gemm_swiglu(a, w13, offsets, scale_a, scale_b, rows)
 
 
 def moe_route(logits: torch.Tensor, top_k: int, renormalize: bool = True
@@ -527,6 +533,16 @@ def moe_route(logits: torch.Tensor, top_k: int, renormalize: bool = True
     expert in expert order; pos [T, k] int32, the row of expert order each (token, slot) takes,
     sorted by expert, then token, then slot). No host sync; k <= 16."""
     return _C.moe_route(logits, top_k, renormalize)
+
+
+def moe_route_rows(logits: torch.Tensor, top_k: int, renormalize: bool = True
+                   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+                              torch.Tensor]:
+    """`moe_route` plus the inverse of pos: (ids, weights, offsets, pos, rows), rows [T * k]
+    int32 with rows[pos[t, s]] = t, the token of each row of expert order. That is the row
+    table `grouped_gemm(..., rows=rows)` gathers x through, in place of `moe_dispatch`'s
+    permuted copy. Two launches, no host sync."""
+    return _C.moe_route_rows(logits, top_k, renormalize)
 
 
 def moe_dispatch(x: torch.Tensor, logits: torch.Tensor, top_k: int, renormalize: bool = True
