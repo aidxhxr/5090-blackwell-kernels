@@ -672,7 +672,8 @@ From the forced-tile sweep over the 120 shapes, with W = 170 the blocks of a wav
    it beat 128x128 on all twenty weights, and even with few tiles it beats the old route
    (128x1024x4096, 16 tiles: 117% against 101% on variant 1).
 
-Decode shapes (M <= 64), K % 128 != 0 and MX mode keep the old route. Two more rules came out
+Decode shapes (M <= 64) and K % 128 != 0 keep the old route; MX mode has its own rule
+("MX mode" below). Two more rules came out
 of the same sweep, both for grids under one wave in the static plan:
 
 - When the grid would leave more than half the card idle, every tile is split two ways,
@@ -756,21 +757,111 @@ it runs 1024 tokens of the same weight at 529.
 
 ### MX mode
 
-MX mode keeps the old route: a Stream-K piece can start at any k-step, and the MX k-loop runs
-whole groups of scale chunks, so the pieces would have to be cut on group boundaries first.
-`--mode=mx` on the Llama 3 8B and DeepSeek weights at 128, 512 and 2048 tokens (24 shapes,
-against cuBLASLt's VEC32_UE8M0 kernel): 60 to 147% of cuBLASLt MXFP8, and the old route's
-problems are all there. The lm_head at 512 and 2048 tokens runs 60 and 64% (the raster
-again), and 512 x 4096 x 14336 runs 62% (183.5 us against 113.3) on variant 1's small tiles.
-Against variant 3's per-tensor rows of the same session the MX rows take 1.0x to 2.1x as
-long, 1.0x to 1.6x at 128 tokens.
-MX on the Stream-K kernel is the open item below.
+Source: the `MX` and `SFW` template arguments of `fp8gemm_v3_kernel`, `route_rule_mx`, the
+rows with dtype `mxfp8` in `results/fp8gemm_models.json` (measured 2026-10-30, `--iters=20`,
+`--mode=mx --tiles`).
+
+MX mode ran the old route until now, because a Stream-K piece can start at any k-step and
+the MX k-loop runs whole groups of scale chunks. The fix is in the plan, not the kernel: in
+MX mode a k-step of the plan is one chunk group, SPC = 2 or 4 stages of 128 bytes (8-byte
+chunks when K % 512 != 0, 16-byte ones otherwise), so `p.KT`, the static ranges, the
+K-passes and the fixup flags all count groups, every piece starts and ends on a group
+boundary, the producer issues SPC stages per plan step and the knobs (which count stages)
+are divided by SPC. The consumer warps then run the group loop of variants 1 and 2: the
+chunks of the warp's rows of A and columns of Bt for the next group are fetched from global
+memory while this group's stages run, and each stage's words are shuffled out of them. The
+piece's tile coordinates are read before the k-loop here (the chunk rows need them), where
+the per-tensor loop reads them after it to keep the accumulators alone live; the 64-wide
+tiles and 128x128 have the registers for that, 128x256 does not:
+
+| tile | per-tensor registers / stack | MX, 8-byte chunks | MX, 16-byte chunks |
+|---|---|---|---|
+| 0: 128x256 bk128 s2 | 168 / 16 B | 168 / 312 B | 168 / 448 B |
+| 1: 128x128 bk128 s3 | 164 / 8 B | 162 / 8 B | 168 / 8 B |
+| 2: 128x128 bk64 s2 x2 | 96 / 8 B | 96 / 160 B | 96 / 240 B |
+| 3: 128x64 bk128 s4 | 96 / 8 B | 126 / 8 B | 127 / 8 B |
+| 4: 64x128 bk128 s4 | 96 / 8 B | 126 / 8 B | 126 / 8 B |
+
+The 128x256 tile holds 128 fp32 accumulators per lane and the two chunk sets are 32 more
+registers at a 168-register cap, so it spills into the k-loop and runs 38 to 97% of
+cuBLASLt MXFP8 on the shapes the per-tensor rule gives it, where 128x128 runs 83 to 162%.
+The MX rule is therefore the per-tensor rule with 128x128 wherever that rule would run
+128x256, and the 64-wide tiles elsewhere. `fp8gemm_v3_route_name(M, N, K, mx=True)` reports
+it. A piece's bits are the same every run on every tile, as in per-tensor mode, and with
+exact partial sums every tile gives variant 0's bits, which are cuBLASLt's
+(`test_fp8gemm_mx_variant3_pieces_carry_the_scales`).
+
+The 120 model shapes against cuBLASLt's MXFP8 kernel (`VEC32_UE8M0`, its scales in the
+tiled layout), one session, geometric mean of cuBLASLt time over ours; "before" is the old
+route (`v3old`), "after" the MX rule, "oracle" the best row of the sweep per shape:
+
+| M | shapes | before | after | oracle | below cuBLASLt before | after |
+|---|---|---|---|---|---|---|
+| 128 | 20 | 111.8% | 133.0% | 133.9% | 3 | 0 |
+| 256 | 20 | 84.7% | 121.5% | 121.7% | 13 | 6 |
+| 512 | 20 | 82.9% | 110.9% | 112.8% | 16 | 9 |
+| 1024 | 20 | 92.9% | 107.0% | 107.9% | 13 | 9 |
+| 2048 | 20 | 90.4% | 101.1% | 102.2% | 15 | 9 |
+| 4096 | 20 | 89.5% | 100.5% | 101.3% | 17 | 14 |
+| all | 120 | 91.6% | 111.8% | 112.8% | 77 | 47 |
+
+96 shapes move up by more than 3%, 5 move down, and the rule's pick is the fastest row on
+99 of the 120. Selected rows:
+
+| M x N x K | what it is | cuBLASLt MXFP8 | before | after |
+|---|---|---|---|---|
+| 128 x 4096 x 4096 | Llama 3 8B q_proj, 128 tokens | 25.8 us | 109.6% | 147.3% |
+| 256 x 4096 x 4096 | same, 256 tokens | 33.7 us | 121.1% | 155.6% |
+| 512 x 1024 x 4096 | k/v proj | 21.7 us | 92.2% | 145.8% |
+| 128 x 6144 x 4096 | fused qkv | 33.7 us | 132.2% | 142.0% |
+| 512 x 4096 x 14336 | Llama 3 8B down, 512 tokens | 105.4 us | 57.2% | 105.2% |
+| 4096 x 4096 x 4096 | | 205.8 us | 92.7% | 95.3% |
+| 4096 x 128256 x 4096 | Llama 3 8B lm_head | 7.42 ms | 65.7% | 99.5% |
+| 2048 x 28672 x 8192 | Llama 3 70B gate/up | 1.59 ms | 65.9% | 97.4% |
+| 4096 x 25600 x 5120 | Qwen 3 32B gate/up | 1.77 ms | 63.0% | 99.7% |
+| 128 x 8192 x 28672 | Llama 3 70B down | 209.3 us | 108.4% | 125.9% |
+| 512 x 768 x 2048 | Qwen 3 30B-A3B expert | 25.1 us | 132.9% | 196.7% |
+| 128 x 5120 x 2304 | DeepSeek expert down | 28.9 us | 120.4% | 181.2% |
+
+4096³ is 636 TFLOPS in MX mode on variant 3 against 619 on the old route, in a session where
+cuBLASLt's MXFP8 kernel read 606 (688 in the "MX scales" section's session: another process
+held the card this time, so the TFLOPS are low and the percentages are what to read).
+Against variant 3's per-tensor rows of the 2026-10-23 session the MX rows take 0.99x to
+1.67x as long, 1.16x on the geometric mean and 1.00x to 1.31x at 128 tokens.
+
+What lost:
+
+- **128x256 in MX mode** (above). There is no register budget for it: the accumulators alone
+  are 128 of the 168, and the scale words cannot go through shared memory either, the two
+  48 KB stages leave 2,976 bytes of the 99 KB a block may take and one stage's words for 384
+  rows are 1,536.
+- **Variant 2's MX configuration as a tile.** Variant 2 runs MX mode on four 64-byte stages
+  (configuration 4), 4% over three 128-byte ones. On the Stream-K kernel a 128x128 tile with
+  four 64-byte stages at one block per SM ran 0.96x of the 128-byte tile over the 91 shapes
+  where both were forced (0.85x to 1.07x, 10 wins), and 128x64 with eight 64-byte stages
+  0.97x of the 128-byte one over 29 (0.73x to 1.11x, 9 wins). Both were dropped. With the
+  128-byte tiles a chunk group is 2 or 4 stages, so every piece's chunk words are shuffled
+  per stage the way variant 2 does it, and when the group is a multiple of the ring (the
+  64-wide tiles with 16-byte chunks) the stage index is an immediate; that path measured
+  the same as the computed one.
+- **Five shapes run slower than the old route**: 512x2048x768 (154.6% to 129.5%, 3 groups of
+  two stages per tile, where variant 2's wave of 64 whole tiles plus a split-K tail beats 24
+  blocks of Stream-K pieces), and four deep-K shapes at 1024 to 4096 tokens where variant 2's
+  data-parallel waves win as they do in per-tensor mode: 2048x4096x14336 115.8% to 108.7%,
+  2048x4096x12288 109.4% to 100.5%, 4096x4096x12288 98.4% to 95.0% and 1024x10240x8192 87.0%
+  to 83.3%. The rule keeps 128x128 there: the five are 3 to 16% behind, and the rule gains
+  3% or more on 96 of the other 115.
+- **Still below cuBLASLt, 47 shapes**, all at 256 tokens and up: the lm_head and the widest
+  gate/up weights at 93 to 99.7%, the other large grids at 83 to 99.9%, 31 of the 47 at 95%
+  and up. This is the MX kernel's own cost, 8 to 10% against the per-tensor kernel where
+  cuBLASLt's tiled scales cost it 3% ("MX at 90%" below), on shapes where the per-tensor
+  variant 3 is itself at 95 to 113%.
 
 ### The engine
 
 `quant.FP8Linear` (the engine's `fp8` and `fp8-tok` weights) calls `sk.fp8gemm` with the
 default variant, so every prefill step of more than 64 tokens now runs variant 3; decode steps
-(M <= 64) still run variant 1's decode kernels and `mxfp8` weights the old route. Not
+(M <= 64) still run variant 1's decode kernels; `mxfp8` weights take the MX rule. Not
 measured end to end. A row's bits now depend on M through the tile and the split, as they
 did before through variant 1's tile choice and atomic tail; for M > 64 they no longer depend
 on the run. `tests/test_quant.py` passes on the new default.
@@ -783,7 +874,7 @@ instruction that doubles the fp32-accumulate rate, found in cuBLASLt's SASS and 
 1,014 TFLOPS; the three rungs, with v2 at 99 to 139% of cuBLASLt on the shapes it takes and
 the decode shapes at the 16 MB single-launch floor, 112 to 141% of cuBLASLt; MX mode on
 every rung, with the scale operand layout measured and the scales fetched by the consumer
-warps.
+warps, on the Stream-K kernel too, 111.8% of cuBLASLt MXFP8 over the 120 model shapes.
 
 Open:
 
@@ -791,9 +882,9 @@ Open:
   of cuBLASLt, at cuBLASLt's clock. Multicast would halve the L2 bytes again but is a slow
   path on sm_120.
 - **Stream-K.** Done in per-tensor mode: variant 3 ("Model shapes"), 129.1% of cuBLASLt over
-  the 120 model shapes against 103.8% for the old default. Open there: MX mode on it (pieces
-  cut on scale-chunk groups), the lm_head at 256 tokens (85.9%), and the two deep-K shapes
-  where variant 2's data-parallel waves still win.
+  the 120 model shapes against 103.8% for the old default, and in MX mode, 111.8% of
+  cuBLASLt MXFP8 against 91.6%. Open there: the lm_head at 256 tokens (85.9%), and the
+  deep-K shapes where variant 2's data-parallel waves still win in both modes.
 - **MX at 90%.** The MX mode costs 8 to 10% on the large shapes against the per-tensor
   kernel where cuBLASLt's MXFP8 kernel costs it 3%: eight shuffles per stage on the MIO
   queue the `ldmatrix` traffic already fills, and the chunk loads. cuBLASLt takes its scales
