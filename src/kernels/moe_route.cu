@@ -275,12 +275,13 @@ __global__ void positions_kernel(const int32_t* __restrict__ ids, int32_t* __res
     }
 }
 
-// One workspace per process: base[nb][E] and the counter, zeroed once at allocation (the
-// last block of every launch puts the counter back to 0).
+// One workspace per process, allocated once at its largest (MAX_BLOCKS x MAX_E counts, 256
+// KB, and the counter, zeroed once; the last block of every launch puts the counter back to
+// 0). It is never reallocated, so a routing captured in a CUDA graph keeps a valid base
+// whatever token counts run between captures and replays.
 struct Workspace {
     int32_t* base = nullptr;
     unsigned* counter = nullptr;
-    size_t cap = 0;
 };
 
 template <typename LT>
@@ -317,13 +318,9 @@ MoeRoutePlan moe_route(const void* logits, bool logits_fp32, int T, int E, int k
     nb = cdiv(T, tb);
 
     static mr::Workspace w;
-    const size_t need = static_cast<size_t>(nb) * E;
-    if (w.cap < need) {
-        if (w.base) SPARK_CUDA_CHECK(cudaFree(w.base));
-        SPARK_CUDA_CHECK(cudaMalloc(&w.base, need * sizeof(int32_t)));
-        w.cap = need;
-    }
-    if (!w.counter) {
+    if (!w.base) {
+        const size_t words = static_cast<size_t>(mr::MAX_BLOCKS) * mr::MAX_E;
+        SPARK_CUDA_CHECK(cudaMalloc(&w.base, words * sizeof(int32_t)));
         SPARK_CUDA_CHECK(cudaMalloc(&w.counter, sizeof(unsigned)));
         SPARK_CUDA_CHECK(cudaMemset(w.counter, 0, sizeof(unsigned)));  // once
     }

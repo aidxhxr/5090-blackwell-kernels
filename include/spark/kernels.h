@@ -529,8 +529,9 @@ void ce_combine(const float* partials, const float* target_logit, const int64_t*
 // row in expert order is plan.base[(t / plan.tb) * E + e] + rank; rows are sorted by expert,
 // then token, then slot (the stable sort of the flat ids). moe_positions adds that base in
 // place (rank -> pos); moe_permute does it while moving the rows. The plan points into a
-// per-process workspace that the next moe_route call overwrites, and like grouped_gemm the
-// routing is not safe on two streams at once. Requires 1 <= k <= min(E, 16), E <= 512.
+// per-process workspace, allocated once at its largest, that the next moe_route call
+// overwrites; like grouped_gemm the routing is not safe on two streams at once and is safe
+// to capture in a CUDA graph. Requires 1 <= k <= min(E, 16), E <= 512.
 struct MoeRoutePlan {
     const int32_t* base;  // [nb, E]
     int tb;               // tokens per route block
