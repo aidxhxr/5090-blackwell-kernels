@@ -4,11 +4,16 @@
 //   ./bench_attention_bwd --b=1 --h=32 --s=4096 --d=128 --causal=1 --variant=2 --iters=20
 //   ./bench_attention_bwd --hq=32 --hkv=8 ...              # grouped-query attention
 //   ./bench_attention_bwd --deterministic=1 ...            # time the deterministic dQ pass
+//   ./bench_attention_bwd --hq=32 --hkv=8 --s=8192 --window=512 --sinks=1 --variant=3
+//                                                          # a sliding window and sink logits
+//   ./bench_attention_bwd --sweep=window                   # the window sweep (variant 3)
 //
 // Setup per shape: Q, K uniform in [-2, 2], V and dO in [-1, 1] (bf16), then the forward
 // (variant 5, the default rung) with its log-sum-exp output gives O and L. The rows time the
 // backward alone: attention_bwd_bf16 from (Q, K, V, O, dO, L) to (dQ, dK, dV), preprocess and
-// dQ conversion included.
+// dQ conversion included. With a window or sinks the forward is attention_window_bf16 (the
+// window is causal and aligned to the last key, so the query at row i sits at key position
+// i + S_kv - S_q) and the backward attention_bwd_window_bf16, whose d(sinks) is checked too.
 //
 // Correctness, against a CPU double-precision reference from the same bf16 inputs, the GPU's
 // O (bf16) and the GPU's L:
@@ -22,7 +27,8 @@
 // launches must agree bit for bit.
 //
 // FLOPs: the five products of S_q x S_kv x D, 2.5x the forward's count,
-// 10 * B * H_q * S_q * S_kv * D, halved under the causal mask (FlashAttention's convention).
+// 10 * B * H_q * S_q * S_kv * D, halved under the causal mask (FlashAttention's convention);
+// under a window, over the (query, key) pairs the window leaves.
 // GB/s: Q, O, dO read and dQ written (H_q heads), K, V read and dK, dV written (H_kv heads).
 //
 // stdout: one JSON object per row (collected by scripts/run_all_benches.sh)
@@ -48,6 +54,10 @@ using bf16 = __nv_bfloat16;
 struct Shape {
     int B, Hq, Hkv, Sq, Skv, D;
     int causal;
+    int window = 0;  // keys each query sees, its own included (0: no window); implies causal
+    int sinks = 0;   // sink logits, one per query head
+    // Row i sits at key position i + off: the window is aligned to the last key.
+    int off() const { return window ? Skv - Sq : 0; }
 };
 
 // Same spelling as bench_attention (scripts/shape_utils.py parses both).
@@ -62,8 +72,21 @@ std::string shape_str(const Shape& s) {
     else
         r += "_sq" + std::to_string(s.Sq) + "_skv" + std::to_string(s.Skv);
     r += "_d" + std::to_string(s.D);
-    if (s.causal) r += "_causal";
+    if (s.causal || s.window) r += "_causal";
+    if (s.window) r += "_w" + std::to_string(s.window);
+    if (s.sinks) r += "_sink";
     return r;
+}
+
+// (query, key) pairs the mask leaves: FlashAttention's convention halves the full count under
+// the causal mask; a window keeps min(pos + 1, W) keys per row.
+double visible_pairs(const Shape& s) {
+    if (s.window) {
+        double n = 0;
+        for (int i = 0; i < s.Sq; ++i) n += std::min(i + s.off() + 1, s.window);
+        return n;
+    }
+    return static_cast<double>(s.Sq) * s.Skv * (s.causal ? 0.5 : 1.0);
 }
 
 std::vector<float> to_host(const bf16* d, size_t n) {
@@ -88,7 +111,7 @@ std::vector<bf16> upload_rounded(std::vector<float>& h, bf16** dptr) {
 // Everything the reference needs, on the host.
 struct Host {
     Shape s;
-    std::vector<float> q, k, v, o, dout, lse;
+    std::vector<float> q, k, v, o, dout, lse, sinks;
     double scale = 0;
     int group = 1;
     size_t qrow(int bh, int i) const { return (static_cast<size_t>(bh) * s.Sq + i) * s.D; }
@@ -99,26 +122,54 @@ struct Host {
         for (int d = 0; d < s.D; ++d) acc += static_cast<double>(a[d]) * b[d];
         return acc;
     }
-    bool visible(int i, int j) const { return !s.causal || j <= i; }
+    // Row i at key position i + off sees key j under the causal bound and the window's edge.
+    bool visible(int i, int j) const {
+        const int pos = i + s.off();
+        if ((s.causal || s.window) && j > pos) return false;
+        return !s.window || j > pos - s.window;
+    }
+    // Keys row i sees: [lo, hi).
+    void key_range(int i, int& lo, int& hi) const {
+        const int pos = i + s.off();
+        hi = s.causal || s.window ? std::min(s.Skv, pos + 1) : s.Skv;
+        lo = s.window ? std::max(0, pos - s.window + 1) : 0;
+    }
     // Dv_i = dO_i . O_i from the GPU's bf16 O, as the kernels compute it.
     double dvec(int bh, int i) const {
         return dot(dout.data() + qrow(bh, i), o.data() + qrow(bh, i));
     }
 };
 
-// Reference log-sum-exp of one query row.
+// Reference log-sum-exp of one query row, the sink logit included when there is one.
 double ref_lse(const Host& h, int bh, int i) {
     const int bkv = h.bkv_of(bh);
     double mx = -INFINITY;
     std::vector<double> sc;
-    for (int j = 0; j < h.s.Skv; ++j) {
-        if (!h.visible(i, j)) break;
+    int lo, hi;
+    h.key_range(i, lo, hi);
+    for (int j = lo; j < hi; ++j) {
         sc.push_back(h.scale * h.dot(h.q.data() + h.qrow(bh, i), h.k.data() + h.krow(bkv, j)));
+        mx = std::max(mx, sc.back());
+    }
+    if (h.s.sinks) {
+        sc.push_back(h.sinks[bh % h.s.Hq]);
         mx = std::max(mx, sc.back());
     }
     double sum = 0.0;
     for (double x : sc) sum += std::exp(x - mx);
     return mx + std::log(sum);
+}
+
+// d(sink_h) = -sum over the head's rows of exp(sink_h - L_i) Dv_i, from the GPU's L and O.
+double ref_dsink(const Host& h, int hq) {
+    double acc = 0.0;
+    for (int b = 0; b < h.s.B; ++b) {
+        const int bh = b * h.s.Hq + hq;
+        for (int i = 0; i < h.s.Sq; ++i)
+            acc -=
+                std::exp(h.sinks[hq] - h.lse[static_cast<size_t>(bh) * h.s.Sq + i]) * h.dvec(bh, i);
+    }
+    return acc;
 }
 
 // dQ row i of head bh.
@@ -128,7 +179,9 @@ void ref_dq(const Host& h, int bh, int i, std::vector<double>& out) {
     const float* q = h.q.data() + h.qrow(bh, i);
     const float* d = h.dout.data() + h.qrow(bh, i);
     const double L = h.lse[static_cast<size_t>(bh) * h.s.Sq + i], Dv = h.dvec(bh, i);
-    for (int j = 0; j < h.s.Skv && h.visible(i, j); ++j) {
+    int lo, hi;
+    h.key_range(i, lo, hi);
+    for (int j = lo; j < hi; ++j) {
         const float* k = h.k.data() + h.krow(bkv, j);
         const double p = std::exp(h.scale * h.dot(q, k) - L);
         const double ds = p * (h.dot(d, h.v.data() + h.krow(bkv, j)) - Dv);
@@ -148,7 +201,8 @@ void ref_dkv(const Host& h, int bkv, int j, const std::vector<double>& dv_all,
     const int b = bkv / h.s.Hkv, kvh = bkv % h.s.Hkv;
     for (int hg = 0; hg < h.group; ++hg) {
         const int bh = b * h.s.Hq + kvh * h.group + hg;
-        for (int i = h.s.causal ? j : 0; i < h.s.Sq; ++i) {
+        for (int i = 0; i < h.s.Sq; ++i) {
+            if (!h.visible(i, j)) continue;
             const float* q = h.q.data() + h.qrow(bh, i);
             const float* d = h.dout.data() + h.qrow(bh, i);
             const size_t r = static_cast<size_t>(bh) * h.s.Sq + i;
@@ -218,7 +272,11 @@ Result validate(const Host& h, const std::vector<float>& gq, const std::vector<f
     return r;
 }
 
-bool run_one(cudaStream_t stream, const Shape& s, int variant, int iters, bool deterministic) {
+// `median_ms` receives the row's time when given; `ref_ms` is printed as the row's reference
+// (the window sweep's full causal time); `kernel` names the row (the window sweep's rows are
+// "attention_bwd_window" rows, full causal ones included).
+bool run_one(cudaStream_t stream, const Shape& s, int variant, int iters, bool deterministic,
+             double* median_ms = nullptr, double ref_ms = 0.0, const char* kernel = nullptr) {
     if (!spark::attention_bwd_supports(s.Sq, s.Skv, s.D, variant)) {
         std::fprintf(stderr, "  skip variant %d shape %s: not supported\n", variant,
                      shape_str(s).c_str());
@@ -246,15 +304,29 @@ bool run_one(cudaStream_t stream, const Shape& s, int variant, int iters, bool d
     upload_rounded(h.v, &dv_in);
     upload_rounded(h.dout, &ddo);
     bf16 *d_o, *gQ, *gK, *gV;
-    float* d_lse;
+    float *d_lse, *d_sinks = nullptr, *d_dsinks = nullptr;
     SPARK_CUDA_CHECK(cudaMalloc(&d_o, nQ * sizeof(bf16)));
     SPARK_CUDA_CHECK(cudaMalloc(&gQ, nQ * sizeof(bf16)));
     SPARK_CUDA_CHECK(cudaMalloc(&gK, nK * sizeof(bf16)));
     SPARK_CUDA_CHECK(cudaMalloc(&gV, nK * sizeof(bf16)));
     SPARK_CUDA_CHECK(cudaMalloc(&d_lse, BH * s.Sq * sizeof(float)));
+    if (s.sinks) {
+        h.sinks.resize(s.Hq);
+        spark::bench::fill_uniform(h.sinks, -1.0f, 3.0f, 7890);  // logits in [-1, 3]
+        SPARK_CUDA_CHECK(cudaMalloc(&d_sinks, s.Hq * sizeof(float)));
+        SPARK_CUDA_CHECK(cudaMalloc(&d_dsinks, s.Hq * sizeof(float)));
+        SPARK_CUDA_CHECK(
+            cudaMemcpy(d_sinks, h.sinks.data(), s.Hq * sizeof(float), cudaMemcpyHostToDevice));
+    }
 
-    spark::attention_bf16(dq_in, dk_in, dv_in, d_o, s.B, s.Hq, s.Hkv, s.Sq, s.Skv, s.D,
-                          s.causal != 0, spark::attention_num_variants() - 1, stream, d_lse);
+    const bool local = s.window > 0 || s.sinks;
+    if (local)
+        spark::attention_window_bf16(dq_in, dk_in, dv_in, d_o, s.B, s.Hq, s.Hkv, s.Sq, s.Skv, s.D,
+                                     s.causal != 0, s.window, d_sinks,
+                                     spark::attention_num_variants() - 1, stream, d_lse);
+    else
+        spark::attention_bf16(dq_in, dk_in, dv_in, d_o, s.B, s.Hq, s.Hkv, s.Sq, s.Skv, s.D,
+                              s.causal != 0, spark::attention_num_variants() - 1, stream, d_lse);
     SPARK_CUDA_CHECK(cudaStreamSynchronize(stream));
     h.o = to_host(d_o, nQ);
     h.lse.resize(BH * s.Sq);
@@ -262,8 +334,13 @@ bool run_one(cudaStream_t stream, const Shape& s, int variant, int iters, bool d
         cudaMemcpy(h.lse.data(), d_lse, h.lse.size() * sizeof(float), cudaMemcpyDeviceToHost));
 
     auto bwd = [&](int v, bool det) {
-        spark::attention_bwd_bf16(dq_in, dk_in, dv_in, d_o, ddo, d_lse, gQ, gK, gV, s.B, s.Hq,
-                                  s.Hkv, s.Sq, s.Skv, s.D, s.causal != 0, det, v, stream);
+        if (local)
+            spark::attention_bwd_window_bf16(dq_in, dk_in, dv_in, d_o, ddo, d_lse, gQ, gK, gV, s.B,
+                                             s.Hq, s.Hkv, s.Sq, s.Skv, s.D, s.causal != 0, s.window,
+                                             d_sinks, d_dsinks, det, v, stream);
+        else
+            spark::attention_bwd_bf16(dq_in, dk_in, dv_in, d_o, ddo, d_lse, gQ, gK, gV, s.B, s.Hq,
+                                      s.Hkv, s.Sq, s.Skv, s.D, s.causal != 0, det, v, stream);
     };
     bwd(variant, deterministic);
     SPARK_CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -313,6 +390,18 @@ bool run_one(cudaStream_t stream, const Shape& s, int variant, int iters, bool d
     const Result res = validate(h, to_host(gQ, nQ), to_host(gK, nK), to_host(gV, nK), qrows, krows,
                                 dv_all, deterministic ? "deterministic" : "atomic", variant);
     ok = ok && res.ok;
+    if (s.sinks) {
+        std::vector<float> got(s.Hq);
+        SPARK_CUDA_CHECK(
+            cudaMemcpy(got.data(), d_dsinks, s.Hq * sizeof(float), cudaMemcpyDeviceToHost));
+        Check c;
+        for (int hq = 0; hq < s.Hq; ++hq) c.add(got[hq], ref_dsink(h, hq));
+        if (!c.ok()) {
+            std::fprintf(stderr, "  FAIL d(sinks) variant %d shape %s: %.3e (tol %.3e)\n", variant,
+                         shape_str(s).c_str(), c.max_err, c.tol());
+            ok = false;
+        }
+    }
 
     // The other dQ mode once, for its correctness and (deterministic) reproducibility.
     if (variant >= 1 && !deterministic) {
@@ -336,11 +425,10 @@ bool run_one(cudaStream_t stream, const Shape& s, int variant, int iters, bool d
     const auto t =
         spark::bench::time_kernel([&] { bwd(variant, deterministic); }, stream, 5, iters);
 
-    double flops = 10.0 * BH * s.Sq * static_cast<double>(s.Skv) * s.D;
-    if (s.causal) flops *= 0.5;
+    const double flops = 10.0 * BH * visible_pairs(s) * s.D;
     const double bytes = 2.0 * (4.0 * nQ + 4.0 * nK);
     spark::bench::Row row;
-    row.kernel = "attention_bwd";
+    row.kernel = kernel ? kernel : local ? "attention_bwd_window" : "attention_bwd";
     row.dtype = "bf16";
     row.variant = variant;
     row.shape = shape_str(s);
@@ -348,16 +436,45 @@ bool run_one(cudaStream_t stream, const Shape& s, int variant, int iters, bool d
     row.min_ms = t.min_ms;
     row.tflops = flops / (t.median_ms * 1e-3) / 1e12;
     row.gbps = bytes / (t.median_ms * 1e-3) / 1e9;
-    row.ref_ms = 0.0;
+    row.ref_ms = ref_ms;
     row.max_abs_err = res.worst_err;
     row.max_rel_err = res.worst_rel;
     row.ok = ok;
     spark::bench::print_row(row);
+    if (median_ms) *median_ms = t.median_ms;
 
     for (void* p : {static_cast<void*>(dq_in), static_cast<void*>(dk_in), static_cast<void*>(dv_in),
                     static_cast<void*>(ddo), static_cast<void*>(d_o), static_cast<void*>(gQ),
                     static_cast<void*>(gK), static_cast<void*>(gV), static_cast<void*>(d_lse)})
         SPARK_CUDA_CHECK(cudaFree(p));
+    if (d_sinks) SPARK_CUDA_CHECK(cudaFree(d_sinks));
+    if (d_dsinks) SPARK_CUDA_CHECK(cudaFree(d_dsinks));
+    return ok;
+}
+
+// --sweep=window: sliding windows against the full causal backward on the same shapes, every
+// windowed row with the full row's time as its ref_ms. Llama-3-8B heads (32 query, 8 K/V,
+// D = 128) at 8K and 32K tokens with windows of 128 (gpt-oss), 512 and 4096 (Mistral, Gemma),
+// then gpt-oss's own heads (64 query, 8 K/V, D = 64, window 128) with its sink logits at 8K.
+bool window_sweep(cudaStream_t stream, int variant, int iters) {
+    bool ok = true;
+    auto pair = [&](Shape full, const std::vector<std::pair<int, int>>& wins, int full_iters) {
+        double full_ms = 0.0;
+        ok = run_one(stream, full, variant, full_iters, false, &full_ms, 0.0,
+                     "attention_bwd_window") &&
+             ok;
+        for (const auto& [w, sk] : wins) {
+            Shape s = full;
+            s.window = w;
+            s.sinks = sk;
+            ok = run_one(stream, s, variant, iters, false, nullptr, full_ms,
+                         "attention_bwd_window") &&
+                 ok;
+        }
+    };
+    pair({1, 32, 8, 8192, 8192, 128, 1}, {{128, 0}, {512, 0}, {4096, 0}}, iters);
+    pair({1, 32, 8, 32768, 32768, 128, 1}, {{128, 0}, {512, 0}, {4096, 0}}, 5);
+    pair({1, 64, 8, 8192, 8192, 64, 1}, {{128, 0}, {128, 1}}, iters);
     return ok;
 }
 
@@ -367,14 +484,26 @@ int run(int argc, char** argv) {
     spark::bench::Args args(argc, argv);
     spark::bench::print_device_banner();
 
+    if (args.get("sweep", "") == "window") {
+        spark::bench::print_header();
+        const int variant = args.geti("variant", spark::attention_bwd_num_variants() - 1);
+        if (!window_sweep(nullptr, variant, args.geti("iters", 30))) {
+            std::fprintf(stderr, "CORRECTNESS FAILURE\n");
+            return 1;
+        }
+        return 0;
+    }
+
     std::vector<Shape> shapes;
     if (args.has("b") || args.has("h") || args.has("hq") || args.has("hkv") || args.has("s") ||
-        args.has("sq") || args.has("skv") || args.has("d") || args.has("causal")) {
+        args.has("sq") || args.has("skv") || args.has("d") || args.has("causal") ||
+        args.has("window") || args.has("sinks")) {
         const int s = args.geti("s", 4096);
         const int h = args.geti("h", 32);
         const int hq = args.geti("hq", h);
         shapes.push_back({args.geti("b", 1), hq, args.geti("hkv", hq), args.geti("sq", s),
-                          args.geti("skv", s), args.geti("d", 128), args.geti("causal", 0)});
+                          args.geti("skv", s), args.geti("d", 128), args.geti("causal", 0),
+                          args.geti("window", 0), args.geti("sinks", 0)});
     } else {
         // Small shapes, checked on every row: both head sizes, both masks, a length that is not
         // a multiple of any tile, S_q != S_kv, and GQA groups of 4. Then the forward bench's
