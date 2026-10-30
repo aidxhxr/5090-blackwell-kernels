@@ -20,9 +20,11 @@
 //   * the schedule is variant 4/6's Stream-K hybrid: with G resident blocks and `tiles`
 //     tiles, the last partial wave plus one full wave are cut into G equal ranges of
 //     (tile, k-step) work and summed through the deterministic K-ordered chain fixup of
-//     hgemm_streamk.cuh (one fp32 slot and one epoch-tagged flag per Stream-K tile); every
-//     earlier tile is whole and goes to block tile % G. So an expert with 3 rows costs one
-//     tile of k-steps, not an SM idling while a large expert finishes;
+//     hgemm_streamk.cuh (one fp32 slot and one flag per Stream-K tile; the flag counts the
+//     k-steps accumulated so far and the piece that finishes the tile puts it back to 0, so
+//     no launch carries state into the next and a captured launch replays); every earlier
+//     tile is whole and goes to block tile % G. So an expert with 3 rows costs one tile of
+//     k-steps, not an SM idling while a large expert finishes;
 //   * the mainloop is fp8gemm variant 2's (fp8gemm_tma.cu) and hgemm variant 6's: one
 //     producer lane publishes each piece through an int4 ring and issues two TMA boxes per
 //     stage, 128 rows by BKB bytes of A from a 2-D map over [T, K] and 128 rows by BKB bytes
@@ -105,10 +107,9 @@ struct Params {
     int KT;                     // k-steps per tile
     int grid;                   // resident blocks in the launch
     float* slots;               // 2 * grid Stream-K tiles of BM x BN fp32
-    unsigned long long* flags;  // per Stream-K tile: (epoch << 32) | k-steps accumulated
-    unsigned epoch;
-    const float* scale_a;  // fp8: [1] or null (1)
-    const float* scale_b;  // fp8: [E] or null (1)
+    unsigned long long* flags;  // per Stream-K tile: k-steps accumulated, 0 between launches
+    const float* scale_a;       // fp8: [1] or null (1)
+    const float* scale_b;       // fp8: [E] or null (1)
 };
 
 // The work split every block derives from the tile count: tiles [0, dp) are whole and
@@ -389,17 +390,21 @@ __global__ void __launch_bounds__(THREADS, 1)
         }
 
         // Chain fixup for Stream-K tiles, hgemm variant 6's, with the producer out of it.
+        // The flag holds the k-steps summed into the slot so far. hgemm tags it with a
+        // per-launch epoch; here the piece that finishes the tile (the last reader of its
+        // flag) writes 0 back instead, so every launch starts from zeroed flags and a
+        // launch captured in a CUDA graph replays with the same parameters.
         bool finish = true;
         if (kb > 0 || ke < p.KT) {
             const int tile_r = tile - sp.dp;
             float4* slot =
                 reinterpret_cast<float4*>(p.slots + static_cast<size_t>(tile_r) * (BM * BN));
             unsigned long long* flag = p.flags + tile_r;
-            const unsigned long long tag = static_cast<unsigned long long>(p.epoch) << 32;
             if (kb > 0) {
                 if (tid == 0) {
-                    while (ld_acquire_gpu(flag) != (tag | static_cast<unsigned>(kb))) {
+                    while (ld_acquire_gpu(flag) != static_cast<unsigned long long>(kb)) {
                     }
+                    if (ke == p.KT) *flag = 0ull;
                 }
                 named_barrier_sync(FIXUP_BARRIER, CONSUMERS);
 #pragma unroll
@@ -426,7 +431,7 @@ __global__ void __launch_bounds__(THREADS, 1)
                 }
                 __threadfence();
                 named_barrier_sync(FIXUP_BARRIER, CONSUMERS);
-                if (tid == 0) st_release_gpu(flag, tag | static_cast<unsigned>(ke));
+                if (tid == 0) st_release_gpu(flag, static_cast<unsigned long long>(ke));
                 finish = false;
             }
         }
@@ -447,7 +452,6 @@ struct Workspace {
     float* slots = nullptr;
     unsigned long long* flags = nullptr;
     size_t tiles = 0;
-    unsigned epoch = 0;
 };
 
 template <bool FP8, int BM, int BKB, int STAGES, bool SWIGLU>
@@ -489,7 +493,6 @@ void launch(const void* A, const void* W, const int32_t* offsets, __nv_bfloat16*
         SPARK_CUDA_CHECK(cudaMalloc(&w.flags, w.tiles * sizeof(unsigned long long)));
         SPARK_CUDA_CHECK(cudaMemset(w.flags, 0, w.tiles * sizeof(unsigned long long)));  // once
     }
-    if (++w.epoch == 0) w.epoch = 1;
 
     Params p;
     p.offsets = offsets;
@@ -500,7 +503,6 @@ void launch(const void* A, const void* W, const int32_t* offsets, __nv_bfloat16*
     p.grid = grid;
     p.slots = w.slots;
     p.flags = w.flags;
-    p.epoch = w.epoch;
     p.scale_a = scale_a;
     p.scale_b = scale_b;
     grouped_kernel<FP8, BM, BKB, STAGES, SWIGLU>

@@ -452,7 +452,8 @@ void w1gemm_moe_bf16(const __nv_bfloat16* A, const uint32_t* packed, const __nv_
 // scales; needs an sm_120a / sm_121a build. Requires 1 <= E <= 512, N % 128 == 0, K % 64 ==
 // 0 (bf16) or K % 128 == 0 (fp8), 16-byte aligned A and W. Stream-K tiles are summed in a
 // fixed order, so the output is the same bits every run. Not safe to run concurrently on
-// two streams (one workspace per configuration).
+// two streams (one workspace per configuration); safe to capture in a CUDA graph (nothing
+// in a launch's parameters changes from one call to the next).
 void grouped_gemm_bf16(const __nv_bfloat16* A, const __nv_bfloat16* W, const int32_t* offsets,
                        __nv_bfloat16* C, int T, int E, int N, int K, cudaStream_t stream);
 void grouped_gemm_fp8(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* W, const int32_t* offsets,
