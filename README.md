@@ -651,6 +651,31 @@ sweep, the tile sweep and what is left are in
 [docs/design/moe_layer.md](docs/design/moe_layer.md); `scripts/bench_moe_layer.py`,
 `results/moe_layer.json`, 62 tests in `tests/test_moe_layer.py`.
 
+### the MoE layer in the engine
+
+`ModelWeights.random(moe=cfg)` gives the serving engine an MoE model: the same attention, and
+`MoELayer` where the dense MLP was, its output added to the residual by the next layer's
+norm. Nothing in it waits on the host, so the engine's decode graphs capture the experts
+like the rest of the step, and graphed and eager decode give the same tokens. Two layers is
+what fit next to the card's other tenants (6.3 GB of weights), vocabulary 32,000, the
+serving bench's prompt mix, decode ms/step with graphs / eager:
+
+| batch | dense (Llama-3-8B) | qwen-like: 64 x 1792, top-8 | Mixtral 8x7B: 8 x 14336, top-2 |
+|---|---|---|---|
+| 1 | 0.741 / 0.748 | 0.769 / 0.782 | 1.177 / 1.188 |
+| 8 | 0.782 / 0.789 | 2.549 / 2.562 | 3.397 / 3.409 |
+| 32 | 0.859 / 0.867 | 3.692 / 3.706 | 3.767 / 3.777 |
+| 64 | 1.031 / 1.039 | 3.874 / 3.885 | 3.982 / 3.989 |
+
+The graph saves 7 to 14 us a step, 0.2 to 1.6%. An eager MoE step takes 0.16 to 0.37 ms
+of host time to issue and 0.76 to 3.8 ms on the GPU, so the GPU never waits on the host and
+there is little for the graph to take back. The qwen-like model has the dense model's
+active parameters (8 experts of 1792 are its 14336 columns): at one token both read 1.14 GB
+and the MoE step is 4% slower. From 8 tokens up the step reads every expert the batch
+touched, 3.3x the dense step at 8 and 3.8 to 4.3x at 32 and 64. Details in
+[docs/design/serving.md](docs/design/serving.md); `scripts/bench_engine_moe.py`,
+`results/engine_moe.json`, `tests/test_engine_moe.py`.
+
 ## attention
 
 Fused scaled-dot-product attention, forward, bf16 in and out, fp32 math. Head sizes 64 and
