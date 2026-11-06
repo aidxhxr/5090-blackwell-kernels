@@ -1,5 +1,5 @@
 """Linear cross-entropy at an lm_head's shapes: torch eager, torch.compile of the same
-function, and spark_kernels.linear_cross_entropy variants 1 to 3 (docs/design/cross_entropy.md).
+function, and spark_kernels.linear_cross_entropy variants 1 to 4 (docs/design/cross_entropy.md).
 
     python scripts/bench_cross_entropy.py --vocab 128256 --tokens 2048 4096 8192
     python scripts/bench_cross_entropy.py --vocab 151936 --tokens 8192 --methods v1 v2
@@ -100,6 +100,7 @@ def make_methods(sk, chunk):
         "v1": lambda h, w, y: sk.linear_cross_entropy(h, w, y, variant=1, chunk=chunk),
         "v2": lambda h, w, y: sk.linear_cross_entropy(h, w, y, variant=2, chunk=chunk),
         "v3": lambda h, w, y: sk.linear_cross_entropy(h, w, y, variant=3, chunk=chunk),
+        "v4": lambda h, w, y: sk.linear_cross_entropy(h, w, y, variant=4, chunk=chunk),
     }
 
 
@@ -145,7 +146,7 @@ def run_shape(sk, V: int, T: int, methods: dict, names: list[str], args) -> list
 
         for mode, step in (("fwd", fwd), ("fwd_bwd", fwd_bwd)):
             row = {"kernel": "cross_entropy", "V": V, "D": D_MODEL, "T": T, "method": name,
-                   "mode": mode, "chunk": args.chunk if name in ("v1", "v2", "v3") else None,
+                   "mode": mode, "chunk": args.chunk if name in ("v1", "v2", "v3", "v4") else None,
                    "budget_gb": args.budget_gb}
             t0 = time.perf_counter()
             try:
@@ -192,8 +193,8 @@ def run_shape(sk, V: int, T: int, methods: dict, names: list[str], args) -> list
 def run_pieces(sk, V: int, T: int, chunk: int, args) -> list[dict]:
     """The kernels one at a time at one chunk (and the forward GEMMs over all T rows): the
     three ce_gemm epilogues against torch's h @ w.T (cuBLAS), the row kernel, the transpose,
-    the two hgemm products of a chunk's backward, and variant 3's band kernel (the recompute
-    and both products in one launch, counted as three GEMMs)."""
+    the two hgemm products of a chunk's backward, and the band kernel of variants 3 and 4 (the
+    recompute and both products in one launch, counted as three GEMMs)."""
     C_ = sk.ops._C
     g = torch.Generator(device="cuda").manual_seed(1)
     h = torch.randn(T, D_MODEL, device="cuda", generator=g).to(torch.bfloat16)
@@ -210,14 +211,17 @@ def run_pieces(sk, V: int, T: int, chunk: int, args) -> list[dict]:
     dh = torch.empty(chunk, D_MODEL, device="cuda", dtype=torch.bfloat16)
     dw = torch.empty(V, D_MODEL, device="cuda", dtype=torch.bfloat16)
     C_.ce_logits(hc, w, logits)
-    dh_f32 = torch.zeros((chunk + 127) // 128 * 128, D_MODEL, device="cuda")
-    slots = torch.zeros(C_.ce_backward_slots() * 128, D_MODEL, device="cuda")
+    dh_f32 = torch.zeros((chunk + 255) // 256 * 256, D_MODEL, device="cuda")
+    slots = torch.zeros(max(C_.ce_backward_slots(3), C_.ce_backward_slots(4)) * 128, D_MODEL,
+                        device="cuda")
     flags = torch.zeros(2 * (V // 128) + 1, device="cuda", dtype=torch.int32)
 
-    def bwd_band():
+    def bwd_band(variant):
+        # each variant on its default pool of slots
+        n = C_.ce_backward_slots(variant) * 128
         flags.zero_()
         dh_f32.zero_()
-        C_.ce_backward(hc, w, yc, lse, scale, -100, dh_f32, slots, flags, dw, True)
+        C_.ce_backward(hc, w, yc, lse, scale, -100, dh_f32, slots[:n], flags, dw, True, variant)
 
     gemm = 2 * chunk * V * D_MODEL
     move = chunk * V * 2
@@ -234,7 +238,8 @@ def run_pieces(sk, V: int, T: int, chunk: int, args) -> list[dict]:
         "hgemm dw slab += g^T h": (
             lambda: sk.hgemm(slab_buf, hc, residual=dw[:slab], out=dw[:slab]),
             2 * slab * c_pad * D_MODEL, None),
-        "ce_backward band (v3)": (bwd_band, 3 * gemm, None),
+        "ce_backward band (v3)": (lambda: bwd_band(3), 3 * gemm, None),
+        "ce_backward band (v4)": (lambda: bwd_band(4), 3 * gemm, None),
     }
     rows = []
     for name, (fn, flops, nbytes) in pieces.items():
@@ -265,7 +270,7 @@ def main() -> int:
     ap.add_argument("--vocab", type=int, nargs="+", default=[128256, 151936])
     ap.add_argument("--tokens", type=int, nargs="+", default=[2048, 4096, 8192])
     ap.add_argument("--methods", nargs="+",
-                    default=["torch", "torch_compile", "v1", "v2", "v3"])
+                    default=["torch", "torch_compile", "v1", "v2", "v3", "v4"])
     ap.add_argument("--chunk", type=int, default=None, help="rows per chunk (default CE_CHUNK)")
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--warmup", type=int, default=3)
