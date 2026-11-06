@@ -2035,6 +2035,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "a [M, K] bf16 @ the int4 weight (packed, scales, zeros) -> [M, N] bf16, fp32 accumulate",
           py::arg("a"), py::arg("packed"), py::arg("scales"), py::arg("zeros") = py::none(),
           py::arg("variant") = -1);
+    // w4gemm's tuning hook and variant 3's route (tests/test_w4gemm.py, the sweeps).
+    m.def("w4gemm_set_config", &spark::w4gemm_set_config,
+          "force entry `entry` of w4gemm's table on variant 2 with `split` (-1: the rule)",
+          py::arg("entry"), py::arg("split") = 0);
+    m.def("w4gemm_num_configs", &spark::w4gemm_num_configs, "entries in w4gemm's table");
+    m.def("w4gemm_v3_set_route", &spark::w4gemm_v3_set_route,
+          "w4gemm variant 3's route: -1 the rule, -2 the four-warp shapes at every M",
+          py::arg("route"));
+    m.def("w4gemm_v3_route", &spark::w4gemm_v3_route, "w4gemm variant 3's route");
+    m.def(
+        "w4gemm_v3_route_name",
+        [](int M, int N, int K, bool asym) {
+            return std::string(spark::w4gemm_v3_route_name(M, N, K, asym));
+        },
+        "what w4gemm variant 3 (batch invariant) runs for an M x N x K problem, with symmetric "
+        "weights or, with asym, zero points",
+        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("asym") = false);
     m.def("w1_quantize", &w1_quantize,
           "sign (bits=1) or ternary (bits=2) quantization of a [K, N] bf16 weight, one scale "
           "per 128 k: (packed [N, K * bits / 32] int32, scales [K/128, N] bf16)",
