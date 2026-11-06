@@ -48,7 +48,11 @@
 // `deterministic` swaps the dQ atomics for a separate query-tile-outer kernel (forward
 // variant 2's structure with Q and dO fragments in registers, K and V streamed) that
 // recomputes S and dP for dQ, and runs the key-tile kernel without its dQ product: seven
-// matrix products instead of five, no atomics, bitwise reproducible.
+// matrix products instead of five, no atomics, bitwise reproducible. Under a window of up to
+// 128 keys variant 3 runs the band kernel instead, in both modes: a block walks a range of
+// key tiles in order and finishes each query tile's dQ itself, the earlier key tile's part
+// carried in a slot of its own, so there is no fp32 dQ buffer, no atomics and no dQ pass,
+// and the result is bitwise reproducible.
 //
 // Local attention (attention_bwd_window_bf16, the backward of attention_window_bf16): query
 // row i sits at key position i + off (off = S_kv - S_q under a window) and sees key j when
@@ -1646,6 +1650,388 @@ __global__ void __launch_bounds__(THREADS, 1)
     }
 }
 
+// ---------------------------------------------------------------------------------------
+// Variant 3 under a small window: dQ finished in the kernel, no fp32 buffer, no atomics.
+// Under a window of W <= 128 keys a 32-row query tile sees the keys of two key tiles (three
+// when the diagonal is shifted off the tile grid), so its dQ is a sum of two products. The
+// band kernel gives each block a contiguous range of key tiles, K/V head major, and walks it
+// in order, so the key tiles a query tile sees run one after the other on the same block:
+//   - a query tile's dQ product adds the part of the earlier key tiles from a carry slot in
+//     global memory that the same thread wrote there (so nothing to order), and stores the
+//     sum as bf16 dQ when this is the last key tile the query tile sees, or writes it back;
+//   - a block whose range starts inside a head first replays the key tiles before it that
+//     the query tiles it finishes see (the halo, one key tile at W <= 128), computing their
+//     dQ part and dropping their dK and dV, and the block before drops those query tiles'
+//     dQ instead of storing it.
+// Every dQ element is a sum in key-tile order on one thread and every dK and dV row belongs
+// to one block, so the result is the same bits every run in both modes, and the zeroing in
+// the preprocess, the atomics and the conversion pass are gone. Within a key tile the walk
+// is query tile major (the group's heads inner), which puts the carry's read half a key tile
+// after its write, the least this order allows. The loop, the stage and dS^T rings across
+// items and the per-item K and V loads are the persistent kernel's.
+// ---------------------------------------------------------------------------------------
+
+// Drop the 128-byte line at `p` (128-byte aligned) from L2 without writing it back: its
+// contents become undefined. A carry slot read for the last time is dead until its next
+// write, and without this its dirty lines went back to DRAM: 5% at 32K tokens.
+__device__ __forceinline__ void discard_l2(void* p) {
+    asm volatile("discard.global.L2 [%0], 128;\n" ::"l"(p) : "memory");
+}
+
+constexpr int kBandMaxBlocks = 256;
+struct Band {
+    int G;         // blocks
+    int R;         // carry slots per query head of a block (the most query tiles a key tile sees)
+    float* carry;  // [G][group][R][BQ][D] fp32, slot qt % R of query tile qt
+    // Block b owns key tiles [t[b], t[b + 1]), K/V head major: tile t = bkv * kv_tiles + kt.
+    int t[kBandMaxBlocks + 1];
+};
+struct BandBlock {
+    int t_lo, t_hi;  // the block's tiles
+    int kh0, h;      // halo: key tiles [kh0, kh0 + h) of the first head
+    int qr;          // the first query tile the block finishes in its first head
+};
+struct BandItem {
+    int bkv, kt, bh0, qt_lo, nq;
+    int kt_end;  // the block's last key tile of this head: a query tile seeing past it is dropped
+    bool halo;
+};
+struct BandProd {
+    BandItem pc, pn;
+    int pc_u0, pn_u0, issued, pn_ok;
+};
+
+template <int BQ>
+__device__ __forceinline__ BandBlock band_block(const Sched& s, const Band& bd, int blk) {
+    BandBlock r;
+    r.t_lo = bd.t[blk];
+    r.t_hi = bd.t[blk + 1];
+    const int kt_s = r.t_lo % s.kv_tiles;
+    r.kh0 = kt_s;
+    r.h = 0;
+    r.qr = 0;
+    if (kt_s > 0) {
+        int qt0, qt1;
+        q_tile_range(kt_s * BN, BN, BQ, s.q_tiles, 1, s.off, s.window, qt0, qt1);
+        r.qr = qt0;
+        r.kh0 = min(kt_s, window_lo(qt0 * BQ + s.off, s.window) / BN);
+        r.h = kt_s - r.kh0;
+    }
+    return r;
+}
+
+// Item k of the block: the halo's key tiles first (only the query tiles from qr on), then the
+// block's own tiles.
+template <int BQ>
+__device__ __forceinline__ BandItem band_item(const Sched& s, const BandBlock& bb, int k) {
+    BandItem w;
+    w.halo = k < bb.h;
+    const int t = w.halo ? (bb.t_lo / s.kv_tiles) * s.kv_tiles + bb.kh0 + k : bb.t_lo + k - bb.h;
+    w.bkv = t / s.kv_tiles;
+    w.kt = t - w.bkv * s.kv_tiles;
+    int qt0, qt1;
+    q_tile_range(w.kt * BN, BN, BQ, s.q_tiles, 1, s.off, s.window, qt0, qt1);
+    if (w.halo) qt0 = max(qt0, bb.qr);
+    w.qt_lo = qt0;
+    w.nq = max(0, qt1 - qt0);
+    const int b = w.bkv / s.H_kv, kvh = w.bkv - b * s.H_kv;
+    w.bh0 = b * s.H_q + kvh * s.group;
+    const int t_last = bb.t_hi - 1;
+    w.kt_end = t_last / s.kv_tiles == w.bkv ? t_last % s.kv_tiles : s.kv_tiles - 1;
+    return w;
+}
+
+template <int D, int BQ, bool EARLY>
+__global__ void __launch_bounds__(THREADS, 1)
+    bwd_kv_band_kernel(const __grid_constant__ CUtensorMap tmQ,
+                       const __grid_constant__ CUtensorMap tmO, const bf16* __restrict__ K,
+                       const bf16* __restrict__ V, const float2* __restrict__ ld,
+                       bf16* __restrict__ dQ, bf16* __restrict__ dK, bf16* __restrict__ dV, int S_q,
+                       int S_kv, float scale_log2, float scale, Sched sched, Band band) {
+    using C = Cfg<D, BQ, true>;
+    constexpr int CH = D / 8, KT = D / 16, DT = D / 8, QK = BQ / 16;
+    constexpr int BOXES = D / BOX;
+
+    extern __shared__ __align__(1024) unsigned char smem[];
+    if (smem_u32(smem) % 1024 != 0) __trap();
+    bf16* Ks = reinterpret_cast<bf16*>(smem);
+    unsigned char* stages = smem + C::OFF_STAGES;
+    float* lds_base = reinterpret_cast<float*>(smem + C::OFF_LD);
+    bf16* dS_base = reinterpret_cast<bf16*>(smem + C::OFF_DS);
+    uint64_t* full = reinterpret_cast<uint64_t*>(smem + C::OFF_BAR);
+    uint64_t* empty = full + STAGES;
+    uint64_t* ds_full = empty + STAGES;
+    uint64_t* ds_empty = ds_full + 2;
+
+    const int tid = threadIdx.x;
+    const int lane = tid & 31, warp = tid >> 5;
+    const int g = lane >> 2, c2 = (lane & 3) * 2;
+    const int arow = warp * 16 + (lane & 15);
+    const int off = sched.off, window = sched.window;
+
+    if (tid == 0) {
+#pragma unroll
+        for (int s = 0; s < STAGES; ++s) {
+            mbar_init(&full[s], 1);
+            mbar_init(&empty[s], WARPS);
+        }
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            mbar_init(&ds_full[i], THREADS);
+            mbar_init(&ds_empty[i], THREADS);
+        }
+        fence_mbar_init();
+        prefetch_tensormap(&tmQ);
+        prefetch_tensormap(&tmO);
+    }
+    __syncthreads();
+
+    const BandBlock bb = band_block<BQ>(sched, band, blockIdx.x);
+    const int n_items = bb.h + bb.t_hi - bb.t_lo;
+    float* carry_blk = band.carry + static_cast<size_t>(blockIdx.x) * sched.group * band.R * BQ * D;
+
+    // The persistent kernel's producer, on the block's fixed list of items.
+    BandProd* pr = reinterpret_cast<BandProd*>(smem + C::SMEM);
+    auto issue = [&](const BandItem& w, int u, int U) {
+        const int s = U % STAGES, use = U / STAGES;
+        if (use > 0) mbar_wait(&empty[s], (use - 1) & 1);
+        const int bh = w.bh0 + u % sched.group;
+        const int q0 = (w.qt_lo + u / sched.group) * BQ;
+        unsigned char* dst = stages + s * C::STAGE_BYTES;
+        mbar_arrive_expect_tx(&full[s], C::STAGE_BYTES + C::LD_BYTES);
+#pragma unroll
+        for (int bx = 0; bx < BOXES; ++bx) {
+            tma_load_3d(dst + bx * BQ * BOX * 2, &tmQ, &full[s], bx * BOX, q0, bh);
+            tma_load_3d(dst + C::QT_BYTES + bx * BQ * BOX * 2, &tmO, &full[s], bx * BOX, q0, bh);
+        }
+        bulk_load(lds_base + s * (C::LD_BYTES / 4), ld + static_cast<size_t>(bh) * sched.S_pad + q0,
+                  C::LD_BYTES, &full[s]);
+    };
+    auto produce_upto = [&](int U_end) {
+        int u = pr->issued;
+        while (u < U_end) {
+            if (u < pr->pc_u0 + sched.group * pr->pc.nq)
+                issue(pr->pc, u - pr->pc_u0, u);
+            else if (pr->pn_ok && u < pr->pn_u0 + sched.group * pr->pn.nq)
+                issue(pr->pn, u - pr->pn_u0, u);
+            else
+                break;
+            ++u;
+        }
+        pr->issued = u;
+    };
+
+    int U0 = 0;  // loads (= Q tiles) of the block before this item
+    for (int k = 0; k < n_items; ++k) {
+        const BandItem w = band_item<BQ>(sched, bb, k);
+        const int n_it = sched.group * w.nq;
+        const int k0 = w.kt * BN;
+        if (tid == 0) {
+            if (k == 0) pr->issued = 0;
+            pr->pc = w;
+            pr->pc_u0 = U0;
+            pr->pn_ok = 0;
+            if (k + 1 < n_items) {
+                const BandItem pn = band_item<BQ>(sched, bb, k + 1);
+                pr->pn = pn;
+                pr->pn_u0 = U0 + n_it;
+                pr->pn_ok = 1;
+                const int rows = min(BN, S_kv - pn.kt * BN);
+                const size_t o = (static_cast<size_t>(pn.bkv) * S_kv + pn.kt * BN) * D;
+                prefetch_l2(K + o, static_cast<unsigned>(rows) * D * 2);
+                prefetch_l2(V + o, static_cast<unsigned>(rows) * D * 2);
+            }
+            produce_upto(U0 + 2);
+        }
+
+        // K by cp.async, V straight into its A fragments, as the persistent kernel.
+        {
+            const bf16* Kg = K + static_cast<size_t>(w.bkv) * S_kv * D;
+            for (int i = tid; i < BN * CH; i += THREADS) {
+                const int row = i / CH, ch = i - row * CH;
+                const bool ok = k0 + row < S_kv;
+                const size_t o = static_cast<size_t>(ok ? k0 + row : 0) * D + ch * 8;
+                cp_async_16_zfill(Ks + row * D + swz(row, ch) * 8, Kg + o, ok);
+            }
+            cp_async_commit();
+        }
+        unsigned vf[KT][4];
+        {
+            const int r_lo = k0 + warp * 16 + g, r_hi = r_lo + 8;
+            const bool ok_lo = r_lo < S_kv, ok_hi = r_hi < S_kv;
+            const bf16* Vg = V + static_cast<size_t>(w.bkv) * S_kv * D + c2;
+            const unsigned* vlo =
+                reinterpret_cast<const unsigned*>(Vg + static_cast<size_t>(ok_lo ? r_lo : 0) * D);
+            const unsigned* vhi =
+                reinterpret_cast<const unsigned*>(Vg + static_cast<size_t>(ok_hi ? r_hi : 0) * D);
+#pragma unroll
+            for (int kk = 0; kk < KT; ++kk) {
+                vf[kk][0] = ok_lo ? vlo[8 * kk] : 0u;
+                vf[kk][1] = ok_hi ? vhi[8 * kk] : 0u;
+                vf[kk][2] = ok_lo ? vlo[8 * kk + 4] : 0u;
+                vf[kk][3] = ok_hi ? vhi[8 * kk + 4] : 0u;
+            }
+        }
+        cp_async_wait<0>();
+        __syncthreads();  // K is in shared memory
+
+        // dQ tile of iteration u: this key tile's product, plus the carry when an earlier key
+        // tile of the block saw the query tile, stored as bf16 when this is the last key tile
+        // it sees, else written back to its slot; dropped when it sees past the block's range.
+        auto dq_product = [&](int u) {
+            constexpr int MQ = BQ / 16, NW = WARPS / MQ, DTW = DT / NW;
+            static_assert(WARPS % MQ == 0 && DT % NW == 0 && DTW % 2 == 0, "dQ tile split");
+            const int J = U0 + u, buf = J & 1;
+            const bf16* dsb = dS_base + buf * BN * BQ;
+            const int hg = u % sched.group, qt = w.qt_lo + u / sched.group;
+            const int mt = warp % MQ, nw = warp / MQ;
+            const int last = min(sched.kv_tiles - 1, (qt * BQ + BQ - 1 + off) / BN);
+            const bool drop = last > w.kt_end;  // a later block finishes this query tile
+            const bool add = !drop && window_lo(qt * BQ + off, window) / BN < w.kt;
+            const bool fin = last == w.kt;
+            float* slot = carry_blk + (static_cast<size_t>(hg) * band.R + qt % band.R) * (BQ * D);
+            // The carry first, all of it, so the loads are in flight under the products below.
+            // Loaded next to the stores, each load waited for the store before it (the
+            // compiler cannot tell the bf16 store from the next slot), 25% of the stalls.
+            float2 cin[2][DTW];
+#pragma unroll
+            for (int h = 0; h < 2; ++h)
+#pragma unroll
+                for (int dj = 0; dj < DTW; ++dj)
+                    cin[h][dj] =
+                        add ? *reinterpret_cast<const float2*>(slot + (mt * 16 + g + h * 8) * D +
+                                                               nw * DTW * 8 + c2 + dj * 8)
+                            : make_float2(0.f, 0.f);
+            mbar_wait(&ds_full[buf], (J >> 1) & 1);
+            float acc[DTW][4];
+#pragma unroll
+            for (int dj = 0; dj < DTW; ++dj)
+#pragma unroll
+                for (int e = 0; e < 4; ++e) acc[dj][e] = 0.f;
+#pragma unroll
+            for (int kk = 0; kk < BN / 16; ++kk) {
+                unsigned a[4];
+                {
+                    const int i = lane >> 3;
+                    const int krow = kk * 16 + (i >> 1) * 8 + (lane & 7);
+                    ldmatrix_x4_trans(a, dsb + ds_off<BQ>(krow, mt * 2 + (i & 1)));
+                }
+#pragma unroll
+                for (int dj = 0; dj < DTW; dj += 2) {
+                    const int row = kk * 16 + (lane & 15);
+                    unsigned r[4];
+                    ldmatrix_x4_trans(r, Ks + row * D + swz(row, nw * DTW + dj + (lane >> 4)) * 8);
+                    const unsigned b0[2] = {r[0], r[1]};
+                    const unsigned b1[2] = {r[2], r[3]};
+                    mma_bf16_16816(acc[dj], a, b0);
+                    mma_bf16_16816(acc[dj + 1], a, b1);
+                }
+            }
+            mbar_arrive(&ds_empty[buf]);
+            if (drop) return;
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int r = mt * 16 + g + h * 8;
+                const int q = qt * BQ + r;
+                float* cr = slot + r * D + nw * DTW * 8 + c2;
+                bf16* dst =
+                    dQ + (static_cast<size_t>(w.bh0 + hg) * S_q + q) * D + nw * DTW * 8 + c2;
+#pragma unroll
+                for (int dj = 0; dj < DTW; ++dj) {
+                    float x = acc[dj][2 * h], y = acc[dj][2 * h + 1];
+                    if (add) {
+                        x = cin[h][dj].x + x;
+                        y = cin[h][dj].y + y;
+                    }
+                    if (!fin)
+                        *reinterpret_cast<float2*>(cr + dj * 8) = make_float2(x, y);
+                    else if (q < S_q)
+                        *reinterpret_cast<unsigned*>(dst + dj * 8) =
+                            pack_bf16x2(x * scale, y * scale);
+                }
+            }
+            // A slot read for the last time: drop its L2 lines. A row's 32 floats are one
+            // line, read by the four lanes of one g.
+            if (fin && add) {
+                __syncwarp();
+                if ((lane & 3) == 0) {
+#pragma unroll
+                    for (int h = 0; h < 2; ++h)
+                        discard_l2(slot + (mt * 16 + g + h * 8) * D + nw * DTW * 8);
+                }
+            }
+        };
+
+        float dk[DT][4], dv[DT][4];
+#pragma unroll
+        for (int dj = 0; dj < DT; ++dj)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) dk[dj][e] = dv[dj][e] = 0.f;
+        const int kw0 = k0 + warp * 16;
+        const bool kv_tail = k0 + BN > S_kv;
+
+        for (int it = 0; it < n_it; ++it) {
+            const int J = U0 + it, st = J % STAGES;
+            const int q0 = (w.qt_lo + it / sched.group) * BQ;
+            const bf16* qs = reinterpret_cast<const bf16*>(stages + st * C::STAGE_BYTES);
+            const bf16* dos = qs + BQ * D;
+            const float* lds = lds_base + st * (C::LD_BYTES / 4);
+            unsigned pa[QK][4];
+            mbar_wait(&full[st], (J / STAGES) & 1);
+            const bool dead = q0 + BQ - 1 + off < kw0 || kw0 + 15 <= q0 + off - window;
+            if (!dead) {
+                tile_grads<D, BQ, EARLY, true>(Ks, qs, dos, lds, vf, dk, dv, pa, lane, arow, g, c2,
+                                               q0, kw0, S_kv, kv_tail, 1, scale_log2, off, window);
+            } else {
+#pragma unroll
+                for (int kq = 0; kq < QK; ++kq)
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) pa[kq][e] = 0u;
+            }
+            fence_proxy_async_smem();
+            __syncwarp();
+            if (lane == 0) mbar_arrive(&empty[st]);
+
+            const int buf = J & 1;
+            if (J >= 2) mbar_wait(&ds_empty[buf], ((J >> 1) - 1) & 1);
+            bf16* dSs = dS_base + buf * BN * BQ;
+            const int r0 = warp * 16 + g;
+#pragma unroll
+            for (int kq = 0; kq < QK; ++kq) {
+                *reinterpret_cast<unsigned*>(dSs + ds_off<BQ>(r0, 2 * kq) + c2) = pa[kq][0];
+                *reinterpret_cast<unsigned*>(dSs + ds_off<BQ>(r0 + 8, 2 * kq) + c2) = pa[kq][1];
+                *reinterpret_cast<unsigned*>(dSs + ds_off<BQ>(r0, 2 * kq + 1) + c2) = pa[kq][2];
+                *reinterpret_cast<unsigned*>(dSs + ds_off<BQ>(r0 + 8, 2 * kq + 1) + c2) = pa[kq][3];
+            }
+            mbar_arrive(&ds_full[buf]);
+            if (it >= 1) dq_product(it - 1);
+            if (tid == 0) produce_upto(J + 3);
+        }
+        if (n_it > 0) dq_product(n_it - 1);
+
+        // dK and dV of an own tile, whole: no other block adds to them. A halo item's are not
+        // this block's to store.
+        if (!w.halo) {
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int key = kw0 + g + h * 8;
+                if (key >= S_kv) continue;
+                bf16* dkr = dK + (static_cast<size_t>(w.bkv) * S_kv + key) * D + c2;
+                bf16* dvr = dV + (static_cast<size_t>(w.bkv) * S_kv + key) * D + c2;
+#pragma unroll
+                for (int dj = 0; dj < DT; ++dj) {
+                    *reinterpret_cast<unsigned*>(dkr + dj * 8) =
+                        pack_bf16x2(dk[dj][2 * h] * scale, dk[dj][2 * h + 1] * scale);
+                    *reinterpret_cast<unsigned*>(dvr + dj * 8) =
+                        pack_bf16x2(dv[dj][2 * h], dv[dj][2 * h + 1]);
+                }
+            }
+        }
+        U0 += n_it;
+        __syncthreads();  // every warp is past its last K read
+    }
+}
+
 }  // namespace kvt
 
 // ---------------------------------------------------------------------------------------
@@ -1850,7 +2236,7 @@ T* buffer(Buffer& b, size_t count) {
     }
     return static_cast<T*>(b.p);
 }
-Buffer g_ld, g_dq, g_dkv, g_ctr;
+Buffer g_ld, g_dq, g_dkv, g_ctr, g_band;
 
 // Knobs, read once: SPARK_ATTN_BWD_SPLIT = n forces every key tile of variants 1 and 2 into n
 // slices (0: the default rule, which splits only the tail of the last wave).
@@ -1893,6 +2279,23 @@ bool env_zero4() {
         v = e != nullptr && std::atoi(e) != 0;
     }
     return v != 0;
+}
+
+// Whether variant 3 finishes dQ in the band kernel under a window of `window` keys, `tiles`
+// key tiles of 128 in all. Measured: up to 128 keys it beats the deterministic pass at every
+// length tried, and the atomic mode from 2.3 key tiles per SM (3% at 6K tokens, 1.34x at
+// 32K), where at 1.5 it loses 3 to 4% (the halo is a third of a block's work); at 256 keys a
+// query tile sees three key tiles, the halo is a whole one, and it loses to the atomic mode
+// at 8K and 32K tokens. SPARK_ATTN_BWD_BAND = 0 never, 1 under every window.
+bool use_band(int window, bool deterministic, long long tiles) {
+    static int v = -2;
+    if (v == -2) {
+        const char* e = std::getenv("SPARK_ATTN_BWD_BAND");
+        v = e != nullptr ? (std::atoi(e) != 0) : -1;
+    }
+    if (window <= 0) return false;
+    if (v >= 0) return v != 0;
+    return window <= kvt::BN && (deterministic || tiles >= 2LL * num_sms());
 }
 
 int env_split() {
@@ -2130,6 +2533,93 @@ void launch_kv_persist(const Args& a, cudaStream_t stream) {
     launch_split_convert<D, kvt::BN>(a, s, ws_tiles, stream);
 }
 
+// The band kernel's blocks: the key tiles in order, cut so that no block's work (the Q-tile
+// iterations of its tiles plus those of its halo) exceeds the smallest bound that fits in
+// `max_blocks` blocks, found by bisection. Against an even cut of the tiles it measured 3%
+// faster at 6K tokens (2.26 key tiles per SM, so 2 or 3 a block, most with a halo), 1% at
+// 16K, the same at 8K and 32K. Also the carry ring R. Cached per shape.
+void band_ranges(const kv::Sched& s, int BQ, int max_blocks, kvt::Band& bd) {
+    static std::map<std::array<int, 8>, kvt::Band> cache;
+    const std::array<int, 8> key = {s.bkv_count, s.kv_tiles, s.group, s.q_tiles,
+                                    s.off,       s.window,   BQ,      max_blocks};
+    auto hit = cache.find(key);
+    if (hit != cache.end()) {
+        bd = hit->second;
+        return;
+    }
+    const int BN = kvt::BN, kv_tiles = s.kv_tiles, T = s.bkv_count * kv_tiles;
+    std::vector<int> qt0(kv_tiles), qt1(kv_tiles);
+    bd.R = 1;
+    for (int kt = 0; kt < kv_tiles; ++kt) {
+        q_tile_range(kt * BN, BN, BQ, s.q_tiles, 1, s.off, s.window, qt0[kt], qt1[kt]);
+        bd.R = std::max(bd.R, qt1[kt] - qt0[kt]);
+    }
+    // own[kt]: iterations of key tile kt; halo[kt]: those of the halo of a block starting at it.
+    std::vector<long long> own(kv_tiles), halo(kv_tiles, 0);
+    for (int kt = 0; kt < kv_tiles; ++kt) {
+        own[kt] = static_cast<long long>(s.group) * (qt1[kt] - qt0[kt]);
+        if (kt == 0) continue;
+        const int qr = qt0[kt];
+        const int kh0 = std::min(kt, window_lo(qr * BQ + s.off, s.window) / BN);
+        for (int kh = kh0; kh < kt; ++kh)
+            halo[kt] +=
+                static_cast<long long>(s.group) * std::max(0, qt1[kh] - std::max(qt0[kh], qr));
+    }
+    // Greedy cut under a bound M (each block takes at least one tile); the cuts into `t`.
+    auto cut = [&](long long M, int* t) {
+        int n = 0, i = 0;
+        while (i < T) {
+            if (t) t[n] = i;
+            long long c = halo[i % kv_tiles] + own[i % kv_tiles];
+            ++i;
+            while (i < T && c + own[i % kv_tiles] <= M) c += own[i++ % kv_tiles];
+            ++n;
+        }
+        if (t) t[n] = T;
+        return n;
+    };
+    long long lo = 1, hi = 0;
+    for (int kt = 0; kt < kv_tiles; ++kt) hi += own[kt] + halo[kt];
+    hi *= s.bkv_count;
+    while (lo < hi) {
+        const long long mid = (lo + hi) / 2;
+        if (cut(mid, nullptr) <= max_blocks)
+            hi = mid;
+        else
+            lo = mid + 1;
+    }
+    bd.G = cut(lo, bd.t);
+    bd.carry = nullptr;
+    cache.emplace(key, bd);
+}
+
+template <int D, int BQ, bool EARLY>
+void launch_kv_band(const Args& a, cudaStream_t stream) {
+    using C = kvt::Cfg<D, BQ, true>;
+    constexpr int bytes = C::SMEM + 128;  // and the producer's state
+    static_assert(sizeof(kvt::BandProd) <= 128 && bytes <= 99 * 1024, "");
+    auto kernel = kvt::bwd_kv_band_kernel<D, BQ, EARLY>;
+    static bool opted = false;
+    if (!opted) {
+        SPARK_CUDA_CHECK(
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
+        opted = true;
+    }
+    const uint64_t BHq = static_cast<uint64_t>(a.B) * a.H_q;
+    const CUtensorMap tmQ =
+        make_tensor_map_3d_bf16(a.Q, D, a.S_q, BHq, kvt::BOX, BQ, CU_TENSOR_MAP_SWIZZLE_128B);
+    const CUtensorMap tmO =
+        make_tensor_map_3d_bf16(a.dO, D, a.S_q, BHq, kvt::BOX, BQ, CU_TENSOR_MAP_SWIZZLE_128B);
+    int ws_tiles = 0, items = 0;
+    const kv::Sched s = build_sched(a, kvt::BN, BQ, D, false, stream, ws_tiles, items);
+    kvt::Band bd;
+    band_ranges(s, BQ, std::min(num_sms(), kvt::kBandMaxBlocks), bd);
+    bd.carry = buffer<float>(g_band, static_cast<size_t>(bd.G) * s.group * bd.R * BQ * D);
+    kernel<<<bd.G, kvt::THREADS, bytes, stream>>>(tmQ, tmO, a.K, a.V, a.ld, a.dQ, a.dK, a.dV, a.S_q,
+                                                  a.S_kv, a.scale_log2, a.scale, s, bd);
+    SPARK_CHECK_LAUNCH();
+}
+
 template <int D, bool WIN>
 void launch_dq_pass(const Args& a, cudaStream_t stream) {
     constexpr int bytes = dqp::smem_bytes<D>();
@@ -2195,7 +2685,11 @@ void attention_bwd_window_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K,
     const int S_pad = cdiv(S_q, kRowPad) * kRowPad;
     const int rows_pad = B * H_q * S_pad;
     const size_t n_q = static_cast<size_t>(B) * H_q * S_q * D;
-    const bool atomic_dq = variant >= 1 && !deterministic;
+    // Variant 3 under a small window finishes dQ in the band kernel, in both modes.
+    const bool band =
+        variant == 3 &&
+        use_band(window, deterministic, static_cast<long long>(B) * H_kv * cdiv(S_kv, kvt::BN));
+    const bool atomic_dq = variant >= 1 && !deterministic && !band;
 
     Args a;
     a.Q = Q;
@@ -2267,7 +2761,14 @@ void attention_bwd_window_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K,
             case 3: {
                 constexpr int BQ = DD == 128 ? 32 : 64;
                 const bool early = use_early(S_q);
-                if (persist) {
+                if (band) {
+                    if constexpr (WIN) {
+                        if (early)
+                            launch_kv_band<DD, BQ, true>(a, stream);
+                        else
+                            launch_kv_band<DD, BQ, false>(a, stream);
+                    }
+                } else if (persist) {
                     if constexpr (!WIN) {
                         if (early)
                             launch_kv_persist<DD, BQ, true>(a, stream);

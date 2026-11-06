@@ -861,7 +861,9 @@ def attention_bwd(
 
     `window` and `sinks` are `attention`'s, and must be what the forward ran with (its lse
     includes the sink). The key-tile kernels walk only the query tiles a key tile's window
-    reaches, so the backward's time follows the window as the forward's does. With `sinks` the
+    reaches, so the backward's time follows the window as the forward's does. Under a window
+    of up to 128 keys variant 3 finishes dq inside one kernel with no atomics (the band
+    kernel), so there both modes give the same bits every run. With `sinks` the
     result has a fourth tensor, dsinks (float32 [H_q]), the gradient of the sink logits:
     -sum over the head's rows of p_sink * (d_out . out), the sink's softmax probability times
     its dS with no value.
