@@ -57,6 +57,28 @@ def add_rmsnorm_(
     return _C.add_rmsnorm_(x, resid, w, eps)
 
 
+def rmsnorm_fp8(
+    x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`fp8_quantize(rmsnorm(x, w, eps), "row")` in one launch: (q, scale), q float8_e4m3fn
+    shaped like x and scale float32 [..., 1], the same bits as the two ops (the bf16 row is
+    rounded as rmsnorm stores it, then quantized as fp8_quantize does, in registers).
+
+    bfloat16 only; cols a multiple of 8 and at most 32768, 16-byte aligned x and w.
+    """
+    return _C.rmsnorm_fp8(x, w, eps)
+
+
+def add_rmsnorm_fp8_(
+    x: torch.Tensor, resid: torch.Tensor, w: torch.Tensor, eps: float = 1e-6
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`resid += x` in place, then `fp8_quantize(rmsnorm(resid, w, eps), "row")`: the result
+    of `add_rmsnorm_` handed to fp8_quantize's row mode, bit for bit, in one launch and
+    without the bf16 row. Same requirements as `rmsnorm_fp8`, resid 16-byte aligned too.
+    """
+    return _C.add_rmsnorm_fp8_(x, resid, w, eps)
+
+
 def swiglu(gate: torch.Tensor, up: torch.Tensor, variant: int = -1) -> torch.Tensor:
     """silu(gate) * up, elementwise, fp32 math. Any shape; gate and up must match.
 

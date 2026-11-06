@@ -138,6 +138,17 @@ def check_row_ops(sk, rows, ms):
         return sk.add_rmsnorm_(d[:m], xm, w)
 
     _check(rows, "add_rmsnorm_", -1, "4096", add_norm, ms)
+
+    def fp8_bytes(q, s):  # the e4m3 bytes and the fp32 scale's bytes of each row
+        return torch.cat([q.view(torch.uint8), s.view(torch.uint8)], dim=1)
+
+    _check(rows, "rmsnorm_fp8", -1, "4096", lambda m: fp8_bytes(*sk.rmsnorm_fp8(x[:m], w)), ms)
+
+    def add_norm_fp8(m):
+        xm = x[:m].clone()
+        return fp8_bytes(*sk.add_rmsnorm_fp8_(d[:m], xm, w))
+
+    _check(rows, "add_rmsnorm_fp8_", -1, "4096", add_norm_fp8, ms)
     _check(rows, "swiglu", -1, "2x4096", lambda m: sk.swiglu(x[:m], d[:m]), ms)
 
 

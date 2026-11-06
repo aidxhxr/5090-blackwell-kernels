@@ -123,6 +123,47 @@ Tensor add_rmsnorm_(const Tensor& x, Tensor resid, const Tensor& w, double eps) 
     return out;
 }
 
+// rmsnorm(x) * w, or with resid: resid += x then rmsnorm(resid) * w, written as
+// fp8_quantize(h, "row") writes the bf16 h: (e4m3 shaped like x, fp32 scales [..., 1]).
+std::tuple<Tensor, Tensor> norm_fp8(const Tensor& x, Tensor* resid, const Tensor& w, double eps) {
+    const char* name = resid != nullptr ? "add_rmsnorm_fp8_" : "rmsnorm_fp8";
+    check_cuda_contig(x, "x");
+    check_cuda_contig(w, "w");
+    TORCH_CHECK(x.scalar_type() == at::kBFloat16 && w.scalar_type() == at::kBFloat16, name,
+                " supports bfloat16 only");
+    const RowShape s = row_shape(x);
+    TORCH_CHECK(w.dim() == 1 && w.size(0) == s.cols, "w must have shape [cols] = [", s.cols, "]");
+    if (resid != nullptr) {
+        check_cuda_contig(*resid, "resid");
+        TORCH_CHECK(resid->scalar_type() == at::kBFloat16, "resid must be bfloat16");
+        TORCH_CHECK(resid->sizes() == x.sizes(), "resid must have the same shape as x");
+    }
+    const c10::cuda::CUDAGuard guard(x.device());
+    Tensor q = at::empty(x.sizes(), x.options().dtype(at::kFloat8_e4m3fn));
+    auto ssz = x.sizes().vec();
+    ssz.back() = 1;
+    Tensor scales = at::empty(ssz, x.options().dtype(at::kFloat));
+    auto* qp = static_cast<unsigned char*>(q.data_ptr());
+    if (resid != nullptr) {
+        spark::add_rmsnorm_fp8_bf16(bf16_ptr(x), bf16_ptr_mut(*resid), bf16_ptr(w), qp,
+                                    scales.data_ptr<float>(), s.rows, s.cols,
+                                    static_cast<float>(eps), current_stream(x));
+    } else {
+        spark::rmsnorm_fp8_bf16(bf16_ptr(x), bf16_ptr(w), qp, scales.data_ptr<float>(), s.rows,
+                                s.cols, static_cast<float>(eps), current_stream(x));
+    }
+    return {q, scales};
+}
+
+std::tuple<Tensor, Tensor> rmsnorm_fp8(const Tensor& x, const Tensor& w, double eps) {
+    return norm_fp8(x, nullptr, w, eps);
+}
+
+std::tuple<Tensor, Tensor> add_rmsnorm_fp8_(const Tensor& x, Tensor resid, const Tensor& w,
+                                            double eps) {
+    return norm_fp8(x, &resid, w, eps);
+}
+
 // A 2-D tensor whose rows are contiguous but not adjacent: one half of a fused gate|up
 // projection, gu[:, :I] or gu[:, I:].
 bool strided_rows(const Tensor& t) {
@@ -1920,6 +1961,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rmsnorm", &rmsnorm, "RMSNorm over the last dim", py::arg("x"), py::arg("w"),
           py::arg("eps") = 1e-6, py::arg("variant") = -1);
     m.def("add_rmsnorm_", &add_rmsnorm_, "resid += x; return rmsnorm(resid) * w (bf16, in place)",
+          py::arg("x"), py::arg("resid"), py::arg("w"), py::arg("eps") = 1e-6);
+    m.def("rmsnorm_fp8", &rmsnorm_fp8,
+          "rmsnorm(x) * w as fp8_quantize(.., 'row') of it: (e4m3, fp32 scale per row), bf16 x",
+          py::arg("x"), py::arg("w"), py::arg("eps") = 1e-6);
+    m.def("add_rmsnorm_fp8_", &add_rmsnorm_fp8_,
+          "resid += x; rmsnorm(resid) * w as fp8_quantize(.., 'row') of it (bf16, in place)",
           py::arg("x"), py::arg("resid"), py::arg("w"), py::arg("eps") = 1e-6);
     m.def("swiglu", &swiglu,
           "silu(gate) * up (2-D gate and up with contiguous rows may be strided: the halves "

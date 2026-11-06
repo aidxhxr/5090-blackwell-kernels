@@ -21,6 +21,9 @@ is transposed once here. Activations are quantized per call by `fp8_quantize` (p
 scales per tensor or per token, or MX scales; one or two launches) and `fp4_quantize`.
 fp8-tok cannot hand fp8gemm a per-row scale (its scales are per tensor), so it multiplies
 the bf16 output by the row scales afterwards: one more launch, and one more bf16 rounding.
+An fp8-tok projection right after a norm can skip its quantizer: `FP8Linear.gemm` takes the
+e4m3 rows and scales that rmsnorm_fp8 and add_rmsnorm_fp8_ write (the engine does this for
+qkv and gate/up), the same bytes fp8_quantize makes of the norm's bf16 output.
 
 `set_batch_invariant(True)` switches a projection to the GEMM rung whose bits for a row do
 not depend on M (docs/design/batch_invariant.md): w4gemm variant 3 for int4, fp8gemm
@@ -120,10 +123,15 @@ class FP8Linear:
         self.variant = self.invariant_variant if on else -1
 
     def __call__(self, a: torch.Tensor) -> torch.Tensor:
+        return self.gemm(*sk.fp8_quantize(a, "row" if self.per_token else "tensor"))
+
+    def gemm(self, q: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+        """The product for an activation already quantized the way `__call__` quantizes it:
+        (q, s) of fp8_quantize(a, "row") with per_token, or of rmsnorm_fp8 / add_rmsnorm_fp8_
+        (the same bits, the norm before the projection writing them itself), and of
+        fp8_quantize(a, "tensor") without."""
         if self.per_token:
-            q, s = sk.fp8_quantize(a, "row")
             return sk.fp8gemm(q, self.wt, self.one, self.sw, self.variant).mul_(s)
-        q, s = sk.fp8_quantize(a, "tensor")
         return sk.fp8gemm(q, self.wt, s, self.sw, self.variant)
 
     def nbytes(self) -> int:

@@ -295,6 +295,10 @@ class SparkModel:
     (docs/design/batch_invariant.md)."""
 
     context_prefill = True  # prefill rows may continue a cached context (attention_varlen)
+    # fp8-tok: the qkv and gate/up projections take their e4m3 rows and scales from the norm
+    # before them (rmsnorm_fp8, add_rmsnorm_fp8_) instead of a bf16 row and fp8_quantize: the
+    # same bits, one launch and one pass over the row fewer per norm. False runs the two ops.
+    fuse_norm_fp8 = True
 
     def __init__(self, weights: ModelWeights, rope: RoPE, weights_format: str = "bf16",
                  keep_bf16: bool = False, head_format: str = "bf16", prefill_variant: int = -1,
@@ -438,16 +442,23 @@ class SparkModel:
                                  **sc)
         return o
 
+    def _norm_linear(self, lin, x: torch.Tensor, delta, w_norm: torch.Tensor) -> torch.Tensor:
+        """lin(rmsnorm(x) * w_norm), after `x += delta` unless delta is None; fp8-tok with
+        `fuse_norm_fp8` hands lin the norm's own e4m3 rows (FP8Linear.gemm)."""
+        if self.fuse_norm_fp8 and self.format == "fp8-tok":
+            if delta is None:
+                return lin.gemm(*sk.rmsnorm_fp8(x, w_norm, EPS))
+            return lin.gemm(*sk.add_rmsnorm_fp8_(delta, x, w_norm, EPS))
+        if delta is None:
+            return lin(sk.rmsnorm(x, w_norm, EPS))
+        return lin(sk.add_rmsnorm_(delta, x, w_norm, EPS))  # x += delta, then the norm
+
     def _layers_quant(self, x: torch.Tensor, b: Batch, cache: PagedKVCache, decode: bool):
         delta = None  # the previous layer's down output, not yet added to x
         for layer, (w, lin) in enumerate(zip(self.w.layers, self.lin, strict=True)):
-            if delta is None:
-                h = sk.rmsnorm(x, w.attn_norm, EPS)
-            else:
-                h = sk.add_rmsnorm_(delta, x, w.attn_norm, EPS)  # x += delta, then the norm
-            o = self._attention(lin["qkv"](h), x, b, cache, layer, decode)
-            h2 = sk.add_rmsnorm_(lin["o"](o), x, w.mlp_norm, EPS)
-            gu = lin["gate_up"](h2)
+            qkv = self._norm_linear(lin["qkv"], x, delta, w.attn_norm)
+            o = self._attention(qkv, x, b, cache, layer, decode)
+            gu = self._norm_linear(lin["gate_up"], x, lin["o"](o), w.mlp_norm)
             delta = lin["down"](sk.swiglu(gu[:, :INTERMEDIATE], gu[:, INTERMEDIATE:]))
             if self.trace is not None:
                 self.trace.append(x + delta)
