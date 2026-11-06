@@ -1,9 +1,9 @@
 """Parity of every attention variant against torch's scaled_dot_product_attention (in fp32,
 from the same bf16 inputs), on shapes that cover both head sizes, both masks, a sequence that
-is not a multiple of the 128 x 64 tile, a decode step, the split-KV tail of variants 3 to 5,
-the TMA boxes of variants 4 and 5 that hang off the end of a head, the persistent queue of
-variant 5 with more items than blocks, and grouped-query attention (H_q / H_kv in {1, 4, 8})
-in prefill and decode."""
+is not a multiple of the 128 x 64 or 128 x 128 tile, fewer queries than keys under the causal
+mask, a decode step, the split-KV tail of variants 3 to 6, the TMA boxes of variants 4 to 6
+that hang off the end of a head, the persistent queue of variants 5 and 6 with more items than
+blocks, and grouped-query attention (H_q / H_kv in {1, 4, 8}) in prefill and decode."""
 
 import pytest
 import torch
@@ -18,7 +18,12 @@ SHAPES = [(1, 2, 2, 128, 128, 64), (1, 2, 2, 200, 200, 128), (2, 3, 3, 512, 512,
           # (4 heads x 7 tokens, 8 x 5, which run the 64-row tile with the K/V head stride)
           (1, 8, 2, 300, 300, 128), (2, 8, 1, 200, 200, 64), (1, 32, 8, 1, 4096, 128),
           (1, 16, 2, 2, 1000, 128), (1, 8, 2, 4, 700, 64), (1, 8, 2, 7, 300, 128),
-          (2, 16, 2, 5, 333, 128), (3, 8, 2, 1, 96, 128)]
+          (2, 16, 2, 5, 333, 128), (3, 8, 2, 1, 96, 128),
+          # 128-row tiles against more keys than queries (the causal bound of a row is its
+          # index, so the last tiles of the sequence are past every row), and a sequence one
+          # row past a 128 x 128 tile: variant 6 cuts its tiles to the 16-key blocks each
+          # warp's rows reach on both
+          (1, 4, 2, 300, 1000, 128), (2, 4, 4, 129, 129, 64)]
 TOL = dict(atol=2e-2, rtol=2e-2)  # one bf16 rounding of an fp32 result, P in bf16 for v2-v4
 
 
@@ -69,16 +74,22 @@ def test_attention_gqa_matches_repeated_kv_heads(sk):
                                    sk.attention(q, k8, v8, causal=causal).float(), **TOL)
 
 
-def test_attention_default_is_the_top_rung(sk):
+def test_attention_default_is_variant_5(sk):
+    # variant 6 (128-key tiles) is opt-in: it measured slower than variant 5, so the default
+    # is not the top rung
     q, k, v = _inputs(1, 2, 2, 256, 256, 128)
-    top = sk.num_variants("attention") - 1
-    torch.testing.assert_close(sk.attention(q, k, v, causal=True),
-                               sk.attention(q, k, v, causal=True, variant=top), atol=0, rtol=0)
+    for causal in (False, True):
+        torch.testing.assert_close(sk.attention(q, k, v, causal=causal),
+                                   sk.attention(q, k, v, causal=causal, variant=5), atol=0,
+                                   rtol=0)
+    out, lse = sk.attention_fwd(q, k, v, causal=True)
+    out5, lse5 = sk.attention_fwd(q, k, v, causal=True, variant=5)
+    torch.testing.assert_close(lse, lse5, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("variant", [v for v in _variants() if v >= 3])
 def test_attention_split_tail_is_stable_across_calls(sk, variant):
-    # variants 3 to 5 reuse a workspace for the split tiles; repeated calls must agree
+    # variants 3 to 6 reuse a workspace for the split tiles; repeated calls must agree
     q, k, v = _inputs(1, 4, 4, 512, 512, 128)
     a = sk.attention(q, k, v, variant=variant)
     b = sk.attention(q, k, v, variant=variant)
@@ -103,10 +114,10 @@ TMA_VARIANTS = [v for v in _variants() if v >= 4]
 @pytest.mark.parametrize("variant", TMA_VARIANTS)
 @pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
 def test_attention_tma_heads_do_not_bleed(sk, causal, variant):
-    # Variants 4 and 5 load K and V by TMA in 64-row boxes. With S_kv = 200 the last box of
-    # every head hangs 56 rows past the head; the 3-D tensor map must zero-fill them, not read
-    # the next head's keys. Head 0 is checked alone against a copy of itself with the other
-    # heads made hostile (large values), so a bleed would show.
+    # Variants 4 and 5 load K and V by TMA in 64-row boxes, variant 6 in 128-row ones. With
+    # S_kv = 200 the last box of every head hangs 56 rows past the head; the 3-D tensor map
+    # must zero-fill them, not read the next head's keys. Head 0 is checked alone against a
+    # copy of itself with the other heads made hostile (large values), so a bleed would show.
     B, H, S, D = 1, 3, 200, 128
     q, k, v = _inputs(B, H, H, S, S, D)
     k2, v2 = k.clone(), v.clone()
@@ -122,8 +133,8 @@ def test_attention_tma_heads_do_not_bleed(sk, causal, variant):
 @pytest.mark.parametrize("variant", TMA_VARIANTS)
 def test_attention_tma_repeated_calls_and_streams(sk, variant):
     # Every launch encodes fresh tensor maps and runs the mbarrier pipeline from scratch; the
-    # result must not depend on what ran before, including on another stream. Variant 5 also
-    # keeps a queue counter per stream that every launch must leave zero.
+    # result must not depend on what ran before, including on another stream. Variants 5 and 6
+    # also keep a queue counter per stream that every launch must leave zero.
     q, k, v = _inputs(2, 4, 4, 1000, 1000, 64)
     ref = sk.attention(q, k, v, causal=True, variant=variant)
     s = torch.cuda.Stream()
@@ -137,19 +148,25 @@ def test_attention_tma_repeated_calls_and_streams(sk, variant):
     torch.testing.assert_close(ref.float(), _reference(q, k, v, True), **TOL)
 
 
-@pytest.mark.skipif(5 not in _variants(), reason="variant 5 not built")
+QUEUE_VARIANTS = [v for v in _variants() if v >= 5]
+
+
+@pytest.mark.skipif(not QUEUE_VARIANTS, reason="variant 5 not built")
+@pytest.mark.parametrize("variant", QUEUE_VARIANTS)
 @pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
-def test_attention_v5_queue_with_more_items_than_blocks(sk, causal):
-    # Variant 5's blocks walk a queue: 2 x 8 heads x 16 Q tiles = 256 items on 170 blocks, so
-    # every block takes several, some the split slices of the tail, and the counter is reset
-    # by the last block for the next launch. Two launches back to back on one stream and one
-    # on a second stream while the first may still be running must all agree.
-    q, k, v = _inputs(2, 8, 2, 2048, 2048, 128)
-    a = sk.attention(q, k, v, causal=causal, variant=5)
+@pytest.mark.parametrize("D", [128, 64])
+def test_attention_queue_with_more_items_than_blocks(sk, D, causal, variant):
+    # The blocks of variants 5 and 6 walk a queue: 2 x 8 heads x 16 Q tiles = 256 items on 170
+    # blocks, so every block takes several, some the split slices of the tail, and the counter
+    # is reset by the last block for the next launch. Two launches back to back on one stream
+    # and one on a second stream while the first may still be running must all agree. Variant
+    # 6 runs its inline producer at D = 128 and the producer warp at D = 64.
+    q, k, v = _inputs(2, 8, 2, 2048, 2048, D)
+    a = sk.attention(q, k, v, causal=causal, variant=variant)
     s = torch.cuda.Stream()
     with torch.cuda.stream(s):
-        c = sk.attention(q, k, v, causal=causal, variant=5)
-    b = sk.attention(q, k, v, causal=causal, variant=5)
+        c = sk.attention(q, k, v, causal=causal, variant=variant)
+    b = sk.attention(q, k, v, causal=causal, variant=variant)
     torch.cuda.synchronize()
     torch.testing.assert_close(a, b, atol=0, rtol=0)
     torch.testing.assert_close(a, c, atol=0, rtol=0)
