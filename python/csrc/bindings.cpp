@@ -1272,9 +1272,11 @@ void check_attention_inputs(const Tensor& q, const Tensor& k, const Tensor& v,
     }
 }
 
-// The forward rung for `variant` (-1: the top rung that accepts the shape).
+// The forward rung for `variant` (-1: the default rung, or the next one down that accepts the
+// shape; the rungs above the default are opt-in).
 int attention_variant(const Tensor& q, const Tensor& k, int variant) {
-    int var = resolve_variant(variant, spark::attention_num_variants());
+    int var = variant < 0 ? spark::attention_default_variant()
+                          : resolve_variant(variant, spark::attention_num_variants());
     while (variant < 0 && var > 0 &&
            !spark::attention_supports(static_cast<int>(q.size(2)), static_cast<int>(k.size(2)),
                                       static_cast<int>(q.size(3)), var))

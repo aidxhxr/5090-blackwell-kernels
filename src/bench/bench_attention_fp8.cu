@@ -241,7 +241,7 @@ bool run_shape(cudaStream_t stream, const Shape& s, const std::vector<int>& vari
     double bf16_ms = 0.0;
     Err bf16_err;
     if (opt.compare_bf16) {
-        const int v5 = spark::attention_num_variants() - 1;
+        const int v5 = spark::attention_default_variant();
         SPARK_CUDA_CHECK(cudaMalloc(&dQb, nQ * sizeof(__nv_bfloat16)));
         SPARK_CUDA_CHECK(cudaMalloc(&dKb, nK * sizeof(__nv_bfloat16)));
         SPARK_CUDA_CHECK(cudaMalloc(&dVb, nK * sizeof(__nv_bfloat16)));
