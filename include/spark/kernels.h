@@ -270,10 +270,18 @@ bool fp8gemm_supports(int M, int N, int K, int variant);
 // may both be null (1.0). Requires K % 256 == 0 on top of the per-tensor rules (a row's
 // scales for two 128-k stages are one aligned 8-byte chunk) and 16-byte aligned sfa, sfb;
 // throws std::invalid_argument on a build without the instruction.
+// `layout` FP8_MX_TILED takes both scale tensors in the tiled layout instead, the one variant
+// 3's TMA tiles copy into shared memory a box per stage: groups of 32 rows outermost (rows
+// padded to a multiple of 32, ceil(rows / 32) * K bytes), and in a group, per 128 k, 128 bytes
+// holding the 4 scale bytes of each row, row r of the group (r = g + 8 t + 16 h, g < 8) at
+// byte 4 (4 g + 2 t + h), k-block j of the 128 k in byte j of the four. Variants 0, 1, 3 and
+// 4 take it, variant 2 does not (fp8gemm_mx_supports).
+enum Fp8MxLayout { FP8_MX_ROWS = 0, FP8_MX_TILED = 1 };
 void fp8gemm_mx(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat16* C, int M, int N,
                 int K, const float* scale_a, const float* scale_b, const unsigned char* sfa,
-                const unsigned char* sfb, int variant, cudaStream_t stream);
-bool fp8gemm_mx_supports(int M, int N, int K, int variant);
+                const unsigned char* sfb, int variant, cudaStream_t stream,
+                int layout = FP8_MX_ROWS);
+bool fp8gemm_mx_supports(int M, int N, int K, int variant, int layout = FP8_MX_ROWS);
 // True if the fp8 kernels were compiled for sm_120a / sm_121a, where the block-scaled mma
 // exists. On a plain sm_120 build the per-tensor mode runs the plain instruction and MX mode
 // is refused.
@@ -283,12 +291,13 @@ bool fp8gemm_mx_available();
 // shape, else variant 1), n in [0, fp8gemm_v3_num_tiles()) forces TMA tile n where N and K
 // tile (the old route elsewhere). Process-wide, initial value from SPARK_FP8GEMM_V3_ROUTE;
 // M <= 64 always runs variant 1's decode kernels. fp8gemm_v3_route_name says what variant 3
-// runs for a shape under the current route, in per-tensor or MX mode (the rule differs).
+// runs for a shape under the current route, in per-tensor or MX mode (the rule differs), with
+// row-major or tiled scales.
 enum Fp8gemmV3Route { FP8GEMM_V3_ROUTE_DEFAULT = -1, FP8GEMM_V3_ROUTE_LEGACY = -2 };
 void fp8gemm_v3_set_route(int route);
 int fp8gemm_v3_route();
 int fp8gemm_v3_num_tiles();
-const char* fp8gemm_v3_route_name(int M, int N, int K, bool mx = false);
+const char* fp8gemm_v3_route_name(int M, int N, int K, bool mx = false, bool tiled = false);
 // What variant 4 runs for a shape: the unsplit decode tiles, a TMA tile with whole tiles, or
 // variant 1's tiles without their split-K tail.
 const char* fp8gemm_v4_route_name(int M, int N, int K);
@@ -353,10 +362,12 @@ void fp4_quantize(const __nv_bfloat16* x, unsigned char* q, unsigned char* sf, i
 //   FP8Q_ROW:    one scale per row, `scale` rows device floats. One launch.
 //   FP8Q_MX:     the OCP MX recipe, one e8m0 byte per 32 values of a row, `scale` rows * K/32
 //                bytes (row-major, the layout fp8gemm's sfa takes). One launch.
+//   FP8Q_MX_TILED: the same scales in fp8gemm_mx's FP8_MX_TILED layout, `scale` ceil(rows / 32)
+//                * K bytes, the padding rows' scales written as 0. K % 128 == 0. One launch.
 // The tensor and row scales are the smallest power of two 2^e (e in [-126, 127]) with
 // max|x| / 2^e <= 448; elements are e4m3(x / scale), round to nearest even, saturating.
 // K % 8 == 0 (K % 32 == 0 for MX), x 16-byte and q 8-byte aligned.
-enum Fp8QuantMode { FP8Q_TENSOR = 0, FP8Q_ROW = 1, FP8Q_MX = 2 };
+enum Fp8QuantMode { FP8Q_TENSOR = 0, FP8Q_ROW = 1, FP8Q_MX = 2, FP8Q_MX_TILED = 3 };
 // atomicMax of max|x| over x [n] bf16 (n % 8 == 0, 16-byte aligned) into *work as float bits
 // (non-negative floats order like their bits); *work must hold zero or a smaller amax.
 void absmax_bits(const __nv_bfloat16* x, long long n, unsigned* work, cudaStream_t stream);

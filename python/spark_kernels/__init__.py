@@ -27,9 +27,10 @@ Ops (all run on the current CUDA stream, all accept float32 or bfloat16 unless n
                                              interleaved weight of interleave_gate_up(g, u)
     fp8gemm(a, b_t, scale_a, scale_b, variant=-1, sfa=None, sfb=None)
                                              e4m3 GEMM (a @ b_t.T, scaled), bf16 out; with
-                                             sfa, sfb: MXFP8 (a ue8m0 scale per 32 k)
+                                             sfa, sfb: MXFP8 (a ue8m0 scale per 32 k), row-major
+                                             or tiled
     fp8_quantize(x, mode="tensor")           bf16 -> e4m3 with a power-of-two scale per tensor
-                                             or row, or MX scales per 32 ("mx")
+                                             or row, or MX scales per 32 ("mx", "mx_tiled")
     fp4_quantize(x, fmt="nvfp4", scale=None)   bf16 -> packed e2m1 + blocked block scales
     fp4gemm(a, b_t, sfa, sfb, scale_a=None, scale_b=None, fmt="nvfp4", variant=-1)
                                              fp4 GEMM (NVFP4 or MXFP4), bf16 out

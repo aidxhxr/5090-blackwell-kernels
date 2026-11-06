@@ -9,6 +9,8 @@
 //           which it reads a second time out of L1/L2. One launch.
 //   mx      the OCP MX recipe, a power-of-two scale per 32 consecutive values of a row (e8m0,
 //           e = floor(log2(max)) - 8), one thread per block of 32, as fp4quant.cu's MXFP4.
+//           The scales go out row-major or in fp8gemm_mx's tiled layout (fp8gemm_tile.cuh,
+//           mx_tile_word), which is only where each byte is stored.
 // The tensor and row scales are powers of two too: the smallest 2^e with amax / 2^e <= 448,
 // so x * 2^-e is exact in fp32 and the conversion to e4m3 (round to nearest even, saturating)
 // is the only rounding. e4m3 is a float format, so the range a power of two gives up (at most
@@ -17,6 +19,7 @@
 
 #include <cuda_fp8.h>
 
+#include "fp8gemm_tile.cuh"
 #include "spark/common.cuh"
 #include "spark/kernels.h"
 
@@ -115,11 +118,24 @@ __global__ void __launch_bounds__(kThreads)
     }
 }
 
+// TILED: `padded` covers the rows up to the next multiple of 32 as well, whose threads only
+// write a zero scale.
+template <bool TILED>
 __global__ void __launch_bounds__(kThreads)
     quantize_mx_kernel(const __nv_bfloat16* __restrict__ x, unsigned char* __restrict__ q,
-                       unsigned char* __restrict__ sf, long long blocks) {
+                       unsigned char* __restrict__ sf, long long blocks, long long padded, int K) {
     const long long b = static_cast<long long>(blockIdx.x) * kThreads + threadIdx.x;
-    if (b >= blocks) return;
+    if (b >= padded) return;
+    unsigned char* out = sf + b;
+    if constexpr (TILED) {
+        const int kb_row = K / 32;
+        out = sf + fp8gemm_tile::mx_tile_offset(static_cast<int>(b / kb_row),
+                                                static_cast<int>(b % kb_row), K);
+        if (b >= blocks) {
+            *out = 0;
+            return;
+        }
+    }
     float f[4][8];
     float a = 0.f;
 #pragma unroll
@@ -135,7 +151,7 @@ __global__ void __launch_bounds__(kThreads)
     const float inv = ldexpf(1.0f, -e);
 #pragma unroll
     for (int i = 0; i < 4; ++i) store8(q + 32 * b + 8 * i, f[i], inv);
-    sf[b] = static_cast<unsigned char>(e + 127);
+    *out = static_cast<unsigned char>(e + 127);
 }
 
 }  // namespace
@@ -155,8 +171,11 @@ void fp8_quantize(const __nv_bfloat16* x, unsigned char* q, void* scale, unsigne
                   int K, int mode, cudaStream_t stream) {
     SPARK_REQUIRE(x != nullptr && q != nullptr && scale != nullptr, "fp8_quantize: null pointer");
     SPARK_REQUIRE(rows > 0 && K > 0, "fp8_quantize: rows and K must be positive");
-    SPARK_REQUIRE(K % (mode == FP8Q_MX ? 32 : 8) == 0,
-                  "fp8_quantize: K must be a multiple of 8 (32 for mx)");
+    SPARK_REQUIRE(K % (mode == FP8Q_MX         ? 32
+                       : mode == FP8Q_MX_TILED ? 128
+                                               : 8) ==
+                      0,
+                  "fp8_quantize: K must be a multiple of 8 (32 for mx, 128 for tiled mx)");
     SPARK_REQUIRE(is_aligned16(x), "fp8_quantize: x must be 16-byte aligned");
     SPARK_REQUIRE(reinterpret_cast<uintptr_t>(q) % 8 == 0,
                   "fp8_quantize: q must be 8-byte aligned");
@@ -169,11 +188,18 @@ void fp8_quantize(const __nv_bfloat16* x, unsigned char* q, void* scale, unsigne
                                  stream>>>(x, q, chunks, work, static_cast<float*>(scale));
     } else if (mode == FP8Q_ROW) {
         quantize_row_kernel<<<rows, kThreads, 0, stream>>>(x, q, K, static_cast<float*>(scale));
-    } else {
-        SPARK_REQUIRE(mode == FP8Q_MX, "fp8_quantize: unknown mode");
+    } else if (mode == FP8Q_MX) {
         const long long blocks = n / 32;
-        quantize_mx_kernel<<<static_cast<unsigned>(cdiv64(blocks, kThreads)), kThreads, 0,
-                             stream>>>(x, q, static_cast<unsigned char*>(scale), blocks);
+        quantize_mx_kernel<false>
+            <<<static_cast<unsigned>(cdiv64(blocks, kThreads)), kThreads, 0, stream>>>(
+                x, q, static_cast<unsigned char*>(scale), blocks, blocks, K);
+    } else {
+        SPARK_REQUIRE(mode == FP8Q_MX_TILED, "fp8_quantize: unknown mode");
+        const long long blocks = n / 32;
+        const long long padded = static_cast<long long>(cdiv(rows, 32)) * 32 * (K / 32);
+        quantize_mx_kernel<true>
+            <<<static_cast<unsigned>(cdiv64(padded, kThreads)), kThreads, 0, stream>>>(
+                x, q, static_cast<unsigned char*>(scale), blocks, padded, K);
     }
     SPARK_CHECK_LAUNCH();
 }
