@@ -143,9 +143,9 @@ def test_attention_sink_limits(sk):
 
 @pytest.mark.parametrize("variant", [v for v in _variants("attention") if v >= 3])
 def test_attention_window_split_and_queue_are_stable(sk, variant):
-    # variants 3 to 5 split the tail tiles under a window and merge them with the sink in the
-    # combine kernel; variant 5's queue holds 256 items on 170 blocks. Repeated calls and a
-    # second stream must agree bit for bit.
+    # variants 3 to 6 split the tail tiles under a window and merge them with the sink in the
+    # combine kernel; the queue of variants 5 and 6 holds 256 items on 170 blocks. Repeated
+    # calls and a second stream must agree bit for bit.
     q, k, v = _inputs(2, 8, 2, 2048, 2048, 128)
     sinks = _sinks(8)
     a = sk.attention(q, k, v, causal=True, variant=variant, window=300, sinks=sinks)
