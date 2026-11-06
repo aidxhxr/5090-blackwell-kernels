@@ -406,6 +406,132 @@ def test_fp8gemm_mx_unit_scales_match_per_tensor_bitwise(sk):
                 assert torch.equal(got, plain), (M, N, K, ea, eb, v)
 
 
+# ---- MX mode with the scales in the tiled layout ([ceil(rows/32), K/128, 128] uint8) ------
+# Variant 3's TMA tiles copy them into shared memory a box per stage; variants 0, 1 and 4
+# read them where they read row-major ones; variant 2 refuses them. Ragged M pads the last
+# group of sfa.
+MX_TILED_SHAPES = [(128, 4096, 4096), (100, 1024, 768), (320, 1024, 1024), (256, 4096, 4096),
+                   (1000, 2048, 1024), (512, 8192, 2048), (256, 5120, 2304), (384, 2048, 11008),
+                   (1, 4096, 4096), (16, 11008, 4096), (33, 256, 4096), (64, 4096, 768),
+                   (272, 128, 4096), (2048, 2048, 2048)]
+
+
+def test_mx_tiled_layout_reference():
+    ref = pytest.importorskip("spark_kernels").reference
+    torch.manual_seed(3)
+    for rows, K in [(1, 128), (33, 256), (100, 768), (256, 4096)]:
+        sf = torch.randint(0, 255, (rows, K // 32), dtype=torch.uint8)
+        t = ref.to_mx_tiled(sf)
+        assert t.shape == (-(-rows // 32), K // 128, 128) and t.dtype == torch.uint8
+        assert torch.equal(ref.from_mx_tiled(t, rows), sf)
+        for r in range(rows):
+            g, tt, h = r % 8, (r // 8) % 2, (r // 16) % 2
+            for kb in range(K // 32):
+                assert t[r // 32, kb // 4, 4 * (4 * g + 2 * tt + h) + kb % 4] == sf[r, kb]
+        for r in range(rows, t.shape[0] * 32):  # the padding rows of the last group
+            w = 4 * (r % 8) + 2 * ((r // 8) % 2) + (r // 16) % 2
+            assert not torch.any(t[-1, :, 4 * w:4 * w + 4])
+
+
+@pytest.mark.parametrize("shape", [(1, 128), (3, 256), (64, 14336), (300, 1024), (2048, 4096)],
+                         ids=lambda s: f"{s[0]}x{s[1]}")
+def test_fp8_quantize_mx_tiled_matches_reference(sk, shape):
+    rows, K = shape
+    g = torch.Generator(device="cpu").manual_seed(rows + K)
+    x = (torch.randn(rows, K, generator=g) * 3).to("cuda", torch.bfloat16)
+    x[0, K // 2] = 900.0
+    q, s = sk.fp8_quantize(x, "mx_tiled")
+    q_ref, s_ref = sk.reference.quantize_mx(x)
+    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+    assert s.shape == (-(-rows // 32), K // 128, 128)
+    assert torch.equal(s, sk.reference.to_mx_tiled(s_ref))  # the padding rows' scales are 0
+
+
+def _mx_tiled(sk, sfa, sfb):
+    return sk.reference.to_mx_tiled(sfa), sk.reference.to_mx_tiled(sfb)
+
+
+@pytest.mark.parametrize("shape", MX_TILED_SHAPES, ids=lambda s: f"M{s[0]}_N{s[1]}_K{s[2]}")
+def test_fp8gemm_mx_tiled(sk, v3_route, shape):
+    _mx_supported(sk)
+    M, N, K = shape
+    a, sfa, b_t, sfb = _mx_inputs(M, N, K)
+    ta, tb = _mx_tiled(sk, sfa, sfb)
+    want = sk.reference.fp8gemm_mx(a, sfa, b_t, sfb)
+    assert torch.equal(sk.reference.fp8gemm_mx(a, ta, b_t, tb), want)
+    assert (sk._C.fp8gemm_v3_route_name(M, N, K, mx=True, tiled=True) ==
+            sk._C.fp8gemm_v3_route_name(M, N, K, mx=True))
+    for v in [-1, 1, 3, 4] + ([0] if M % 16 == 0 else []):
+        for _ in range(2):  # the workspace, the flags' epoch and the queue are reused
+            got = sk.fp8gemm(a, b_t, variant=v, sfa=ta, sfb=tb)
+            torch.testing.assert_close(got.float(), want.float(), **MX_TOL)
+
+
+def test_fp8gemm_mx_tiled_every_tile_gives_variant0_bits(sk, v3_route):
+    # The exact inputs of test_fp8gemm_mx_variant3_pieces_carry_the_scales: every fp32 partial
+    # sum is exact, so every variant, tile and split in the tiled layout must give the bits of
+    # variant 0 on row-major scales (cuBLASLt's): the box per stage lands every word of every
+    # row and column in the right lane and byte. Tile 2 (64-byte stages) runs variant 1.
+    _mx_supported(sk)
+    for M, N, K in [(128, 768, 2304), (300, 768, 2304), (256, 4096, 4096), (48, 4096, 4096)]:
+        torch.manual_seed(M + K)
+        a = (torch.randint(-16, 17, (M, K), device="cuda") / 16.0).to(torch.float8_e4m3fn)
+        b_t = (torch.randint(-16, 17, (N, K), device="cuda") / 16.0).to(torch.float8_e4m3fn)
+        sfa = torch.randint(126, 129, (M, K // 32), device="cuda").to(torch.uint8)
+        sfb = torch.randint(126, 129, (N, K // 32), device="cuda").to(torch.uint8)
+        if K > 2304:  # 2^-12 granularity against 2^14 of magnitude at K = 2304; scale 1 above
+            sfa.fill_(127)
+            sfb.fill_(127)
+            sfa[:, ::7] = 128
+            sfb[::5, 1::3] = 126
+        ta, tb = _mx_tiled(sk, sfa, sfb)
+        m16 = M // 16 * 16
+        want = sk.fp8gemm(a[:m16], b_t, variant=0, sfa=sfa[:m16], sfb=sfb)
+        assert torch.equal(sk.fp8gemm(a[:m16], b_t, variant=0, sfa=_mx_tiled(sk, sfa[:m16], sfb)[0],
+                                      sfb=tb), want)
+        for v in (1, 4):
+            assert torch.equal(sk.fp8gemm(a, b_t, variant=v, sfa=ta, sfb=tb)[:m16], want), (M, v)
+        for tile in [-1] + list(range(sk._C.fp8gemm_v3_num_tiles())):
+            v3_route(tile)
+            got = sk.fp8gemm(a, b_t, variant=3, sfa=ta, sfb=tb)
+            assert torch.equal(got[:m16], want), (M, N, K, tile)
+
+
+def test_fp8gemm_mx_tiled_same_bits_every_run(sk, v3_route):
+    _mx_supported(sk)
+    a, sfa, b_t, sfb = _mx_inputs(384, 2048, 8192, seed=5)
+    ta, tb = _mx_tiled(sk, sfa, sfb)
+    for tile in [-1] + list(range(sk._C.fp8gemm_v3_num_tiles())):
+        v3_route(tile)
+        first = sk.fp8gemm(a, b_t, variant=3, sfa=ta, sfb=tb)
+        for _ in range(3):
+            assert torch.equal(sk.fp8gemm(a, b_t, variant=3, sfa=ta, sfb=tb), first), tile
+
+
+def test_fp8gemm_mx_tiled_quantized_activations(sk):
+    _mx_supported(sk)
+    a = torch.randn(300, 4096, device="cuda").to(torch.bfloat16)
+    w = torch.randn(1024, 4096, device="cuda").to(torch.bfloat16)
+    qa, ta = sk.fp8_quantize(a, "mx_tiled")
+    qw, sfw = sk.reference.quantize_mx(w)
+    got = sk.fp8gemm(qa, qw, sfa=ta, sfb=sk.reference.to_mx_tiled(sfw))
+    qa2, sfa2 = sk.fp8_quantize(a, "mx")
+    torch.testing.assert_close(got.float(), sk.fp8gemm(qa2, qw, sfa=sfa2, sfb=sfw).float(),
+                               **MX_TOL)
+
+
+def test_fp8gemm_mx_tiled_rejects(sk):
+    _mx_supported(sk)
+    a, sfa, b_t, sfb = _mx_inputs(2048, 2048, 2048)
+    ta, tb = _mx_tiled(sk, sfa, sfb)
+    with pytest.raises(ValueError):  # variant 2 takes row-major scales only
+        sk.fp8gemm(a, b_t, variant=2, sfa=ta, sfb=tb)
+    with pytest.raises(RuntimeError):  # one of each layout
+        sk.fp8gemm(a, b_t, sfa=ta, sfb=sfb)
+    with pytest.raises(RuntimeError):  # too few groups
+        sk.fp8gemm(a, b_t, sfa=ta[:-1], sfb=tb)
+
+
 def test_fp8gemm_mx_per_tensor_scale_on_top(sk):
     _mx_supported(sk)
     a, sfa, b_t, sfb = _mx_inputs(256, 512, 1024)
