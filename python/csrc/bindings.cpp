@@ -328,7 +328,9 @@ Tensor hgemm(const Tensor& a, const Tensor& b, int variant, const std::optional<
 // contiguous (the layout torch._scaled_mm and cuBLASLt take), per-tensor fp32 scales on the
 // device, bf16 out. With sfa and sfb (MX mode: uint8 ue8m0 scales, [M, K/32] and [N, K/32],
 // one per 32 consecutive k of a row) every product is also scaled by its two block scales,
-// inside the block-scaled mma; the per-tensor scales may then be None (1.0). The default
+// inside the block-scaled mma; the per-tensor scales may then be None (1.0). sfa and sfb may
+// instead both be in the tiled layout (spark::FP8_MX_TILED), [ceil(rows / 32), K / 128, 128]
+// uint8 as fp8_quantize(x, "mx_tiled") and reference.to_mx_tiled make them. The default
 // variant is the highest that accepts the shape.
 Tensor fp8gemm(const Tensor& a, const Tensor& b_t, const std::optional<Tensor>& scale_a,
                const std::optional<Tensor>& scale_b, int variant, const std::optional<Tensor>& sfa,
@@ -364,8 +366,13 @@ Tensor fp8gemm(const Tensor& a, const Tensor& b_t, const std::optional<Tensor>& 
     TORCH_CHECK(aligned16(a) && aligned16(b_t), "fp8gemm needs 16-byte aligned a and b_t storage");
     const int M = static_cast<int>(a.size(0)), N = static_cast<int>(b_t.size(0)),
               K = static_cast<int>(a.size(1));
+    bool tiled = false;
     if (mx) {
         TORCH_CHECK(K % 256 == 0, "fp8gemm with block scales needs K a multiple of 256, got ", K);
+        tiled = sfa->dim() == 3;
+        TORCH_CHECK(sfb->dim() == sfa->dim(),
+                    "fp8gemm: sfa and sfb must both be row-major [rows, K/32] or both tiled "
+                    "[ceil(rows/32), K/128, 128]");
         const std::pair<const Tensor*, const char*> sfs[2] = {{&*sfa, "sfa"}, {&*sfb, "sfb"}};
         const int64_t rows[2] = {M, N};
         for (int i = 0; i < 2; ++i) {
@@ -373,8 +380,16 @@ Tensor fp8gemm(const Tensor& a, const Tensor& b_t, const std::optional<Tensor>& 
             check_cuda_contig(sf, sfs[i].second);
             TORCH_CHECK(sf.scalar_type() == at::kByte, sfs[i].second,
                         " must be uint8 (ue8m0: exponent + 127)");
-            TORCH_CHECK(sf.dim() == 2 && sf.size(0) == rows[i] && sf.size(1) == K / 32,
-                        sfs[i].second, " must be [", rows[i], ", ", K / 32, "], got ", sf.sizes());
+            if (tiled) {
+                TORCH_CHECK(
+                    sf.size(0) == (rows[i] + 31) / 32 && sf.size(1) == K / 128 && sf.size(2) == 128,
+                    sfs[i].second, " (tiled) must be [", (rows[i] + 31) / 32, ", ", K / 128,
+                    ", 128], got ", sf.sizes());
+            } else {
+                TORCH_CHECK(sf.dim() == 2 && sf.size(0) == rows[i] && sf.size(1) == K / 32,
+                            sfs[i].second, " must be [", rows[i], ", ", K / 32, "], got ",
+                            sf.sizes());
+            }
             TORCH_CHECK(sf.device() == a.device(), sfs[i].second, " must be on a's device");
             TORCH_CHECK(aligned16(sf), sfs[i].second, " needs 16-byte aligned storage");
         }
@@ -383,8 +398,10 @@ Tensor fp8gemm(const Tensor& a, const Tensor& b_t, const std::optional<Tensor>& 
     Tensor c = at::empty({M, N}, a.options().dtype(at::kBFloat16));
     int v = variant < 0 ? spark::fp8gemm_default_variant()
                         : resolve_variant(variant, spark::fp8gemm_num_variants());
+    const int layout = tiled ? spark::FP8_MX_TILED : spark::FP8_MX_ROWS;
     const auto supports = [&](int vv) {
-        return mx ? spark::fp8gemm_mx_supports(M, N, K, vv) : spark::fp8gemm_supports(M, N, K, vv);
+        return mx ? spark::fp8gemm_mx_supports(M, N, K, vv, layout)
+                  : spark::fp8gemm_supports(M, N, K, vv);
     };
     while (variant < 0 && v > 0 && !supports(v)) --v;
     const auto* pa = reinterpret_cast<const __nv_fp8_e4m3*>(a.data_ptr());
@@ -392,7 +409,8 @@ Tensor fp8gemm(const Tensor& a, const Tensor& b_t, const std::optional<Tensor>& 
     if (mx) {
         spark::fp8gemm_mx(pa, pb, bf16_ptr_mut(c), M, N, K, sa, sb,
                           static_cast<const unsigned char*>(sfa->data_ptr()),
-                          static_cast<const unsigned char*>(sfb->data_ptr()), v, current_stream(a));
+                          static_cast<const unsigned char*>(sfb->data_ptr()), v, current_stream(a),
+                          layout);
     } else {
         spark::fp8gemm(pa, pb, bf16_ptr_mut(c), M, N, K, sa, sb, v, current_stream(a));
     }
@@ -486,7 +504,8 @@ std::tuple<Tensor, Tensor, std::optional<Tensor>> fp4_quantize(const Tensor& x,
 }
 
 // bf16 [rows, K] -> (e4m3 [rows, K], scales): one fp32 scale ("tensor", shape [1]), one per
-// row ("row", [rows, 1]) or one e8m0 byte per 32 values ("mx", [rows, K / 32] uint8).
+// row ("row", [rows, 1]) or one e8m0 byte per 32 values ("mx", [rows, K / 32] uint8, or
+// "mx_tiled", the same in fp8gemm's tiled layout, [ceil(rows / 32), K / 128, 128] uint8).
 std::tuple<Tensor, Tensor> fp8_quantize(const Tensor& x, const std::string& mode) {
     check_cuda_contig(x, "x");
     TORCH_CHECK(x.scalar_type() == at::kBFloat16, "fp8_quantize expects bfloat16 x");
@@ -499,12 +518,18 @@ std::tuple<Tensor, Tensor> fp8_quantize(const Tensor& x, const std::string& mode
         m = spark::FP8Q_TENSOR;
     } else if (mode == "row") {
         m = spark::FP8Q_ROW;
+    } else if (mode == "mx_tiled") {
+        m = spark::FP8Q_MX_TILED;
     } else {
-        TORCH_CHECK(mode == "mx", "fp8_quantize mode must be 'tensor', 'row' or 'mx', got ", mode);
+        TORCH_CHECK(mode == "mx",
+                    "fp8_quantize mode must be 'tensor', 'row', 'mx' or 'mx_tiled', got ", mode);
         m = spark::FP8Q_MX;
     }
-    TORCH_CHECK(K % (m == spark::FP8Q_MX ? 32 : 8) == 0,
-                "fp8_quantize needs K a multiple of 8 (32 for mx), got ", K);
+    TORCH_CHECK(K % (m == spark::FP8Q_MX         ? 32
+                     : m == spark::FP8Q_MX_TILED ? 128
+                                                 : 8) ==
+                    0,
+                "fp8_quantize needs K a multiple of 8 (32 for mx, 128 for mx_tiled), got ", K);
     TORCH_CHECK(rows > 0 && K > 0, "fp8_quantize needs a non-empty x");
     const c10::cuda::CUDAGuard guard(x.device());
     Tensor q = at::empty({rows, K}, x.options().dtype(at::kFloat8_e4m3fn));
@@ -515,8 +540,10 @@ std::tuple<Tensor, Tensor> fp8_quantize(const Tensor& x, const std::string& mode
         scale = work.narrow(0, 1, 1);
     } else if (m == spark::FP8Q_ROW) {
         scale = at::empty({rows, 1}, x.options().dtype(at::kFloat));
-    } else {
+    } else if (m == spark::FP8Q_MX) {
         scale = at::empty({rows, K / 32}, x.options().dtype(at::kByte));
+    } else {
+        scale = at::empty({(rows + 31) / 32, K / 128, 128}, x.options().dtype(at::kByte));
     }
     spark::fp8_quantize(bf16_ptr(x), static_cast<unsigned char*>(q.data_ptr()), scale.data_ptr(),
                         work.defined() ? static_cast<unsigned*>(work.data_ptr()) : nullptr, rows, K,
@@ -1942,7 +1969,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("out") = py::none());
     m.def("fp8gemm", &fp8gemm,
           "fp8 (e4m3) tensor-core GEMM: scale_a * scale_b * a @ b_t^T, b_t is [N, K], bf16 out; "
-          "sfa [M, K/32] and sfb [N, K/32] uint8 ue8m0 add a scale per 32 k (MXFP8)",
+          "sfa [M, K/32] and sfb [N, K/32] uint8 ue8m0 add a scale per 32 k (MXFP8), or both "
+          "in the tiled layout, [ceil(rows/32), K/128, 128]",
           py::arg("a"), py::arg("b_t"), py::arg("scale_a") = py::none(),
           py::arg("scale_b") = py::none(), py::arg("variant") = -1, py::arg("sfa") = py::none(),
           py::arg("sfb") = py::none());
@@ -1952,12 +1980,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("route"));
     m.def(
         "fp8gemm_v3_route_name",
-        [](int M, int N, int K, bool mx) {
-            return std::string(spark::fp8gemm_v3_route_name(M, N, K, mx));
+        [](int M, int N, int K, bool mx, bool tiled) {
+            return std::string(spark::fp8gemm_v3_route_name(M, N, K, mx, tiled));
         },
         "what fp8gemm variant 3 runs for an M x N x K problem under the current route, in "
-        "per-tensor mode or, with mx, with MXFP8 block scales",
-        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("mx") = false);
+        "per-tensor mode or, with mx, with MXFP8 block scales (tiled: in the tiled layout)",
+        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("mx") = false, py::arg("tiled") = false);
     m.def("fp8gemm_v3_num_tiles", &spark::fp8gemm_v3_num_tiles,
           "number of TMA tiles fp8gemm variant 3 can be forced to");
     m.def(
@@ -1976,7 +2004,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("x"), py::arg("fmt") = "nvfp4", py::arg("scale") = py::none());
     m.def("fp8_quantize", &fp8_quantize,
           "bf16 [rows, K] -> (e4m3 [rows, K], power-of-two scales per tensor or row, or MX "
-          "e8m0 scales per 32)",
+          "e8m0 scales per 32, row-major or tiled)",
           py::arg("x"), py::arg("mode") = "tensor");
     m.def("w4_quantize", &w4_quantize,
           "round-to-nearest int4 quantization of a [K, N] bf16 weight, one scale per 128 k: "
