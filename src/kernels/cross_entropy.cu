@@ -14,7 +14,9 @@
 //       tile into softmax minus one-hot times the scale before the one rounding to bf16;
 //   v3  variant 2's forward and a backward with no chunk: ce_bwd_kernel recomputes each
 //       128 x 128 tile of the gradient and multiplies it straight into dh and dw through L2
-//       reductions (the last section of this file).
+//       reductions (the last section of this file);
+//   v4  variant 3's kernel on 256 x 128 tiles (256 rows of h): 23% fewer bytes through L2,
+//       and slower, since the L2's input charges per request (the last section).
 //
 // ce_gemm is grouped_gemm's bf16 kernel with one expert: logits = h w^T with both operands
 // K-contiguous, a persistent grid of one 288-thread block per SM, one producer lane issuing
@@ -683,45 +685,75 @@ __global__ void ce_combine_kernel(const float2* __restrict__ part, const float* 
 //   strip that reused it arrived, so its reductions missed to DRAM: 56 ms per band
 //   against 31 with them.
 //
-// The stages are 32 columns of D (64 bytes) so that the gradient tile (32 KB), three stages
-// (48 KB) and the warps' staging boxes (16 KB) fit in the 99 KB a block may take. The
-// reduces run through the L2 atomics in an order that depends on timing, so dh and dw are
-// not bit for bit reproducible across runs (variants 1 and 2 are).
+// Two tile configurations (bwd::Tile). Variant 3's is 128 x 128 with stages of 32 columns of
+// D (64 bytes), so that the gradient tile (32 KB), three stages (48 KB) and the warps'
+// staging boxes (16 KB) fit in the 99 KB a block may take. Variant 4's is 256 rows of h by
+// 128 of w. Per band the kernel moves four equal terms through the L2: the h boxes again for
+// every vocabulary strip, the w boxes again for every 128 rows of h (both twice, once per
+// pass), one fp32 partial of dh per strip and one of dw per tile of rows. 256 rows halve the
+// two w-side terms and leave the h-side ones, so 3/4 of the bytes for the same mma. The
+// gradient tile is then 64 KB, so the rest is tight: two stages of 16 columns (12 KB), a
+// 1 KB staging box per warp, so each warp reduces its share of a stage in three [16 x 16]
+// pieces (two of dh, one of dw), and a 2 KB table of the tile's rows. A 288-thread block gets
+// at most 168 registers a thread, and the 64 x 64 warp tile of the recompute holds 128
+// accumulators, so the epilogue reads the rows' lse and target from that table instead of
+// global memory. Measured (docs/design/cross_entropy.md), variant 4 moves 23% fewer bytes
+// through L2 than variant 3, and its band kernel runs 6% slower (3.6 to 3.8% on the whole
+// op): what both saturate is the L2's input from the crossbar, which costs about as much per
+// read request as per 32-byte sector of reduce data, and 16-column stages make twice the read
+// requests of 32-column ones. Variant 3 stays the default of the two. The reduces run
+// through the L2 atomics in an order that depends on timing, so dh and dw are not bit for bit
+// reproducible across runs (variants 1 and 2 are).
 
 namespace bwd {
 
-constexpr int BM = 128, BN = 128;  // the gradient tile: rows of h by rows of w
-constexpr int BKB = 64;            // bytes of D per stage
-constexpr int BK = BKB / 2;        // 32 columns of D per stage
-constexpr int STAGES = 3;
-constexpr int WARPS_M = 2, WARPS_N = 4;  // the recompute's warp layout, ce_gemm's
-constexpr int CONSUMER_WARPS = WARPS_M * WARPS_N;
+constexpr int BN = 128;  // rows of w per gradient tile, in both configurations
+constexpr int CONSUMER_WARPS = 8;
 constexpr int CONSUMERS = CONSUMER_WARPS * 32;
 constexpr int THREADS = CONSUMERS + 32;
-constexpr int SLOTS = 16;  // recycled fp32 strips of dw by default, 32 MB at D = 4096
-constexpr int P_NT = 4;    // the second pass: 8 x 1 warps of 16 x 32
-constexpr int P_ROWS = BM / CONSUMER_WARPS;  // 16 rows of the [128 x 32] partial per warp
-constexpr int G_ROW = BN * 2;                // bytes per row of the bf16 gradient tile: 16 chunks
-constexpr int G_BYTES = BM * G_ROW;          // 32 KB
-constexpr int P_ROW = BK * 4;                // bytes per row of the fp32 partial: 8 chunks
-constexpr int P_BYTES = P_ROWS * P_ROW;      // 2 KB per warp
-constexpr int BAR_EPI = 1;                   // the one named barrier, over the consumer threads
-constexpr int FOLD_BUFS = 4;                 // chunks of a strip fold in flight
-constexpr int ITEM_DEPTH = 2;                // tiles the producer may hand over ahead
+constexpr int P_ROWS = 16;     // rows of an fp32 partial box: one m16 tile of a product
+constexpr int G_ROW = BN * 2;  // bytes per row of the bf16 gradient tile: 16 chunks
+constexpr int BAR_EPI = 1;     // the one named barrier, over the consumer threads
+constexpr int FOLD_BUFS = 4;   // chunks of a strip fold in flight
+constexpr int ITEM_DEPTH = 2;  // tiles the producer may hand over ahead
 
-using Cm = fp8gemm_tile::Cfg<BM, BN, BKB, STAGES, WARPS_M, WARPS_N>;
-using AccM = Cm::Acc;
-using AccP = float[P_NT][4];
+// One configuration of the band kernel: BM rows of h per gradient tile, BKB bytes of D per
+// stage and STAGES of them, the recompute's WARPS_M x WARPS_N layout of the eight warps, and
+// SLOTS recycled fp32 strips of dw by default.
+template <int BM_, int BKB_, int STAGES_, int WARPS_M_, int SLOTS_>
+struct Tile {
+    static constexpr int BM = BM_, BKB = BKB_, BK = BKB / 2, STAGES = STAGES_;
+    static constexpr int WARPS_M = WARPS_M_, WARPS_N = CONSUMER_WARPS / WARPS_M;
+    static constexpr int SLOTS = SLOTS_;
+    // the rows' (lse, target) from a table in shared memory (grad_to_smem), not from global
+    static constexpr bool ROW_TABLE = BM > 128;
+    using Cm = fp8gemm_tile::Cfg<BM, BN, BKB, STAGES, WARPS_M, WARPS_N>;
+    static constexpr int P_NT = BK / 8;             // n8 tiles of a partial: its BK columns
+    static constexpr int P_ROW = BK * 4;            // bytes per row of the fp32 partial
+    static constexpr int P_BYTES = P_ROWS * P_ROW;  // one warp's staging box
+    static constexpr int STAGING_BYTES = CONSUMER_WARPS * P_BYTES;
+    static constexpr int DH_PIECES = BM / P_ROWS / CONSUMER_WARPS;  // of dh, per warp per stage
+    static_assert(BN / P_ROWS == CONSUMER_WARPS, "one 16-row piece of dw per warp per stage");
+    static_assert(BKB == 32 || BKB == 64, "stages of 16 or 32 columns of D");
+    static constexpr int G_BYTES = BM * G_ROW;
+    static constexpr int G_OFF = STAGES * Cm::STAGE;
+    static constexpr int P_OFF = G_OFF + G_BYTES;  // 1024-aligned for the swizzles
+    static constexpr int ROW_OFF = P_OFF + STAGING_BYTES;
+    static constexpr int BAR_OFF = ROW_OFF + (ROW_TABLE ? BM * 8 : 0);
+    static constexpr int smem_bytes() {
+        return (BAR_OFF + (2 * STAGES + FOLD_BUFS + 2 * ITEM_DEPTH) * 8 + ITEM_DEPTH * 4 + 16 +
+                1023) /
+               1024 * 1024;
+    }
+    static_assert(smem_bytes() <= 101376, "the stages, the gradient tile and the staging fit");
+    static_assert(P_OFF % 1024 == 0 && P_BYTES % 1024 == 0, "every warp's staging is 1024-aligned");
+};
 
-constexpr int G_OFF = STAGES * Cm::STAGE;  // 48 KB
-constexpr int P_OFF = G_OFF + G_BYTES;     // 80 KB, 1024-aligned for the 128B swizzle
-constexpr int BAR_OFF = P_OFF + CONSUMER_WARPS * P_BYTES;
-constexpr int smem_bytes() {
-    return (BAR_OFF + (2 * STAGES + FOLD_BUFS + 2 * ITEM_DEPTH) * 8 + ITEM_DEPTH * 4 + 16 + 1023) /
-           1024 * 1024;
-}
-static_assert(smem_bytes() <= 101376, "three 16 KB stages, the gradient tile and the staging fit");
-static_assert(P_OFF % 1024 == 0 && P_BYTES % 1024 == 0, "every warp's staging is 1024-aligned");
+// variant 3: 128 x 128, three stages of 32 columns, 2 x 4 warps of 64 x 32, 16 slots (32 MB)
+using Tile3 = Tile<128, 64, 3, 2, 16>;
+// variant 4: 256 x 128, two stages of 16 columns, 4 x 2 warps of 64 x 64. A band has half
+// as many tiles of rows, so twice the strips are in flight and the pool is twice as deep.
+using Tile4 = Tile<256, 32, 2, 4, 32>;
 
 struct __align__(8) bf16x4 {
     __nv_bfloat162 h[2];
@@ -743,6 +775,13 @@ struct Params {
     int* next_tile;     // [1] the tile counter: blocks take tiles in order as they free up
     int first;          // first band: dw = slot, else dw += slot
     int nslots;         // recycled fp32 strips the slots buffer holds
+};
+
+// A row of the tile as the gradient epilogue needs it: lse * log2(e), +inf for a row that
+// does not count or lies past M (so exp gives 0), and the target column, -1 for such a row.
+struct RowEntry {
+    float lb;
+    int y;
 };
 
 __device__ __forceinline__ int ld_acquire_gpu_s32(const int* p) {
@@ -769,7 +808,7 @@ __device__ __forceinline__ unsigned long long policy_evict_first() {
     asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(pol));
     return pol;
 }
-// The [16 x 32] fp32 box at `src` (128B-swizzled rows) added into the map at (x, y).
+// The [16 x BK] fp32 box at `src` (swizzled rows) added into the map at (x, y).
 __device__ __forceinline__ void tma_reduce_add_2d(const CUtensorMap* map, const void* src, int x,
                                                   int y, unsigned long long pol) {
     asm volatile(
@@ -786,10 +825,10 @@ __device__ __forceinline__ void bulk_wait_all() {
     asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
 }
 
-// One 32-byte k-step of the recompute on a 64-byte stage (ce::bf16_step on bwd::Cm).
-template <int KK>
+// One 32-byte k-step of the recompute (ce::bf16_step on the configuration's Cm).
+template <class Cm, int KK>
 __device__ __forceinline__ void step(const unsigned char* as, const unsigned char* bs, int wm,
-                                     int wn, int lane, AccM& acc) {
+                                     int wn, int lane, typename Cm::Acc& acc) {
     constexpr int SBK = Cm::BK, MT = Cm::MT, NT = Cm::NT, WROWS = Cm::WROWS, WCOLS = Cm::WCOLS;
     unsigned afrag[MT][4];
     unsigned bfrag[NT][2];
@@ -818,12 +857,26 @@ __device__ __forceinline__ void step(const unsigned char* as, const unsigned cha
         for (int nj = 0; nj < NT; ++nj) mma_bf16_16816(acc[mi][nj], afrag[mi], bfrag[nj]);
 }
 
+// The table entry of row `row` of the band; the kernel fills a tile's table at its top.
+__device__ __forceinline__ RowEntry row_entry(const Params& p, int row) {
+    const bool in = row < p.M;
+    const long long y = in ? __ldg(p.targets + row) : -1;
+    const bool counts = in && y != p.ignore_index && y >= 0 && y < p.tiles_n * BN;
+    return {counts ? __ldg(p.lse + row) * kLog2e : __int_as_float(0x7f800000),
+            counts ? static_cast<int>(y) : -1};
+}
+
 // The gradient tile into shared memory: g = bf16((exp(x - lse) - [col == y]) * scale), 0 on
 // a row that does not count or past M. Row r of G is 256 bytes, 16-byte chunk c stored at
 // chunk c ^ (r & 7), so that the 8 rows of an ldmatrix matrix, with or without .trans, land
-// in 8 different bank groups.
-__device__ __forceinline__ void grad_to_smem(const AccM& acc, const Params& p, unsigned char* G,
-                                             int row0, int bn, int wm, int wn, int lane) {
+// in 8 different bank groups. With ROW_TABLE the rows' lse and target come from the tile's
+// table in shared memory: variant 4's warps hold 128 accumulators here, and with eight rows'
+// targets and lse in flight from global memory as well the kernel spilled.
+template <class C>
+__device__ __forceinline__ void grad_to_smem(const typename C::Cm::Acc& acc, const Params& p,
+                                             const RowEntry* rows, unsigned char* G, int row0,
+                                             int bn, int wm, int wn, int lane) {
+    using Cm = typename C::Cm;
     constexpr int MT = Cm::MT, NT = Cm::NT;
     const int g = lane >> 2;
     const int t = lane & 3;
@@ -833,12 +886,21 @@ __device__ __forceinline__ void grad_to_smem(const AccM& acc, const Params& p, u
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
             const int r = wm * Cm::WROWS + mi * 16 + g + 8 * h;
-            const int row = row0 + r;
-            const bool in = row < p.M;
-            const long long y = in ? __ldg(p.targets + row) : -1;
-            const bool counts = in && y != p.ignore_index && y >= 0 && y < p.tiles_n * BN;
-            const float coef = counts ? scale : 0.f;
-            const float lb = in ? __ldg(p.lse + row) * kLog2e : 0.f;
+            float coef, lb;
+            long long y;
+            if constexpr (C::ROW_TABLE) {
+                const RowEntry e = rows[r];
+                coef = scale;
+                lb = e.lb;
+                y = e.y;
+            } else {
+                const int row = row0 + r;
+                const bool in = row < p.M;
+                y = in ? __ldg(p.targets + row) : -1;
+                const bool counts = in && y != p.ignore_index && y >= 0 && y < p.tiles_n * BN;
+                coef = counts ? scale : 0.f;
+                lb = in ? __ldg(p.lse + row) * kLog2e : 0.f;
+            }
             unsigned char* grow = G + r * G_ROW;
 #pragma unroll
             for (int nj = 0; nj < NT; ++nj) {
@@ -854,36 +916,36 @@ __device__ __forceinline__ void grad_to_smem(const AccM& acc, const Params& p, u
     }
 }
 
-// One of the two products of a stage, this warp's 16 rows of it: P[16 x 32] =
-// A[16 x 128] B[128 x 32], A from the gradient tile (TRANS: as G^T) and B from the stage's h
-// or w box ([128 rows of k][32 of d], 64-byte rows, the TMA 64B swizzle, read with
-// ldmatrix.trans).
-template <bool TRANS>
-__device__ __forceinline__ void product(const unsigned char* G, const unsigned char* box, int warp,
-                                        int lane, AccP& acc) {
-    constexpr int SBK = Cm::BK;
+// One 16-row piece of one of the two products of a stage: P[16 x BK] = A[16 x K] B[K x BK].
+// Not TRANS (dh): A is rows r0.. of G and K = BN, B the stage's w box. TRANS (dw): A is rows
+// r0.. of G^T, read through ldmatrix.trans from G, K = BM, B the stage's h box. A box is
+// [K rows][BK of d], BKB-byte rows in the TMA swizzle, read with ldmatrix.trans.
+template <class C, bool TRANS>
+__device__ __forceinline__ void product(const unsigned char* G, const unsigned char* box, int r0,
+                                        int lane, float (&acc)[C::P_NT][4]) {
+    constexpr int SBK = C::BKB, NT = C::P_NT, K = TRANS ? C::BM : BN;
 #pragma unroll
-    for (int nj = 0; nj < P_NT; ++nj)
+    for (int nj = 0; nj < NT; ++nj)
 #pragma unroll
         for (int q = 0; q < 4; ++q) acc[nj][q] = 0.f;
 #pragma unroll
-    for (int ks = 0; ks < BN / 16; ++ks) {
+    for (int ks = 0; ks < K / 16; ++ks) {
         unsigned afrag[4];
-        unsigned bfrag[P_NT][2];
+        unsigned bfrag[NT][2];
         if constexpr (!TRANS) {
             // rows of G are the product's rows: 16 rows, chunks 2 ks and 2 ks + 1
-            const int row = warp * P_ROWS + (lane & 15);
+            const int row = r0 + (lane & 15);
             const int ch = 2 * ks + (lane >> 4);
             ldmatrix_x4(afrag, G + row * G_ROW + (ch ^ (row & 7)) * 16);
         } else {
             // columns of G are the product's rows: matrices (v 0-7 | 8-15) x (t 0-7 | 8-15)
             // read transposed from rows t of G
             const int row = ks * 16 + (lane & 7) + 8 * (lane >> 4);
-            const int ch = 2 * warp + ((lane >> 3) & 1);
+            const int ch = (r0 >> 3) + ((lane >> 3) & 1);
             ldmatrix_x4_trans(afrag, G + row * G_ROW + (ch ^ (row & 7)) * 16);
         }
 #pragma unroll
-        for (int nj = 0; nj < P_NT; nj += 2) {
+        for (int nj = 0; nj < NT; nj += 2) {
             const int krow = ks * 16 + (lane & 15);
             const int ch = nj + (lane >> 4);
             unsigned r[4];
@@ -894,29 +956,33 @@ __device__ __forceinline__ void product(const unsigned char* G, const unsigned c
             bfrag[nj + 1][1] = r[3];
         }
 #pragma unroll
-        for (int nj = 0; nj < P_NT; ++nj) mma_bf16_16816(acc[nj], afrag, bfrag[nj]);
+        for (int nj = 0; nj < NT; ++nj) mma_bf16_16816(acc[nj], afrag, bfrag[nj]);
     }
 }
 
-// The warp's partial into its staging box: 16 rows of 32 floats, 16-byte chunk c of row r at
-// chunk c ^ (r & 7), the TMA 128B swizzle. Lane (g, t) holds columns 2t, 2t+1 of rows g and
-// g + 8 of each n8 tile, one float2 store each. The swizzle sends lanes t and t ^ 2 of one
-// row pair to the same banks, so the store goes out as two half-warp stores, each of which
-// covers the 32 banks once.
-__device__ __forceinline__ void stage_partial(const AccP& acc, unsigned char* P, int lane) {
+// The warp's partial into its staging box: 16 rows of BK floats in the TMA swizzle of their
+// row size. Lane (g, t) holds columns 2t, 2t+1 of rows g and g + 8 of each n8 tile, one
+// float2 store each. With 128-byte rows (variant 3) the swizzle sends lanes t and t ^ 2 of
+// one row pair to the same banks, so the store goes out as two half-warp stores, each of
+// which covers the 32 banks once. With 64-byte rows (variant 4) a whole-warp store already
+// covers each bank twice, the least 256 bytes can take.
+template <class C>
+__device__ __forceinline__ void stage_partial(const float (&acc)[C::P_NT][4], unsigned char* P,
+                                              int lane) {
+    constexpr int HALVES = C::P_ROW == 128 ? 2 : 1;
     const int g = lane >> 2;
     const int t = lane & 3;
 #pragma unroll
-    for (int half = 0; half < 2; ++half) {
-        if ((t >> 1) != half) continue;
+    for (int half = 0; half < HALVES; ++half) {
+        if (HALVES == 2 && (t >> 1) != half) continue;
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
             const int row = g + 8 * h;
 #pragma unroll
-            for (int nj = 0; nj < P_NT; ++nj) {
+            for (int nj = 0; nj < C::P_NT; ++nj) {
                 const int col = nj * 8 + 2 * t;
-                const int ch = (col >> 2) ^ (row & 7);
-                *reinterpret_cast<float2*>(P + row * P_ROW + ch * 16 + (col & 3) * 4) =
+                const int ch = fp8gemm_tile::swz<C::P_ROW>(row, col >> 2);
+                *reinterpret_cast<float2*>(P + row * C::P_ROW + ch * 16 + (col & 3) * 4) =
                     make_float2(acc[nj][2 * h], acc[nj][2 * h + 1]);
             }
         }
@@ -943,19 +1009,31 @@ __device__ __forceinline__ void bulk_store_hint(void* gmem_dst, const void* smem
 
 // The finished strip: dw[v-strip] (+)= the slot, rounded once to bf16, and the slot zeroed,
 // 6 MB of traffic per strip by one block. It runs on the bulk copy engine, FOLD_CHUNK
-// floats at a time through the gradient tile's and the staging's shared memory (both idle
-// once the tile is done): a bulk load of the slot chunk and of the dw chunk, the add and
-// the rounding by the threads in place, a bulk store of the bf16 chunk to dw and of the
-// zeroed chunk back to the slot, FOLD_BUFS chunks in flight with the next chunk's loads
-// issued before this chunk's wait: 110 us per strip measured, 0.6 ms of a block's band.
+// floats at a time through shared memory that is idle once the tile is done (the gradient
+// tile for the fp32 chunks, the staging or the rest of the gradient tile for the bf16 ones):
+// a bulk load of the slot chunk and of the dw chunk, the add and the rounding by the threads
+// in place, a bulk store of the bf16 chunk to dw and of the zeroed chunk back to the slot,
+// FOLD_BUFS chunks in flight with the next chunk's loads issued before this chunk's wait:
+// 110 us per strip measured, 0.6 ms of a block's band.
 constexpr int FOLD_CHUNK = 2048;  // floats: 8 KB fp32, 4 KB bf16
 constexpr int FOLD_F32 = FOLD_CHUNK * 4;
 constexpr int FOLD_BF16 = FOLD_CHUNK * 2;
-static_assert(FOLD_BUFS * FOLD_F32 <= G_BYTES && FOLD_BUFS * FOLD_BF16 <= CONSUMER_WARPS * P_BYTES,
-              "the fold's chunks fit in the gradient tile and the staging");
 
-__device__ __forceinline__ void fold_strip(const Params& p, int nt, int tid, unsigned char* G,
-                                           unsigned char* P, uint64_t* fold_bar) {
+// Where the fold's bf16 chunks go: the staging when it holds them, else the gradient tile
+// past the fp32 chunks.
+constexpr int FOLD_F32_BYTES = FOLD_BUFS * FOLD_F32;  // the chunks in flight
+constexpr int FOLD_BF16_BYTES = FOLD_BUFS * FOLD_BF16;
+template <class C>
+constexpr int FOLD_H_OFF =
+    C::STAGING_BYTES >= FOLD_BF16_BYTES ? C::P_OFF : C::G_OFF + FOLD_F32_BYTES;
+
+template <class C>
+__device__ __forceinline__ void fold_strip(const Params& p, int nt, int tid, unsigned char* smem,
+                                           uint64_t* fold_bar) {
+    static_assert(FOLD_F32_BYTES <= C::G_BYTES && FOLD_H_OFF<C> + FOLD_BF16_BYTES <= C::BAR_OFF,
+                  "the fold's chunks fit in the gradient tile and the staging");
+    unsigned char* F = smem + C::G_OFF;
+    unsigned char* H = smem + FOLD_H_OFF<C>;
     const int slot = nt % p.nslots;
     float* s = p.slots + static_cast<size_t>(slot) * BN * p.D;
     __nv_bfloat16* dw = p.dw + static_cast<size_t>(nt) * BN * p.D;
@@ -965,17 +1043,17 @@ __device__ __forceinline__ void fold_strip(const Params& p, int nt, int tid, uns
     auto load = [&](int c) {
         const int buf = c % FOLD_BUFS;
         mbar_arrive_expect_tx(&fold_bar[buf], FOLD_F32 + (p.first ? 0 : FOLD_BF16));
-        bulk_load(G + buf * FOLD_F32, s + static_cast<size_t>(c) * FOLD_CHUNK, FOLD_F32,
+        bulk_load(F + buf * FOLD_F32, s + static_cast<size_t>(c) * FOLD_CHUNK, FOLD_F32,
                   &fold_bar[buf]);
         if (!p.first)
-            bulk_load_hint(P + buf * FOLD_BF16, dw + static_cast<size_t>(c) * FOLD_CHUNK, FOLD_BF16,
+            bulk_load_hint(H + buf * FOLD_BF16, dw + static_cast<size_t>(c) * FOLD_CHUNK, FOLD_BF16,
                            &fold_bar[buf], evict_first);
     };
     if (tid == 0) load(0);
     for (int c = 0; c < chunks; ++c) {
         const int buf = c % FOLD_BUFS;
-        float4* f = reinterpret_cast<float4*>(G + buf * FOLD_F32);
-        bf16x4* h = reinterpret_cast<bf16x4*>(P + buf * FOLD_BF16);
+        float4* f = reinterpret_cast<float4*>(F + buf * FOLD_F32);
+        bf16x4* h = reinterpret_cast<bf16x4*>(H + buf * FOLD_BF16);
         if (tid == 0 && c + 1 < chunks) {
             // the next chunk's buffer was last stored from by chunk c + 1 - FOLD_BUFS: let at
             // most FOLD_BUFS - 2 store groups stay pending, so that one has been read
@@ -1013,16 +1091,20 @@ __device__ __forceinline__ void fold_strip(const Params& p, int nt, int tid, uns
     if (tid == 0) bulk_wait_all();
 }
 
+template <class C>
 __global__ void __launch_bounds__(THREADS, 1)
     ce_bwd_kernel(const __grid_constant__ CUtensorMap tmA, const __grid_constant__ CUtensorMap tmB,
                   const __grid_constant__ CUtensorMap tmDh,
                   const __grid_constant__ CUtensorMap tmDw, Params p) {
+    using Cm = typename C::Cm;
+    constexpr int STAGES = C::STAGES, BM = C::BM, BKB = C::BKB, BK = C::BK;
     constexpr int A_STAGE = Cm::A_STAGE, STAGE_BYTES = Cm::STAGE;
 
     extern __shared__ __align__(1024) unsigned char smem[];
-    unsigned char* G = smem + G_OFF;
-    unsigned char* P = smem + P_OFF;
-    uint64_t* full_bar = reinterpret_cast<uint64_t*>(smem + BAR_OFF);
+    unsigned char* G = smem + C::G_OFF;
+    unsigned char* P = smem + C::P_OFF;
+    RowEntry* rows = reinterpret_cast<RowEntry*>(smem + C::ROW_OFF);
+    uint64_t* full_bar = reinterpret_cast<uint64_t*>(smem + C::BAR_OFF);
     uint64_t* empty_bar = full_bar + STAGES;
     uint64_t* fold_bar = empty_bar + STAGES;
     uint64_t* item_full = fold_bar + FOLD_BUFS;
@@ -1096,14 +1178,14 @@ __global__ void __launch_bounds__(THREADS, 1)
         prefetch_tensormap(&tmDh);
         prefetch_tensormap(&tmDw);
     }
-    const int wm = warp / WARPS_N;
-    const int wn = warp % WARPS_N;
-    unsigned char* Pw = P + warp * P_BYTES;
+    const int wm = warp / C::WARPS_N;
+    const int wn = warp % C::WARPS_N;
+    unsigned char* Pw = P + warp * C::P_BYTES;
     const unsigned long long keep = policy_evict_last();
     unsigned g_kt = 0;
     unsigned n_item = 0;
-    AccM acc;
-    AccP pa;
+    typename Cm::Acc acc;
+    float pa[C::P_NT][4];
 
     for (;;) {
         const int r = n_item % ITEM_DEPTH;
@@ -1117,6 +1199,13 @@ __global__ void __launch_bounds__(THREADS, 1)
         const int nt = tile / p.tiles_m;
         const int bn = nt * BN;
         const int slot_row = (nt % p.nslots) * BN;
+        if constexpr (C::ROW_TABLE) {
+            // the tile's rows, one per thread; every warp left the previous tile's table
+            // behind the barriers that ended it
+            static_assert(BM == CONSUMERS, "one row of the table per consumer thread");
+            rows[tid] = row_entry(p, row0 + tid);
+            named_barrier_sync(BAR_EPI, CONSUMERS);
+        }
 
         // pass 1: the logits tile
 #pragma unroll
@@ -1129,8 +1218,8 @@ __global__ void __launch_bounds__(THREADS, 1)
             const int s = g_kt % STAGES;
             mbar_wait(&full_bar[s], (g_kt / STAGES) & 1);
             const unsigned char* as = smem + s * STAGE_BYTES;
-            step<0>(as, as + A_STAGE, wm, wn, lane, acc);
-            step<32>(as, as + A_STAGE, wm, wn, lane, acc);
+            step<Cm, 0>(as, as + A_STAGE, wm, wn, lane, acc);
+            if constexpr (BKB == 64) step<Cm, 32>(as, as + A_STAGE, wm, wn, lane, acc);
             fence_proxy_async_smem();
             __syncwarp();
             if (lane == 0) mbar_arrive(&empty_bar[s]);
@@ -1138,7 +1227,7 @@ __global__ void __launch_bounds__(THREADS, 1)
         // Every warp finished reading the previous tile's G before the barrier that ended
         // it, so G can be overwritten now. The strip's slot must have been folded and
         // zeroed by its previous user before any warp adds into it.
-        grad_to_smem(acc, p, G, row0, bn, wm, wn, lane);
+        grad_to_smem<C>(acc, p, rows, G, row0, bn, wm, wn, lane);
         if (tid == 0 && nt >= p.nslots) {
             while (ld_acquire_gpu_s32(p.folded + nt - p.nslots) == 0) {
             }
@@ -1150,22 +1239,27 @@ __global__ void __launch_bounds__(THREADS, 1)
             const int s = g_kt % STAGES;
             mbar_wait(&full_bar[s], (g_kt / STAGES) & 1);
             const unsigned char* as = smem + s * STAGE_BYTES;
-            // dh[t-tile] += G w[v-tile]
-            product<false>(G, as + A_STAGE, warp, lane, pa);
-            if (lane == 0) bulk_wait_read();
-            __syncwarp();
-            stage_partial(pa, Pw, lane);
-            fence_proxy_async_smem();
-            __syncwarp();
-            if (lane == 0) tma_reduce_add_2d(&tmDh, Pw, kt * BK, row0 + warp * P_ROWS, keep);
+            // dh[t-tile] += G w[v-tile]: the warp's DH_PIECES pieces of 16 rows, each reduced
+            // while the next one is computed
+#pragma unroll
+            for (int j = 0; j < C::DH_PIECES; ++j) {
+                const int r0 = (warp * C::DH_PIECES + j) * P_ROWS;
+                product<C, false>(G, as + A_STAGE, r0, lane, pa);
+                if (lane == 0) bulk_wait_read();
+                __syncwarp();
+                stage_partial<C>(pa, Pw, lane);
+                fence_proxy_async_smem();
+                __syncwarp();
+                if (lane == 0) tma_reduce_add_2d(&tmDh, Pw, kt * BK, row0 + r0, keep);
+            }
             // dw[v-tile] += G^T h[t-tile]
-            product<true>(G, as, warp, lane, pa);
+            product<C, true>(G, as, warp * P_ROWS, lane, pa);
             fence_proxy_async_smem();
             __syncwarp();
             if (lane == 0) mbar_arrive(&empty_bar[s]);
             if (lane == 0) bulk_wait_read();
             __syncwarp();
-            stage_partial(pa, Pw, lane);
+            stage_partial<C>(pa, Pw, lane);
             fence_proxy_async_smem();
             __syncwarp();
             if (lane == 0) tma_reduce_add_2d(&tmDw, Pw, kt * BK, slot_row + warp * P_ROWS, keep);
@@ -1184,7 +1278,7 @@ __global__ void __launch_bounds__(THREADS, 1)
         }
         named_barrier_sync(BAR_EPI, CONSUMERS);
         if (*fold_flag) {
-            fold_strip(p, nt, tid, G, P, fold_bar);
+            fold_strip<C>(p, nt, tid, smem, fold_bar);
             __threadfence();
             named_barrier_sync(BAR_EPI, CONSUMERS);
             if (tid == 0) {
@@ -1195,18 +1289,61 @@ __global__ void __launch_bounds__(THREADS, 1)
     }
 }
 
+template <class C>
 int resident_blocks() {
-    constexpr int bytes = smem_bytes();
+    constexpr int bytes = C::smem_bytes();
     static int resident = 0;
     if (resident == 0) {
-        SPARK_CUDA_CHECK(cudaFuncSetAttribute(ce_bwd_kernel,
+        SPARK_CUDA_CHECK(cudaFuncSetAttribute(ce_bwd_kernel<C>,
                                               cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
         int per_sm = 0;
-        SPARK_CUDA_CHECK(
-            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, ce_bwd_kernel, THREADS, bytes));
+        SPARK_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, ce_bwd_kernel<C>,
+                                                                       THREADS, bytes));
         resident = (per_sm > 0 ? per_sm : 1) * num_sms();
     }
     return resident;
+}
+
+// The band on one configuration: the operand maps in the swizzle of the stage's rows, the
+// reduction maps in that of the partial's rows.
+template <class C>
+void launch_band(const __nv_bfloat16* h, const __nv_bfloat16* w, int rows, int V, int D,
+                 const CeBackwardArgs& a, cudaStream_t stream) {
+    constexpr CUtensorMapSwizzle op_swz =
+        C::BKB == 64 ? CU_TENSOR_MAP_SWIZZLE_64B : CU_TENSOR_MAP_SWIZZLE_32B;
+    constexpr CUtensorMapSwizzle p_swz =
+        C::P_ROW == 128 ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_64B;
+    const int grid = resident_blocks<C>();
+    const int kbytes = D * 2;
+    const int tiles_m = cdiv(rows, C::BM);
+    const CUtensorMap tmA = make_tensor_map_2d_u8(h, rows, kbytes, C::BM, C::BKB, op_swz);
+    const CUtensorMap tmB = make_tensor_map_2d_u8(w, V, kbytes, BN, C::BKB, op_swz);
+    const CUtensorMap tmDh =
+        make_tensor_map_2d(CU_TENSOR_MAP_DATA_TYPE_FLOAT32, 4, a.dh,
+                           static_cast<uint64_t>(tiles_m) * C::BM, D, P_ROWS, C::BK, p_swz);
+    const CUtensorMap tmDw =
+        make_tensor_map_2d(CU_TENSOR_MAP_DATA_TYPE_FLOAT32, 4, a.slots,
+                           static_cast<uint64_t>(a.slots_n) * BN, D, P_ROWS, C::BK, p_swz);
+    Params p{};
+    p.M = rows;
+    p.tiles_m = tiles_m;
+    p.tiles_n = V / BN;
+    p.KT = D / C::BK;
+    p.grid = grid;
+    p.D = D;
+    p.targets = a.targets;
+    p.lse = a.lse;
+    p.scale = a.scale;
+    p.ignore_index = a.ignore_index;
+    p.dw = a.dw;
+    p.slots = a.slots;
+    p.done = a.flags;
+    p.folded = a.flags + p.tiles_n;
+    p.next_tile = a.flags + 2 * p.tiles_n;
+    p.first = a.first ? 1 : 0;
+    p.nslots = a.slots_n;
+    ce_bwd_kernel<C><<<grid, THREADS, C::smem_bytes(), stream>>>(tmA, tmB, tmDh, tmDw, p);
+    SPARK_CHECK_LAUNCH();
 }
 
 }  // namespace bwd
@@ -1286,53 +1423,30 @@ void ce_combine(const float* partials, const float* target_logit, const int64_t*
     SPARK_CHECK_LAUNCH();
 }
 
-int ce_backward_slots() {
-    return ce::bwd::SLOTS;
+int ce_backward_slots(int variant) {
+    return variant == 4 ? ce::bwd::Tile4::SLOTS : ce::bwd::Tile3::SLOTS;
+}
+
+int ce_backward_tile_rows(int variant) {
+    return variant == 4 ? ce::bwd::Tile4::BM : ce::bwd::Tile3::BM;
 }
 
 void ce_backward_bf16(const __nv_bfloat16* h, const __nv_bfloat16* w, int T, int V, int D,
                       const CeBackwardArgs& a, cudaStream_t stream) {
-    using namespace ce::bwd;
     SPARK_REQUIRE(ce_gemm_supports(V, D),
                   "ce_backward: requires V a multiple of 128 and D a multiple of 64");
+    SPARK_REQUIRE(a.variant == 3 || a.variant == 4, "ce_backward: variant must be 3 or 4");
     SPARK_REQUIRE(h && w && a.targets && a.lse && a.scale && a.dh && a.slots && a.flags && a.dw,
                   "ce_backward: null pointer");
     SPARK_REQUIRE(is_aligned16(h) && is_aligned16(w) && is_aligned16(a.dh) &&
                       is_aligned16(a.slots) && is_aligned16(a.dw),
                   "ce_backward: operands must be 16-byte aligned");
-    if (T <= 0) return;
-    const int grid = resident_blocks();
-    const int kbytes = D * 2;
-    const int tiles_m = cdiv(T, BM);
-    const CUtensorMap tmA = make_tensor_map_2d_u8(h, T, kbytes, BM, BKB, CU_TENSOR_MAP_SWIZZLE_64B);
-    const CUtensorMap tmB = make_tensor_map_2d_u8(w, V, kbytes, BN, BKB, CU_TENSOR_MAP_SWIZZLE_64B);
-    const CUtensorMap tmDh = make_tensor_map_2d(CU_TENSOR_MAP_DATA_TYPE_FLOAT32, 4, a.dh,
-                                                static_cast<uint64_t>(tiles_m) * BM, D, P_ROWS, BK,
-                                                CU_TENSOR_MAP_SWIZZLE_128B);
     SPARK_REQUIRE(a.slots_n >= 1, "ce_backward: at least one slot");
-    const CUtensorMap tmDw = make_tensor_map_2d(CU_TENSOR_MAP_DATA_TYPE_FLOAT32, 4, a.slots,
-                                                static_cast<uint64_t>(a.slots_n) * BN, D, P_ROWS,
-                                                BK, CU_TENSOR_MAP_SWIZZLE_128B);
-    Params p{};
-    p.M = T;
-    p.tiles_m = tiles_m;
-    p.tiles_n = V / BN;
-    p.KT = D / BK;
-    p.grid = grid;
-    p.D = D;
-    p.targets = a.targets;
-    p.lse = a.lse;
-    p.scale = a.scale;
-    p.ignore_index = a.ignore_index;
-    p.dw = a.dw;
-    p.slots = a.slots;
-    p.done = a.flags;
-    p.folded = a.flags + p.tiles_n;
-    p.next_tile = a.flags + 2 * p.tiles_n;
-    p.first = a.first ? 1 : 0;
-    p.nslots = a.slots_n;
-    ce_bwd_kernel<<<grid, THREADS, smem_bytes(), stream>>>(tmA, tmB, tmDh, tmDw, p);
-    SPARK_CHECK_LAUNCH();
+    if (T <= 0) return;
+    if (a.variant == 4)
+        ce::bwd::launch_band<ce::bwd::Tile4>(h, w, T, V, D, a, stream);
+    else
+        ce::bwd::launch_band<ce::bwd::Tile3>(h, w, T, V, D, a, stream);
 }
 
 }  // namespace spark
