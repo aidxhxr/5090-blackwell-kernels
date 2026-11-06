@@ -17,6 +17,7 @@
 
 #include <cuda_fp8.h>
 
+#include "fp8quant.cuh"
 #include "spark/common.cuh"
 #include "spark/kernels.h"
 
@@ -25,17 +26,6 @@ namespace spark {
 namespace {
 
 constexpr int kThreads = 256;
-
-// The smallest power of two s with amax / s <= 448, e clamped to [-126, 127] (so 1 / s is a
-// finite normal float, also for an all-zero input).
-__device__ __forceinline__ float pow2_scale(float amax) {
-    const float r = fmaxf(amax, 1.17549435e-38f) / 448.0f;
-    int p = 0;
-    const float m = frexpf(r, &p);  // r = m * 2^p, m in [0.5, 1)
-    int e = m == 0.5f ? p - 1 : p;  // ceil(log2(r))
-    e = max(-126, min(127, e));
-    return ldexpf(1.0f, e);
-}
 
 __device__ __forceinline__ void load8(float (&f)[8], const __nv_bfloat16* p) {
     const bf16x8 v = *reinterpret_cast<const bf16x8*>(p);
@@ -52,17 +42,6 @@ __device__ __forceinline__ float amax8(const float (&f)[8]) {
 #pragma unroll
     for (int i = 0; i < 8; ++i) a = fmaxf(a, fabsf(f[i]));
     return a;
-}
-
-// Eight values times inv, converted to e4m3 and stored as 8 bytes.
-__device__ __forceinline__ void store8(unsigned char* q, const float (&f)[8], float inv) {
-    unsigned w[2] = {0u, 0u};
-#pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        const __nv_fp8_e4m3 v(f[i] * inv);
-        w[i / 4] |= static_cast<unsigned>(v.__x) << (8 * (i % 4));
-    }
-    *reinterpret_cast<uint2*>(q) = make_uint2(w[0], w[1]);
 }
 
 __global__ void __launch_bounds__(kThreads)

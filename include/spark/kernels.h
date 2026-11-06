@@ -48,6 +48,18 @@ int rmsnorm_num_variants();
 void add_rmsnorm_bf16(const __nv_bfloat16* x, __nv_bfloat16* resid, const __nv_bfloat16* w,
                       __nv_bfloat16* out, int rows, int cols, float eps, cudaStream_t stream);
 
+// Both norms straight into fp8, for an fp8 GEMM with a scale per token: q [rows][cols] e4m3
+// bytes and scales [rows] fp32 are what fp8_quantize(FP8Q_ROW) makes of the bf16 output of
+// rmsnorm_bf16 (variant 4) or add_rmsnorm_bf16, bit for bit, and that bf16 row is never
+// written. add_rmsnorm_fp8_bf16 updates resid in place as add_rmsnorm_bf16 does. One launch,
+// the row in registers: cols % 8 == 0 and cols <= 32768, x, resid and w 16-byte aligned, q
+// 8-byte aligned.
+void rmsnorm_fp8_bf16(const __nv_bfloat16* x, const __nv_bfloat16* w, unsigned char* q,
+                      float* scales, int rows, int cols, float eps, cudaStream_t stream);
+void add_rmsnorm_fp8_bf16(const __nv_bfloat16* x, __nv_bfloat16* resid, const __nv_bfloat16* w,
+                          unsigned char* q, float* scales, int rows, int cols, float eps,
+                          cudaStream_t stream);
+
 // ---- SwiGLU (fused gated activation) ---------------------------------------------------
 // out[i] = silu(gate[i]) * up[i], n elements. variant 0: scalar, 1: 128-bit vectorized
 // (16-byte aligned pointers; any n, the remainder is handled in-kernel).

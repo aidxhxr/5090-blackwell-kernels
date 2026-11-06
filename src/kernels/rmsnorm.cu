@@ -7,7 +7,8 @@
 //   variant 3: one 256-thread block per row  (for very wide rows)
 //   variant 4: single pass, the row held in registers by a 32..1024-thread group
 // Plus the fused residual-add + RMSNorm used in Llama/Qwen decoder blocks (same single-pass
-// design).
+// design), and both norms writing the per-token e4m3 row an fp8 GEMM takes instead of bf16
+// (rmsnorm_fp8, add_rmsnorm_fp8: the bytes fp8_quantize's row mode makes of the bf16 output).
 //
 // All math accumulates in fp32 regardless of the storage type T.
 
@@ -15,7 +16,9 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <string>
 
+#include "fp8quant.cuh"
 #include "spark/common.cuh"
 #include "spark/kernels.h"
 
@@ -278,6 +281,21 @@ __device__ __forceinline__ float group_reduce_sum(float v, float* red, int tid) 
     return v;
 }
 
+// The same for a max of non-negative values (an amax), on its own shared array.
+template <int G>
+__device__ __forceinline__ float group_reduce_max(float v, float* red, int tid) {
+    v = warp_reduce_max(v);
+    if constexpr (Group<G>::kWarps > 1) {
+        if ((tid & (kWarpSize - 1)) == 0) red[tid >> 5] = v;
+        __syncthreads();
+        const int first = (tid / G) * Group<G>::kWarps;
+        v = 0.0f;
+#pragma unroll
+        for (int k = 0; k < Group<G>::kWarps; ++k) v = fmaxf(v, red[first + k]);
+    }
+    return v;
+}
+
 template <typename T, int G, int VPT>
 __global__ void __launch_bounds__(Group<G>::kBlock)
     rmsnorm_reg_kernel(const T* __restrict__ x, const T* __restrict__ w, T* __restrict__ out,
@@ -382,6 +400,85 @@ __global__ void __launch_bounds__(Group<G>::kBlock)
     }
 }
 
+// Both norms into fp8 for a GEMM with per-token activation scales: the row as rmsnorm_reg_kernel
+// (kAdd false) or add_rmsnorm_reg_kernel (kAdd true) computes it, rounded to bf16 as they store
+// it and kept in registers, then the group's amax of those values, pow2_scale of it and the e4m3
+// bytes of fp8quant.cuh. The bf16 row is never written: one launch and one pass over it fewer
+// than the norm followed by fp8_quantize's row mode, and the same bits (a max does not depend
+// on its order, and the sum of squares is the bf16 kernel's, element for element).
+template <bool kAdd, int G, int VPT>
+__global__ void __launch_bounds__(Group<G>::kBlock)
+    rmsnorm_fp8_reg_kernel(const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ resid,
+                           const __nv_bfloat16* __restrict__ w, unsigned char* __restrict__ q,
+                           float* __restrict__ scales, int rows, int cols, float eps) {
+    using VT = VecTraits<__nv_bfloat16>;
+    constexpr int kW = VT::kWidth;
+    __shared__ float red[Group<G>::kBlock / kWarpSize];
+    __shared__ float red_max[Group<G>::kBlock / kWarpSize];
+
+    const int tid = threadIdx.x;
+    const int t = tid % G;
+    const int row = blockIdx.x * Group<G>::kRowsPerBlock + tid / G;
+    const bool active = row < rows;  // no early return before the second group reduction
+    const int nvec = cols / kW;
+    const int64_t off = static_cast<int64_t>(row) * cols;
+
+    float v[VPT][kW];
+    float sumsq = 0.0f;
+    if (active) {
+#pragma unroll
+        for (int i = 0; i < VPT; ++i) {
+            const int idx = t + i * G;
+            if (idx < nvec) {
+                if constexpr (kAdd) {
+                    float xv[kW];
+                    float rv[kW];
+                    VT::load(x + off + idx * kW, xv);
+                    VT::load(resid + off + idx * kW, rv);
+#pragma unroll
+                    for (int e = 0; e < kW; ++e) {
+                        const float s = __bfloat162float(__float2bfloat16(xv[e] + rv[e]));
+                        v[i][e] = s;
+                        sumsq += s * s;
+                    }
+                    VT::store(resid + off + idx * kW, v[i]);
+                } else {
+                    VT::load(x + off + idx * kW, v[i]);
+#pragma unroll
+                    for (int e = 0; e < kW; ++e) sumsq += v[i][e] * v[i][e];
+                }
+            }
+        }
+    }
+    sumsq = group_reduce_sum<G>(sumsq, red, tid);
+    const float inv = rsqrtf(sumsq / static_cast<float>(cols) + eps);
+    float amax = 0.0f;
+    if (active) {
+#pragma unroll
+        for (int i = 0; i < VPT; ++i) {
+            const int idx = t + i * G;
+            if (idx < nvec) {
+                float wv[kW];
+                VT::load(w + idx * kW, wv);
+#pragma unroll
+                for (int e = 0; e < kW; ++e) {
+                    v[i][e] = __bfloat162float(__float2bfloat16(v[i][e] * inv * wv[e]));
+                    amax = fmaxf(amax, fabsf(v[i][e]));
+                }
+            }
+        }
+    }
+    const float scale = pow2_scale(group_reduce_max<G>(amax, red_max, tid));
+    if (!active) return;
+    if (t == 0) scales[row] = scale;
+    const float rs = 1.0f / scale;
+#pragma unroll
+    for (int i = 0; i < VPT; ++i) {
+        const int idx = t + i * G;
+        if (idx < nvec) store8(q + off + idx * kW, v[i], rs);
+    }
+}
+
 // Launch helpers: pick the smallest group whose registers hold the row, then the vector
 // count. `Launch` is a functor template <G, VPT> that issues the kernel.
 template <typename T, int G, template <int, int> class Launch>
@@ -461,6 +558,34 @@ struct AddRmsLaunch {
     }
 };
 
+struct NormFp8Args {
+    const __nv_bfloat16* x;
+    __nv_bfloat16* resid;  // null without the residual add
+    const __nv_bfloat16* w;
+    unsigned char* q;
+    float* scales;
+    int rows, cols;
+    float eps;
+    cudaStream_t stream;
+    static NormFp8Args& get() {
+        static NormFp8Args a;
+        return a;
+    }
+};
+
+template <bool kAdd>
+struct NormFp8Launch {
+    template <int G, int VPT>
+    struct L {
+        static void run() {
+            const NormFp8Args& a = NormFp8Args::get();
+            const int grid = cdiv(a.rows, Group<G>::kRowsPerBlock);
+            rmsnorm_fp8_reg_kernel<kAdd, G, VPT><<<grid, Group<G>::kBlock, 0, a.stream>>>(
+                a.x, a.resid, a.w, a.q, a.scales, a.rows, a.cols, a.eps);
+        }
+    };
+};
+
 // True if the single-pass kernel can take this input (alignment, vector width, row length).
 template <typename T>
 bool reg_ok(const void* x, const void* w, const void* out, int cols) {
@@ -523,6 +648,28 @@ void rmsnorm_dispatch(const T* x, const T* w, T* out, int rows, int cols, float 
     SPARK_CHECK_LAUNCH();
 }
 
+// Both fp8 norms: the single-pass kernel only, so a row is reduced in the order the bf16
+// kernels reduce it (the bits match theirs only where they run the same kernel).
+template <bool kAdd>
+void norm_fp8_dispatch(const __nv_bfloat16* x, __nv_bfloat16* resid, const __nv_bfloat16* w,
+                       unsigned char* q, float* scales, int rows, int cols, float eps,
+                       cudaStream_t stream) {
+    const std::string name = kAdd ? "add_rmsnorm_fp8" : "rmsnorm_fp8";
+    SPARK_REQUIRE(rows >= 0 && cols > 0, name + ": rows must be >= 0 and cols > 0");
+    SPARK_REQUIRE(cols % 8 == 0 && cols <= 1024 * kMaxElemsPerThread,
+                  name + ": cols must be a multiple of 8 and at most 32768 (row in registers)");
+    SPARK_REQUIRE(x != nullptr && w != nullptr && q != nullptr && scales != nullptr &&
+                      (!kAdd || resid != nullptr),
+                  name + ": null pointer");
+    SPARK_REQUIRE(is_aligned16(x) && is_aligned16(w) && (!kAdd || is_aligned16(resid)),
+                  name + ": x, resid and w must be 16-byte aligned");
+    SPARK_REQUIRE(reinterpret_cast<uintptr_t>(q) % 8 == 0, name + ": q must be 8-byte aligned");
+    if (rows == 0) return;
+    NormFp8Args::get() = {x, resid, w, q, scales, rows, cols, eps, stream};
+    launch_reg<__nv_bfloat16, NormFp8Launch<kAdd>::template L>(cols);
+    SPARK_CHECK_LAUNCH();
+}
+
 }  // namespace
 
 int rmsnorm_num_variants() {
@@ -560,6 +707,17 @@ void add_rmsnorm_bf16(const __nv_bfloat16* x, __nv_bfloat16* resid, const __nv_b
     add_rmsnorm_bf16_kernel<kWarps>
         <<<grid, kWarps * kWarpSize, 0, stream>>>(x, resid, w, out, rows, cols, eps);
     SPARK_CHECK_LAUNCH();
+}
+
+void rmsnorm_fp8_bf16(const __nv_bfloat16* x, const __nv_bfloat16* w, unsigned char* q,
+                      float* scales, int rows, int cols, float eps, cudaStream_t stream) {
+    norm_fp8_dispatch<false>(x, nullptr, w, q, scales, rows, cols, eps, stream);
+}
+
+void add_rmsnorm_fp8_bf16(const __nv_bfloat16* x, __nv_bfloat16* resid, const __nv_bfloat16* w,
+                          unsigned char* q, float* scales, int rows, int cols, float eps,
+                          cudaStream_t stream) {
+    norm_fp8_dispatch<true>(x, resid, w, q, scales, rows, cols, eps, stream);
 }
 
 }  // namespace spark
