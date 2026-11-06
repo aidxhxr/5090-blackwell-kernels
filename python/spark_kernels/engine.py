@@ -68,6 +68,11 @@ it costs.
 Weights: `ModelWeights.random()` draws every matrix on the GPU. w_gate_up is stored in the
 interleaved layout of `interleave_gate_up` (gate_j at column 2j, up_j at 2j + 1), the layout
 `hgemm_swiglu` takes; the torch model reads the same tensor as its two strided halves.
+`ModelWeights.random(moe=cfg)` draws a mixture-of-experts model instead: the same attention,
+and in every layer the experts of `cfg` (a `moe_layer.MoELayerConfig` of hidden 4096, e.g.
+Mixtral 8x7B's own layer) where the dense MLP was. SparkModel runs them with
+`moe_layer.MoELayer`, whose forward never waits on the host, so the decode graphs capture the
+experts too; TorchModel runs `moe_layer.torch_moe`.
 """
 
 from __future__ import annotations
@@ -94,6 +99,7 @@ from .layer import (
     LayerWeights,
     RoPE,
 )
+from .moe_layer import MoELayer, MoELayerConfig, MoEWeights, torch_moe
 from .pages import PageTable, page_hashes
 from .spec import NgramDrafter, accept, cut_at_stop
 
@@ -111,19 +117,27 @@ def cdiv(a: int, b: int) -> int:
 
 @dataclass
 class ModelWeights:
-    """bf16 weights of the whole model in hgemm's [K, N] layout."""
+    """bf16 weights of the whole model in hgemm's [K, N] layout. With `experts` (one
+    MoEWeights per layer, in the checkpoint layout moe_layer.py describes) every layer's MLP
+    is those experts, and the layers' w_gate_up and w_down are None."""
 
     embed: torch.Tensor  # [V, 4096]
     layers: list[LayerWeights]  # w_gate_up interleaved (see the module docstring)
     final_norm: torch.Tensor  # [4096]
     lm_head: torch.Tensor  # [4096, V]
+    experts: list[MoEWeights] | None = None
 
     @staticmethod
     def random(n_layers: int = N_LAYERS, vocab: int = VOCAB, device="cuda",
-               seed: int = 0) -> ModelWeights:
+               seed: int = 0, moe: MoELayerConfig | None = None) -> ModelWeights:
         """N(0, 1/K) projections and 1 + 0.1 N(0, 1) norms, as LayerWeights.random, drawn on
-        the GPU (14 GB of layer weights take seconds there and minutes on the CPU)."""
+        the GPU (14 GB of layer weights take seconds there and minutes on the CPU). With
+        `moe` each layer gets that config's experts (MoEWeights.random, its own seed per
+        layer) and no dense MLP."""
+        if moe is not None and moe.hidden != HIDDEN:
+            raise ValueError(f"the experts take the model's hidden size {HIDDEN}, got {moe.hidden}")
         g = torch.Generator(device=device).manual_seed(seed)
+        dense = moe is None
 
         def proj(k, n):
             return torch.empty(k, n, device=device, dtype=torch.bfloat16).normal_(
@@ -135,16 +149,24 @@ class ModelWeights:
 
         layers = [LayerWeights(attn_norm=norm(HIDDEN), w_qkv=proj(HIDDEN, QKV_WIDTH),
                                w_o=proj(Q_WIDTH, HIDDEN), mlp_norm=norm(HIDDEN),
-                               w_gate_up=proj(HIDDEN, 2 * INTERMEDIATE),
-                               w_down=proj(INTERMEDIATE, HIDDEN)) for _ in range(n_layers)]
+                               w_gate_up=proj(HIDDEN, 2 * INTERMEDIATE) if dense else None,
+                               w_down=proj(INTERMEDIATE, HIDDEN) if dense else None)
+                  for _ in range(n_layers)]
+        experts = None if dense else [MoEWeights.random(moe, device, seed=(seed << 16) + i)
+                                      for i in range(n_layers)]
         embed = torch.empty(vocab, HIDDEN, device=device, dtype=torch.bfloat16).normal_(
             0.0, 1.0, generator=g)
         return ModelWeights(embed=embed, layers=layers, final_norm=norm(HIDDEN),
-                            lm_head=proj(HIDDEN, vocab))
+                            lm_head=proj(HIDDEN, vocab), experts=experts)
 
     def bytes(self) -> int:
-        return (sum(w.bytes() for w in self.layers) + self.embed.numel() * 2 +
-                self.lm_head.numel() * 2 + self.final_norm.numel() * 2)
+        rest = self.embed.numel() * 2 + self.lm_head.numel() * 2 + self.final_norm.numel() * 2
+        if self.experts is None:
+            return rest + sum(w.bytes() for w in self.layers)
+        rest += sum(t.numel() * 2 for w in self.layers
+                    for t in (w.attn_norm, w.w_qkv, w.w_o, w.mlp_norm))
+        return rest + sum(t.numel() * 2 for e in self.experts for t in (e.router, e.w13, e.w2)
+                          if t is not None)
 
 
 KV_FORMATS = ("bf16", "fp8")
@@ -292,7 +314,18 @@ class SparkModel:
     arithmetic in both, on a bf16 or an fp8 cache). A token's logits are then the same
     whatever else is in its forward. fp8 (one activation scale over the batch) and the fp4
     formats are refused; `prefill_variant` is not used in this mode
-    (docs/design/batch_invariant.md)."""
+    (docs/design/batch_invariant.md).
+
+    With MoE weights (`weights.experts`, ModelWeights.random(moe=cfg)) a layer is the same
+    attention half, the MLP norm, then `moe_layer.MoELayer` where the gate/up and down GEMMs
+    were: the router GEMM, the routing, the gate/up grouped GEMM with the SwiGLU in its
+    epilogue, the down grouped GEMM and the weighted combine, whose output the next layer's
+    attention norm adds to x (`add_rmsnorm_`). None of it waits on the host and the grouped
+    GEMM's grid is fixed, so the engine captures a decode step with the experts in it as it
+    does a dense one. Each MoELayer keeps the interleaved gate/up copy its epilogue reads, and
+    the checkpoint-layout w13 of `weights.experts` is freed (set to None) unless `keep_bf16`;
+    `dequantized()` gives it back for a reference model. bf16 weights only, and no
+    batch_invariant: the grouped GEMM picks its tile from the rows per expert."""
 
     context_prefill = True  # prefill rows may continue a cached context (attention_varlen)
     # fp8-tok: the qkv and gate/up projections take their e4m3 rows and scales from the norm
@@ -315,6 +348,17 @@ class SparkModel:
                                      "the whole batch, and fp4gemm has no invariant rung)")
         self.batch_invariant = bool(batch_invariant)
         self.w = weights
+        self.moe: list[MoELayer] | None = None
+        if weights.experts is not None:
+            if weights_format != "bf16" or self.batch_invariant:
+                raise ValueError("the MoE layers take bf16 weights on the default kernels: no "
+                                 "quantized weights_format and no batch_invariant")
+            self.moe = []
+            for e in weights.experts:
+                self.moe.append(MoELayer(e))  # its own interleaved copy of w13
+                if not keep_bf16:
+                    e.w13 = None
+            torch.cuda.empty_cache()
         self.rope = rope
         self.prefill_variant = prefill_variant
         # set to a list to collect the residual stream [T, 4096] after every layer (a parity
@@ -354,6 +398,10 @@ class SparkModel:
         rest = w.embed.numel() * 2 + w.final_norm.numel() * 2
         rest += self.head.nbytes() if self.head is not None else w.lm_head.numel() * 2
         rest += sum((lw.attn_norm.numel() + lw.mlp_norm.numel()) * 2 for lw in w.layers)
+        if self.moe is not None:
+            rest += sum((lw.w_qkv.numel() + lw.w_o.numel()) * 2 for lw in w.layers)
+            return rest + sum((m.router.numel() + m.w13.numel() + m.w2.numel()) * 2
+                              for m in self.moe)
         if self.lin is None:
             return rest + sum(getattr(lw, n).numel() * 2 for lw in w.layers
                               for n in ("w_qkv", "w_o", "w_gate_up", "w_down"))
@@ -365,7 +413,8 @@ class SparkModel:
         head = self.head.dequantize() if self.head is not None else self.w.lm_head
         if self.lin is None:
             return ModelWeights(embed=self.w.embed, layers=self.w.layers,
-                                final_norm=self.w.final_norm, lm_head=head)
+                                final_norm=self.w.final_norm, lm_head=head,
+                                experts=self._experts())
         layers = []
         for lw, d in zip(self.w.layers, self.lin, strict=True):
             gu = d["gate_up"].dequantize()
@@ -376,6 +425,15 @@ class SparkModel:
                 w_down=d["down"].dequantize()))
         return ModelWeights(embed=self.w.embed, layers=layers, final_norm=self.w.final_norm,
                             lm_head=head)
+
+    def _experts(self) -> list[MoEWeights] | None:
+        """weights.experts with each w13 in the checkpoint layout, rebuilt from the
+        interleaved copy (gate rows at 2j, up rows at 2j + 1) where it was freed."""
+        if self.moe is None:
+            return None
+        return [e if e.w13 is not None else
+                MoEWeights(e.cfg, e.router, torch.cat([m.w13[:, 0::2], m.w13[:, 1::2]], 1), e.w2)
+                for e, m in zip(self.w.experts, self.moe, strict=True)]
 
     def _quant_linears(self):
         if self.lin is not None:
@@ -390,6 +448,8 @@ class SparkModel:
 
     def set_batch_invariant(self, on: bool) -> None:
         """Switches the batch-invariant kernels on or off (see the class docstring)."""
+        if on and self.moe is not None:
+            raise ValueError("batch_invariant does not cover the MoE layers")
         self._set_quant_invariant(bool(on))
         self.batch_invariant = bool(on)
 
@@ -415,6 +475,8 @@ class SparkModel:
     def _layers(self, x: torch.Tensor, b: Batch, cache: PagedKVCache, decode: bool):
         if self.lin is not None:
             return self._layers_quant(x, b, cache, decode)
+        if self.moe is not None:
+            return self._layers_moe(x, b, cache, decode)
         v = self._gemm_variant(decode)
         for layer, w in enumerate(self.w.layers):
             h = sk.rmsnorm(x, w.attn_norm, EPS)
@@ -426,6 +488,26 @@ class SparkModel:
             sk.hgemm(a, w.w_down, v, residual=x, out=x)
             if self.trace is not None:
                 self.trace.append(x.clone())  # x is updated in place by the next layer
+        return x
+
+    def _layers_moe(self, x: torch.Tensor, b: Batch, cache: PagedKVCache, decode: bool):
+        """The layer loop with an MoELayer as each MLP: its output is added to x by the next
+        layer's attention norm, and after the last layer by a plain add."""
+        v = self._gemm_variant(decode)
+        delta = None
+        for layer, (w, moe) in enumerate(zip(self.w.layers, self.moe, strict=True)):
+            if delta is None:
+                h = sk.rmsnorm(x, w.attn_norm, EPS)
+            else:
+                h = sk.add_rmsnorm_(delta, x, w.attn_norm, EPS)  # x += delta, then the norm
+            qkv = sk.hgemm(h, w.w_qkv, v)
+            o = self._attention(qkv, x, b, cache, layer, decode)
+            sk.hgemm(o, w.w_o, v, residual=x, out=x)
+            delta = moe(sk.rmsnorm(x, w.mlp_norm, EPS))
+            if self.trace is not None:
+                self.trace.append(x + delta)
+        if delta is not None:
+            x.add_(delta)
         return x
 
     @staticmethod
@@ -475,7 +557,10 @@ class SparkModel:
         kernel keeps its split-K partials in one buffer per process that it frees and
         reallocates when a launch needs more, so a CUDA graph captured before the largest
         launch would keep the address of a freed buffer. After this the buffer has its final
-        size for every M a graphed decode step (and any prefill of <= 64 tokens) runs."""
+        size for every M a graphed decode step (and any prefill of <= 64 tokens) runs. An
+        MoE model has no dense MLP GEMMs to run here: the grouped GEMM keeps one workspace per
+        tile config and the routing one of its largest size, each allocated once and never
+        moved, so the runs before each capture (Engine._capture_all) are all they need."""
         w = self.w.layers[0]
         v = self._gemm_variant(True)
         dev = self.w.embed.device
@@ -490,8 +575,10 @@ class SparkModel:
             else:
                 sk.hgemm(x, w.w_qkv, v)
                 sk.hgemm(x.new_zeros(m, Q_WIDTH), w.w_o, v, residual=x, out=x.clone())
-                sk.hgemm_swiglu(x, w.w_gate_up, v)
-                sk.hgemm(x.new_zeros(m, INTERMEDIATE), w.w_down, v, residual=x, out=x.clone())
+                if self.moe is None:
+                    sk.hgemm_swiglu(x, w.w_gate_up, v)
+                    sk.hgemm(x.new_zeros(m, INTERMEDIATE), w.w_down, v, residual=x,
+                             out=x.clone())
             if self.head is not None:
                 self.head(x)
             else:
@@ -528,9 +615,16 @@ class TorchModel:
     and v are rounded to e4m3 with the cache's scales (`quantize_kv_cache`, the rounding of
     rope_append_paged_ up to k being rounded to bf16 first here), stored, and the attention,
     at prefill too, runs on the dequantized values in bf16, so both models see the same
-    rounding of the cache."""
+    rounding of the cache.
+
+    With MoE weights the MLP is `moe_layer.torch_moe`, transformers' experts loop with the
+    routing weights and each token's sum in fp32, eager even with `compile` (the loop reads
+    the experts hit back to the host)."""
 
     def __init__(self, weights: ModelWeights, rope: RoPE, compile: bool = False):
+        if weights.experts is not None and any(e.w13 is None for e in weights.experts):
+            raise ValueError("a SparkModel freed these experts' w13: build it with keep_bf16 "
+                             "or pass its dequantized() weights")
         self.w = weights
         self.rope = rope
         self.trace: list[torch.Tensor] | None = None  # see SparkModel.trace
@@ -555,6 +649,12 @@ class TorchModel:
         x = x + o @ w_o
         gu = F.rms_norm(x, (HIDDEN,), mlp_norm, EPS) @ w_gate_up
         return x + (F.silu(gu[:, 0::2]) * gu[:, 1::2]) @ w_down
+
+    @staticmethod
+    def _post_moe(x, o, w_o, mlp_norm, experts: MoEWeights):
+        x = x + o @ w_o
+        h = F.rms_norm(x, (HIDDEN,), mlp_norm, EPS)
+        return x + torch_moe(h, experts, acc_dtype=torch.float32)
 
     def _forward(self, x, b: Batch, cache: PagedKVCache, decode: bool):
         T = x.shape[0]
@@ -612,7 +712,10 @@ class TorchModel:
                     outs.append(o1[0].transpose(0, 1).reshape(n, Q_WIDTH))
                     t0 += n
                 o = torch.cat(outs)
-            x = post(x, o, w.w_o, w.mlp_norm, w.w_gate_up, w.w_down)
+            if self.w.experts is None:
+                x = post(x, o, w.w_o, w.mlp_norm, w.w_gate_up, w.w_down)
+            else:
+                x = self._post_moe(x, o, w.w_o, w.mlp_norm, self.w.experts[layer])
             if self.trace is not None:
                 self.trace.append(x)
         return x
