@@ -967,17 +967,21 @@ std::tuple<Tensor, Tensor> ce_rows(const Tensor& logits_in, const Tensor& target
     return {loss, lse};
 }
 
-// Variant 3's backward for one band of rows (ce_backward_bf16): dh_f32 [>= cdiv(T, 128) *
-// 128, D] float32, zero on entry, receives the band's dh; slots [ce_backward_slots() * 128,
+// Variant 3's backward for one band of rows (ce_backward_bf16), or variant 4's on 256-row
+// tiles: dh_f32 [>= T rounded up to ce_backward_tile_rows(variant), D] float32, zero on
+// entry, receives the band's dh; slots [ce_backward_slots(variant) * 128,
 // D] float32 and flags [>= 2 * V / 128 + 1] int32 are the kernel's scratch, zero on entry (the
 // slots are zero again on exit); dw [V, D] bf16 is stored when `first` and added to after.
 void ce_backward(const Tensor& h, const Tensor& w, const Tensor& targets, const Tensor& lse,
                  const Tensor& scale, int64_t ignore_index, const Tensor& dh_f32,
-                 const Tensor& slots, const Tensor& flags, const Tensor& dw_in, bool first) {
+                 const Tensor& slots, const Tensor& flags, const Tensor& dw_in, bool first,
+                 int64_t variant) {
     Tensor dw = dw_in;
     const CeShape s = ce_check(h, w, &targets, "ce_backward");
     const c10::cuda::CUDAGuard guard(h.device());
-    const int64_t rows_pad = (static_cast<int64_t>(s.T) + 127) / 128 * 128;
+    TORCH_CHECK(variant == 3 || variant == 4, "ce_backward: variant must be 3 or 4, got ", variant);
+    const int64_t tile = spark::ce_backward_tile_rows(static_cast<int>(variant));
+    const int64_t rows_pad = (static_cast<int64_t>(s.T) + tile - 1) / tile * tile;
     check_cuda_contig(dh_f32, "dh_f32");
     TORCH_CHECK(dh_f32.scalar_type() == at::kFloat && dh_f32.dim() == 2 &&
                     dh_f32.size(0) >= rows_pad && dh_f32.size(1) == s.D &&
@@ -1008,10 +1012,14 @@ void ce_backward(const Tensor& h, const Tensor& w, const Tensor& targets, const 
     a.flags = flags.data_ptr<int>();
     a.dw = bf16_ptr_mut(dw);
     a.first = first;
+    a.variant = static_cast<int>(variant);
     spark::ce_backward_bf16(bf16_ptr(h), bf16_ptr(w), s.T, s.V, s.D, a, current_stream(h));
 }
-int64_t ce_backward_slots() {
-    return spark::ce_backward_slots();
+int64_t ce_backward_slots(int64_t variant) {
+    return spark::ce_backward_slots(static_cast<int>(variant));
+}
+int64_t ce_backward_tile_rows(int64_t variant) {
+    return spark::ce_backward_tile_rows(static_cast<int>(variant));
 }
 
 // out[c - c0][r] = x[r][c] for c in [c0, c1), r < rows, and 0 for rows <= r < ld: a column
@@ -2028,14 +2036,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "past rows",
           py::arg("x"), py::arg("c0"), py::arg("c1"), py::arg("ld"), py::arg("out"));
     m.def("ce_backward", &ce_backward,
-          "variant 3's backward for one band of rows: dh_f32 (zeroed) += the band's dh, dw "
-          "(stored when first, else added to) through recycled fp32 strips; no [rows, V] "
-          "tensor",
+          "variant 3's (or, on 256 x 128 tiles, 4's) backward for one band of rows: dh_f32 "
+          "(zeroed) += the band's dh, dw (stored when first, else added to) through recycled "
+          "fp32 strips; no [rows, V] tensor",
           py::arg("h"), py::arg("w"), py::arg("targets"), py::arg("lse"), py::arg("scale"),
           py::arg("ignore_index"), py::arg("dh_f32"), py::arg("slots"), py::arg("flags"),
-          py::arg("dw"), py::arg("first"));
+          py::arg("dw"), py::arg("first"), py::arg("variant") = 3);
     m.def("ce_backward_slots", &ce_backward_slots,
-          "the recycled fp32 strips of dw that ce_backward's slots buffer holds");
+          "the recycled fp32 strips of dw that ce_backward's slots buffer holds by default",
+          py::arg("variant") = 3);
+    m.def("ce_backward_tile_rows", &ce_backward_tile_rows,
+          "rows of h per gradient tile of ce_backward: its dh_f32 is padded to a multiple",
+          py::arg("variant") = 3);
     m.def("grouped_gemm_swiglu", &grouped_gemm_swiglu,
           "grouped_gemm with the SwiGLU in the epilogue: w [E, 2I, K] with rows alternating gate "
           "and up -> [T, I] bf16",
