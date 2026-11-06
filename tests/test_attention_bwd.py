@@ -312,3 +312,57 @@ def test_attention_bwd_window_rejects_bad_inputs(sk):
         sk.attention_bwd(q, k, v, out, do, lse, window=16)
     with pytest.raises(RuntimeError):  # one sink per query head
         sk.attention_bwd(q, k, v, out, do, lse, sinks=torch.zeros(3, device="cuda"))
+
+
+# ---- the band kernel: variant 3 under a window of up to 128 keys ----------------------------
+
+# The deterministic mode takes the band at any length: on these few key tiles every block of it
+# is one tile and the halo before it, a window on and off the tile grid, a shifted diagonal, a
+# window of one key
+BAND_SMALL = [s for s in WINDOW_SHAPES if s[-1] <= 128] + [(1, 4, 1, 200, 1000, 128, 100),
+                                                           (2, 8, 2, 700, 700, 64, 1)]
+
+
+@pytest.mark.parametrize("sink", [False, True], ids=["nosink", "sink"])
+@pytest.mark.parametrize("shape", BAND_SMALL, ids=_wshape_id)
+def test_attention_bwd_band_small_matches_autograd(sk, shape, sink):
+    *dims, window = shape
+    q, k, v, do = _inputs(*dims)
+    sinks = _sinks(dims[1]) if sink else None
+    out, lse = sk.attention_fwd(q, k, v, causal=True, window=window, sinks=sinks)
+    kw = dict(causal=True, variant=3, window=window, sinks=sinks, deterministic=True)
+    a = sk.attention_bwd(q, k, v, out, do, lse, **kw)
+    b = sk.attention_bwd(q, k, v, out, do, lse, **kw)
+    for x, y in zip(a, b, strict=True):
+        assert torch.equal(x, y)
+    ref = _window_reference(q, k, v, do, window, sinks)
+    for got, want, name in zip(a, ref[1:], ("dq", "dk", "dv", "dsinks"), strict=False):
+        _assert_grad_close(got, want, name)
+
+
+# The default mode takes the band from 2 key tiles of 128 per SM (512 on the 5090's 170): the
+# sweep's 8K and 16K rows, gpt-oss's heads with sinks, queries against a longer cache (the
+# diagonal off the tile grid), two sequences whose length is no tile multiple, a window of one
+BAND_LARGE = [(1, 32, 8, 8192, 8192, 128, 128), (1, 32, 8, 16384, 16384, 128, 64),
+              (1, 64, 8, 8192, 8192, 64, 128), (1, 32, 8, 6000, 8200, 128, 100),
+              (2, 16, 4, 6000, 6000, 64, 128), (1, 32, 8, 8192, 8192, 128, 1)]
+
+
+@pytest.mark.parametrize("shape", BAND_LARGE, ids=_wshape_id)
+def test_attention_bwd_band_matches_variant0(sk, shape):
+    # many key tiles per block: the carry across a block's tiles, the halos, cuts that cross
+    # heads and sequences. Against variant 0 (the scalar kernels, fp32 throughout; a torch
+    # reference would need the S x S scores), and the same bits in both modes and every run
+    *dims, window = shape
+    q, k, v, do = _inputs(*dims)
+    sinks = _sinks(dims[1]) if dims[5] == 64 else None
+    out, lse = sk.attention_fwd(q, k, v, causal=True, window=window, sinks=sinks)
+    kw = dict(causal=True, window=window, sinks=sinks)
+    ref = sk.attention_bwd(q, k, v, out, do, lse, variant=0, **kw)
+    a = sk.attention_bwd(q, k, v, out, do, lse, variant=3, **kw)
+    b = sk.attention_bwd(q, k, v, out, do, lse, variant=3, **kw)
+    c = sk.attention_bwd(q, k, v, out, do, lse, variant=3, deterministic=True, **kw)
+    for x, y, z in zip(a, b, c, strict=True):
+        assert torch.equal(x, y) and torch.equal(x, z)
+    for got, want, name in zip(a, ref, ("dq", "dk", "dv", "dsinks"), strict=False):
+        _assert_grad_close(got, want.float(), name)
