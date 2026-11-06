@@ -86,6 +86,7 @@ rows past `S_q` in a zero-filled tile go through the same code.
 | 3 | variant 2's kernel with a schedule: the tiles of the last partial wave are split along the keys over the idle SMs and merged by a combine kernel; `S_q <= 64` runs a 64-row tile; decode shapes (the query rows sharing a K/V head fit 16 rows) run the flash-decoding kernel of the "Long-context decode" section | wave quantization on 170 SMs, a short query that no longer pays for 128 rows, and a decode step that streams each K/V head once for its whole group of query heads |
 | 4 | variant 3's tile with K and V fed by TMA into full / empty mbarrier stages issued by one lane, no block-wide barrier in the KV loop | the per-tile `__syncthreads` that kept both warps of a scheduler in the same phase, so their softmaxes were a hole in the tensor pipe |
 | 5 | variant 4's tile and pipeline on a persistent grid: 170 resident blocks take (b, h, q-tile) items from a queue in the heaviest-first order, a producer warp publishes each item to the consumer warps through a shared-memory ring and keeps the TMA loads running across items; the split-KV tail stays on for the non-causal shapes | the per-block prologue (barrier init, the Q box and the first K/V box before any `mma`), 1,028 times on the causal 4096 shape, and the per-SM spread a static assignment of six blocks per SM leaves |
+| 6 | variant 5 with 128-key tiles: K and V in stages of their own, the producer back on lane 0 of warp 0 at `D = 128`, each warp's products cut to the 16-key blocks its rows reach on the causal diagonal; opt-in | meant to halve how often the two warps of a scheduler meet in their softmaxes; measured 4 to 6% slower than variant 5 at `D = 128` and 11% at `D = 64`, because the registers it needs push the producer back onto a compute warp and the wider tile adds more work than the half-as-frequent rescale saves |
 
 ### Variant 0
 
@@ -662,6 +663,149 @@ GQA is the same `kv_index` stride on the K/V head; rows past `S_q` and keys past
 zero-filled by the copy engine as before. The split workspace stays one per device, shared
 with variants 3 and 4 (the same caveat about concurrent split launches on two streams); the
 queue counters are per stream.
+
+### Variant 6: 128-key tiles
+
+Variant 5's section ends on the last few percent of idle pipe, and the biggest piece of it is
+the tiles where both warps of a scheduler sit in their softmaxes at once. A 128-key tile
+halves how often a warp enters a softmax per FLOP: the row max and its two shuffles, the O
+rescale (64 `FMUL` at `D = 128`) and the barrier waits are paid once per 128 keys, and each
+product phase is 128 `mma` long instead of 64, so the other warp has twice the work queued to
+hide a softmax under. I built it as variant 6 and it is slower on every prefill shape. It
+stays in the source as an opt-in rung (`variant=6`); the default is still variant 5
+(`attention_default_variant()`).
+
+**What had to change.** A warp's S is 16 rows by 128 keys, 16 n8 accumulators, 64 registers
+where variant 5 had 32. A stage of variant 5 held a K tile and a V tile of 64 keys, 32 KB at
+`D = 128`; the same pair at 128 keys is 64 KB and three of them do not fit 99 KB. So K and V
+are separate loads, each 128 x D (32 KB, the size of the Q tile), and an item is the load
+sequence Q, K0, V0, K1, V1, ..., load `u` in stage `u mod 3`, 96 KB in all, the same as
+variant 5. A warp releases K's stage right after its `Q K^T`, so the next V streams in under
+its softmax and `P V`. The fastest warp can still run about 128 keys ahead of the slowest,
+as with variant 5's three combined stages. At `D = 64` a tile is 16 KB and
+there are six stages. Under the causal mask the last tile of a Q tile is its diagonal, of
+which warp `w` needs the first `16 (w + 1)` keys, so each warp runs both products only on the
+16-key blocks some row of its own reaches; the same bound clips the keys past `S_kv` and,
+under a window, the blocks before it. The queue, the ring, the split rule, the epilogue, GQA,
+the window, the sinks and the routing of `S_q <= 64` are variant 5's.
+
+**Registers.** S, O and Q's fragments are 160 registers at `D = 128`, and the nine-warp block
+caps every thread at 168. `ptxas -v`, CUDA 13.2, `sm_120`:
+
+| kernel | warps | registers | spill stores / loads |
+|---|---|---|---|
+| variant 5, `D = 128`, producer warp (the default) | 9 | 168 | 52 / 64 B |
+| variant 5, `D = 128`, inline producer (`SPARK_ATTN_V5_PWARP=0`) | 8 | 232 | 0 |
+| variant 6, `D = 128`, inline producer (its default) | 8 | 255 | 12 / 12 B, two values reloaded once per item after the tile loop |
+| variant 6, `D = 128`, producer warp (`SPARK_ATTN_V6_PWARP=1`) | 9 | 168 | 3,412 / 3,696 B |
+| variant 5, `D = 64`, producer warp | 9 | 152 | 0 |
+| variant 6, `D = 64`, producer warp (its default) | 9 | 168 | 92 / 140 B |
+| variant 6, `D = 64`, inline producer | 8 | 227 | 0 |
+
+So at `D = 128` the producer goes back onto lane 0 of warp 0, the arrangement variant 5 had
+measured 1.6% slower. The first build of that also spilled inside the tile loop: the
+producer's state (the load and item counters, the current item and its next tile, ten values)
+sat in registers on all 256 threads. It now lives in shared memory, read only by the producing lane. I tried two ways to
+issue the loads from there. The one in the source by default is variant 5's inline scheme:
+before warp 0 reads load `u` it waits for the stage and issues up to load `u + 2`, so warp 0
+waits for the slowest warp twice per tile. The other is the producer I had listed as untried
+under "What remains": lane 0 polls the empty barriers with `mbarrier.test_wait` twice per tile,
+issues whatever stages have freed, and blocks only when warp 0 is about to wait on a load
+nobody has issued (`SPARK_ATTN_V6_AHEAD=1` or `2`). A third way out was a twelve-warp block
+whose producer warpgroup hands its registers to the compute warps with `setmaxnreg` (24 for
+the producer, 240 for the rest; it is `sm_120a`-only, which the extension builds for). ptxas
+keeps `setmaxnreg` in a small test kernel, `USETMAXREG` in the SASS and registers up to R237
+after the increase, but in this kernel it drops both instructions without a message and
+allocates the whole block in 168 registers, with 3.4 KB of spill. I did not find what makes it
+drop them, so that version is not in the source.
+
+**Measured** (TFLOPS, `--iters=30`, one process per configuration in one hold of the GPU,
+2026-11-05):
+
+| shape | v5 | v5, inline producer | v6 | v6, polling producer | v6, producer warp (spilled) |
+|---|---|---|---|---|---|
+| b1 h32 s4096 d128 | **238.3** | 235.4 | 225.9 | 206.9 | 156.3 |
+| b1 h32 s4096 d128 causal | **232.8** | 229.6 | 219.4 | 203.8 | 143.8 |
+| b1 h32 s8192 d128 causal | **233.7** | 233.1 | 225.3 | 208.0 | 152.7 |
+| b4 h32 s2048 d128 causal | **215.3** | 214.9 | 208.7 | 201.9 | 124.8 |
+| b1 hq32 hkv8 s4096 d128 causal | **233.4** | 230.3 | 219.8 | 203.2 | 144.5 |
+
+At `D = 64`, 4096 causal: variant 5 227.7, variant 5 with its inline producer 216.0, variant 6
+with the producer warp (its default) 204.2, variant 6 inline 192.2. The polling producer at
+lookahead 1 and 2 measured the same, 203.6 to 203.8 causal, so it is not about how far ahead
+it issues: loads only go out at warp 0's poll points, which can be half a tile after the
+stage frees, and Nsight puts 16.3% of the warps' stall samples on the barrier waits and their
+branches, against 6.7% with the blocking scheme.
+
+The second column settles it. With the same eight warps and the same inline
+producer, variant 6 is still 3 to 5% behind variant 5 at `D = 128`, so the 128-key tile itself
+loses here, before the producer arrangement comes into it. Nsight, 4096 causal, one launch
+each, 2.52 GHz under the profiler:
+
+| | v5 | v5, inline | v6 | v5, `D = 64` | v6, `D = 64` |
+|---|---|---|---|---|---|
+| duration | 681 µs | 687 µs | 721 µs | 345 µs | 390 µs |
+| warps, registers | 9, 168 | 8, 232 | 8, 255 | 9, 152 | 9, 168 |
+| tensor pipe active, mean over SMs | 96.3% | 94.6% | 89.9% | 95.7% | 85.0% |
+| tensor pipe active, slowest SM | 94.9% | 93.2% | 88.7% | 94.3% | 80.9% |
+| instructions executed | 180.8 M | 166.4 M | 168.9 M | 117.6 M | 128.0 M |
+| `math_pipe_throttle` per issue | 7.96 | 9.25 | 8.96 | 5.95 | 4.70 |
+| `short_scoreboard` per issue | 0.78 | 0.17 | 0.43 | 0.23 | 1.10 |
+| local loads executed | 354 K | 0 | 26 K | 0 | 1.29 M |
+
+Against variant 5 inline the tile did what it was for: `FMUL` (the rescale) went from 18.1 M
+to 9.4 M executed. Everything around it grew more. `LOP3` went from 0.7 M to 4.6 M, `IADD` from
+2.2 M to 3.7 M, `BRA` from 6.7 M to 8.5 M, `SYNCS` (the barrier polls) from 5.0 M to 5.9 M.
+Per warp and tile that is about 100 integer instructions, half in the loop's head (the K wait,
+the block bounds, the producer's checks, the whole or cut tile branch) and half between the
+two products: V's stage and parity (a division by three), the block bounds again, and the
+swizzled `ldmatrix` addresses, which the 255-register build recomputes from the lane index
+every tile. The stall samples rose 5% (71.1 K to 74.7 K), the same as the time, and the samples
+on the `HMMA`s themselves did not move (56.4 K and 56.8 K): the extra time is in the
+instructions between the products. The row sum is one more: a 32-long chain of
+dependent `FADD` per row instead of 16, 495 samples to 1,313. Splitting the max and the sum
+into two chains each measured within noise (225.9 against 225.9 without the mask, 219.5
+against 219.2 with it), so it is not in the source. At `D = 64` the nine-warp build spills
+inside the loop, 1.29 M local loads, and the pipe drops to 85%.
+
+The diagonal cut also does less than it should. Nsight counts 139.85 G tensor products for
+variant 6 at 4096 causal and 139.59 G for variant 5, where running both products only on each
+warp's blocks would leave 137.98 G. The count is what you get if `P V` skips and `Q K^T` does
+not: ptxas turned the per-block branches of the `Q K^T` cut into predicated `HMMA`. That is
+1.3% of the causal products, and the non-causal shapes, which have no diagonal, lose 5%
+anyway.
+
+**The rest of the sweep.** The default `bench_attention` sweep, median of 50, the same hold as
+the flash column of the README (rows in `results/attention.json`):
+
+| shape | v5 ms / TFLOPS | v6 ms / TFLOPS | v6 time / v5 |
+|---|---|---|---|
+| b1 h4 s512 d128 | 0.0130 / 41.2 | 0.0148 / 36.2 | 1.14 |
+| b1 h4 s512 d128 causal | 0.0192 / 14.0 | 0.0274 / 9.8 | 1.43 |
+| b1 h4 s512 d64 causal | 0.0110 / 12.2 | 0.0172 / 7.8 | 1.56 |
+| b1 hq8 hkv2 s512 d128 causal | 0.0192 / 28.0 | 0.0276 / 19.4 | 1.44 |
+| b1 h32 s4096 d128 | 1.1504 / 238.9 | 1.2118 / 226.8 | 1.05 |
+| b1 h32 s4096 d128 causal | 0.5803 / 236.8 | 0.6152 / 223.4 | 1.06 |
+| b1 h32 s8192 d128 causal | 2.2960 / 239.4 | 2.4326 / 226.0 | 1.06 |
+| b4 h32 s2048 d128 causal | 0.6087 / 225.8 | 0.6375 / 215.6 | 1.05 |
+| b1 h32 s4096 d64 causal | 0.2936 / 234.1 | 0.3305 / 207.9 | 1.13 |
+| b1 hq32 hkv8 s4096 d128 causal | 0.5807 / 236.7 | 0.6152 / 223.4 | 1.06 |
+
+The small shapes lose most for a reason that has nothing to do with the softmax: with fewer
+tiles than blocks the tail split cuts the lightest tile into as many slices as it has KV
+tiles, and at 512 tokens under the mask that is one 128-key tile, so variant 6 runs 16 items
+on 170 SMs where variant 5 runs 32. The decode rows run variant 3's kernels in both and match
+to 0.6%. Under a window (32/8 heads, 16K tokens, `D = 128`, `bench_attention --window=W`):
+0.263 against 0.300 ms at `W = 128`, 1.242 against 1.297 at 1024, 4.149 against 4.281 at 4096,
+0.267 against 0.304 at 128 with sinks, and 0.283 against 0.380 on gpt-oss's 64/8 heads at
+`D = 64` with `W = 128` and sinks. A 128-key window spans two or three tiles of 128 keys, so
+variant 6 loads more keys than the windows reach.
+
+**Correctness.** Every pytest parity test runs variant 6 (causal and not, both head sizes, GQA,
+cache slices read in place, boxes past the end of a head, the window and sink sweep, the queue
+with more items than blocks on two streams), plus two shapes for its tile: 300 queries against
+1,000 keys under the top-left mask, and 129 tokens, one row past a 128 x 128 tile. The
+existing kernels compile to the same SASS as before.
 
 ## FP8: `attention_fp8`
 
@@ -1392,16 +1536,18 @@ at 16K and 1024: the queue already evens the items out, and the split adds a com
 
 - **The last 3%.** The tensor pipe is 96 to 97.5% active in variant 5; the block prologue
   is gone. What is left is mostly the tiles where both warps of a scheduler meet in their
-  softmaxes. A 128-key tile would halve how often that can happen per FLOP, at 32 more
-  registers for S and 64 KB per stage, which the 168-register budget of the nine-warp block
-  and the 99 KB of shared memory do not have; it would need the producer back on a consumer
-  lane (the inline scheme, 1.6% slower here) or a two-stage pipeline.
+  softmaxes. The 128-key tile was the plan for it and lost (variant 6): it needs 32 more
+  registers than the nine-warp block has, and even on eight warps with the same producer as
+  variant 5's inline build it is 3 to 5% slower, because the wider tile adds more per-tile
+  work than the half-as-frequent rescale saves.
 - **The producer's register cost.** Nine warps cap the kernel at 168 registers per thread
   because three warps share one scheduler's 16 K registers. The inline producer keeps 8 warps
-  and 228 registers but stalls warp 0 on the slowest warp's release. A producer that polls the
-  barriers without blocking (`mbarrier.test_wait`) from lane 0 of warp 0, issuing whenever a
-  stage happens to be free and blocking only when the load is about to be needed, has not
-  been tried; it would give the persistent kernel variant 4's register budget back.
+  and 232 registers but stalls warp 0 on the slowest warp's release. A producer that polls the
+  barriers without blocking, from lane 0 of warp 0, measured 7% slower than that on variant 6's
+  eight-warp block (203.8 against 219.4 TFLOPS causal at 4096), because it only issues at warp
+  0's poll points; it has not been tried on variant 5. `setmaxnreg`, which would give a
+  producer warpgroup's registers to the compute warps, assembles for `sm_120a` but ptxas drops
+  it from this kernel (variant 6's section).
 - **Ping-pong, revisited.** The named-barrier schedules lost because one `mma.sync` warp
   does not fill the pipe alone. A version that keeps two warps per scheduler in the `mma`
   phase and only forbids two softmaxes at once (a barrier a warp takes before its softmax and
