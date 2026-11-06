@@ -22,7 +22,7 @@ and a decode step at 64 sequences is 3.5 times `torch.compile`'s. On real Llama-
 weights that engine is closer to an fp32 reference than transformers is, and it matches or
 beats vLLM on every static batch, decode and prefill row I measured. Over 120 real
 projection shapes the bf16 GEMM averages 112% of cuBLAS and the fp8 GEMM 129% of cuBLASLt,
-112% of its MXFP8 kernel with block scales. A
+118% of its MXFP8 kernel with block scales. A
 whole MoE layer on these kernels is ahead of vLLM's `fused_moe` on 10 of the 12 rows I ran
 and level on the other two, captures in a CUDA graph, and
 a batch-invariant mode gives a request the same logits bit for bit whatever else is in its
@@ -395,7 +395,35 @@ shape and variant 1 elsewhere. Over all 120 shapes the geometric mean goes from 
 47 shapes still are, all at 256 tokens and up and 31 of them at 95% or better: the MX
 kernel's own 8 to 10% over the per-tensor one, on shapes where the per-tensor variant 3 is
 at 95 to 113%. Five got slower, 512 x 2048 x 768 from 154.6% to 129.5% and four deep-K
-shapes by 3 to 7%. Details in [fp8gemm.md, "Model shapes"](docs/design/fp8gemm.md), rows in
+shapes by 3 to 7%.
+
+Most of that last bit was the scale operand's layout. The consumer warps fetched row-major
+scales a group of stages ahead and shuffled eight words into place per stage; cuBLASLt takes
+its scales tiled and has them copied. Now `fp8_quantize(x, "mx_tiled")` and
+`reference.to_mx_tiled` write them in a layout where a stage's scales for a block's rows are
+one TMA box and each lane's scale register is one aligned word: 32 rows per 128 bytes per 128
+k, in the order the instruction's two thread-ids read them. The producer copies that box
+beside A and Bt, the consumer warps read their words with three shared loads per stage, and
+`sk.fp8gemm` takes either layout. At 4096³ the instruction count stays the same and the
+cycles drop 12%: the chunk loads and the shuffles were latency, not issue slots.
+
+| M x N x K | what it is | cuBLASLt MXFP8 | row-major | tiled |
+|---|---|---|---|---|
+| 256 x 4096 x 4096 | Llama 3 8B q_proj, 256 tokens | 33.9 us | 150.1% | 164.5% |
+| 512 x 4096 x 4096 | same, 512 tokens | 35.8 us | 101.7% | 116.4% |
+| 1024 x 10240 x 8192 | Llama 3 70B qkv | 287.4 us | 89.1% | 99.9% |
+| 4096 x 14336 x 4096 | Llama 3 8B gate/up | 785.5 us | 94.6% | 103.8% |
+| 4096 x 25600 x 5120 | Qwen 3 32B gate/up | 1.75 ms | 94.2% | 101.8% |
+| 4096 x 128256 x 4096 | Llama 3 8B lm_head | 7.29 ms | 99.3% | 107.1% |
+
+% of cuBLASLt MXFP8, both layouts in one session. Over all 120 shapes the geometric mean goes
+from 111.8% to 118.1% (117.7 to 118.3% over four sweeps), and the shapes below cuBLASLt from
+47 to 11; 38 of the 47 from the sweep before are at or above it now. 4096³ runs 723 TFLOPS,
+107.2% of cuBLASLt's MXFP8 kernel, against 665 with row-major scales. What is still below is
+the 70B gate/up and down at 256 tokens and the Qwen 3 32B ones at 512 (90 to 94.5%), three
+more at 93 to 98%, and four at 99.3 to 99.9%. The 128x256 tile still sits out MX mode: 168
+registers is all a nine-warp block gets here, and next to 128 accumulators even six scale
+words spill. Details in [fp8gemm.md, "Model shapes"](docs/design/fp8gemm.md), rows in
 `results/fp8gemm_models.json`.
 
 ## the fp4 GEMM
@@ -1324,9 +1352,8 @@ numbers, the sweeps that picked the constants, and which Nsight metric moved:
 
 Things I'd still like to do: a 128-key tile for attention, which would halve how often the
 two warps of a scheduler land in their softmaxes together (the 3% of tensor pipe still idle);
-the MX GEMM's last 10%, which is the scale operand's layout (cuBLASLt takes its scales in a
-tiled layout that one TMA box serves; a row-major one costs the consumer warps eight shuffles
-per stage); and a GB10 run when the Spark arrives. Both
+the MX GEMM's 128x256 tile, which needs more than the 168 registers a nine-warp block gets
+here; and a GB10 run when the Spark arrives. Both
 cards are consumer Blackwell, so `mma.sync`, `cp.async` and TMA are there and `tcgen05` isn't.
 
 ```
