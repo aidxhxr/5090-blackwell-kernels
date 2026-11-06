@@ -8,7 +8,7 @@ step. The tests below show that on the default kernels, then check the invariant
 bit (torch.equal):
 
   * hgemm variant 7, fp8gemm variant 4 and w4gemm variant 3: row i of A B is the same at
-    every M, whichever kernel M picks;
+    every M, whichever kernel M picks (for w4gemm also whichever route, tile and schedule);
   * paged_decode variant 2 and attention_varlen variant 2, on a bf16 and on an e4m3 cache: a
     query row's output is the same whatever the batch around it, and the same from either op;
   * Engine(batch_invariant=True): every request's logits, step by step, are the same alone,
@@ -175,6 +175,36 @@ def test_w4gemm_invariant_rows_do_not_depend_on_m(sk, n, k, asym):
         lo = (MS[-1] - m) // 2
         assert torch.equal(sk.w4gemm(a[lo:lo + m].contiguous(), ww, variant=INV_W4),
                            full[lo:lo + m])
+
+
+@pytest.mark.parametrize("asym", [False, True], ids=["sym", "asym"])
+@pytest.mark.parametrize("n,k", [(4096, 4096), (1024, 4096), (192, 4096), (512, 1152)])
+def test_w4gemm_invariant_routes_and_tiles_give_the_same_bits(sk, n, k, asym):
+    """From 17 rows variant 3 runs variant 2's wide tiles in the class order, which compute the
+    four-warp shapes' four chains one after another: the rule, the four-warp route at every M,
+    and every class-order tile forced with every schedule (whole, four pieces, the plan) give
+    the same bits."""
+    a, w = _operands(600, n, k, n + k + 3)
+    ww = sk.W4Weight.quantize(w, asym)
+    prev = sk._C.w4gemm_v3_route()
+    sk._C.w4gemm_v3_set_route(-2)
+    try:
+        four = sk.w4gemm(a, ww, variant=INV_W4)
+    finally:
+        sk._C.w4gemm_v3_set_route(prev)
+    assert torch.equal(sk.w4gemm(a, ww, variant=INV_W4), four)
+    nc = sk._C.w4gemm_num_configs()
+    widths = dict(zip(range(nc - 5, nc), (128, 64, 128, 64, 128), strict=True))
+    for entry, width in widths.items():
+        if n % width:
+            continue
+        for split in (1, 4, 0):
+            sk._C.w4gemm_set_config(entry, split)
+            try:
+                got = sk.w4gemm(a, ww, variant=2)
+            finally:
+                sk._C.w4gemm_set_config(-1, 0)
+            assert torch.equal(got, four), (entry, split)
 
 
 def test_quantized_invariant_rungs_are_not_the_default(sk):
@@ -438,6 +468,23 @@ def test_quantized_engine_logits_are_batch_invariant(sk, weights, fmt, kv):
         for s in ref:
             assert torch.equal(got[s], ref[s]), f"{fmt} + {kv} cache, {name}: request {s}"
         assert tok == ref_tok, name
+
+
+def test_int4_engine_logits_do_not_depend_on_the_w4gemm_route(sk, weights):
+    """w4gemm variant 3's two routes give the same bits, so an engine on the four-warp shapes
+    alone gets the logits of one on the class-order tiles, in 32 slots and alone."""
+    rope = L.RoPE(1024)
+    reqs = _requests()
+    ref, ref_tok, _ = _serve(weights, rope, reqs, True, "int4", "bf16", **SCHEDULES["batch_32"])
+    prev = sk._C.w4gemm_v3_route()
+    sk._C.w4gemm_v3_set_route(-2)
+    try:
+        got, tok, _ = _serve(weights, rope, reqs, True, "int4", "bf16", **SCHEDULES["alone"])
+    finally:
+        sk._C.w4gemm_v3_set_route(prev)
+    for s in ref:
+        assert torch.equal(got[s], ref[s]), f"request {s}"
+    assert tok == ref_tok
 
 
 def test_default_quantized_engine_is_not_batch_invariant(sk, weights):
