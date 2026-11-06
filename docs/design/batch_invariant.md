@@ -15,7 +15,8 @@ decode graph has, how its prompt is chunked, whether it is preempted and resumed
 it lands in, whether its prefix came from the cache, and whether speculative decoding
 verified its tokens. It is five kernel rungs and a flag:
 
-- `hgemm` variant 7, `fp8gemm` variant 4 and `w4gemm` variant 3: no route splits K by M;
+- `hgemm` variant 7, `fp8gemm` variant 4 and `w4gemm` variant 3: no route splits K by M
+  (w4gemm's one split is between the four chains its order already has);
 - `paged_decode` variant 2 and `attention_varlen` variant 2: one arithmetic per query row,
   fixed by the row's own sequence, in both ops, on a bf16 or an e4m3 cache;
 - `SparkModel(batch_invariant=...)` / `Engine(batch_invariant=...)`, which picks them, for
@@ -299,6 +300,18 @@ groups of weights per warp instead of 4 did not move it (17 and 64 us): 256 one-
 blocks leave most SMs with one warp to issue from, and the time is latency, not bytes in
 flight.
 
+From 17 rows variant 3 now runs variant 2's wide tiles in the class order instead
+([w4gemm](w4gemm.md), "Batch invariant: variant 3"). The four chains of an element are a
+property of the element, not of the warps: one warp can run them one after another (the
+groups 0, 4, 8, ..., then 1, 5, 9, ...), add each into a running sum as it ends, and get the
+same bits. That frees the tile from four warps along K, and it allows one K split, at a
+chain's boundary: a tile cut into its four chains, the four sums added in class order by the
+block that finishes it. The rule runs the class-order 128 x 32 tile (64 x 32 when the
+128-wide pieces would not reach the SMs) with whole tiles for the full waves and the last
+partial wave cut. `w4gemm_v3_set_route(-2)` runs the four-warp shapes at every M, and the
+tests check that the two routes, every class-order tile and every schedule give the same
+bits, and that an int4 engine gets the same logits on either route.
+
 ### The e4m3 cache in variant 2
 
 Decode variant 1 on an e4m3 cache reads the slabs into fragments with D permuted; varlen
@@ -335,18 +348,23 @@ decode ms/step and prefill tok/s, default / invariant:
 
 | engine | batch 1 | 8 | 32 | 64 |
 |---|---|---|---|---|
-| int4 + bf16 cache, decode | 1.426 / 1.490 | 1.586 / 1.578 | 2.073 / 2.400 | 3.129 / 3.861 |
-| int4 + bf16 cache, prefill | 49,789 / 38,138 | 51,733 / 36,062 | 50,344 / 29,822 | 49,745 / 30,207 |
-| int4 + fp8 cache, decode | 1.426 / 1.523 | 1.539 / 1.582 | 1.912 / 2.280 | 2.771 / 3.545 |
-| int4 + fp8 cache, prefill | 49,452 / 37,980 | 51,745 / 35,977 | 50,279 / 29,783 | 49,746 / 30,174 |
+| int4 + bf16 cache, decode | 1.425 / 1.493 | 1.587 / 1.578 | 2.083 / 2.172 | 3.157 / 3.173 |
+| int4 + bf16 cache, prefill | 48,421 / 48,539 | 50,619 / 51,511 | 49,473 / 48,758 | 48,980 / 48,496 |
+| int4 + fp8 cache, decode | 1.425 / 1.528 | 1.541 / 1.586 | 1.919 / 2.055 | 2.806 / 2.862 |
+| int4 + fp8 cache, prefill | 48,733 / 48,288 | 50,778 / 51,087 | 49,422 / 48,106 | 48,437 / 47,842 |
 | fp8-tok + fp8 cache, decode | 2.052 / 2.133 | 2.154 / 2.177 | 2.278 / 2.352 | 2.587 / 2.655 |
 | fp8-tok + fp8 cache, prefill | 119,043 / 109,296 | 132,887 / 128,068 | 131,896 / 125,809 | 129,759 / 123,762 |
 | bf16 + fp8 cache, decode | 2.901 / 2.985 | 2.999 / 3.021 | 3.158 / 3.235 | 3.595 / 3.667 |
 | bf16 + fp8 cache, prefill | 60,489 / 56,490 | 65,638 / 63,240 | 65,605 / 64,663 | 65,107 / 64,079 |
 
-fp8-tok and the fp8 cache cost what the bf16 engine paid: 1 to 4% at decode, 4 to 8% at
-prefill. int4 is the expensive one: 0 to 5% at decode up to 8 slots, 16 to 28% at 32 and 64,
-and 23 to 41% at prefill. The kernels say where:
+The int4 rows are from 2026-11-05, with w4gemm variant 3 on the class-order tiles; the rest
+are from the first run. fp8-tok and the fp8 cache cost what the bf16 engine paid: 1 to 4% at
+decode, 4 to 8% at prefill. int4 was the expensive one on the four-warp shapes: the same run
+with `invariant_four_warps` (the engine on the four-warp route) gives 2.412 and 3.869 ms at
+32 and 64 slots on the bf16 cache, 2.290 and 3.564 on the fp8 one, 16 to 27% over the
+default, and 29,760 to 37,828 prefill tok/s, 22 to 40% under it. With the class-order tiles
+int4 costs 0.5 to 7% at decode at 32 and 64 slots and is within 3% of the default at
+prefill. The kernels say where:
 
 **fp8gemm**, variant 3 against 4, us per call (ten launches between events, median of 50
 samples at M <= 64, 10 above; B rotated past L2 at M <= 64):
@@ -364,26 +382,26 @@ The same bits and time at M = 1 to 64 (the default never split there); above, th
 partial wave Stream-K filled, up to 1.38x on down at 2048 and 1.37x on qkv at 512, as for
 hgemm 7.
 
-**w4gemm**, variant 2 against 3:
+**w4gemm**, variant 2 / variant 3 on the four-warp route / variant 3 (`bench_invariant.py
+--part w4`, 2026-11-05):
 
 | M | qkv | o | gate_up | down | lm_head |
 |---|---|---|---|---|---|
-| 1 | 10.5 / 10.4 | 7.8 / 7.8 | 38.2 / 40.1 | 21.2 / 21.1 | 158.2 / 163.7 |
-| 8 | 10.7 / 10.6 | 8.1 / 8.2 | 38.1 / 38.6 | 23.6 / 23.7 | 158.3 / 159.3 |
-| 32 | 16.9 / 17.3 | 13.2 / 14.3 | 51.8 / 71.2 | 29.1 / 47.7 | 214.9 / 322.9 |
-| 64 | 26.1 / 37.6 | 20.8 / 25.5 | 89.6 / 139.8 | 48.6 / 80.9 | 377.3 / 615.6 |
-| 128 | 40.2 / 59.3 | 29.6 / 40.5 | 159.4 / 215.6 | 82.5 / 130.2 | 731.2 / 948.3 |
-| 512 | 136.4 / 193.7 | 94.5 / 135.9 | 621.6 / 830.1 | 305.8 / 450.0 | 2,880 / 3,716 |
-| 2048 | 532.9 / 713.8 | 354.6 / 483.1 | 2,456 / 3,310 | 1,207 / 1,608 | 11,661 / 14,784 |
-| 4096 | 1,040 / 1,416 | 711.0 / 945.6 | 5,001 / 6,610 | 2,523 / 3,527 | |
+| 1 | 10.5 / 10.5 / 10.5 | 8.1 / 7.9 / 8.1 | 36.9 / 40.3 / 40.3 | 21.3 / 21.2 / 21.2 | 158.1 / 163.9 / 163.9 |
+| 8 | 10.7 / 10.7 / 10.7 | 8.5 / 8.3 / 8.3 | 38.2 / 38.9 / 38.9 | 24.9 / 24.2 / 24.2 | 158.3 / 159.3 / 159.4 |
+| 32 | 16.8 / 17.1 / 20.3 | 13.5 / 14.6 / 12.5 | 53.2 / 71.3 / 52.1 | 29.0 / 48.8 / 34.1 | 217.3 / 327.0 / 202.8 |
+| 64 | 26.4 / 37.7 / 29.1 | 20.9 / 25.7 / 20.0 | 91.7 / 140.5 / 89.0 | 49.4 / 81.2 / 57.4 | 383.3 / 618.0 / 380.9 |
+| 128 | 41.1 / 60.1 / 44.8 | 30.1 / 40.8 / 35.9 | 163.2 / 216.2 / 167.9 | 84.1 / 130.3 / 108.2 | 742.1 / 952.8 / 730.1 |
+| 512 | 139.6 / 193.9 / 142.1 | 95.9 / 136.0 / 100.2 | 632.6 / 835.3 / 636.9 | 308.8 / 447.3 / 332.9 | 2,938 / 3,720 / 2,817 |
+| 2048 | 535.6 / 715.3 / 534.7 | 357.7 / 482.8 / 359.9 | 2,520 / 3,318 / 2,499 | 1,229 / 1,605 / 1,247 | 11,857 / 14,802 / 11,169 |
+| 4096 | 1,080 / 1,426 / 1,072 | 718.8 / 951.5 / 715.4 | 5,081 / 6,620 / 4,986 | 2,585 / 3,572 / 2,625 | |
 
-The same bits and time at M = 1 and 8 (the default runs the same four-warp shapes unsplit
-there). From 32 up the default splits K across blocks or runs Stream-K; the fixed family
-costs 1.0 to 1.4x at 32, 1.2 to 1.7x at 64 and 1.27 to 1.47x from 128 up, the 64 x 32 tile
-keeping a quarter of its warps along N where Stream-K's 128 x 32 tile keeps all of them. A
-four-warp tile that is wider in N does not fit the 99 KB of shared memory a block may take
-with the staged activations of 32 rows; the shapes are in w4gemm.cu's `kEntries` for the
-next try.
+The same bits and time at M = 1 and 8 on both routes (the default runs the same four-warp
+shapes unsplit there). From 32 up the default splits K across blocks or runs Stream-K, and
+the four-warp shapes cost 1.02 to 1.68x; the class-order tiles bring that to 0.93 to 1.29x,
+0.94 to 1.08x from 512 rows. The rows still behind are o and down at 128 and 256 rows and
+qkv and down at 32: four pieces per tile is the finest invariant cut, and Stream-K cuts
+finer.
 
 **Attention on the e4m3 cache**, variant 1 against 2, the pool rotated past L2:
 
