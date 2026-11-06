@@ -25,7 +25,10 @@
 // MX mode (fp8gemm_mx): the same four variants with a ue8m0 scale per row per 32 k on both
 // operands, sfa[M][K/32] and sfb[N][K/32], applied by the block-scaled mma itself
 // (fp8gemm_tile.cuh, MxFrag / MxChunk). Requires K % 256 == 0 so that a row's scales for
-// two 128-k stages are one aligned 8-byte chunk.
+// two 128-k stages are one aligned 8-byte chunk. The scales may also come in the tiled layout
+// (FP8_MX_TILED, fp8gemm_tile::mx_tile_word): variant 3's TMA tiles then copy them into shared
+// memory beside A and Bt, variants 0 and 1 read them where they read row-major ones, and
+// variant 2 does not take them.
 
 #include <cuda_fp8.h>
 
@@ -71,8 +74,9 @@ constexpr int V0_ROWS = 16, V0_COLS = 32;
 // In MX mode lane (g, t) also reads, per k32 step, the scale byte of row g + 8 (t & 1) and of
 // column g for that k-block, straight from the scale tensors (the lanes the instruction reads
 // with thread-id 0: fp8gemm_tile.cuh). This is the reference the smem variants are checked
-// against: nothing about the fragment or word layout is assumed beyond the probe.
-template <bool MX>
+// against: nothing about the fragment or word layout is assumed beyond the probe. TILED: the
+// byte of (row, k-block) is at fp8gemm_tile::mx_tile_offset instead.
+template <bool MX, bool TILED = false>
 __global__ void __launch_bounds__(V0_THREADS)
     fp8gemm_v0_kernel(const unsigned char* __restrict__ A, const unsigned char* __restrict__ Bt,
                       __nv_bfloat16* __restrict__ C, int M, int N, int K,
@@ -89,7 +93,8 @@ __global__ void __launch_bounds__(V0_THREADS)
     const unsigned char* a0 = A + static_cast<size_t>(row + g) * K + 4 * t;
     const unsigned char* a1 = a0 + static_cast<size_t>(8) * K;
     const unsigned char* b0 = Bt + static_cast<size_t>(col + g) * K + 4 * t;
-    const unsigned char* sa = mx.a + static_cast<size_t>(row + g + 8 * (t & 1)) * mx.ld;
+    const int ra = row + g + 8 * (t & 1);
+    const unsigned char* sa = mx.a + static_cast<size_t>(ra) * mx.ld;
     const unsigned char* sb = mx.b + static_cast<size_t>(col + g) * mx.ld;
     float acc[4] = {0.f, 0.f, 0.f, 0.f};
     for (int k0 = 0; k0 < K; k0 += 32) {
@@ -100,7 +105,10 @@ __global__ void __launch_bounds__(V0_THREADS)
         a[3] = *reinterpret_cast<const unsigned*>(a1 + k0 + 16);
         b[0] = *reinterpret_cast<const unsigned*>(b0 + k0);
         b[1] = *reinterpret_cast<const unsigned*>(b0 + k0 + 16);
-        if constexpr (MX)
+        if constexpr (MX && TILED)
+            mma_e4m3_16832_mx<0>(acc, a, b, mx.a[fp8gemm_tile::mx_tile_offset(ra, k0 >> 5, K)],
+                                 mx.b[fp8gemm_tile::mx_tile_offset(col + g, k0 >> 5, K)]);
+        else if constexpr (MX)
             mma_e4m3_16832_mx<0>(acc, a, b, sa[k0 >> 5], sb[k0 >> 5]);
         else
             mma_e4m3_16832(acc, a, b);
@@ -131,7 +139,7 @@ struct Sched {
     int* counters;
 };
 
-template <class C, bool MX, int SFW>
+template <class C, bool MX, int SFW, bool TILED = false>
 __global__ void __launch_bounds__(C::THREADS)
     fp8gemm_v1_kernel(const unsigned char* __restrict__ A, const unsigned char* __restrict__ Bt,
                       __nv_bfloat16* __restrict__ Cout, int M, int N, int K,
@@ -173,8 +181,8 @@ __global__ void __launch_bounds__(C::THREADS)
     const float scale = *scale_a * *scale_b;
 
     typename C::Acc acc;
-    fp8gemm_tile::mainloop<C, MX, SFW>(A, Bt, K, bm, bn, m_valid, kt_begin, kt_end - kt_begin,
-                                       smem_raw, acc, mx);
+    fp8gemm_tile::mainloop<C, MX, SFW, TILED>(A, Bt, K, bm, bn, m_valid, kt_begin,
+                                              kt_end - kt_begin, smem_raw, acc, mx);
 
     if (tile < sched.dp_tiles) {
         fp8gemm_tile::store_bf16<C>(acc, scale, Cout, M, N, bm, bn);
@@ -231,15 +239,16 @@ struct Workspace {
 
 // Resident blocks per GPU for one configuration (and mode: the MX kernel holds two stages of
 // scale words in registers and may fit fewer blocks); also the > 48 KB smem opt-in.
-template <class C, bool MX, int SFW>
+template <class C, bool MX, int SFW, bool TILED = false>
 int resident_blocks() {
     static int resident = 0;
     if (resident == 0) {
-        SPARK_CUDA_CHECK(cudaFuncSetAttribute(
-            fp8gemm_v1_kernel<C, MX, SFW>, cudaFuncAttributeMaxDynamicSharedMemorySize, C::SMEM));
+        SPARK_CUDA_CHECK(cudaFuncSetAttribute(fp8gemm_v1_kernel<C, MX, SFW, TILED>,
+                                              cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                              C::SMEM));
         int per_sm = 0;
         SPARK_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &per_sm, fp8gemm_v1_kernel<C, MX, SFW>, C::THREADS, C::SMEM));
+            &per_sm, fp8gemm_v1_kernel<C, MX, SFW, TILED>, C::THREADS, C::SMEM));
         resident = (per_sm > 0 ? per_sm : 1) * num_sms();
     }
     return resident;
@@ -247,7 +256,8 @@ int resident_blocks() {
 
 // The scale chunk width of MX mode for this K (fp8gemm_tile::MxChunk): 16-byte chunks when
 // every row stride is 16-byte aligned, else 8. Per-tensor mode is the SFW = 2 instantiation,
-// whose code does not depend on it.
+// whose code does not depend on it. Tiled scales are fetched a word at a time whatever the
+// chunk, so they take SFW = 2 at every K (one instantiation per tile).
 constexpr int sfw_for(int K) {
     return K % 512 == 0 ? 4 : 2;
 }
@@ -260,12 +270,12 @@ constexpr int max_split(int KT) {
 
 // `split` K-slices for the `tail` last tiles in row-major tile order (whole tiles first).
 // split == 1 is a plain launch of `tiles` blocks with no workspace.
-template <class C, bool MX, int SFW>
+template <class C, bool MX, int SFW, bool TILED = false>
 void launch(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout, int M, int N,
             int K, const float* scale_a, const float* scale_b, MxScales mx, int tail, int split,
             cudaStream_t stream) {
     constexpr int BM = C::BM, BN = C::BN;
-    (void)resident_blocks<C, MX, SFW>();  // the smem opt-in, if the caller has not done it
+    (void)resident_blocks<C, MX, SFW, TILED>();  // the smem opt-in, if not done yet
     Sched s;
     s.tiles_n = N / BN;
     const int tiles = cdiv(M, BM) * s.tiles_n;
@@ -274,7 +284,7 @@ void launch(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout
         s.split = 1;
         s.ws = nullptr;
         s.counters = nullptr;
-        fp8gemm_v1_kernel<C, MX, SFW>
+        fp8gemm_v1_kernel<C, MX, SFW, TILED>
             <<<tiles, C::THREADS, C::SMEM, stream>>>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, s);
         return;
     }
@@ -295,30 +305,38 @@ void launch(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout
     SPARK_CUDA_CHECK(
         cudaMemsetAsync(w.counters, 0, static_cast<size_t>(tail) * sizeof(int), stream));
     const int grid = s.dp_tiles + tail * s.split;
-    fp8gemm_v1_kernel<C, MX, SFW>
+    fp8gemm_v1_kernel<C, MX, SFW, TILED>
         <<<grid, C::THREADS, C::SMEM, stream>>>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, s);
 }
 
 // Wave quantization (hgemm variant 3's rule): the tiles past the last full wave of resident
 // blocks are split along K over the otherwise idle blocks, `split = min(KT, resident / tail)`.
 // `unsplit` (variant 4, batch invariant) runs every tile whole instead.
-template <class C, bool MX, int SFW>
+template <class C, bool MX, int SFW, bool TILED = false>
 void launch_tiles_sfw(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout, int M,
                       int N, int K, const float* scale_a, const float* scale_b, MxScales mx,
                       cudaStream_t stream, bool unsplit) {
-    const int resident = resident_blocks<C, MX, SFW>();
+    const int resident = resident_blocks<C, MX, SFW, TILED>();
     const int tiles = cdiv(M, C::BM) * (N / C::BN);
     const int KT = K / C::BK;
     const int tail = unsplit ? 0 : tiles % resident;
     const int split = tail > 0 ? std::min(max_split<C, MX, SFW>(KT), resident / tail) : 1;
-    launch<C, MX, SFW>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, tail, split, stream);
+    launch<C, MX, SFW, TILED>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, tail, split, stream);
 }
 
-// MX mode picks the chunk width from K; per-tensor mode has one instantiation.
+// MX mode picks the chunk width from K (tiled scales: SFW = 2); per-tensor mode has one
+// instantiation.
 template <class C, bool MX>
 void launch_tiles(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout, int M,
                   int N, int K, const float* scale_a, const float* scale_b, MxScales mx,
                   cudaStream_t stream, bool unsplit = false) {
+    if constexpr (MX) {
+        if (mx.tiled) {
+            launch_tiles_sfw<C, MX, 2, true>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream,
+                                             unsplit);
+            return;
+        }
+    }
     if (MX && sfw_for(K) == 4)
         launch_tiles_sfw<C, MX, 4>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream, unsplit);
     else
@@ -337,7 +355,7 @@ bool fits(int N) {
     return N % C::BN == 0 && N / C::BN <= resident_blocks<C, MX, 2>();
 }
 
-template <class C, bool MX, int SFW>
+template <class C, bool MX, int SFW, bool TILED = false>
 void launch_decode_sfw(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout, int M,
                        int N, int K, const float* scale_a, const float* scale_b, MxScales mx,
                        cudaStream_t stream, bool unsplit) {
@@ -345,14 +363,21 @@ void launch_decode_sfw(const unsigned char* A, const unsigned char* Bt, __nv_bfl
     const int KT = K / C::BK;
     const int split =
         unsplit ? 1 : std::min(max_split<C, MX, SFW>(KT), std::max(1, cdiv(kMinCtas, strips)));
-    launch<C, MX, SFW>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, split > 1 ? strips : 0, split,
-                       stream);
+    launch<C, MX, SFW, TILED>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, split > 1 ? strips : 0,
+                              split, stream);
 }
 
 template <class C, bool MX>
 void launch_decode(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout, int M,
                    int N, int K, const float* scale_a, const float* scale_b, MxScales mx,
                    cudaStream_t stream, bool unsplit) {
+    if constexpr (MX) {
+        if (mx.tiled) {
+            launch_decode_sfw<C, MX, 2, true>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream,
+                                              unsplit);
+            return;
+        }
+    }
     if (MX && sfw_for(K) == 4)
         launch_decode_sfw<C, MX, 4>(A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream, unsplit);
     else
@@ -479,7 +504,10 @@ void run(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat16* C, int 
     switch (variant) {
         case 0: {
             const dim3 grid(N / V0_COLS, M / V0_ROWS);
-            if (MX)
+            if (MX && mx.tiled)
+                fp8gemm_v0_kernel<true, true>
+                    <<<grid, V0_THREADS, 0, stream>>>(a, b, C, M, N, K, scale_a, scale_b, mx);
+            else if (MX)
                 fp8gemm_v0_kernel<true>
                     <<<grid, V0_THREADS, 0, stream>>>(a, b, C, M, N, K, scale_a, scale_b, mx);
             else
@@ -497,9 +525,10 @@ void run(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat16* C, int 
             fp8gemm_tma(A, Bt, C, M, N, K, scale_a, scale_b, mx, stream);
             break;
         case 3:
-            // The shapes the route leaves alone: variant 2 or variant 1.
+            // The shapes the route leaves alone: variant 2 or variant 1 (variant 1 for tiled
+            // scales, which variant 2 does not take).
             if (!fp8gemm_tma_sk(A, Bt, C, M, N, K, scale_a, scale_b, mx, stream)) {
-                if (fp8gemm_tma_supports(M, N, K))
+                if (!mx.tiled && fp8gemm_tma_supports(M, N, K))
                     fp8gemm_tma(A, Bt, C, M, N, K, scale_a, scale_b, mx, stream);
                 else if (MX)
                     v1::launch_auto<true>(a, b, C, M, N, K, scale_a, scale_b, mx, stream);
@@ -543,8 +572,10 @@ bool fp8gemm_supports(int M, int N, int K, int variant) {
     return true;  // variant 1 zero-fills rows past M; variant 3 runs it where its tiles do not
 }
 
-bool fp8gemm_mx_supports(int M, int N, int K, int variant) {
-    return K % 256 == 0 && fp8gemm_supports(M, N, K, variant);
+bool fp8gemm_mx_supports(int M, int N, int K, int variant, int layout) {
+    if (layout == FP8_MX_TILED && variant == 2) return false;
+    return (layout == FP8_MX_ROWS || layout == FP8_MX_TILED) && K % 256 == 0 &&
+           fp8gemm_supports(M, N, K, variant);
 }
 
 bool fp8gemm_mx_available() {
@@ -577,7 +608,7 @@ void fp8gemm(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat16* C, 
 
 void fp8gemm_mx(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat16* C, int M, int N,
                 int K, const float* scale_a, const float* scale_b, const unsigned char* sfa,
-                const unsigned char* sfb, int variant, cudaStream_t stream) {
+                const unsigned char* sfb, int variant, cudaStream_t stream, int layout) {
     SPARK_REQUIRE(A != nullptr && Bt != nullptr && C != nullptr && sfa != nullptr && sfb != nullptr,
                   "fp8gemm_mx: null pointer");
     SPARK_REQUIRE((scale_a == nullptr) == (scale_b == nullptr),
@@ -590,6 +621,9 @@ void fp8gemm_mx(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat16* 
     SPARK_REQUIRE(is_aligned16(sfa) && is_aligned16(sfb),
                   "fp8gemm_mx: sfa, sfb must be 16-byte aligned");
     SPARK_REQUIRE(variant != 0 || M % 16 == 0, "fp8gemm_mx variant 0: M must be a multiple of 16");
+    SPARK_REQUIRE(layout == FP8_MX_ROWS || layout == FP8_MX_TILED, "fp8gemm_mx: unknown layout");
+    SPARK_REQUIRE(layout == FP8_MX_ROWS || variant != 2,
+                  "fp8gemm_mx: variant 2 takes row-major scales only");
     SPARK_REQUIRE(fp8gemm_mx_available(),
                   "fp8gemm_mx: this build has no block-scaled mma (compile for sm_120a / sm_121a)");
     if (scale_a == nullptr) {
@@ -600,7 +634,8 @@ void fp8gemm_mx(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat16* 
     MxScales mx;
     mx.a = sfa;
     mx.b = sfb;
-    mx.ld = K / 32;
+    mx.tiled = layout == FP8_MX_TILED;
+    mx.ld = mx.tiled ? K : K / 32;
     run(A, Bt, C, M, N, K, scale_a, scale_b, mx, variant, stream);
 }
 
