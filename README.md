@@ -1178,6 +1178,14 @@ That is 1,538 GB/s for rmsnorm and 1,551 for softmax on inputs bigger than L2, t
 The fused residual add plus rmsnorm is 1.25x PyTorch running the two ops and swiglu is 1.6x
 `F.silu(g) * u`, because PyTorch's version is two kernels.
 
+On the fp8-tok engine the norm also does the quantizer's job. `add_rmsnorm_fp8_` and
+`rmsnorm_fp8` keep the normed row in registers, take its amax there and write the e4m3 row and
+its per-token scale, so the bf16 row is never written and `fp8_quantize` never runs before qkv
+and gate/up. The bytes and scales are `torch.equal` to the two ops. At hidden 4096 that is
+1.38x the two ops at 1 to 64 rows (2.81 against 3.88 us at one row, in a CUDA graph) and 1.47
+to 1.48x from 512 to 8192 rows, where the add form runs at 1,529 GB/s. On 8 layers it takes 17
+to 19 us off a 2.07 to 2.99 ms decode step and adds 0.4 to 2.2% to prefill.
+
 One thing the 96 MB L2 does to you: a 4096 x 1024 bf16 input is 8 MB and never leaves L2
 between timing iterations, so those rows in the full tables read 2 to 4 TB/s. They are L2
 numbers. The headline shapes are 256 MB and up for that reason.
