@@ -241,6 +241,10 @@ it (same arithmetic, the parity tests still compare bytes).
 fp8-tok keeps a cost: fp8gemm takes per-tensor scales only, so the row scales multiply the
 bf16 output afterwards, 8.8 ms of torch elementwise on a 2048-token prefill. For a 0.002
 perplexity gain I would not pay it; a per-row scale in fp8gemm's epilogue would make it free.
+The quantizer in front of qkv and gate/up is gone, though: the norm before each writes the
+e4m3 rows and their scales itself (`add_rmsnorm_fp8_`, `rmsnorm_fp8`), the same bytes as
+`fp8_quantize`, which takes 17 to 19 us off an 8-layer decode step
+([rmsnorm.md](rmsnorm.md)).
 
 ### A CUDA graph bug the engine found
 
