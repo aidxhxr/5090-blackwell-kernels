@@ -2123,6 +2123,10 @@ int attention_num_variants() {
     return 6;
 }
 
+int attention_default_variant() {
+    return 5;
+}
+
 bool attention_supports(int S_q, int S_kv, int D, int variant) {
     if (variant < 0 || variant >= attention_num_variants()) return false;
     if (S_q <= 0 || S_kv <= 0) return false;
