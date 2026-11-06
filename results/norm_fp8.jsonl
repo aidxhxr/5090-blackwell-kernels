@@ -1,0 +1,50 @@
+{"kind": "op", "op": "add_rmsnorm_fp8_", "rows": 1, "cols": 4096, "graph_us": 2.807999961078167, "eager_us": 4.171200096607208, "bytes": 28672, "graph_gbps": 10.210826352359003}
+{"kind": "op", "op": "add_rmsnorm_ + fp8_quantize", "rows": 1, "cols": 4096, "graph_us": 3.880000114440918, "eager_us": 7.148800045251846, "bytes": 45056, "graph_gbps": 11.61237079151279}
+{"kind": "op", "op": "rmsnorm_fp8", "rows": 1, "cols": 4096, "graph_us": 2.345599979162216, "eager_us": 4.038399830460548, "bytes": 12288, "graph_gbps": 5.238744930578033}
+{"kind": "op", "op": "rmsnorm + fp8_quantize", "rows": 1, "cols": 4096, "graph_us": 3.4800000488758087, "eager_us": 7.123199850320816, "bytes": 28672, "graph_gbps": 8.239080344054106}
+{"kind": "op", "op": "add_rmsnorm_", "rows": 1, "cols": 4096, "graph_us": 2.6528000831604004, "eager_us": 3.4703999757766724, "bytes": 32768, "graph_gbps": 12.352231217122853}
+{"kind": "op", "op": "rmsnorm", "rows": 1, "cols": 4096, "graph_us": 2.1296000108122826, "eager_us": 3.4480001777410507, "bytes": 16384, "graph_gbps": 7.693463522171346}
+{"kind": "op", "op": "fp8_quantize row", "rows": 1, "cols": 4096, "graph_us": 1.5296000055968761, "eager_us": 3.9903998374938965, "bytes": 12288, "graph_gbps": 8.033472773952436}
+{"kind": "op", "op": "add_rmsnorm_fp8_", "rows": 8, "cols": 4096, "graph_us": 3.2687999308109283, "eager_us": 4.24639992415905, "bytes": 229376, "graph_gbps": 70.17131817642203}
+{"kind": "op", "op": "add_rmsnorm_ + fp8_quantize", "rows": 8, "cols": 4096, "graph_us": 4.499199986457825, "eager_us": 7.3183998465538025, "bytes": 360448, "graph_gbps": 80.11379824966997}
+{"kind": "op", "op": "rmsnorm_fp8", "rows": 8, "cols": 4096, "graph_us": 2.6559999212622643, "eager_us": 4.1680000722408295, "bytes": 98304, "graph_gbps": 37.01204929000186}
+{"kind": "op", "op": "rmsnorm + fp8_quantize", "rows": 8, "cols": 4096, "graph_us": 3.8832001388072968, "eager_us": 7.228799909353256, "bytes": 229376, "graph_gbps": 59.06880711805175}
+{"kind": "op", "op": "add_rmsnorm_", "rows": 8, "cols": 4096, "graph_us": 3.0592000111937523, "eager_us": 3.5119999200105667, "bytes": 262144, "graph_gbps": 85.69037625549267}
+{"kind": "op", "op": "rmsnorm", "rows": 8, "cols": 4096, "graph_us": 2.3471999913454056, "eager_us": 3.4511998295783997, "bytes": 131072, "graph_gbps": 55.841854329962764}
+{"kind": "op", "op": "fp8_quantize row", "rows": 8, "cols": 4096, "graph_us": 1.63199994713068, "eager_us": 4.124800115823746, "bytes": 98304, "graph_gbps": 60.23529606899457}
+{"kind": "op", "op": "add_rmsnorm_fp8_", "rows": 64, "cols": 4096, "graph_us": 3.4063998609781265, "eager_us": 4.297599941492081, "bytes": 1835008, "graph_gbps": 538.6942446249069}
+{"kind": "op", "op": "add_rmsnorm_ + fp8_quantize", "rows": 64, "cols": 4096, "graph_us": 4.694399982690811, "eager_us": 7.29919970035553, "bytes": 2883584, "graph_gbps": 614.2603976295903}
+{"kind": "op", "op": "rmsnorm_fp8", "rows": 64, "cols": 4096, "graph_us": 2.7744000777602196, "eager_us": 4.171200096607208, "bytes": 786432, "graph_gbps": 283.46019966770206}
+{"kind": "op", "op": "rmsnorm + fp8_quantize", "rows": 64, "cols": 4096, "graph_us": 3.988799825310707, "eager_us": 7.252799719572067, "bytes": 1835008, "graph_gbps": 460.0401324619147}
+{"kind": "op", "op": "add_rmsnorm_", "rows": 64, "cols": 4096, "graph_us": 3.1295999884605408, "eager_us": 3.537600114941597, "bytes": 2097152, "graph_gbps": 670.1022519595532}
+{"kind": "op", "op": "rmsnorm", "rows": 64, "cols": 4096, "graph_us": 2.4768000468611717, "eager_us": 3.4832000732421875, "bytes": 1048576, "graph_gbps": 423.3591651166398}
+{"kind": "op", "op": "fp8_quantize row", "rows": 64, "cols": 4096, "graph_us": 1.6303999349474907, "eager_us": 4.112000018358231, "bytes": 786432, "graph_gbps": 482.3552694911805}
+{"kind": "op", "op": "add_rmsnorm_fp8_", "rows": 512, "cols": 4096, "graph_us": 4.422400146722794, "eager_us": 4.772799834609032, "bytes": 14680064, "graph_gbps": 3319.4789057879843}
+{"kind": "op", "op": "add_rmsnorm_ + fp8_quantize", "rows": 512, "cols": 4096, "graph_us": 6.489600241184235, "eager_us": 7.198400050401688, "bytes": 23068672, "graph_gbps": 3554.7138718347906}
+{"kind": "op", "op": "rmsnorm_fp8", "rows": 512, "cols": 4096, "graph_us": 3.5888001322746277, "eager_us": 4.276800155639648, "bytes": 6291456, "graph_gbps": 1753.0806308827218}
+{"kind": "op", "op": "rmsnorm + fp8_quantize", "rows": 512, "cols": 4096, "graph_us": 5.665599927306175, "eager_us": 7.175999879837036, "bytes": 14680064, "graph_gbps": 2591.0872967304513}
+{"kind": "op", "op": "add_rmsnorm_", "rows": 512, "cols": 4096, "graph_us": 4.19359989464283, "eager_us": 4.529599845409393, "bytes": 16777216, "graph_gbps": 4000.671599937867}
+{"kind": "op", "op": "rmsnorm", "rows": 512, "cols": 4096, "graph_us": 3.465599939227104, "eager_us": 3.7615999579429626, "bytes": 8388608, "graph_gbps": 2420.5355918464215}
+{"kind": "op", "op": "fp8_quantize row", "rows": 512, "cols": 4096, "graph_us": 2.343999966979027, "eager_us": 4.043199867010117, "bytes": 6291456, "graph_gbps": 2684.0682971973324}
+{"kind": "op", "op": "add_rmsnorm_fp8_", "rows": 2048, "cols": 4096, "graph_us": 14.403200149536133, "eager_us": 14.723199605941772, "bytes": 58720256, "graph_gbps": 4076.889537766448}
+{"kind": "op", "op": "add_rmsnorm_ + fp8_quantize", "rows": 2048, "cols": 4096, "graph_us": 21.108800172805786, "eager_us": 21.73919975757599, "bytes": 92274688, "graph_gbps": 4371.384789500085}
+{"kind": "op", "op": "rmsnorm_fp8", "rows": 2048, "cols": 4096, "graph_us": 7.956799864768982, "eager_us": 8.363199979066849, "bytes": 25165824, "graph_gbps": 3162.807212410723}
+{"kind": "op", "op": "rmsnorm + fp8_quantize", "rows": 2048, "cols": 4096, "graph_us": 15.28480052947998, "eager_us": 16.097599267959595, "bytes": 58720256, "graph_gbps": 3841.7417281138555}
+{"kind": "op", "op": "add_rmsnorm_", "rows": 2048, "cols": 4096, "graph_us": 15.769599378108978, "eager_us": 16.0863995552063, "bytes": 67108864, "graph_gbps": 4255.584583407939}
+{"kind": "op", "op": "rmsnorm", "rows": 2048, "cols": 4096, "graph_us": 10.094399750232697, "eager_us": 10.61440035700798, "bytes": 33554432, "graph_gbps": 3324.064117752668}
+{"kind": "op", "op": "fp8_quantize row", "rows": 2048, "cols": 4096, "graph_us": 5.41439987719059, "eager_us": 5.796800181269646, "bytes": 25165824, "graph_gbps": 4647.94336783599}
+{"kind": "op", "op": "add_rmsnorm_fp8_", "rows": 8192, "cols": 4096, "graph_us": 153.59840393066406, "eager_us": 154.16640043258667, "bytes": 234881024, "graph_gbps": 1529.1892232553912}
+{"kind": "op", "op": "add_rmsnorm_ + fp8_quantize", "rows": 8192, "cols": 4096, "graph_us": 226.9711971282959, "eager_us": 226.79998874664307, "bytes": 369098752, "graph_gbps": 1626.1920308389008}
+{"kind": "op", "op": "rmsnorm_fp8", "rows": 8192, "cols": 4096, "graph_us": 22.331200540065765, "eager_us": 22.409600019454956, "bytes": 100663296, "graph_gbps": 4507.742242491346}
+{"kind": "op", "op": "rmsnorm + fp8_quantize", "rows": 8192, "cols": 4096, "graph_us": 105.99679946899414, "eager_us": 106.18879795074463, "bytes": 234881024, "graph_gbps": 2215.9256239496804}
+{"kind": "op", "op": "add_rmsnorm_", "rows": 8192, "cols": 4096, "graph_us": 177.85279750823975, "eager_us": 178.22400331497192, "bytes": 268435456, "graph_gbps": 1509.3125312665584}
+{"kind": "op", "op": "rmsnorm", "rows": 8192, "cols": 4096, "graph_us": 73.6240029335022, "eager_us": 72.98719882965088, "bytes": 134217728, "graph_gbps": 1823.0159004153381}
+{"kind": "op", "op": "fp8_quantize row", "rows": 8192, "cols": 4096, "graph_us": 21.459199488162994, "eager_us": 20.187200605869293, "bytes": 100663296, "graph_gbps": 4690.915709857975}
+{"kind": "engine", "mode": "fused", "layers": 8, "batch": 1, "weights_format": "fp8-tok", "kv_format": "bf16", "new": 64, "repeats": 3, "prompt_tokens": 884, "decode_ms_per_step": 2.0689548437076155, "prefill_tok_s": 119883.60233596688}
+{"kind": "engine", "mode": "fused", "layers": 8, "batch": 8, "weights_format": "fp8-tok", "kv_format": "bf16", "new": 64, "repeats": 3, "prompt_tokens": 6073, "decode_ms_per_step": 2.21511517156614, "prefill_tok_s": 135930.35138383266}
+{"kind": "engine", "mode": "fused", "layers": 8, "batch": 32, "weights_format": "fp8-tok", "kv_format": "bf16", "new": 64, "repeats": 3, "prompt_tokens": 17986, "decode_ms_per_step": 2.4625560181448236, "prefill_tok_s": 135009.52921995678}
+{"kind": "engine", "mode": "fused", "layers": 8, "batch": 64, "weights_format": "fp8-tok", "kv_format": "bf16", "new": 64, "repeats": 3, "prompt_tokens": 38822, "decode_ms_per_step": 2.9874833599023987, "prefill_tok_s": 132134.8127011194}
+{"kind": "engine", "mode": "two ops", "layers": 8, "batch": 1, "weights_format": "fp8-tok", "kv_format": "bf16", "new": 64, "repeats": 3, "prompt_tokens": 884, "decode_ms_per_step": 2.085847703710897, "prefill_tok_s": 119418.26031710726}
+{"kind": "engine", "mode": "two ops", "layers": 8, "batch": 8, "weights_format": "fp8-tok", "kv_format": "bf16", "new": 64, "repeats": 3, "prompt_tokens": 6073, "decode_ms_per_step": 2.233551251265453, "prefill_tok_s": 134042.57377646552}
+{"kind": "engine", "mode": "two ops", "layers": 8, "batch": 32, "weights_format": "fp8-tok", "kv_format": "bf16", "new": 64, "repeats": 3, "prompt_tokens": 17986, "decode_ms_per_step": 2.480793420545524, "prefill_tok_s": 132092.38938109583}
+{"kind": "engine", "mode": "two ops", "layers": 8, "batch": 64, "weights_format": "fp8-tok", "kv_format": "bf16", "new": 64, "repeats": 3, "prompt_tokens": 38822, "decode_ms_per_step": 3.006777125847293, "prefill_tok_s": 129569.27566648144}
