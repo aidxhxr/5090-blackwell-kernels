@@ -693,6 +693,7 @@ to 7% faster than flash on prefill and still 16 to 32% behind.
 | v3 | the last partial wave split along the keys and merged by a combine kernel; a 64-row tile for short queries; a flash-decoding kernel for decode |
 | v4 | K and V through TMA into mbarrier stages issued by one lane, no barrier in the KV loop |
 | v5 | a persistent grid: 170 resident blocks take Q tiles from a queue, heaviest first, and a producer warp keeps the TMA pipeline running from one tile into the next |
+| v6 | 128-key tiles on variant 5's grid; opt-in, slower than v5 (below) |
 
 The trick variant 2 is built on is FlashAttention-2's: after S = Q K^T each lane holds exactly
 the pairs of S the next mma wants for its A operand, so P is four conversions and never
@@ -762,6 +763,32 @@ measured slower; the design note has them.
 TFLOPS, causal counted as half the products the way FlashAttention reports it. The 32/8 row is
 grouped-query attention and matches its multi-head twin, as it should: it is the same math
 with a stride on the K/V pointer.
+
+Variant 6 is the 128-key tile I had on the list for the 3 to 4% of tensor pipe variant 5 leaves
+idle: one softmax per 128 keys instead of 64, so the two warps of a scheduler would meet in
+theirs half as often. It is slower on every prefill shape, so it stays opt-in (`variant=6`) and
+the default is still variant 5. Its S takes 32 more registers, which the nine-warp block does
+not have (built that way it spills 3.4 KB), so at D = 128 the producer goes back onto warp 0.
+That is not the whole loss. On the same eight warps with the same inline producer it is still 3
+to 5% behind variant 5: the rescale it halves is 64 `FMUL` a tile, and the integer and branch
+work around the wider tile grew by more, so the tensor pipe is 89.9% busy against 94.6% for
+that build of variant 5 (96.3% with its producer warp). A producer that polls the barriers
+instead of blocking was 7% slower again, and `setmaxnreg`, which would hand a producer
+warpgroup's registers to the compute warps, ptxas drops from this kernel. The tables are in the
+design note.
+
+| shape (B x H x S x D) | v5 | v6 | flash | v6 / v5 |
+|---|---|---|---|---|
+| 1 x 32 x 4096 x 128 | **238.9** | 226.8 | 188.3 | 0.95x |
+| 1 x 32 x 4096 x 128, causal | **236.8** | 223.4 | 172.9 | 0.94x |
+| 1 x 32 x 8192 x 128, causal | **239.4** | 226.0 | 196.9 | 0.94x |
+| 4 x 32 x 2048 x 128, causal | **225.8** | 215.6 | 178.4 | 0.95x |
+| 1 x 32 x 4096 x 64, causal | **234.1** | 207.9 | 164.0 | 0.89x |
+| 1 x 32/8 x 4096 x 128, causal | **236.7** | 223.4 | 173.2 | 0.94x |
+
+TFLOPS, 2026-11-05: v5 and v6 from the default `bench_attention` sweep (`results/attention.json`)
+and flash from `scripts/bench_torch.py`, in one hold of the GPU. Variant 6 is behind under a
+window too, 0.300 against 0.263 ms at 16K tokens, 32/8 heads and W = 128.
 
 ### decode
 
@@ -1389,11 +1416,9 @@ numbers, the sweeps that picked the constants, and which Nsight metric moved:
   [unified memory](docs/design/unified.md), [decode grids on 48 SMs](docs/design/decode_spark.md),
   [the Grace cores](docs/design/grace.md), [DeepSeek V4.1 Flash on 128 GB](docs/design/moe_spark.md)
 
-Things I'd still like to do: a 128-key tile for attention, which would halve how often the
-two warps of a scheduler land in their softmaxes together (the 3% of tensor pipe still idle);
-the MX GEMM's last 10%, which is the scale operand's layout (cuBLASLt takes its scales in a
-tiled layout that one TMA box serves; a row-major one costs the consumer warps eight shuffles
-per stage); and a GB10 run when the Spark arrives. Both
+Things I'd still like to do: the MX GEMM's last 10%, which is the scale operand's layout
+(cuBLASLt takes its scales in a tiled layout that one TMA box serves; a row-major one costs the
+consumer warps eight shuffles per stage); and a GB10 run when the Spark arrives. Both
 cards are consumer Blackwell, so `mma.sync`, `cp.async` and TMA are there and `tcgen05` isn't.
 
 ```
