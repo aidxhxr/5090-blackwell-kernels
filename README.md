@@ -1032,8 +1032,9 @@ Decode costs under 2%: the decode GEMMs are the same kernels, and the invariant 
 up to 1.6x on a 128-token GEMM.
 
 The quantized engines are covered too: `fp8gemm` variant 4 and `w4gemm` variant 3 never
-split K by M (the int4 rung keeps four warps along K at every M and sums them in a fixed
-order), and variant 2 of both attention ops reads the e4m3 cache, each slab converted to
+split K by M (the int4 rung sums every output as the same four chains over every fourth
+128-k group, in four warps along K or, from 17 rows, one after another in one warp of a wide
+tile), and variant 2 of both attention ops reads the e4m3 cache, each slab converted to
 bf16 in shared memory before the same arithmetic. `scripts/check_invariance.py` runs every
 op alone and in batches of 1, 8, 32 and 256 and reports which agree bit for bit; it is also
 what shows that `fp8` with one activation scale over the batch cannot be made invariant (a
@@ -1043,19 +1044,23 @@ default / invariant:
 
 | engine | batch 1 | 8 | 32 | 64 |
 |---|---|---|---|---|
-| int4, decode | 1.426 / 1.490 | 1.586 / 1.578 | 2.073 / 2.400 | 3.129 / 3.861 |
-| int4, prefill | 49,789 / 38,138 | 51,733 / 36,062 | 50,344 / 29,822 | 49,745 / 30,207 |
+| int4, decode | 1.425 / 1.493 | 1.587 / 1.578 | 2.083 / 2.172 | 3.157 / 3.173 |
+| int4, prefill | 48,421 / 48,539 | 50,619 / 51,511 | 49,473 / 48,758 | 48,980 / 48,496 |
 | fp8-tok + fp8 cache, decode | 2.052 / 2.133 | 2.154 / 2.177 | 2.278 / 2.352 | 2.587 / 2.655 |
 | fp8-tok + fp8 cache, prefill | 119,043 / 109,296 | 132,887 / 128,068 | 131,896 / 125,809 | 129,759 / 123,762 |
 | bf16 + fp8 cache, decode | 2.901 / 2.985 | 2.999 / 3.021 | 3.158 / 3.235 | 3.595 / 3.667 |
 | bf16 + fp8 cache, prefill | 60,489 / 56,490 | 65,638 / 63,240 | 65,605 / 64,663 | 65,107 / 64,079 |
 
 fp8-tok and the fp8 cache cost what bf16 did, 1 to 4% at decode and 4 to 8% at prefill.
-int4 pays more: its default splits K across blocks from 32 rows and runs Stream-K at
-prefill, and the fixed four-warp shapes are 1.2 to 1.7x on the decode GEMMs at 32 to 64
-rows and 1.3 to 1.5x at prefill, which is 16 to 28% of a decode step at 32 and 64 slots and
-23 to 41% of the prefill. Details in
-[docs/design/batch_invariant.md](docs/design/batch_invariant.md).
+int4 used to pay more: its default splits K across blocks from 32 rows and runs Stream-K at
+prefill, and on the four-warp shapes alone invariance cost 16 and 23% of a decode step at 32
+and 64 slots and 22 to 40% of the prefill (2.412 and 3.869 ms, 29,772 to 37,711 tok/s in the
+same run). Running the four chains one after another in one warp lets the invariant rung use
+the default's wide tiles, with a tile cut only between chains for the last wave: 4.3 and
+0.5% at 32 and 64 slots now, and prefill within 2% of the default. The int4 rows are from
+2026-11-05, the others from the first run. Details in
+[docs/design/batch_invariant.md](docs/design/batch_invariant.md) and
+[docs/design/w4gemm.md](docs/design/w4gemm.md).
 
 ## real models
 
