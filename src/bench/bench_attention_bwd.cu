@@ -323,10 +323,10 @@ bool run_one(cudaStream_t stream, const Shape& s, int variant, int iters, bool d
     if (local)
         spark::attention_window_bf16(dq_in, dk_in, dv_in, d_o, s.B, s.Hq, s.Hkv, s.Sq, s.Skv, s.D,
                                      s.causal != 0, s.window, d_sinks,
-                                     spark::attention_num_variants() - 1, stream, d_lse);
+                                     spark::attention_default_variant(), stream, d_lse);
     else
         spark::attention_bf16(dq_in, dk_in, dv_in, d_o, s.B, s.Hq, s.Hkv, s.Sq, s.Skv, s.D,
-                              s.causal != 0, spark::attention_num_variants() - 1, stream, d_lse);
+                              s.causal != 0, spark::attention_default_variant(), stream, d_lse);
     SPARK_CUDA_CHECK(cudaStreamSynchronize(stream));
     h.o = to_host(d_o, nQ);
     h.lse.resize(BH * s.Sq);

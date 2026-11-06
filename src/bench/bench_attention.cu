@@ -379,7 +379,7 @@ int run(int argc, char** argv) {
 
     if (args.get("sweep", "") == "window") {
         spark::bench::print_header();
-        const int variant = args.geti("variant", spark::attention_num_variants() - 1);
+        const int variant = args.geti("variant", spark::attention_default_variant());
         if (!window_sweep(nullptr, variant, args.geti("iters", 50))) {
             std::fprintf(stderr, "CORRECTNESS FAILURE\n");
             return 1;

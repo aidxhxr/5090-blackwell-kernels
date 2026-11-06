@@ -678,6 +678,9 @@ void attention_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_b
                     bool causal, int variant, cudaStream_t stream, float* lse = nullptr,
                     int kv_cap = 0);
 int attention_num_variants();
+// The variant a caller should run, the one variant -1 means in the bindings: 5. A rung above it
+// can then be opt-in.
+int attention_default_variant();
 bool attention_supports(int S_q, int S_kv, int D, int variant);
 
 // ---- Fused attention backward -------------------------------------------------------------

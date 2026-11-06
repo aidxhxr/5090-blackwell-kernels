@@ -458,7 +458,7 @@ bool run_prefill(const Cfg& c, const std::vector<int>& lens, const std::vector<i
         SPARK_CUDA_CHECK(cudaMemcpy(cv[b], tv.data(), n * 2, cudaMemcpyHostToDevice));
         SPARK_CUDA_CHECK(cudaMemset(cq[b], 0, nqb * 2));
     }
-    const int top = spark::attention_num_variants() - 1;
+    const int top = spark::attention_default_variant();
     const Timing tr = time_kernel(
         [&] {
             for (int b = 0; b < B; ++b)
