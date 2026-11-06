@@ -102,6 +102,43 @@ def test_w4gemm_asymmetric(sk, M, variant):
         _case(sk, M, 4096, 4096, variant, asym=True)
 
 
+# Variant 3's class-order tiles, the last five entries of the launcher's table, forced on
+# variant 2 through the tuning hook with each schedule: every tile whole, every tile in four
+# class pieces, and the plan (whole waves, the last partial one in pieces).
+CLASS_SPLITS = {"whole": 1, "pieces": 4, "plan": 0}
+
+
+@pytest.mark.parametrize("asym", [False, True], ids=["sym", "asym"])
+@pytest.mark.parametrize("split", CLASS_SPLITS.values(), ids=CLASS_SPLITS.keys())
+@pytest.mark.parametrize("M", [1, 17, 33, 100, 256])
+@pytest.mark.parametrize("shape", [(384, 256), (1152, 256), (4096, 4096)],
+                         ids=lambda s: f"K{s[0]}_N{s[1]}")
+def test_w4gemm_class_order_tiles(sk, shape, M, split, asym):
+    K, N = shape
+    n = sk._C.w4gemm_num_configs()
+    for entry in range(n - 5, n):
+        sk._C.w4gemm_set_config(entry, split)
+        try:
+            # twice: the pieces' counters are put back to zero by the kernel
+            _case(sk, M, K, N, 2, asym=asym, reps=2)
+        finally:
+            sk._C.w4gemm_set_config(-1, 0)
+
+
+@pytest.mark.parametrize("M", [1, 16, 17, 64, 65, 2048])
+def test_w4gemm_v3_route_names(sk, M):
+    """Variant 3 runs the four-warp shapes to 16 rows and the class-order tiles above, and the
+    four-warp route keeps them at every M."""
+    name = sk._C.w4gemm_v3_route_name(M, 4096, 4096)
+    assert name.startswith("class order") == (M > 16), name
+    prev = sk._C.w4gemm_v3_route()
+    sk._C.w4gemm_v3_set_route(-2)
+    try:
+        assert "4 warps along K" in sk._C.w4gemm_v3_route_name(M, 4096, 4096)
+    finally:
+        sk._C.w4gemm_v3_set_route(prev)
+
+
 # Llama-3-8B projections (fused q|k|v, o, fused gate|up, down) at decode and serving sizes.
 LLAMA = [(4096, 6144), (4096, 4096), (4096, 28672), (14336, 4096)]
 

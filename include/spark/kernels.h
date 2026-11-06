@@ -407,13 +407,30 @@ void w4_repack(const int32_t* qweight, int32_t* packed, int K, int N, cudaStream
 //            four warps along K (warp w on every fourth 128-k group from w, in order) and no
 //            K split across blocks, the four partials summed in warp order, so every output
 //            is the same chain of k16 steps and adds at every M and row i of C has the same
-//            bits whatever M is. Opt-in: variant -1 is still 2 (w4gemm_default_variant)
+//            bits whatever M is. From 17 rows, variant 2's wide tiles in the class order:
+//            one warp runs the same four chains one after another and sums them in the same
+//            order, a K split only at a chain's boundary. Opt-in: variant -1 is still 2
+//            (w4gemm_default_variant)
 void w4gemm_bf16(const __nv_bfloat16* A, const int32_t* packed, const __nv_bfloat16* scales,
                  const uint8_t* zeros, __nv_bfloat16* C, int M, int N, int K, int variant,
                  cudaStream_t stream);
 int w4gemm_num_variants();
 int w4gemm_default_variant();
 bool w4gemm_supports(int M, int N, int K, int variant);
+// Tuning hooks (docs/design/w4gemm.md). w4gemm_set_config forces entry `entry` of the
+// launcher's table on variant 2 with `split` (the K split of a one-tile-per-block shape, or
+// for the class-order entries 1 whole tiles, 4 four class pieces per tile, 0 the plan);
+// entry -1 is the rule, SPARK_W4_CFG="entry[,split]" the initial value. w4gemm_v3_set_route
+// picks variant 3's route: RULE the wide class-order tiles where the rule puts them,
+// FOUR_WARPS the four-warp shapes at every M (the route before them); every route gives the
+// same bits. SPARK_W4_V3_ROUTE is the initial value. Process-wide. w4gemm_v3_route_name says
+// what variant 3 runs for a problem under the current route.
+enum W4gemmV3Route { W4GEMM_V3_ROUTE_RULE = -1, W4GEMM_V3_ROUTE_FOUR_WARPS = -2 };
+void w4gemm_set_config(int entry, int split);
+int w4gemm_num_configs();
+void w4gemm_v3_set_route(int route);
+int w4gemm_v3_route();
+const char* w4gemm_v3_route_name(int M, int N, int K, bool asym = false);
 
 // ---- 1-bit / ternary weight GEMM (src/kernels/w1gemm.cu) ----------------------------------
 // C[M,N] = A[M,K] * dequant(W)[K,N] for bf16 A and C, 1-bit (sign) or 2-bit (ternary) weights
