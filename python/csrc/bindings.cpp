@@ -10,7 +10,9 @@
 // num_variants() - 1 except where the top rung has requirements the rung below does not
 // (swiglu: 16-byte aligned storage; hgemm: N and K multiples of 64), in which case the default
 // steps down one rung, and except for sgemm, whose variants 6 and 7 trade fp32 accuracy for
-// the tensor cores (TF32) and are opt-in. An explicitly requested variant is never substituted.
+// the tensor cores (TF32) and are opt-in, and attention, whose variant 6 (128-key tiles)
+// measured slower than variant 5 and is opt-in. An explicitly requested variant is never
+// substituted.
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_bf16.h>

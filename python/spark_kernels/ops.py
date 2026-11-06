@@ -9,8 +9,9 @@ ladders have a top rung with extra requirements, and there the default steps dow
 instead of failing: `swiglu` needs 16-byte aligned storage for its vectorized variant, and
 `hgemm` needs N and K multiples of 64 for its top rungs (variants 3, 4 and 6). `sgemm`'s
 default is its top fp32 rung (variant 5); its TF32 tensor-core variants 6 and 7 are a
-different precision contract and have to be asked for. An explicit variant is never
-substituted; it raises ValueError if it cannot take the input.
+different precision contract and have to be asked for. `attention`'s default is variant 5; its
+variant 6 (128-key tiles) measured slower and has to be asked for too. An explicit variant is
+never substituted; it raises ValueError if it cannot take the input.
 """
 
 from __future__ import annotations
