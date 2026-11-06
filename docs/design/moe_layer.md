@@ -202,13 +202,13 @@ The replay takes 24 to 254 us of host work per call off the step, but the layer 
 GPU-bound at every T here (65 us of kernels at one token against 29 us of issue), so its
 time does not move; the same check on a loaded host (another tenant's engine busy) gave 82
 to 67 us at one token, 1.22x. Mixtral is 0.44 ms at one token and does not move either.
-The gain is a model's: a 48-layer Qwen3 decode step issues 48 times these launches plus
-attention, and that is where the engine's graph buckets (GRAPH_MAX = 64) earn their keep
-on the dense model. Wiring an MoE model into the engine would be: an MoE block in
-`layer.py` on `MoELayer`, its interleaved w13 built at load, `warm_workspaces` running the
-layer at the largest bucket first (the routing's workspace is fixed now, the grouped GEMM's
-Stream-K slots are sized per tile configuration on first use), then `_capture_all` as it
-is. The engine has no MoE checkpoint today, so this is not done.
+The gain would have to be a model's, where a step issues these launches for every layer
+plus attention. The engine now runs the layer in place of its dense MLP and captures it in
+its decode graphs (serving.md, MoE layers; nothing had to be warmed beyond the runs before
+each capture, the grouped GEMM's Stream-K slots being sized per tile configuration from the
+grid). On two layers of Mixtral and of a 64-expert top-8 model the graph saves 7 to 14 us
+a step, 0.2 to 1.6%: an eager step issues in 0.16 to 0.37 ms and runs 0.76 to 3.8 ms on
+the GPU, so the host stays ahead there too.
 
 ## Results
 

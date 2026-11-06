@@ -445,6 +445,109 @@ What to look at first on the card: the decode kernel's registers and spills for 
 instantiation (`o` is 64 floats, plus 32 for Q, 8 for a K row and 16 for the V rows), whether
 6 stages still give one block per SM, and the `D = 64` V reads.
 
+## MoE layers
+
+`ModelWeights.random(n_layers, vocab, moe=cfg)` draws a model whose MLPs are experts:
+`ModelWeights.experts` holds one `MoEWeights` per layer (router, w13 with the gate rows then
+the up rows, w2: the checkpoint layout moe_layer.md uses) and the layers' `w_gate_up` and
+`w_down` are None. `cfg` is any `MoELayerConfig` of hidden 4096, the engine's attention
+being Llama-3-8B's, which is also Mixtral 8x7B's. The dense path is untouched and stays
+the default.
+
+- `SparkModel` builds an `MoELayer` per layer at construction (the interleaved w13 its
+  SwiGLU epilogue reads) and frees the checkpoint-layout w13 unless `keep_bf16`, so the
+  experts are held once; `dequantized()` rebuilds it from the interleaved copy for a
+  reference model. A layer is the attention half as before (norm, qkv GEMM, RoPE and the
+  paged append, attention, the o GEMM with the residual add), the MLP norm, then the six
+  launches of `MoELayer.forward`. Its output is not added by the down GEMM's epilogue as in
+  the dense layer: the next layer's attention norm adds it (`add_rmsnorm_`), and a plain add
+  follows the last layer. Quantized `weights_format` and `batch_invariant` are refused (the
+  grouped GEMM picks its tile from the rows per expert and its Stream-K split from the tile
+  count, so a row's bits depend on the batch).
+- `TorchModel` runs `moe_layer.torch_moe`, transformers' experts loop, with the routing
+  weights and each token's sum in fp32. The loop reads the experts hit back to the host, so
+  it stays eager under `compile`.
+- The graphs. The decode step is captured per bucket exactly as before. What made that
+  possible is the MoE layer's own work from the last round: no launch waits on the host or
+  takes a shape from the routing, the routing's workspace is one allocation of its largest
+  size, and the grouped GEMM keeps one Stream-K workspace per tile configuration, sized from
+  the resident grid (not from T) at its first launch and never freed. `_capture_all`'s two
+  runs per bucket before each capture create every workspace a decode bucket uses, and
+  `warm_workspaces` only skips the dense MLP's GEMMs. A prefill that first runs another tile
+  configuration after the capture allocates that configuration's workspace and moves
+  nothing a graph points at.
+
+**Memory.** The grouped GEMM is a TMA kernel at every size, and its first launch takes
+3.31 GiB of device memory outside torch's allocator, plain or gathered, lazy or eager module
+loading. That is the cost llm_models.md found on hgemm's TMA variants, which the dense
+decode path never launches; the MoE decode path does, at the first step. With about 15 GB
+of the card free (other processes hold the rest), that and the experts left room for two
+layers of either model below.
+
+**Correctness.** The router logits of the two models agree to a bf16 ulp or so (the MLP
+inputs differ by 0.23% relative in the first layer), so a token whose k-th and k+1-th
+logits are that close can go to another expert in one model. Then its row is not
+comparable: one rerouted top-2 row came out 44% off. On the test models' prefill of 302
+tokens over two layers that happened to 2 tokens with the Mixtral-like experts and to 20
+with the qwen-like ones (64 experts, top-8, where the logits around the 8th pick are much
+closer together). `tests/test_engine_moe.py` records both models' MLP inputs, finds the
+rerouted tokens with our routing kernel on ours and torch's routing on the reference's,
+requires each first rerouting to be a near tie (logit gap at most 0.05), and holds the rest
+of the logits to 2% at the prefill and at three teacher-forced decode steps (0.4 to 1%
+measured). Graphed and eager decode agree token for token under continuous batching, the
+graphed engine first, with two prompts long enough (2,500 and 4,200 tokens) that their
+prefill runs the grouped GEMM's 128-row tile, which no decode bucket uses, after the
+capture.
+
+**Measured** (`scripts/bench_engine_moe.py`, two layers of the engine's attention,
+vocabulary 32,000, random bf16 weights, 0.5 GB of cache; static batches of bench_serve.py's
+prompt mix, log-uniform in 64 to 2048, 64 new tokens each, decode ms/step median of 3 runs;
+the same SparkModel with graphs and without). Mixtral is Mixtral 8x7B's MoE layer, 8 experts
+of 14336, top-2. Qwen-like is 64 experts of 1792, top-8 (Qwen3-235B-A22B's routing at half
+its experts): its 8 active experts are the dense MLP's 14336 columns, so a token runs the
+dense model's parameters. Weights: dense 1.40 GB, both MoE models 6.33 GB.
+
+| B | dense graph / eager | qwen-like graph / eager | Mixtral graph / eager | qwen-like / dense | Mixtral / dense |
+|---|---|---|---|---|---|
+| 1 | 0.741 / 0.748 | 0.769 / 0.782 | 1.177 / 1.188 | 1.04x | 1.59x |
+| 8 | 0.782 / 0.789 | 2.549 / 2.562 | 3.397 / 3.409 | 3.26x | 4.35x |
+| 32 | 0.859 / 0.867 | 3.692 / 3.706 | 3.767 / 3.777 | 4.30x | 4.38x |
+| 64 | 1.031 / 1.039 | 3.874 / 3.885 | 3.982 / 3.989 | 3.76x | 3.86x |
+
+The graph saves 7 to 8 us a step on the dense model and 7 to 14 us on the MoE ones, 0.2 to
+1.6%. The reason is in the step on its own, every slot empty (the weights stream as in a
+real step, no K/V is read), timed two ways: the captured step replayed back to back, and the
+host's time to issue the same step eagerly with no sync.
+
+| bucket | dense GPU / host, ms | qwen-like | Mixtral |
+|---|---|---|---|
+| 1 | 0.732 / 0.079 | 0.761 / 0.160 | 1.175 / 0.156 |
+| 8 | 0.740 / 0.079 | 2.535 / 0.176 | 3.383 / 0.160 |
+| 32 | 0.750 / 0.085 | 3.604 / 0.367 | 3.703 / 0.176 |
+| 64 | 0.809 / 0.085 | 3.701 / 0.317 | 3.821 / 0.177 |
+
+An MoE layer roughly doubles the host's work per layer (the dense two-layer step issues in
+0.08 ms, the MoE one in 0.16), but the GPU's share is 5 to 22 times the host's, so eager
+already keeps the GPU busy and what the graph takes back is those 7 to 14 us. It is the
+dense finding above again, and the layer-alone finding in moe_layer.md.
+
+**Where the step goes.** At one token the step reads the attention projections, the k
+experts per layer and the lm_head: 1.135 GB for the dense model, 1.136 GB for qwen-like
+(the router adds 0.5 MB a layer), 1.839 GB for Mixtral (two experts of 352 MB per layer).
+That is 1,531, 1,476 and 1,563 GB/s. So the qwen-like step pays 4% for spreading the same
+bytes over eight experts of one row each against one dense GEMM, and Mixtral's step costs
+what its bytes say, 1.59x the time for 1.62x the bytes. From 8 tokens up each token brings
+its own experts: 8 tokens make 64 picks over qwen-like's 64 experts and 16 over Mixtral's 8,
+and from 32 tokens nearly every expert of the layer is in the step, so the step reads most
+of the 6.33 GB and costs 3.7 to 4.0 ms where the dense step, reading its 1.4 GB once for
+the whole batch, costs 0.86 to 1.03 ms. That is the MoE decode tax at small batch, and the
+graph does nothing about it.
+
+**Not done.** fp8 or int4 experts in the engine (the layer has no quantized path yet), batch
+invariance for the MoE layers, an MoE checkpoint loader (`hf.py` loads Llama-shaped
+models only), and other hidden sizes: the engine's attention is fixed at Llama-3-8B's
+shape, so Qwen3-30B-A3B (hidden 2048) cannot run as it is.
+
 ## Correctness
 
 - `tests/test_paged.py`: `paged_decode` (both variants) against SDPA in fp32 per sequence on the
@@ -460,6 +563,10 @@ instantiation (`o` is 64 floats, plus 32 for Q, 8 for a K row and 16 for the V r
   of four prompts, then three teacher-forced decode steps, logits within 2% relative error),
   and graph against eager decode token for token under continuous batching, with every page
   back on the free list at the end.
+- `tests/test_engine_moe.py`: the same two checks on two MoE models (a top-2 of 8 experts
+  wide enough to take the permuted copy at prefill, a top-8 of 64 narrow ones), the
+  rerouted rows set aside as the MoE section says, plus what SparkModel does to the experts'
+  weights and what it refuses.
 - The fp8 cache's checks are listed in its section above.
 - `bench_paged` validates every variant against a CPU double-precision reference: every row of
   up to eight sequences per decode batch and 256 sampled rows per prefill batch.
