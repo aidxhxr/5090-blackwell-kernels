@@ -575,22 +575,26 @@ void ce_combine(const float* partials, const float* target_logit, const int64_t*
 // cp.reduce.async.bulk; dw accumulates per vocabulary strip in one of ce_backward_slots()
 // recycled fp32 strips and is folded into bf16 dw when the strip's last tile completes
 // (stored on the first band, added on the others). The reductions are L2 atomics, so dh
-// and dw differ in the last bits between runs. Same shape rules as ce_gemm_bf16.
+// and dw differ in the last bits between runs. Same shape rules as ce_gemm_bf16. variant 4
+// is the same kernel on 256 x 128 tiles (256 rows of h), which moves 3/4 of the bytes
+// through L2; its dh is padded to ce_backward_tile_rows(4) = 256 rows.
 struct CeBackwardArgs {
     const int64_t* targets = nullptr;  // [T]
     const float* lse = nullptr;        // [T]
     const float* scale = nullptr;      // [1]: d loss / d loss_row for a row that counts
     int ignore_index = -100;
-    float* dh = nullptr;          // [cdiv(T, 128) * 128][D] fp32, zero on entry
-    float* slots = nullptr;       // [slots_n * 128][D] fp32, zero on entry and exit
-    int slots_n = 0;              // recycled strips in `slots`; ce_backward_slots() is the default
-    int* flags = nullptr;         // [2 * V / 128 + 1] int32, zero on entry
+    float* dh = nullptr;     // [cdiv(T, tile rows) * tile rows][D] fp32, zero on entry
+    float* slots = nullptr;  // [slots_n * 128][D] fp32, zero on entry and exit
+    int slots_n = 0;       // recycled strips in `slots`; ce_backward_slots(variant) is the default
+    int* flags = nullptr;  // [2 * V / 128 + 1] int32, zero on entry
     __nv_bfloat16* dw = nullptr;  // [V][D]
     bool first = true;            // this band stores dw; later bands add to it
+    int variant = 3;              // 3: 128 x 128 tiles, 4: 256 x 128
 };
 void ce_backward_bf16(const __nv_bfloat16* h, const __nv_bfloat16* w, int T, int V, int D,
                       const CeBackwardArgs& a, cudaStream_t stream);
-int ce_backward_slots();
+int ce_backward_slots(int variant = 3);
+int ce_backward_tile_rows(int variant = 3);
 
 // ---- MoE layer: routing, permute, combine (src/kernels/moe_route.cu, moe_permute.cu) ------
 // moe_route: logits [T, E] (fp32 or bf16) -> ids [T, k] int32 (the top k experts of each
