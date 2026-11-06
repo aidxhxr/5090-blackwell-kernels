@@ -147,6 +147,30 @@ def test_quant_graph_decode_matches_eager(sk, weights, fmt):
     assert same >= 0.6 * sum(news), f"{same} of {sum(news)} tokens agree"
 
 
+@pytest.mark.parametrize("invariant", [True, False])
+def test_fp8_tok_fused_norm_matches_two_ops(sk, weights, invariant):
+    """fp8-tok's qkv and gate/up projections take the e4m3 rows rmsnorm_fp8 and
+    add_rmsnorm_fp8_ write; with fuse_norm_fp8 off they quantize the norm's bf16 output with
+    fp8_quantize. Same bytes into every GEMM, so the logits are the same bits where the
+    kernels are deterministic (the batch-invariant rungs never split K). The default rungs
+    add split-K partials with atomics in any order, so there only a tolerance holds."""
+    rope = L.RoPE(1024)
+    g = torch.Generator().manual_seed(5)
+    prompts = [torch.randint(0, VOCAB, (n,), generator=g) for n in (37, 200, 1, 64)]
+    toks = [torch.randint(0, VOCAB, (4,), generator=g).cuda() for _ in range(3)]
+    model = E.SparkModel(weights, rope, weights_format="fp8-tok", keep_bf16=True,
+                         batch_invariant=invariant)
+    outs = []
+    for fuse in (True, False):
+        model.fuse_norm_fp8 = fuse
+        outs.append(_prefill_and_decode(model, prompts, toks))
+    for i, (a, b) in enumerate(zip(*outs, strict=True)):
+        if invariant:
+            assert torch.equal(a, b), f"step {i}: {_rel(a, b)}"
+        else:
+            assert _rel(a, b) < 1e-2, f"step {i}: {_rel(a, b)}"
+
+
 @pytest.mark.parametrize("head", ["int4", "fp8"])
 def test_quant_head(sk, weights, head):
     """lm_head in a low-precision format, against TorchModel on its dequantized weights."""
