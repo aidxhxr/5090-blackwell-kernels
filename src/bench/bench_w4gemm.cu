@@ -4,6 +4,7 @@
 //   ./bench_w4gemm --m=1 --n=4096 --k=4096 --variant=2 --iters=50
 //   ./bench_w4gemm --m=16 --n=28672 --k=4096 --asym   # asymmetric weights (zero points)
 //   ./bench_w4gemm --m=1 --n=4096 --k=4096 --chain=20 # also time 20 launches per event pair
+//   ./bench_w4gemm --sweep=invariant [--ms=32,2048]    # variant 3's routes and class tiles
 //
 // For every weight shape the bench quantizes a random bf16 W [K, N] on the GPU
 // (w4_quantize_bf16) and checks the codes, scales and zero points bit for bit against the same
@@ -33,6 +34,7 @@
 #include <vector>
 
 #include "bench_common.hpp"
+#include "model_shapes.hpp"
 #include "spark/kernels.h"
 
 #define CUBLAS_CHECK(expr)                                                                      \
@@ -373,6 +375,94 @@ bool run_m(cublasHandle_t handle, cudaStream_t stream, const Weight& w, int M,
     return all_ok;
 }
 
+// --sweep=invariant: variant 3 against its four-warp route at one M. Rows "MxNxK@label":
+// v2 (the default), v3four (variant 3's four-warp shapes, the route before the class order),
+// v3 (the rule) and c<e>s<s> (class-order entry e forced on variant 2 with schedule s: 1
+// whole tiles, 4 four class pieces per tile, 0 the plan). Every output but v2's must be the
+// four-warp route's bits (a row is ok only then) and within the tolerance of cuBLAS.
+bool sweep_invariant_m(cublasHandle_t handle, cudaStream_t stream, const Weight& w, int M,
+                       int iters) {
+    const int N = w.N, K = w.K;
+    const size_t nA = static_cast<size_t>(M) * K, nC = static_cast<size_t>(M) * N;
+    std::vector<float> hA(nA);
+    spark::bench::fill_uniform(hA, -1.0f, 1.0f, 1234 + M);
+    std::vector<__nv_bfloat16> hAb(nA);
+    for (size_t i = 0; i < nA; ++i) hAb[i] = __float2bfloat16(hA[i]);
+    __nv_bfloat16* dA = dmalloc<__nv_bfloat16>(nA);
+    __nv_bfloat16* dC = dmalloc<__nv_bfloat16>(nC);
+    SPARK_CUDA_CHECK(cudaMemcpy(dA, hAb.data(), nA * 2, cudaMemcpyHostToDevice));
+    cublas_gemm(handle, dA, w.d(0), dC, M, N, K);
+    SPARK_CUDA_CHECK(cudaStreamSynchronize(stream));
+    const auto ref = to_host_f32(dC, nC);
+    double max_ref = 0.0;
+    for (size_t i = 0; i < nC; ++i) max_ref = std::max(max_ref, std::fabs((double)ref[i]));
+    const double tol = 2e-2 * max_ref + 1e-3;
+
+    const int saved_route = spark::w4gemm_v3_route();
+    std::vector<uint16_t> four(nC);
+    struct Cfg {
+        std::string label;
+        int variant, route, entry, split;
+    };
+    std::vector<Cfg> cfgs = {{"v3four", 3, spark::W4GEMM_V3_ROUTE_FOUR_WARPS, -1, 0},
+                             {"v2", 2, saved_route, -1, 0},
+                             {"v3", 3, spark::W4GEMM_V3_ROUTE_RULE, -1, 0}};
+    for (int e = 15; e < spark::w4gemm_num_configs(); ++e)
+        for (int s : {1, 4, 0})
+            cfgs.push_back(
+                {"c" + std::to_string(e) + "s" + std::to_string(s), 2, saved_route, e, s});
+    const std::string shape = std::to_string(M) + "x" + std::to_string(N) + "x" + std::to_string(K);
+    const double flops = 2.0 * M * N * static_cast<double>(K);
+    bool all_ok = true;
+    double t_four = 0;
+    for (const Cfg& c : cfgs) {
+        spark::w4gemm_v3_set_route(c.route);
+        spark::w4gemm_set_config(c.entry, c.split);
+        auto run = [&](int turn) {
+            spark::w4gemm_bf16(dA, w.p(turn), w.s(turn), w.z(turn), dC, M, N, K, c.variant, stream);
+        };
+        SPARK_CUDA_CHECK(cudaMemset(dC, 0, nC * 2));
+        try {
+            run(0);
+        } catch (const std::exception& e) {  // a forced entry whose width does not divide N
+            std::fprintf(stderr, "  skip %s@%s: %s\n", shape.c_str(), c.label.c_str(), e.what());
+            continue;
+        }
+        SPARK_CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::vector<uint16_t> bits(nC);
+        SPARK_CUDA_CHECK(cudaMemcpy(bits.data(), dC, nC * 2, cudaMemcpyDeviceToHost));
+        if (c.label == "v3four") four = bits;
+        const bool same = bits == four;
+        const auto got = to_host_f32(dC, nC);
+        const auto err = spark::bench::compare(got.data(), ref.data(), nC);
+        const bool ok = err.max_abs <= tol && (same || c.variant == 2 && c.entry < 0);
+        int turn = 0;
+        const auto t = spark::bench::time_kernel([&] { run(turn++); }, stream, 5, iters);
+        if (c.label == "v3four") t_four = t.median_ms;
+        spark::bench::Row row;
+        row.kernel = "w4gemm";
+        row.dtype = "w4a16";
+        row.variant = c.variant;
+        row.shape = shape + "@" + c.label;
+        row.median_ms = t.median_ms;
+        row.min_ms = t.min_ms;
+        row.tflops = flops / (t.median_ms * 1e-3) / 1e12;
+        row.ref_ms = t_four;
+        row.max_abs_err = err.max_abs;
+        row.max_rel_err = err.max_rel;
+        row.ok = ok;
+        spark::bench::print_row(row);
+        std::fprintf(stderr, "    %s: %.3fx the four-warp route%s\n", c.label.c_str(),
+                     t.median_ms / t_four, same ? ", same bits" : ", other bits");
+        all_ok = all_ok && ok;
+    }
+    spark::w4gemm_set_config(-1, 0);
+    spark::w4gemm_v3_set_route(saved_route);
+    std::fprintf(stderr, "  v3 at %s: %s\n", shape.c_str(), spark::w4gemm_v3_route_name(M, N, K));
+    for (void* p : {static_cast<void*>(dA), static_cast<void*>(dC)}) SPARK_CUDA_CHECK(cudaFree(p));
+    return all_ok;
+}
+
 }  // namespace
 
 int run(int argc, char** argv) {
@@ -413,6 +503,22 @@ int run(int argc, char** argv) {
 
     spark::bench::print_header();
     bool all_ok = true;
+    if (args.get("sweep", "") == "invariant") {
+        // the Llama projections (or --n, --k) at decode batches and prefill (or --ms)
+        if (!(args.has("n") || args.has("k")))
+            weights = {{6144, 4096}, {4096, 4096}, {28672, 4096}, {4096, 14336}};
+        ms = spark::bench::parse_int_list(args.get("ms", "32,64,128,256,512,2048,4096"));
+        for (const auto& ws : weights) {
+            Weight w = make_weight(ws.N, ws.K, false, stream);
+            for (int m : ms)
+                all_ok = sweep_invariant_m(handle, stream, w, m,
+                                           m >= 512 ? std::min(iters, 20) : iters) &&
+                         all_ok;
+            all_ok = all_ok && w.quant_ok;
+            w.free_all();
+        }
+        weights.clear();
+    }
     for (const auto& ws : weights) {
         {
             Weight w = make_weight(ws.N, ws.K, asym_only, stream);
