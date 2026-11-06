@@ -938,14 +938,15 @@ with softmax minus one-hot folded into the epilogue. Variant 3 is the backward w
 chunk at all, the way Cut Cross-Entropy does it: one kernel recomputes each 128 x 128
 tile of the gradient and multiplies it straight into dh and dw through L2 reductions, with
 a 2048-row band of fp32 dh and sixteen recycled fp32 strips of dw as its only scratch.
+Variant 4 is the same kernel on 256 x 128 tiles, to move less through the L2.
 
-| D = 4096, forward + backward | torch | torch.compile | v1 | v2 | v3 |
-|---|---|---|---|---|---|
-| V = 128256, T = 2048 | 35.1 ms, 3.15 GB | 29.2 ms, 1.59 GB | **28.3 ms**, 1.66 GB | 36.7 ms, 1.66 GB | 40.8 ms, **1.14 GB** |
-| V = 128256, T = 8192 | does not fit in 10 GB | 115.4 ms, 3.22 GB | **113.5 ms**, 1.71 GB | 146.9 ms, 1.71 GB | 164.8 ms, **1.19 GB** |
-| V = 128256, T = 16384 | does not fit | 228.6 ms, 5.39 GB | **228.0 ms**, 1.78 GB | 295.4 ms, 1.78 GB | 329.5 ms, **1.25 GB** |
-| V = 151936, T = 16384 | does not fit | does not fit | **269.8 ms**, 2.07 GB | 349.3 ms, 2.07 GB | not run |
-| forward only, V = 128256, T = 8192 | does not fit | 37.9 ms, 2.10 GB | 36.7 ms, 0.53 GB | **35.8 ms**, 0.07 GB | 35.8 ms, 0.07 GB |
+| D = 4096, forward + backward | torch | torch.compile | v1 | v2 | v3 | v4 |
+|---|---|---|---|---|---|---|
+| V = 128256, T = 2048 | 35.1 ms, 3.15 GB | 29.2 ms, 1.59 GB | **28.3 ms**, 1.66 GB | 36.7 ms, 1.66 GB | 40.8 ms, **1.14 GB** | 42.4 ms, 1.17 GB |
+| V = 128256, T = 8192 | does not fit in 10 GB | 115.4 ms, 3.22 GB | **113.5 ms**, 1.71 GB | 146.9 ms, 1.71 GB | 164.8 ms, **1.19 GB** | 170.5 ms, 1.22 GB |
+| V = 128256, T = 16384 | does not fit | 228.6 ms, 5.39 GB | **228.0 ms**, 1.78 GB | 295.4 ms, 1.78 GB | 329.5 ms, **1.25 GB** | 342.6 ms, 1.29 GB |
+| V = 151936, T = 16384 | does not fit | does not fit | **269.8 ms**, 2.07 GB | 349.3 ms, 2.07 GB | not run | not run |
+| forward only, V = 128256, T = 8192 | does not fit | 37.9 ms, 2.10 GB | 36.7 ms, 0.53 GB | **35.8 ms**, 0.07 GB | 35.8 ms, 0.07 GB | 35.8 ms, 0.07 GB |
 
 Peak memory above the inputs, gradients included (dw alone is 1.05 GB). The win is memory:
 ours stays flat in T, `torch.compile` grows with the logits it keeps. On time it is a tie
@@ -958,9 +959,18 @@ under variants 1 and 2 at every length (the chunk of logits it never has) and a 
 kernel at 97% of the L2's peak throughput, since recomputing a tile and feeding both
 products from it moves twice the operand bytes of a GEMM through the L2 and adds the
 reductions on top. It is opt-in; the default stays variant 1.
+
+Variant 4 tried to move less: 256 rows of h per tile halve the w re-reads and the dw
+partials, and ncu counts 23% fewer L2 bytes. It is 3.6 to 3.8% slower than variant 3 (both
+run again in one session on 2026-11-05). The unit both saturate is the L2's input from the
+crossbar, which costs about as much per read request as per 32 bytes of reduce data, and
+the 64 KB gradient tile leaves room only for 16-column stages, whose 32-byte rows make
+twice the read requests. That gives the saving back. It stays opt-in. And with the tensor
+pipe at 90% under ncu, three GEMMs' worth of mma alone take 26.6 of variant 3's 31.5 ms a
+band, so no traffic cut could buy it more than 15%.
 [docs/design/cross_entropy.md](docs/design/cross_entropy.md) has the design, what the L2
-can add per second by instruction, what each piece of the kernel costs, and the chunk
-sweep.
+can add per second by instruction, what each piece of the kernel costs, the chunk sweep,
+and variant 4's traffic math and ncu numbers.
 
 ## serving a batch
 

@@ -12,8 +12,9 @@ the card shared: other tenants held about 18 GB, so the bench caps its own proce
 (`torch.cuda.set_per_process_memory_fraction`) and records a method that would need more as
 not fitting. Every timed method's first call was checked first, its loss and both gradients
 against the first method that fit at that shape (torch, `torch.compile` where torch did
-not fit, variant 1 where neither did), and the 59 tests in `tests/test_cross_entropy.py`
-pass. Variant 3 and its section were measured on 2026-10-30 under the same conditions.
+not fit, variant 1 where neither did), and the 71 tests in `tests/test_cross_entropy.py`
+pass. Variant 3 and its section were measured on 2026-10-30 under the same conditions,
+variant 4 and its section on 2026-11-05 (other tenants held about 17 GB).
 
 ## The problem
 
@@ -46,10 +47,12 @@ and recomputes them in the backward.
 | 1 | per chunk: logits GEMM, the fused row kernel (loss and gradient row in place), dh and dw by `hgemm` | a scale by the upstream gradient | dh and dw | one chunk of logits and one transposed slab |
 | 2 | one GEMM whose epilogue keeps (max, sum of exp) per row per 128-column tile, a combine | per chunk: the GEMM again with softmax minus one-hot in its epilogue, dh and dw by `hgemm` | the `[T]` log-sum-exp | forward: the `[T, V/128]` partials; backward: as variant 1 |
 | 3 | variant 2's | one kernel per band of `chunk` rows: each 128 x 128 tile of the gradient recomputed and multiplied straight into dh and dw through L2 reductions | the `[T]` log-sum-exp | a band of fp32 dh (32 MB at 2048 rows) and 16 fp32 strips of dw (32 MB); nothing of size T x V |
+| 4 | variant 2's | variant 3's kernel on 256 x 128 tiles (256 rows of h) | the `[T]` log-sum-exp | as variant 3, with 32 strips of dw (64 MB) |
 
-Variant 1 does three GEMMs of 2TVD flops each, the same as torch. Variants 2 and 3 do
+Variant 1 does three GEMMs of 2TVD flops each, the same as torch. Variants 2 to 4 do
 four: the price of holding nothing between the passes is computing the logits twice.
-`variant=-1` takes 1 when a gradient is needed and 2 when not (an eval loss); 3 is opt-in.
+`variant=-1` takes 1 when a gradient is needed and 2 when not (an eval loss); 3 and 4 are
+opt-in.
 
 ## The GEMM
 
@@ -225,14 +228,14 @@ backward follows the same curve, 154.5 ms at 512 to 146.2 at 8192.
 
 ## Correctness
 
-`tests/test_cross_entropy.py`, 59 tests, all pass on the card: the loss and both gradients
-of variants 0 to 3 against torch autograd in fp32 on the same bf16 inputs, on four
+`tests/test_cross_entropy.py`, 71 tests, all pass on the card: the loss and both gradients
+of variants 0 to 4 against torch autograd in fp32 on the same bf16 inputs, on four
 shapes (T = 77 to 1000, two not a multiple of 64; D = 64 to 512; V = 384 to 4096) with 15%
 of the rows ignored, at a chunk of 64 rows (several chunks, a ragged last one) and of 4096
 (one chunk); "sum" with an upstream gradient of 0.37; a custom ignore_index with only h
 requiring a gradient; the no-grad forward; every row ignored (nan, as torch); the shape
-rules; variant 2's forward in STATS pieces of 128 rows; variant 3's band kernel on its
-own over two bands with 32 strips on its 16 slots, every slot handed back zeroed. And
+rules; variant 2's forward in STATS pieces of 128 rows; the band kernel of variants 3
+and 4 on its own over two bands with 32 strips on 16 slots, every slot handed back zeroed. And
 the pieces on their own: the
 row kernel against `F.cross_entropy` on bf16 logits at V up to 151936, the STATS
 epilogue's lse and loss and the GRAD epilogue against fp32 torch, the LOGITS epilogue
@@ -343,7 +346,101 @@ bf16's resolution everywhere, which for a trained model's peaked distribution is
 them; on the random weights these benches use the softmax is not sparse, so that filter
 cannot be judged here and is not built.
 
+## Variant 4: a 256-row tile, and why fewer bytes did not help
+
+Variant 3 is L2-bound, so the obvious next rung moves less through the L2. Per 2048-row
+band at V = 128256 and D = 4096 its traffic is four equal terms:
+
+| term | per band | why |
+|---|---|---|
+| h boxes, read again | 2 x 1002 x 16.8 MB = 33.6 GB | every vocabulary strip streams the band's h, once per pass |
+| w boxes, read again | 2 x 16 x 1.05 GB = 33.6 GB | every 128 rows of h stream all of w, once per pass |
+| dh partials | 1002 x 33.6 MB = 33.6 GB | one fp32 [2048 x D] partial per vocabulary strip |
+| dw partials | 16 x 2.10 GB = 33.6 GB | one fp32 [V x D] partial per 128 rows of h |
+
+134.5 GB, and the folds and the rest are the other 6 GB of the 140.4 ncu counts. A tile
+of 256 rows of w halves the two h-side terms, one of 256 rows of h the two w-side ones:
+100.9 GB either way. I took 256 rows of h, so BN stays 128: V % 128 stays the only shape
+rule (Qwen 3's 151936 is not a multiple of 256), and the strips, slots and fold are
+variant 3's unchanged. That is variant 4, `bwd::Tile4` next to variant 3's `Tile3`, one
+templated kernel.
+
+**What it costs to fit.** The bf16 gradient tile is 64 KB now, and the rest has to fit in
+the 35 KB left of the 99 KB a block may take: two stages of 16 columns of D (12 KB each,
+32-byte rows), a 1 KB staging box per warp (so each warp reduces its share of a stage in
+three [16 x 16] pieces, two of dh and one of dw) and a 2 KB table of the tile's rows:
+101,376 bytes, the limit exactly. The table is there for registers. A 288-thread block gets
+at most 168 registers a thread, the recompute's 64 x 64 warp tile holds 128 accumulators,
+and loading eight rows' target and lse from global memory in the epilogue spilled 280
+bytes. With the rows read from shared memory instead (filled at the top of each tile, one
+row a thread) it is 168 registers and no spills, as variant 3 is. A band has 8 tiles of
+rows instead of 16, so twice the strips are in flight; the slot pool, measured on the band
+kernel alone in one session (variant 3 at 31.45 and 31.52 ms before and after):
+
+| slots | 16 | 24 | 32 | 40 | 48 |
+|---|---|---|---|---|---|
+| v4 band | 35.37 ms | 33.24 ms | 33.32 ms | 33.31 ms | 33.31 ms |
+
+Flat from 24; the default is 32 (64 MB).
+
+**Measured.** The band kernel alone (`--pieces`): variant 3 31.47 ms, 205.1 TFLOPS counted
+as three GEMMs; variant 4 33.30 ms, 193.9. The whole op, the same bench and budget as
+above, every method of a row in one session on 2026-11-05:
+
+| T | torch.compile | v1 | v2 | v3 | v4 |
+|---|---|---|---|---|---|
+| 2048 | 29.14 ms, 1.59 GB | **28.26 ms**, 1.66 GB | 36.63 ms, 1.66 GB | 40.89 ms, **1.14 GB** | 42.37 ms, 1.17 GB |
+| 8192 | 115.43 ms, 3.22 GB | **113.44 ms**, 1.71 GB | 146.98 ms, 1.71 GB | 164.29 ms, **1.19 GB** | 170.50 ms, 1.22 GB |
+| 16384 | 229.11 ms, 5.39 GB | **228.85 ms**, 1.78 GB | 296.12 ms, 1.78 GB | 330.15 ms, **1.25 GB** | 342.62 ms, 1.29 GB |
+
+Variant 4 is 3.6 to 3.8% slower than variant 3 and holds 33 to 34 MB more (the deeper
+pool).
+
+**Why.** ncu on one band of each, plus a probe that isolates one variable: variant 3's own
+128 x 128 tile on 16-column stages (four of them, and its fold in 4 KB chunks to fit; a
+build not committed):
+
+| | v3 | v4 | v3's tile, 16-column stages |
+|---|---|---|---|
+| band, bench clocks | 31.47 ms | 33.30 ms | 40.3 ms |
+| band, under ncu | 32.43 ms | 33.96 ms | 42.08 ms |
+| L2 bytes | 140.4 GB | 107.5 GB | 140.8 GB |
+| L2 read sectors | 2.19 G | 1.68 G | 2.20 G |
+| L2 reduce sectors | 2.10 G | 1.58 G | 2.10 G |
+| operand row (one read request each) | 64 B | 32 B | 32 B |
+| L2 hit rate | 97.6% | 93.7% | 97.5% |
+| DRAM bytes | 7.2 GB | 12.1 GB | 7.7 GB |
+| L2 input from the crossbar, busy | 96.7% | 95.6% | 98.3% |
+| tensor pipe | 90.1% | 85.7% | not collected |
+
+Variant 4 moves 23% fewer bytes, as the table above says it should, and is still bound by
+the same unit at 96%. That unit is the L2's input from the crossbar, not its bytes: in
+bytes per second variant 4 runs at 3.2 TB/s against variant 3's 4.3. The probe moves
+variant 3's bytes with 32-byte operand rows and takes 28% longer. Counting a read request
+per box row, a fit to the three kernels gives the input about 9.1 ms per billion read
+requests and 10.2 ms per billion 32-byte sectors of reduce data (busy time under ncu's
+clocks), so a request costs about as much as 32 bytes of reduce payload. It puts variant 3
+at 9.9 ms of requests and 21.4 ms of reduces, and predicts variant 4 at 31.4 ms of busy
+time against the 32.5 measured; the rest is its lower hit rate (the deeper pool and the
+dh band are 96 MB of evict_last lines) and 4.9 GB more DRAM. So variant 4 saves a quarter
+of the reduce sectors and pays it back in read requests: 1.68 G requests of 32 bytes
+against variant 3's 1.09 G of 64. 32-column stages are what would keep the saving, and
+they need 2 x 24 KB next to the 64 KB tile, 112 KB.
+
+There is a second ceiling close under that one. The tensor pipe is at 90.1% on variant 3
+and 85.7% on variant 4, the same 29.1 to 29.2 ms of mma under ncu's clock, which is what
+three GEMMs at `ce_gemm`'s rate take at that clock; at bench clocks they take 26.6 ms. So
+the most any traffic cut can buy variant 3 is that gap, 15% of its 31.47 ms, 4.9 ms a band
+or 20 ms of the 164 ms op at 8192 tokens, and with four GEMMs to variant 1's three it would
+still be behind variant 1. Variant 4 stays as an opt-in rung (`variant=4`); variant 3 is
+the better chunk-free backward on this card.
+
 ## What is left
+
+**A 192-row tile on 32-column stages.** The one wider tile whose stages keep 64-byte
+rows: a 48 KB gradient tile, two 20 KB stages and 8 KB of staging fit. It would cut the
+w-side terms by a third. Its 20 pieces of a stage do not split evenly over eight warps, and
+a 2048-row band is 10.67 tiles of rows; not built.
 
 **hgemm with a transposed A.** dw goes through a transposed copy of the gradient because
 hgemm takes A only K-contiguous. A mode that loads the A tile from `[K, M]` (two 64-column
