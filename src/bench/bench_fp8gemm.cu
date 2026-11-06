@@ -4,6 +4,7 @@
 //                                         # per-tensor scales (dtype e4m3) then MX (dtype mxfp8)
 //   ./bench_fp8gemm --m=4096 --n=4096 --k=4096 --variant=1 --iters=50 --mode=mx
 //   ./bench_fp8gemm --models[=llama3-8b] [--ms=128,512] [--tiles] [--mode=mx]   # model shapes
+//   ./bench_fp8gemm --mode=mx --layout=tiled  # MX scales in fp8gemm_mx's tiled layout
 //
 // C = scale_a * scale_b * A[M,K] * Bt[N,K]^T, e4m3 in, bf16 out. cuBLASLt's fp8 path only takes
 // this layout (A row-major, B column-major, both K-contiguous), so the reference is timed on
@@ -14,7 +15,9 @@
 // with the OCP MX recipe (a ue8m0 scale per 32 k, docs/design/fp8gemm.md), sfa[M][K/32] and
 // sfb[N][K/32] handed to fp8gemm_mx, against cuBLASLt's MXFP8 path (scale mode VEC32_UE8M0,
 // which wants the scales in its 32x4x4 tiled layout) if the installed library has it for
-// this GPU, and a CPU fp32 dot product of the dequantized values either way.
+// this GPU, and a CPU fp32 dot product of the dequantized values either way. --layout=tiled
+// hands fp8gemm_mx the same scales in its own tiled layout (FP8_MX_TILED, rows with dtype
+// "mxfp8_tiled"); with --models both layouts run unless --layout says one.
 //
 // stdout: one JSON object per row (collected by scripts/run_all_benches.sh)
 // stderr: human-readable table incl. "% of cuBLASLt"
@@ -194,10 +197,30 @@ std::vector<unsigned char> to_blocked(const std::vector<unsigned char>& sf, int 
     return out;
 }
 
-// Runs one shape for one variant, per-tensor or MX. Returns false on a correctness failure.
-bool run_one(cudaStream_t stream, const Shape& s, int variant, int iters, bool mx) {
+// fp8gemm_mx's tiled layout (kernels.h, FP8_MX_TILED) of a [rows][K/32] ue8m0 scale tensor:
+// groups of 32 rows, K bytes each, and in a group per 128 k a 128-byte block with row r's 4
+// bytes at word 4 (r % 8) + 2 ((r / 8) % 2) + (r / 16) % 2. Rows are padded to whole groups.
+std::vector<unsigned char> to_tiled(const std::vector<unsigned char>& sf, int rows, int KB) {
+    const int groups = (rows + 31) / 32;
+    std::vector<unsigned char> out(static_cast<size_t>(groups) * KB * 32, 0);
+    for (int r = 0; r < rows; ++r) {
+        const int rr = r % 32;
+        const int word = 4 * (rr % 8) + 2 * ((rr / 8) % 2) + (rr / 16) % 2;
+        for (int c = 0; c < KB; ++c)
+            out[static_cast<size_t>(r / 32) * KB * 32 + static_cast<size_t>(c / 4) * 128 +
+                word * 4 + c % 4] = sf[static_cast<size_t>(r) * KB + c];
+    }
+    return out;
+}
+
+// Runs one shape for one variant, per-tensor or MX (`tiled`: the MX scales in the tiled
+// layout). Returns false on a correctness failure.
+bool run_one(cudaStream_t stream, const Shape& s, int variant, int iters, bool mx,
+             bool tiled = false) {
     const int M = s.M, N = s.N, K = s.K;
-    const bool supported = mx ? spark::fp8gemm_mx_supports(M, N, K, variant)
+    tiled = mx && tiled;
+    const int layout = tiled ? spark::FP8_MX_TILED : spark::FP8_MX_ROWS;
+    const bool supported = mx ? spark::fp8gemm_mx_supports(M, N, K, variant, layout)
                               : spark::fp8gemm_supports(M, N, K, variant);
     if (!supported) {
         std::fprintf(stderr, "  skip variant %d shape %dx%dx%d%s: shape not supported\n", variant,
@@ -248,8 +271,13 @@ bool run_one(cudaStream_t stream, const Shape& s, int variant, int iters, bool m
     const float* d_scale_b = dScale + 1;
     if (mx) {
         // The scale tensors rotate with Bt on the decode shapes (they are 1/32 of its bytes).
+        // Ours are row-major or tiled; cuBLASLt's are its own tiled layout.
         const auto blkA = to_blocked(hSfa, M, KB);
         const auto blkB = to_blocked(hSfb, N, KB);
+        if (tiled) {
+            hSfa = to_tiled(hSfa, M, KB);
+            hSfb = to_tiled(hSfb, N, KB);
+        }
         SPARK_CUDA_CHECK(cudaMalloc(&dSfa, hSfa.size()));
         SPARK_CUDA_CHECK(cudaMalloc(&dSfb, copies * hSfb.size()));
         SPARK_CUDA_CHECK(cudaMalloc(&dSfaBlk, blkA.size()));
@@ -286,7 +314,8 @@ bool run_one(cudaStream_t stream, const Shape& s, int variant, int iters, bool m
 
     auto run_ours = [&](const __nv_fp8_e4m3* b, const unsigned char* sfb) {
         if (mx)
-            spark::fp8gemm_mx(dA, b, dC, M, N, K, nullptr, nullptr, dSfa, sfb, variant, stream);
+            spark::fp8gemm_mx(dA, b, dC, M, N, K, nullptr, nullptr, dSfa, sfb, variant, stream,
+                              layout);
         else
             spark::fp8gemm(dA, b, dC, M, N, K, d_scale_a, d_scale_b, variant, stream);
     };
@@ -361,7 +390,7 @@ bool run_one(cudaStream_t stream, const Shape& s, int variant, int iters, bool m
     const double flops = 2.0 * M * N * static_cast<double>(K);
     spark::bench::Row row;
     row.kernel = "fp8gemm";
-    row.dtype = mx ? "mxfp8" : "e4m3";
+    row.dtype = tiled ? "mxfp8_tiled" : mx ? "mxfp8" : "e4m3";
     row.variant = variant;
     row.shape = std::to_string(M) + "x" + std::to_string(N) + "x" + std::to_string(K);
     row.median_ms = t_us.median_ms;
@@ -431,18 +460,21 @@ std::vector<unsigned char> random_ue8m0(size_t n, uint32_t seed) {
     return v;
 }
 
-// A candidate row: label, variant and variant 3's route. Labels: v1, v2, v3old (variant 3
-// on the route before it, which is what the default ran before variant 3), v3 (the
-// default) and, with --tiles, v3t<n> (TMA tile n forced).
+// A candidate row: label, variant, variant 3's route and, in MX mode, the scale layout.
+// Labels: v1, v2, v3old (variant 3 on the route before it, which is what the default ran
+// before variant 3), v3 (the default) and, with --tiles, v3t<n> (TMA tile n forced); with
+// tiled MX scales v3tl (the default) and v3tl<n>.
 struct ModelCand {
     std::string label;
     int variant;
     int route;
+    bool tiled = false;
 };
 
 // One weight at every M of `ms`. Returns false on a correctness failure.
 bool run_models_weight(cudaStream_t stream, const spark::bench::ModelWeight& w,
-                       const std::vector<int>& ms, bool mx, bool tiles, int iters) {
+                       const std::vector<int>& ms, bool mx, bool tiles, int iters, bool rows_l,
+                       bool tiled_l) {
     const int N = w.N, K = w.K, KB = K / 32;
     const int max_m = *std::max_element(ms.begin(), ms.end());
     const size_t nB = static_cast<size_t>(N) * K;  // bytes
@@ -467,38 +499,58 @@ bool run_models_weight(cudaStream_t stream, const spark::bench::ModelWeight& w,
         SPARK_CUDA_CHECK(cudaMemcpy(dB + c * nB, dB, nB, cudaMemcpyDeviceToDevice));
     // MX scales, row-major for us and tiled for cuBLASLt. The first M rows of the max_m-row
     // tensors are the M-row tensors in both layouts (the tiled one is row tiles outermost).
+    // Ours also in the tiled layout (the first M rows of the max_m-row tensor are the M-row
+    // tensor there too: groups outermost).
     unsigned char *dSfa = nullptr, *dSfb = nullptr, *dSfaBlk = nullptr, *dSfbBlk = nullptr;
-    size_t sfb_bytes = 0, sfb_blk_bytes = 0;
+    unsigned char *dSfaT = nullptr, *dSfbT = nullptr;
+    size_t sfb_bytes = 0, sfb_blk_bytes = 0, sfb_t_bytes = 0;
     if (mx) {
         const auto sfa = random_ue8m0(static_cast<size_t>(max_m) * KB, 11);
         const auto sfb = random_ue8m0(static_cast<size_t>(N) * KB, 12);
         const auto blkA = to_blocked(sfa, max_m, KB);
         const auto blkB = to_blocked(sfb, N, KB);
+        const auto tA = to_tiled(sfa, max_m, KB);
+        const auto tB = to_tiled(sfb, N, KB);
         sfb_bytes = sfb.size();
         sfb_blk_bytes = blkB.size();
+        sfb_t_bytes = tB.size();
         SPARK_CUDA_CHECK(cudaMalloc(&dSfa, sfa.size()));
         SPARK_CUDA_CHECK(cudaMalloc(&dSfaBlk, blkA.size()));
+        SPARK_CUDA_CHECK(cudaMalloc(&dSfaT, tA.size()));
         SPARK_CUDA_CHECK(cudaMalloc(&dSfb, copies * sfb_bytes));
         SPARK_CUDA_CHECK(cudaMalloc(&dSfbBlk, copies * sfb_blk_bytes));
+        SPARK_CUDA_CHECK(cudaMalloc(&dSfbT, copies * sfb_t_bytes));
         SPARK_CUDA_CHECK(cudaMemcpy(dSfa, sfa.data(), sfa.size(), cudaMemcpyHostToDevice));
         SPARK_CUDA_CHECK(cudaMemcpy(dSfaBlk, blkA.data(), blkA.size(), cudaMemcpyHostToDevice));
+        SPARK_CUDA_CHECK(cudaMemcpy(dSfaT, tA.data(), tA.size(), cudaMemcpyHostToDevice));
         for (int c = 0; c < copies; ++c) {
             SPARK_CUDA_CHECK(
                 cudaMemcpy(dSfb + c * sfb_bytes, sfb.data(), sfb_bytes, cudaMemcpyHostToDevice));
             SPARK_CUDA_CHECK(cudaMemcpy(dSfbBlk + c * sfb_blk_bytes, blkB.data(), sfb_blk_bytes,
+                                        cudaMemcpyHostToDevice));
+            SPARK_CUDA_CHECK(cudaMemcpy(dSfbT + c * sfb_t_bytes, tB.data(), sfb_t_bytes,
                                         cudaMemcpyHostToDevice));
         }
     }
     SPARK_CUDA_CHECK(cudaDeviceSynchronize());
 
     const int dflt = spark::FP8GEMM_V3_ROUTE_DEFAULT;
-    std::vector<ModelCand> cands = {{"v1", 1, dflt},
-                                    {"v2", 2, dflt},
-                                    {"v3old", 3, spark::FP8GEMM_V3_ROUTE_LEGACY},
-                                    {"v3", 3, dflt}};
-    if (tiles)
-        for (int t = 0; t < spark::fp8gemm_v3_num_tiles(); ++t)
-            cands.push_back({"v3t" + std::to_string(t), 3, t});
+    std::vector<ModelCand> cands;
+    if (!mx || rows_l) {
+        cands = {{"v1", 1, dflt},
+                 {"v2", 2, dflt},
+                 {"v3old", 3, spark::FP8GEMM_V3_ROUTE_LEGACY},
+                 {"v3", 3, dflt}};
+        if (tiles)
+            for (int t = 0; t < spark::fp8gemm_v3_num_tiles(); ++t)
+                cands.push_back({"v3t" + std::to_string(t), 3, t});
+    }
+    if (mx && tiled_l) {
+        cands.push_back({"v3tl", 3, dflt, true});
+        if (tiles)
+            for (int t = 0; t < spark::fp8gemm_v3_num_tiles(); ++t)
+                cands.push_back({"v3tl" + std::to_string(t), 3, t, true});
+    }
     const int saved_route = spark::fp8gemm_v3_route();
 
     bool all_ok = true;
@@ -529,22 +581,26 @@ bool run_models_weight(cudaStream_t stream, const spark::bench::ModelWeight& w,
         std::fprintf(stderr, "    cuBLASLt%s %.4f ms, %.1f TFLOPS\n", mx ? " MXFP8" : "",
                      t_ref.median_ms, flops / (t_ref.median_ms * 1e-3) / 1e12);
         for (const auto& c : cands) {
-            const bool sup = mx ? spark::fp8gemm_mx_supports(M, N, K, c.variant)
+            const int layout = c.tiled ? spark::FP8_MX_TILED : spark::FP8_MX_ROWS;
+            const bool sup = mx ? spark::fp8gemm_mx_supports(M, N, K, c.variant, layout)
                                 : spark::fp8gemm_supports(M, N, K, c.variant);
             if (!sup) continue;
             if (c.route >= 0) {
                 // A forced tile that does not fit falls back to the old route, and a forced
-                // tile the rule picks anyway is the v3 row: skip both duplicates.
+                // tile the rule picks anyway is the v3 (v3tl) row: skip both duplicates.
                 spark::fp8gemm_v3_set_route(dflt);
-                const std::string by_rule = spark::fp8gemm_v3_route_name(M, N, K, mx);
+                const std::string by_rule = spark::fp8gemm_v3_route_name(M, N, K, mx, c.tiled);
                 spark::fp8gemm_v3_set_route(c.route);
-                const std::string forced = spark::fp8gemm_v3_route_name(M, N, K, mx);
+                const std::string forced = spark::fp8gemm_v3_route_name(M, N, K, mx, c.tiled);
                 if (by_rule == forced || forced == "v1" || forced == "v2") continue;
             }
             spark::fp8gemm_v3_set_route(c.route);
             auto run_ours = [&](int copy) {
                 const __nv_fp8_e4m3* b = dB + static_cast<size_t>(copy) * nB;
-                if (mx)
+                if (mx && c.tiled)
+                    spark::fp8gemm_mx(dA, b, dC, M, N, K, nullptr, nullptr, dSfaT,
+                                      dSfbT + copy * sfb_t_bytes, c.variant, stream, layout);
+                else if (mx)
                     spark::fp8gemm_mx(dA, b, dC, M, N, K, nullptr, nullptr, dSfa,
                                       dSfb + copy * sfb_bytes, c.variant, stream);
                 else
@@ -577,15 +633,16 @@ bool run_models_weight(cudaStream_t stream, const spark::bench::ModelWeight& w,
             row.ok = ok;
             spark::bench::print_row(row);
             std::fprintf(stderr, "    %-8s %-34s %.1f%% of cuBLASLt\n", c.label.c_str(),
-                         c.variant == 3 ? spark::fp8gemm_v3_route_name(M, N, K, mx) : "",
+                         c.variant == 3 ? spark::fp8gemm_v3_route_name(M, N, K, mx, c.tiled) : "",
                          100.0 * t_ref.median_ms / t.median_ms);
         }
     }
     spark::fp8gemm_v3_set_route(saved_route);
-    for (void* d : {static_cast<void*>(dA), static_cast<void*>(dB), static_cast<void*>(dC),
-                    static_cast<void*>(dRef), static_cast<void*>(dScale),
-                    static_cast<void*>(scratch), static_cast<void*>(dSfa), static_cast<void*>(dSfb),
-                    static_cast<void*>(dSfaBlk), static_cast<void*>(dSfbBlk)})
+    for (void* d :
+         {static_cast<void*>(dA), static_cast<void*>(dB), static_cast<void*>(dC),
+          static_cast<void*>(dRef), static_cast<void*>(dScale), static_cast<void*>(scratch),
+          static_cast<void*>(dSfa), static_cast<void*>(dSfb), static_cast<void*>(dSfaBlk),
+          static_cast<void*>(dSfbBlk), static_cast<void*>(dSfaT), static_cast<void*>(dSfbT)})
         if (d) SPARK_CUDA_CHECK(cudaFree(d));
     return all_ok;
 }
@@ -619,6 +676,12 @@ int run(int argc, char** argv) {
     const std::string mode = args.get("mode", args.has("models") ? "tensor" : "both");
     SPARK_REQUIRE(mode == "tensor" || mode == "mx" || mode == "both",
                   "--mode must be tensor, mx or both");
+    // --layout=rows|tiled|both: the MX scale layout handed to fp8gemm_mx (default: rows, both
+    // with --models).
+    const std::string layout = args.get("layout", args.has("models") ? "both" : "rows");
+    SPARK_REQUIRE(layout == "rows" || layout == "tiled" || layout == "both",
+                  "--layout must be rows, tiled or both");
+    const bool rows_l = layout != "tiled", tiled_l = layout != "rows";
     std::vector<bool> modes;
     if (mode != "mx") modes.push_back(false);
     if (mode != "tensor") {
@@ -641,13 +704,18 @@ int run(int argc, char** argv) {
             for (const auto& w : spark::bench::model_weights()) {
                 if (filter != "1" && std::string(w.model).find(filter) == std::string::npos)
                     continue;
-                all_ok = run_models_weight(stream, w, ms, mx, args.has("tiles"), iters) && all_ok;
+                all_ok = run_models_weight(stream, w, ms, mx, args.has("tiles"), iters, rows_l,
+                                           tiled_l) &&
+                         all_ok;
             }
         }
     } else {
         for (bool mx : modes) {
             for (const auto& s : shapes) {
-                for (int v : variants) all_ok = run_one(stream, s, v, iters, mx) && all_ok;
+                for (int v : variants) {
+                    if (!mx || rows_l) all_ok = run_one(stream, s, v, iters, mx) && all_ok;
+                    if (mx && tiled_l) all_ok = run_one(stream, s, v, iters, mx, true) && all_ok;
+                }
             }
         }
     }
