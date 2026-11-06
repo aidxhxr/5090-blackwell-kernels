@@ -7,6 +7,7 @@
 //   ./bench_attention_bwd --hq=32 --hkv=8 --s=8192 --window=512 --sinks=1 --variant=3
 //                                                          # a sliding window and sink logits
 //   ./bench_attention_bwd --sweep=window                   # the window sweep (variant 3)
+//   SPARK_ATTN_BWD_BAND=0 ./bench_attention_bwd ...        # no band kernel under a window
 //
 // Setup per shape: Q, K uniform in [-2, 2], V and dO in [-1, 1] (bf16), then the forward
 // (variant 5, the default rung) with its log-sum-exp output gives O and L. The rows time the
@@ -454,8 +455,10 @@ bool run_one(cudaStream_t stream, const Shape& s, int variant, int iters, bool d
 
 // --sweep=window: sliding windows against the full causal backward on the same shapes, every
 // windowed row with the full row's time as its ref_ms. Llama-3-8B heads (32 query, 8 K/V,
-// D = 128) at 8K and 32K tokens with windows of 128 (gpt-oss), 512 and 4096 (Mistral, Gemma),
-// then gpt-oss's own heads (64 query, 8 K/V, D = 64, window 128) with its sink logits at 8K.
+// D = 128) at 8K and 32K tokens with windows of 128 (gpt-oss), 256, 512, 1024 (Gemma 3) and
+// 4096 (Mistral, Gemma 2), then gpt-oss's own heads (64 query, 8 K/V, D = 64, window 128)
+// with its sink logits at 8K. Up to 128 keys variant 3 runs the band kernel;
+// SPARK_ATTN_BWD_BAND=0 times the atomic path there instead, =1 the band at every window.
 bool window_sweep(cudaStream_t stream, int variant, int iters) {
     bool ok = true;
     auto pair = [&](Shape full, const std::vector<std::pair<int, int>>& wins, int full_iters) {
@@ -472,8 +475,10 @@ bool window_sweep(cudaStream_t stream, int variant, int iters) {
                  ok;
         }
     };
-    pair({1, 32, 8, 8192, 8192, 128, 1}, {{128, 0}, {512, 0}, {4096, 0}}, iters);
-    pair({1, 32, 8, 32768, 32768, 128, 1}, {{128, 0}, {512, 0}, {4096, 0}}, 5);
+    const std::vector<std::pair<int, int>> wins = {
+        {128, 0}, {256, 0}, {512, 0}, {1024, 0}, {4096, 0}};
+    pair({1, 32, 8, 8192, 8192, 128, 1}, wins, iters);
+    pair({1, 32, 8, 32768, 32768, 128, 1}, wins, 5);
     pair({1, 64, 8, 8192, 8192, 64, 1}, {{128, 0}, {128, 1}}, iters);
     return ok;
 }
