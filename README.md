@@ -874,7 +874,8 @@ exponentials, so they share a basic block with `mma` work, added 0.7 to 2.6% fro
 up (209.8 to 211.2 TFLOPS causal at 4096, 217.3 to 219.9 at 8192, 225.6 to 229.6 without the
 mask, measured 2026-10-13; the table above is the earlier sweep). The atomics make the last
 bits of dQ run-to-run dependent; `deterministic=True` computes dQ in a separate pass instead,
-1.4x the time under the causal mask. The numbers, the profiles and the experiments that lost
+1.4x the time under the causal mask (under a window of up to 128 keys both modes run the band
+kernel below and give the same bits). The numbers, the profiles and the experiments that lost
 are in [the design note](docs/design/attention_bwd.md).
 
 ### sliding window and sinks
@@ -915,20 +916,26 @@ gradient comes out as a fourth tensor: the sink is one more softmax entry with n
 its dP is zero and d(sink) = -sum over the head's rows of p_sink (dO . O), summed from the
 preprocess rows by one small deterministic kernel.
 
-| backward, 32/8 heads, D = 128 | full causal | W = 4096 | W = 512 | W = 128 | flex_attention, W = 128 |
-|---|---|---|---|---|---|
-| 8K tokens | 6.35 ms | 4.91 | 1.14 | **0.644** | 1.12 |
-| 32K tokens | 95.6 ms | 24.0 | 4.57 | **2.61** | 4.32 |
+| backward, 32/8 heads, D = 128 | full causal | W = 4096 | 1024 | 512 | 256 | 128 | flex_attention, W = 128 |
+|---|---|---|---|---|---|---|---|
+| 8K tokens | 6.34 ms | 4.91 | 1.85 | 1.14 | 0.795 | **0.587** | 1.12 |
+| 32K tokens | 95.7 ms | 24.1 | 7.50 | 4.57 | 3.14 | **1.94** | 4.34 |
 
 Variant 3 from `scripts/bench_attention_window.py --only=bwd`; flex is `torch.autograd.grad`
-through the compiled `flex_attention` with the window's block mask, 1.65 to 2.06x slower than
-ours on the six window rows (9.98 and 49.6 ms at W = 4096). At W = 4096 the window rows run
-at the full backward's rate, 214 TFLOPS on the window's pairs. At W = 128 they are bound by
-bytes: Q, O, dO, dQ, dK and dV move whatever the window, and the fp32 dQ accumulator's round
-trip is a third of the 32K row, where the deterministic mode, which has none, is 4% faster.
-The no-window rows did not move (0.1 to 1.4% within noise, old and new binary in one hold of
-the GPU). The numbers and what remains are in [the design
-note](docs/design/attention_bwd.md#sliding-window-and-sinks).
+through the compiled `flex_attention` with the window's block mask, 1.87 to 2.24x slower than
+ours on the ten window rows (10.1 and 49.5 ms at W = 4096). At W = 4096 the window rows run
+at the full backward's rate, 214 TFLOPS on the window's pairs. Up to W = 128 a query tile sees
+two key tiles of 128, and variant 3 runs the band kernel there: a block walks a range of key
+tiles in order and finishes each query tile's dQ itself, the first key tile's part waiting in
+a slot of its own until the second, so the fp32 dQ buffer, its zeroing, the atomics and the
+conversion pass are gone, 0.85 ms of the old 2.61 at 32K tokens. That row is 1.35x faster
+than before (2.62 ms in the same session, when flex was 1.66x behind), 8K 1.09x (0.642), and
+gpt-oss's heads with sinks take 0.585 ms at 8K against 0.637. It gives the same bits every
+run, so `deterministic=True` costs nothing there. Below two key tiles per SM (4K tokens on
+these heads) the halo a block replays is a third of its work and the atomic path stays; past
+128 keys the band loses. The no-window rows did not move (within 0.6%, old and new binary
+interleaved in one hold of the GPU). The numbers and what remains are in [the design
+note](docs/design/attention_bwd.md#the-band-kernel-dq-without-the-round-trip).
 
 ## a whole layer
 
@@ -1326,7 +1333,7 @@ default stays on the CUDA cores.
 | `cpu_w1gemv`, `cpu_route`, `cpu_sample` | the 1-bit GEMV on the Arm cores: scalar, NEON sign masks in fp32, NEON int8 dot products; sigmoid top-k routing and top-k / top-p sampling, no CUDA | the scalar path, `reference.w1_dequantize`, `moe.route`; runs on any Arm machine |
 | `attention` bf16 | warp per row, CUDA-core flash attention, `mma.sync` flash attention, split-KV tail, TMA mbarrier pipeline, persistent tile queue with a producer warp; GQA and a flash-decoding kernel | `F.scaled_dot_product_attention` |
 | `attention_fp8` e4m3 | warp per row on dequantized inputs, variant 5's persistent TMA kernel with both products on the block-scaled fp8 `mma.sync`, P rounded to e4m3 in registers, V transposed by `ldmatrix.trans` and byte permutes | the bf16 kernel, `F.scaled_dot_product_attention` in bf16 |
-| `attention_bwd` bf16 | warp per row, FlashAttention-2's key-tile loop on `mma.sync`, V in registers with a double-buffered Q/dO tile and a simulated split, TMA and mbarriers with no block barrier; GQA, a deterministic dQ pass, an autograd Function | torch autograd through `F.scaled_dot_product_attention` (flash and cuDNN) |
+| `attention_bwd` bf16 | warp per row, FlashAttention-2's key-tile loop on `mma.sync`, V in registers with a double-buffered Q/dO tile and a simulated split, TMA and mbarriers with no block barrier; GQA, a deterministic dQ pass, windows and sinks (dQ finished in one kernel up to 128 keys), an autograd Function | torch autograd through `F.scaled_dot_product_attention` (flash and cuDNN) |
 | `rope_append` bf16 | RoPE on q and k plus the K/V cache append from a fused q\|k\|v projection, one launch | the torch spelling, ten kernels |
 | `layer` | one Llama-3-8B decoder layer from the kernels above, prefill and decode with a K/V cache, our decode step as a CUDA graph | the same layer in PyTorch, eager and `torch.compile` |
 | `linear_cross_entropy` | torch's bf16 logits and fp32 loss; chunked over T with a fused row kernel for the loss and the gradient in place (Liger's recipe); the forward with no logits from a GEMM epilogue of per-tile row max and sum, the backward with softmax minus one-hot in the recompute's epilogue | `F.cross_entropy(h @ w.T)`, eager and `torch.compile` |
