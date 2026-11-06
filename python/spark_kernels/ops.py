@@ -242,7 +242,11 @@ def fp8gemm(
     them), and each product a[m, k] * b_t[n, k] is multiplied by 2**(sfa[m, k // 32] - 127) *
     2**(sfb[n, k // 32] - 127) inside the tensor-core instruction, before the fp32 sum. The
     per-tensor scales may then be omitted (1.0). Needs K a multiple of 256 and 16-byte
-    aligned scale storage; the same variants apply.
+    aligned scale storage; the same variants apply. The scales may also both come in the
+    tiled layout, [ceil(rows / 32), K // 128, 128] uint8 (`fp8_quantize(x, "mx_tiled")`,
+    `reference.to_mx_tiled`), which variant 3's TMA tiles copy into shared memory with each
+    stage instead of fetching row-major chunks per warp; variants 0, 1, 3 and 4 take it,
+    variant 2 does not.
     """
     return _C.fp8gemm(a, b_t, scale_a, scale_b, variant, sfa, sfb)
 
@@ -254,10 +258,12 @@ def fp8_quantize(x: torch.Tensor, mode: str = "tensor") -> tuple[torch.Tensor, t
     max|x| / 2^e <= 448 (e clamped to [-126, 127]); two launches (an amax pass, then the
     conversion). mode="row": the same per row, shape [rows, 1]; one launch. mode="mx": the
     OCP MX recipe of `reference.quantize_mx`, a uint8 e8m0 scale per 32 values of a row,
-    shape [rows, K // 32], what fp8gemm takes as sfa; one launch. Elements are x / scale
-    rounded to nearest even, saturating at 448. A power-of-two scale makes the division
-    exact, so the e4m3 rounding is the only one; `reference.quantize_fp8_pow2` is the same
-    arithmetic. Needs K a multiple of 8 (32 for "mx").
+    shape [rows, K // 32], what fp8gemm takes as sfa; one launch. mode="mx_tiled": the same
+    scales in fp8gemm's tiled layout, [ceil(rows / 32), K // 128, 128] (`reference.to_mx_tiled`
+    of the "mx" ones). Elements are x / scale rounded to nearest even, saturating at 448. A
+    power-of-two scale makes the division exact, so the e4m3 rounding is the only one;
+    `reference.quantize_fp8_pow2` is the same arithmetic. Needs K a multiple of 8 (32 for
+    "mx", 128 for "mx_tiled").
     """
     return _C.fp8_quantize(x, mode)
 

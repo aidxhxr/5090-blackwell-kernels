@@ -143,26 +143,30 @@ class FP8Linear:
 
 class MXFP8Linear:
     """W8A8 MXFP8: e4m3 with a power-of-two scale per 32 k on both operands, applied inside
-    the block-scaled mma. K must be a multiple of 256."""
+    the block-scaled mma. K must be a multiple of 256. Both scale tensors are kept in
+    fp8gemm's tiled layout (`reference.to_mx_tiled`), which variant 3's TMA tiles copy with
+    each stage; the bytes are the same as the row-major ones."""
 
     invariant_variant = 4
 
     def __init__(self, w: torch.Tensor):
-        self.wt, self.sfb = ref.quantize_mx(w.t().contiguous())
+        self.wt, sfb = ref.quantize_mx(w.t().contiguous())
+        self.sfb = ref.to_mx_tiled(sfb)
         self.variant = -1
 
     def set_batch_invariant(self, on: bool) -> None:
         self.variant = self.invariant_variant if on else -1
 
     def __call__(self, a: torch.Tensor) -> torch.Tensor:
-        q, sfa = sk.fp8_quantize(a, "mx")
+        q, sfa = sk.fp8_quantize(a, "mx_tiled")
         return sk.fp8gemm(q, self.wt, sfa=sfa, sfb=self.sfb, variant=self.variant)
 
     def nbytes(self) -> int:
         return _nbytes(self.wt, self.sfb)
 
     def dequantize(self) -> torch.Tensor:
-        return ref.dequantize_mx(self.wt, self.sfb).t().to(torch.bfloat16)
+        sfb = ref.from_mx_tiled(self.sfb, self.wt.shape[0])
+        return ref.dequantize_mx(self.wt, sfb).t().to(torch.bfloat16)
 
 
 class FP4Linear:

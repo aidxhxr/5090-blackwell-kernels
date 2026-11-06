@@ -106,10 +106,44 @@ def quantize_fp8_pow2(x: torch.Tensor, per_row: bool = False) -> tuple[torch.Ten
     return q, s
 
 
+def _mx_tile_word() -> torch.Tensor:
+    # Word of row r of a 32-row group in the tiled layout: r = g + 8 t + 16 h -> 4 g + 2 t + h.
+    r = torch.arange(32)
+    return 4 * (r % 8) + 2 * ((r // 8) % 2) + r // 16
+
+
+def to_mx_tiled(sf: torch.Tensor) -> torch.Tensor:
+    """The tiled layout of a [rows, K // 32] MX scale tensor, the one fp8gemm's variant 3
+    copies into shared memory a TMA box per stage: [ceil(rows / 32), K // 128, 128] uint8. Rows
+    are padded to a multiple of 32 with zero scales; in a group of 32 rows, the 128 bytes of
+    each 128 k hold row r's four scale bytes as one word, row g + 8 t + 16 h (g < 8) at word
+    4 g + 2 t + h. `fp8_quantize(x, "mx_tiled")` writes it directly."""
+    rows, kb = sf.shape
+    if kb % 4 != 0:
+        raise ValueError(f"the tiled layout needs K a multiple of 128, got {kb * 32}")
+    groups = -(-rows // 32)
+    padded = torch.zeros(groups * 32, kb, dtype=torch.uint8, device=sf.device)
+    padded[:rows] = sf.view(torch.uint8)
+    t = padded.view(groups, 32, kb // 4, 4).permute(0, 2, 1, 3)  # [group, k128, row, byte]
+    out = torch.empty_like(t)
+    out[:, :, _mx_tile_word().to(sf.device)] = t
+    return out.reshape(groups, kb // 4, 128).contiguous()
+
+
+def from_mx_tiled(tiled: torch.Tensor, rows: int) -> torch.Tensor:
+    """Inverse of to_mx_tiled: the [rows, K // 32] scale tensor."""
+    groups, k128, _ = tiled.shape
+    t = tiled.reshape(groups, k128, 32, 4)[:, :, _mx_tile_word().to(tiled.device)]
+    return t.permute(0, 2, 1, 3).reshape(groups * 32, k128 * 4)[:rows].contiguous()
+
+
 def fp8gemm_mx(
     a: torch.Tensor, sfa: torch.Tensor, b_t: torch.Tensor, sfb: torch.Tensor
 ) -> torch.Tensor:
-    """The MX GEMM as fp8gemm computes it: fp32 sum of the dequantized products, one bf16 round."""
+    """The MX GEMM as fp8gemm computes it: fp32 sum of the dequantized products, one bf16 round.
+    The scales may be row-major or tiled (3-D, to_mx_tiled), both alike."""
+    if sfa.dim() == 3:
+        sfa, sfb = from_mx_tiled(sfa, a.shape[0]), from_mx_tiled(sfb, b_t.shape[0])
     return (dequantize_mx(a, sfa) @ dequantize_mx(b_t, sfb).t()).to(torch.bfloat16)
 
 
