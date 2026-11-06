@@ -698,11 +698,12 @@ __global__ void ce_combine_kernel(const float2* __restrict__ part, const float* 
 // at most 168 registers a thread, and the 64 x 64 warp tile of the recompute holds 128
 // accumulators, so the epilogue reads the rows' lse and target from that table instead of
 // global memory. Measured (docs/design/cross_entropy.md), variant 4 moves 23% fewer bytes
-// through L2 than variant 3 and runs 6% slower: what both saturate is the L2's input from the
-// crossbar, which costs about as much per read request as per 32-byte sector of reduce data,
-// and 16-column stages make twice the read requests of 32-column ones. Variant 3 stays the
-// default of the two. The reduces run through the L2 atomics in an order that depends on
-// timing, so dh and dw are not bit for bit reproducible across runs (variants 1 and 2 are).
+// through L2 than variant 3, and its band kernel runs 6% slower (3.6 to 3.8% on the whole
+// op): what both saturate is the L2's input from the crossbar, which costs about as much per
+// read request as per 32-byte sector of reduce data, and 16-column stages make twice the read
+// requests of 32-column ones. Variant 3 stays the default of the two. The reduces run
+// through the L2 atomics in an order that depends on timing, so dh and dw are not bit for bit
+// reproducible across runs (variants 1 and 2 are).
 
 namespace bwd {
 
