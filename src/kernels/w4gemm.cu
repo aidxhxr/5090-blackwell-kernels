@@ -10,10 +10,14 @@
 //      multi-stage cp.async pipeline in shared memory, on a Stream-K schedule
 //   3  batch invariant (docs/design/batch_invariant.md): variant 2's four-warps-along-K
 //      shapes with no K split across blocks, so an output is four fixed k16 chains summed in
-//      a fixed order whatever M is; opt-in, -1 stays variant 2
+//      a fixed order whatever M is, and from 17 rows variant 2's wide tiles computing the
+//      same four chains one after another in a warp (the class order); opt-in, -1 stays
+//      variant 2
 // The packed layout, the k order inside a group and the dequant: w4gemm_internal.cuh.
 // Design and measurements: docs/design/w4gemm.md.
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -182,6 +186,61 @@ __device__ __forceinline__ void fixup_tile(const Fixup& f, __nv_bfloat16* C, int
         out[0] = __floats2bfloat162_rn(v.x, v.y);
         out[1] = __floats2bfloat162_rn(v.z, v.w);
         __stcg(wsp, make_float4(0.f, 0.f, 0.f, 0.f));
+    }
+    if (threadIdx.x == 0) atomicExch(f.counters + tile, 0);
+}
+
+// ---- the class order (variant 3's wide tiles) ---------------------------------------------
+
+// Variant 3's four warps along K give an output element four chains, warp w's over the
+// groups w, w + 4, w + 8, ... from zero, added as (((0 + p0) + p1) + p2) + p3. The class
+// order computes the same thing in one warp: it visits a tile's groups class by class (class
+// w is the groups w, w + 4, ...), adds the accumulators into a running sum at the end of
+// each class and starts the next class from zero. Position i of a tile's G groups is in
+// class w when class_start(w) <= i < class_start(w + 1).
+__device__ __forceinline__ int class_start(int w, int G) {
+    return w * (G >> 2) + min(w, G & 3);
+}
+__device__ __forceinline__ int class_of(int i, int G) {
+    return (i >= class_start(1, G)) + (i >= class_start(2, G)) + (i >= class_start(3, G));
+}
+__device__ __forceinline__ int class_group(int i, int G) {
+    const int w = class_of(i, G);
+    return w + 4 * (i - class_start(w, G));
+}
+
+// A tile cut into its four classes, one block each: every block stored its class's sum
+// 0 + p_w in slot w of the tile's four bm x bn fp32 slots (`slots`), and the block whose
+// groups complete the tile's G adds the four slots in class order from zero, as the four
+// warps of a block do, and converts. 0 + p_w differs from p_w only for p_w = -0, and a
+// running sum is never -0, so the adds give the same bits as the four-warp shapes. Every
+// slot is written before it is read: only the counter is reset. Every thread of the block
+// calls it; `s_last` is a __shared__ int.
+__device__ __forceinline__ void combine_classes(const Fixup& f, const float* slots,
+                                                __nv_bfloat16* C, int N, int tile, int len, int G,
+                                                int m0, int rows, int n0, int bm, int bn,
+                                                int* s_last) {
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) *s_last = atomicAdd(f.counters + tile, len) + len == G;
+    __syncthreads();
+    if (!*s_last) return;
+    __threadfence();
+    for (int i = threadIdx.x; i < rows * (bn / 4); i += blockDim.x) {
+        const int r = i / (bn / 4), c = (i % (bn / 4)) * 4;
+        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            const float4 x = __ldcg(reinterpret_cast<const float4*>(slots + (w * bm + r) * bn + c));
+            v.x += x.x;
+            v.y += x.y;
+            v.z += x.z;
+            v.w += x.w;
+        }
+        __nv_bfloat162* out =
+            reinterpret_cast<__nv_bfloat162*>(C + static_cast<size_t>(m0 + r) * N + n0 + c);
+        out[0] = __floats2bfloat162_rn(v.x, v.y);
+        out[1] = __floats2bfloat162_rn(v.z, v.w);
     }
     if (threadIdx.x == 0) atomicExch(f.counters + tile, 0);
 }
@@ -365,7 +424,9 @@ __global__ void __launch_bounds__(WK * 32) w4_warp_kernel(WarpParams p) {
 //   split == 0 Stream-K: gridDim.x resident blocks divide the tiles x G iterations evenly
 //              in tile-major order, so a block may finish one tile, run whole ones and start
 //              another.
-// A tile that no single block covers goes through the Fixup.
+// A tile that no single block covers goes through the Fixup. In the class order (CLS) the
+// first `whole` blocks run tiles 0..whole-1 whole and block whole + 4 j + w runs class w of
+// tile whole + j, its sum going to slot w of that tile's four in fix.ws (combine_classes).
 struct PipeParams {
     const __nv_bfloat16* A;
     const uint4* B;
@@ -375,6 +436,7 @@ struct PipeParams {
     int M, N, K;
     int chunks;
     int split;
+    int whole;
     Fixup fix;
 };
 
@@ -411,8 +473,9 @@ __device__ __forceinline__ int swz(int row, int ch) {
     return ch ^ ((row & 1) << 2);
 }
 
-template <int MTW, int NT, int TW, int WM, int WN, int WK, int STAGES, bool ASYM>
+template <int MTW, int NT, int TW, int WM, int WN, int WK, int STAGES, bool ASYM, bool CLS = false>
 __global__ void __launch_bounds__(WM* WN* WK * 32) w4_pipe_kernel(PipeParams p) {
+    static_assert(!CLS || WK == 1, "the class order runs one group per stage");
     using C_ = PipeCfg<MTW, NT, TW, WM, WN, WK, STAGES, ASYM>;
     constexpr int THREADS = C_::kThreads, BN = C_::kBN, BM = C_::kBM, KS = C_::kKS;
     constexpr int CPR = KS / 8;  // 16-byte chunks per activation row of a stage
@@ -432,7 +495,17 @@ __global__ void __launch_bounds__(WM* WN* WK * 32) w4_pipe_kernel(PipeParams p) 
     const int units = K / 64;
     const int tiles = (N / BN) * p.chunks;
     int it0, it1;
-    if (p.split > 0) {
+    if constexpr (CLS) {
+        int tile = blockIdx.x, b0 = 0, b1 = G;
+        if (tile >= p.whole) {
+            const int j = tile - p.whole;
+            tile = p.whole + j / 4;
+            b0 = class_start(j % 4, G);
+            b1 = class_start(j % 4 + 1, G);
+        }
+        it0 = tile * G + b0;
+        it1 = tile * G + b1;
+    } else if (p.split > 0) {
         const int tile = blockIdx.x % tiles, slice = blockIdx.x / tiles;
         it0 = tile * G + static_cast<int>(static_cast<long long>(slice) * G / p.split);
         it1 = tile * G + static_cast<int>(static_cast<long long>(slice + 1) * G / p.split);
@@ -444,7 +517,8 @@ __global__ void __launch_bounds__(WM* WN* WK * 32) w4_pipe_kernel(PipeParams p) 
 
     // A stage holds up to WK groups of one tile: a cursor moves by min(WK, groups left in the
     // tile and in the range). The load cursor runs STAGES - 1 stages ahead of the compute one
-    // with the same rule; neither divides after the start.
+    // with the same rule; neither divides after the start. A cursor's g is the position in
+    // the tile's order of groups: the group itself, or class_group(g) in the class order.
     struct Cursor {
         int it, tile, g, len;
     };
@@ -481,7 +555,8 @@ __global__ void __launch_bounds__(WM* WN* WK * 32) w4_pipe_kernel(PipeParams p) 
     auto load_stage = [&](int s, const Cursor& cu) {
         int m0, n0;
         tile_origin(cu.tile, m0, n0);
-        const int rows = min(BM, M - m0), gs = cu.g, gcount = cu.len;
+        const int rows = min(BM, M - m0), gcount = cu.len;
+        const int gs = CLS ? class_group(cu.g, G) : cu.g;
         unsigned char* as = a_stage(s);
         for (int i = tid; i < rows * CPR; i += THREADS) {
             const int row = i / CPR, ch = i % CPR;
@@ -526,6 +601,16 @@ __global__ void __launch_bounds__(WM* WN* WK * 32) w4_pipe_kernel(PipeParams p) 
                 for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.f;
     };
     zero_acc();
+    // The class order's running sum of the finished classes, from zero.
+    float sum[CLS ? MTW : 1][CLS ? NT : 1][4];
+    if constexpr (CLS) {
+#pragma unroll
+        for (int i = 0; i < MTW; ++i)
+#pragma unroll
+            for (int j = 0; j < NT; ++j)
+#pragma unroll
+                for (int e = 0; e < 4; ++e) sum[i][j][e] = 0.f;
+    }
 
     Cursor ld = start(it0);
 #pragma unroll
@@ -555,6 +640,29 @@ __global__ void __launch_bounds__(WM* WN* WK * 32) w4_pipe_kernel(PipeParams p) 
         int m0, n0;
         tile_origin(tile, m0, n0);
         const bool full = it_begin == tile * G && it_end == (tile + 1) * G;
+        if constexpr (CLS) {
+            // The sum of every class of the tile into C, or of one class into its slot: the
+            // cut tiles' slots are 4 x BM x BN floats each, from the first cut tile.
+            float* slots =
+                full ? nullptr : p.fix.ws + static_cast<size_t>(tile - p.whole) * 4 * BM * BN;
+            float* slot = full ? nullptr : slots + class_of(it_begin - tile * G, G) * BM * BN;
+#pragma unroll
+            for (int e = 0; e < E; ++e) {
+                int dn, dm;
+                element_coords<NT>(e, lane, dn, dm);
+                const int r = wm * TW + dm, cn = wn * MTW * 16 + dn;
+                if (dm >= TW || m0 + r >= M) continue;
+                const float v = sum[e / (4 * NT)][(e / 4) % NT][e % 4];
+                if (full)
+                    p.C[static_cast<size_t>(m0 + r) * N + n0 + cn] = __float2bfloat16(v);
+                else
+                    __stcg(slot + r * BN + cn, v);
+            }
+            if (!full)
+                combine_classes(p.fix, slots, p.C, N, tile, it_end - it_begin, G, m0,
+                                min(BM, M - m0), n0, BM, BN, &s_last);
+            return;
+        }
         if constexpr (WK > 1) {
             // Only the split > 0 schedule runs WK > 1, and then this is the block's last
             // stage: the pipeline smem is free once the (empty) groups in flight are waited.
@@ -631,6 +739,20 @@ __global__ void __launch_bounds__(WM* WN* WK * 32) w4_pipe_kernel(PipeParams p) 
                 group_mma<NT>(acc[mt], w, rp, act);
             }
         }
+        if constexpr (CLS) {
+            // The end of a class: its chain joins the sum and the next class starts from zero.
+            if (cu.g + 1 == class_start(class_of(cu.g, G) + 1, G)) {
+#pragma unroll
+                for (int i = 0; i < MTW; ++i)
+#pragma unroll
+                    for (int j = 0; j < NT; ++j)
+#pragma unroll
+                        for (int e = 0; e < 4; ++e) {
+                            sum[i][j][e] += acc[i][j][e];
+                            acc[i][j][e] = 0.f;
+                        }
+            }
+        }
         const int tile = cu.tile;
         const bool seg_done = cu.g + cu.len == G || cu.it + cu.len == it1;
         advance(cu);
@@ -677,6 +799,19 @@ Fixup workspace(size_t floats, size_t count) {
         SPARK_CUDA_CHECK(cudaMemset(counters, 0, have_count * sizeof(int)));
     }
     return {ws, counters};
+}
+
+// The slots of the class pieces (combine_classes), four fp32 tiles per cut tile, with the
+// Fixup's counters. Every slot is written before it is read, so nothing needs to be zero;
+// grown and kept like the Fixup's buffer.
+Fixup class_planes(size_t floats, size_t count) {
+    static float* ws = nullptr;
+    static size_t have = 0;
+    if (have < floats) {
+        have = std::max(floats, have * 2);
+        SPARK_CUDA_CHECK(cudaMalloc(&ws, have * sizeof(float)));
+    }
+    return {ws, workspace(0, count).counters};
 }
 
 // The small-M kernels: `split` K slices per (strip, chunk), 0 = pick one so that the grid
@@ -743,10 +878,10 @@ void launch_warp(const Args& a, int split) {
     SPARK_CHECK_LAUNCH();
 }
 
-template <int MTW, int NT, int TW, int WM, int WN, int WK, int STAGES, bool ASYM>
+template <int MTW, int NT, int TW, int WM, int WN, int WK, int STAGES, bool ASYM, bool CLS = false>
 int pipe_slots() {
     using C_ = PipeCfg<MTW, NT, TW, WM, WN, WK, STAGES, ASYM>;
-    auto* fn = w4_pipe_kernel<MTW, NT, TW, WM, WN, WK, STAGES, ASYM>;
+    auto* fn = w4_pipe_kernel<MTW, NT, TW, WM, WN, WK, STAGES, ASYM, CLS>;
     static int resident = 0;
     if (resident == 0) {
         SPARK_CUDA_CHECK(
@@ -780,6 +915,7 @@ void launch_pipe(const Args& a, int split) {
     p.N = a.N;
     p.K = a.K;
     p.chunks = chunks;
+    p.whole = 0;
     if (split <= 0 && WK == 1) split = launch::forced_split_k();
     int grid;
     if (split > 0 || WK > 1) {
@@ -800,67 +936,158 @@ void launch_pipe(const Args& a, int split) {
     SPARK_CHECK_LAUNCH();
 }
 
+// How many of a call's tiles the class order runs whole; the rest go in four class pieces
+// each. split 1: all of them; split 4: none; otherwise the plan: whole tiles for the full
+// waves of the resident blocks, the last partial wave in pieces. Under four groups a tile is
+// whole. Which tiles are whole changes when an output is finished, never its bits.
+//
+// On the Llama projections at 32 to 512 rows (bench_w4gemm --sweep=invariant,
+// docs/design/w4gemm.md) the plan is the fastest of the three schedules or within 0.1 us of
+// it. The first plan cut the last wave only when that took fewer quarter waves than the
+// wave whole; 256 tiles of 128 x 32 on 340 slots (86 SMs with two) then ran whole, 62.4
+// us against 60.3 cut on o at 256 rows, 209.8 against 189.3 on down.
+int class_plan(int tiles, int G, int slots, int split) {
+    if (G < 4 || split == 1) return tiles;
+    if (split == 4) return 0;
+    return tiles / slots * slots;
+}
+
+// class_plan for a call to class tile (MTW, NT, TW, WM, WN, STAGES), symmetric or not:
+// the asymmetric tile's zero points can cost it a resident block per SM.
+template <int MTW, int NT, int TW, int WM, int WN, int STAGES>
+int class_whole(const Args& a, int split) {
+    const int tiles = (a.N / (16 * MTW * WN)) * cdiv(a.M, TW * WM);
+    const int slots = a.Z ? pipe_slots<MTW, NT, TW, WM, WN, 1, STAGES, true, true>()
+                          : pipe_slots<MTW, NT, TW, WM, WN, 1, STAGES, false, true>();
+    return class_plan(tiles, a.K / kG, slots, split);
+}
+
+// Variant 3's wide tiles: the pipelined kernel with one warp along K in the class order,
+// every K split taken at a class boundary (class_plan).
+template <int MTW, int NT, int TW, int WM, int WN, int STAGES, bool ASYM>
+void launch_class(const Args& a, int split) {
+    using C_ = PipeCfg<MTW, NT, TW, WM, WN, 1, STAGES, ASYM>;
+    const int chunks = cdiv(a.M, C_::kBM);
+    const int tiles = (a.N / C_::kBN) * chunks;
+    PipeParams p;
+    p.A = a.A;
+    p.B = a.B;
+    p.S = a.S;
+    p.Z = a.Z;
+    p.C = a.C;
+    p.M = a.M;
+    p.N = a.N;
+    p.K = a.K;
+    p.chunks = chunks;
+    p.split = 1;
+    p.whole = class_whole<MTW, NT, TW, WM, WN, STAGES>(a, split);
+    p.fix = Fixup{nullptr, nullptr};
+    if (p.whole < tiles)
+        p.fix = class_planes(static_cast<size_t>(tiles - p.whole) * 4 * C_::kBM * C_::kBN,
+                             static_cast<size_t>(tiles));
+    w4_pipe_kernel<MTW, NT, TW, WM, WN, 1, STAGES, ASYM, true>
+        <<<p.whole + 4 * (tiles - p.whole), C_::kThreads, C_::kSmem, a.stream>>>(p);
+    SPARK_CHECK_LAUNCH();
+}
+
 // One entry per block shape of variant 2: the columns and tokens one block covers, whether
-// it is a Stream-K grid (which always fits the resident blocks), its resident blocks per GPU
-// and its launcher for symmetric and asymmetric weights.
+// it is a Stream-K grid (which always fits the resident blocks), its resident blocks per GPU,
+// its launcher for symmetric and asymmetric weights, its name (w4gemm_v3_route_name) and,
+// for the class-order tiles, the plan (class_whole).
 struct Entry {
     int bn, bm;
     bool streamk;
     int (*slots)();
     void (*sym)(const Args&, int);
     void (*asym)(const Args&, int);
+    const char* name;
+    int (*whole)(const Args&, int);
 };
 template <int MTW, int NT, int TW, int WK, int D>
-constexpr Entry warp_entry() {
+constexpr Entry warp_entry(const char* name) {
     return {16 * MTW,
             TW,
             false,
             &warp_slots<MTW, NT, TW, WK, D, true>,
             &launch_warp<MTW, NT, TW, WK, D, false>,
-            &launch_warp<MTW, NT, TW, WK, D, true>};
+            &launch_warp<MTW, NT, TW, WK, D, true>,
+            name,
+            nullptr};
 }
 template <int MTW, int NT, int TW, int WM, int WN, int WK, int STAGES>
-constexpr Entry pipe_entry() {
+constexpr Entry pipe_entry(const char* name) {
     return {16 * MTW * WN,
             TW * WM,
             WK == 1,
             &pipe_slots<MTW, NT, TW, WM, WN, WK, STAGES, true>,
             &launch_pipe<MTW, NT, TW, WM, WN, WK, STAGES, false>,
-            &launch_pipe<MTW, NT, TW, WM, WN, WK, STAGES, true>};
+            &launch_pipe<MTW, NT, TW, WM, WN, WK, STAGES, true>,
+            name,
+            nullptr};
+}
+template <int MTW, int NT, int TW, int WM, int WN, int STAGES>
+constexpr Entry class_entry(const char* name) {
+    return {16 * MTW * WN,
+            TW * WM,
+            false,
+            &pipe_slots<MTW, NT, TW, WM, WN, 1, STAGES, true, true>,
+            &launch_class<MTW, NT, TW, WM, WN, STAGES, false>,
+            &launch_class<MTW, NT, TW, WM, WN, STAGES, true>,
+            name,
+            &class_whole<MTW, NT, TW, WM, WN, STAGES>};
 }
 
 const Entry kEntries[] = {
     // independent warps, registers only: (MTW, NT, TW, WK, D)
-    warp_entry<1, 1, 8, 4, 4>(),   // 0: M <= 8, when the pipelined blocks do not fit
-    warp_entry<1, 2, 16, 4, 4>(),  // 1: M <= 16
-    warp_entry<2, 2, 16, 8, 2>(),  // 2: M <= 16, long K
-    warp_entry<1, 1, 8, 1, 4>(),   // 3: M <= 8, one warp per strip (wide N)
-    warp_entry<1, 2, 16, 1, 4>(),  // 4: M <= 16, one warp per strip (wide N)
+    warp_entry<1, 1, 8, 4, 4>("registers 16 x 8, 4 warps along K"),    // 0: M <= 8
+    warp_entry<1, 2, 16, 4, 4>("registers 16 x 16, 4 warps along K"),  // 1: M <= 16
+    warp_entry<2, 2, 16, 8, 2>("registers 32 x 16, 8 warps along K"),  // 2: M <= 16, long K
+    warp_entry<1, 1, 8, 1, 4>("registers 16 x 8, 1 warp"),             // 3: M <= 8, wide N
+    warp_entry<1, 2, 16, 1, 4>("registers 16 x 16, 1 warp"),           // 4: M <= 16, wide N
     // pipelined, warps along K: (MTW, NT, TW, WM, WN, WK, STAGES)
-    pipe_entry<1, 1, 1, 1, 1, 4, 6>(),  // 5: M = 1
-    pipe_entry<1, 1, 4, 1, 1, 4, 4>(),  // 6: M <= 4
-    pipe_entry<1, 1, 8, 1, 1, 4, 4>(),  // 7: M <= 8
+    pipe_entry<1, 1, 1, 1, 1, 4, 6>("pipelined 16 x 1, 4 warps along K"),  // 5: M = 1
+    pipe_entry<1, 1, 4, 1, 1, 4, 4>("pipelined 16 x 4, 4 warps along K"),  // 6: M <= 4
+    pipe_entry<1, 1, 8, 1, 1, 4, 4>("pipelined 16 x 8, 4 warps along K"),  // 7: M <= 8
     // pipelined, warps along N and M, Stream-K
-    pipe_entry<2, 2, 16, 2, 4, 1, 4>(),  // 8: 128 x 32
-    pipe_entry<1, 4, 32, 1, 4, 1, 4>(),  // 9: 64 x 32
-    pipe_entry<2, 4, 32, 1, 4, 1, 3>(),  // 10: 128 x 32
-    pipe_entry<1, 4, 32, 2, 4, 1, 3>(),  // 11: 64 x 64
-    pipe_entry<2, 4, 32, 2, 4, 1, 3>(),  // 12: 128 x 64
+    pipe_entry<2, 2, 16, 2, 4, 1, 4>("Stream-K 128 x 32, 8 warps"),  // 8
+    pipe_entry<1, 4, 32, 1, 4, 1, 4>("Stream-K 64 x 32"),            // 9
+    pipe_entry<2, 4, 32, 1, 4, 1, 3>("Stream-K 128 x 32"),           // 10
+    pipe_entry<1, 4, 32, 2, 4, 1, 3>("Stream-K 64 x 64"),            // 11
+    pipe_entry<2, 4, 32, 2, 4, 1, 3>("Stream-K 128 x 64"),           // 12
     // pipelined, four warps along K and four along N: variant 3's shapes above 32 rows
-    pipe_entry<1, 4, 32, 1, 4, 4, 2>(),  // 13: 64 x 32, 97 KB
-    pipe_entry<1, 2, 16, 1, 4, 4, 2>(),  // 14: 64 x 16, 66 KB
+    pipe_entry<1, 4, 32, 1, 4, 4, 2>("pipelined 64 x 32, 4 warps along K"),  // 13: 97 KB
+    pipe_entry<1, 2, 16, 1, 4, 4, 2>("pipelined 64 x 16, 4 warps along K"),  // 14: 66 KB
+    // entries 8 to 12 in the class order: variant 3's wide tiles (MTW, NT, TW, WM, WN, STAGES)
+    class_entry<2, 2, 16, 2, 4, 4>("class order 128 x 32, 8 warps"),  // 15
+    class_entry<1, 4, 32, 1, 4, 4>("class order 64 x 32"),            // 16
+    class_entry<2, 4, 32, 1, 4, 3>("class order 128 x 32"),           // 17
+    class_entry<1, 4, 32, 2, 4, 3>("class order 64 x 64"),            // 18
+    class_entry<2, 4, 32, 2, 4, 3>("class order 128 x 64"),           // 19
 };
 constexpr int kNumEntries = sizeof(kEntries) / sizeof(kEntries[0]);
 
-// Tuning hook: SPARK_W4_CFG="entry[,split]" forces a block shape (and the K split of the
-// one-tile-per-block shapes).
-// Read once per process: the sweeps of docs/design/w4gemm.md were run through it.
-bool env_override(int& idx, int& split) {
-    static const char* e = std::getenv("SPARK_W4_CFG");
-    if (!e || !*e) return false;
-    idx = std::atoi(e);
-    const char* comma = std::strchr(e, ',');
-    split = comma ? std::atoi(comma + 1) : 0;
+// Tuning hook: forces a block shape on variant 2, with the K split of the one-tile-per-block
+// shapes or the schedule of the class-order ones (class_plan). SPARK_W4_CFG="entry[,split]"
+// sets it for the process and w4gemm_set_config at run time, so one bench process can sweep
+// the table; entry -1 is the rule. The sweeps of docs/design/w4gemm.md were run through it.
+std::atomic<int>& config_slot(int which) {
+    static std::atomic<int> slots[2] = {-1, 0};
+    static const bool read = [] {
+        const char* e = std::getenv("SPARK_W4_CFG");
+        if (e && *e) {
+            slots[0].store(std::atoi(e));
+            const char* comma = std::strchr(e, ',');
+            slots[1].store(comma ? std::atoi(comma + 1) : 0);
+        }
+        return true;
+    }();
+    (void)read;
+    return slots[which];
+}
+
+bool forced_config(int& idx, int& split) {
+    idx = config_slot(0).load(std::memory_order_relaxed);
+    split = config_slot(1).load(std::memory_order_relaxed);
     return idx >= 0 && idx < kNumEntries;
 }
 
@@ -904,24 +1131,49 @@ int pick(const Args& a) {
 
 void launch_v2(const Args& a) {
     int idx = 0, split = 0;
-    if (!env_override(idx, split)) idx = pick(a);
+    if (!forced_config(idx, split)) idx = pick(a);
     const Entry& e = kEntries[idx];
     SPARK_REQUIRE(a.N % e.bn == 0, "w4gemm: N is not a multiple of the block width");
     (a.Z ? e.asym : e.sym)(a, split);
 }
 
-// Variant 3, batch invariant: the shapes with four warps along K (WK = 4) and the K split
-// across blocks forced to 1, at every M. Each of the four warps accumulates every fourth
-// 128-k group in order (warp w the groups w, w + 4, ...), in the warp kernel (entries 0 and
-// 1) and the pipelined kernel (5, 13 and 14) alike, and the block sums the four partials in
-// shared memory in warp order, ((p0 + p1) + p2) + p3, so an output element's chain is the
-// same whichever shape M picks. The shape per M is the fastest of the family on the Llama
-// projections (docs/design/batch_invariant.md). One warp per strip (entries 3 and 4, no
-// split at all, what the default runs on a wide N) was tried first: it costs 2 to 3x on the
+// Variant 3's route (w4gemm_v3_set_route): the rule, or the four-warp shapes at every M.
+std::atomic<int>& v3_route_slot() {
+    static std::atomic<int> slot([] {
+        const char* s = std::getenv("SPARK_W4_V3_ROUTE");
+        return s ? std::atoi(s) : static_cast<int>(W4GEMM_V3_ROUTE_RULE);
+    }());
+    return slot;
+}
+
+// Variant 3, batch invariant. Every shape it runs gives an output element the same four
+// chains, chain w over the 128-k groups w, w + 4, w + 8, ... in order from zero (each group
+// the same eight k16 steps), added (((0 + p0) + p1) + p2) + p3:
+//   * the shapes with four warps along K and the K split across blocks forced to 1, in the
+//     warp kernel (entries 0 and 1) and the pipelined kernel (5, 13 and 14): warp w runs
+//     chain w and the block sums the four partials in shared memory in warp order;
+//   * the class order (entries 15 to 19): one warp runs the four chains one after another
+//     and adds each into a running sum as it ends; a K split cuts a tile only at a class
+//     boundary, and the block that finishes the tile adds the four sums in class order.
+// So the bits of an element do not depend on which shape M picks, on the tile, on the warp
+// or block that computes it, or on the plan. One warp per strip (entries 3 and 4, no split
+// at all, what the default runs on a wide N) was tried first: it costs 2 to 3x on the
 // narrow projections at M <= 16 (o 7.8 to 19 us, down 21 to 65 us), and a deeper ring of
 // loads per warp does not help (17 and 64 us with 16 groups in flight): 256 one-warp blocks
 // leave most SMs with one warp to issue from.
-int pick_invariant(const Args& a) {
+struct Pick {
+    int idx, split;
+};
+// The shape per M: from 17 rows the class-order 128 x 32 tile on the plan, or 64 x 32 when
+// the 128-wide tile's pieces would leave SMs idle; up to 16 rows and on the four-warp route
+// the four-warp shapes. The fastest of the family on the Llama projections
+// (docs/design/w4gemm.md, "Batch invariant").
+Pick pick_invariant(const Args& a) {
+    if (v3_route_slot().load(std::memory_order_relaxed) != W4GEMM_V3_ROUTE_FOUR_WARPS && a.M > 16 &&
+        a.N % 64 == 0) {
+        const int pieces = 4 * (a.N / 128) * cdiv(a.M, 32);
+        return {a.N % 128 == 0 && pieces >= launch::device_shape().sm_count ? 17 : 16, 0};
+    }
     int idx;
     if (a.M <= 1)
         idx = 5;
@@ -934,12 +1186,13 @@ int pick_invariant(const Args& a) {
     else
         idx = 13;
     if (a.N % kEntries[idx].bn != 0) idx = 1;
-    return idx;
+    return {idx, 1};
 }
 
 void launch_v3(const Args& a) {
-    const Entry& e = kEntries[pick_invariant(a)];
-    (a.Z ? e.asym : e.sym)(a, 1);
+    const Pick pk = pick_invariant(a);
+    const Entry& e = kEntries[pk.idx];
+    (a.Z ? e.asym : e.sym)(a, pk.split);
 }
 
 }  // namespace
@@ -955,6 +1208,38 @@ int w4gemm_num_variants() {
 
 int w4gemm_default_variant() {
     return 2;  // 3 is batch invariant and opt-in
+}
+
+void w4gemm_set_config(int entry, int split) {
+    config_slot(0).store(entry, std::memory_order_relaxed);
+    config_slot(1).store(split, std::memory_order_relaxed);
+}
+
+int w4gemm_num_configs() {
+    return kNumEntries;
+}
+
+void w4gemm_v3_set_route(int route) {
+    v3_route_slot().store(route, std::memory_order_relaxed);
+}
+
+int w4gemm_v3_route() {
+    return v3_route_slot().load(std::memory_order_relaxed);
+}
+
+const char* w4gemm_v3_route_name(int M, int N, int K, bool asym) {
+    if (!w4gemm_supports(M, N, K, 3)) return "unsupported";
+    static const uint8_t some_zeros = 0;
+    const Args a{nullptr, nullptr, nullptr, asym ? &some_zeros : nullptr, nullptr, M, N, K, 0};
+    const Pick pk = pick_invariant(a);
+    const Entry& e = kEntries[pk.idx];
+    if (!e.whole) return e.name;
+    const int tiles = (N / e.bn) * cdiv(M, e.bm);
+    const int whole = e.whole(a, pk.split);
+    static thread_local char name[96];
+    std::snprintf(name, sizeof(name), "%s, %d whole tiles + %d in four pieces", e.name, whole,
+                  tiles - whole);
+    return name;
 }
 
 void w4gemm_bf16(const __nv_bfloat16* A, const int32_t* packed, const __nv_bfloat16* scales,
