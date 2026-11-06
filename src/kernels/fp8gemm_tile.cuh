@@ -67,12 +67,34 @@ struct Cfg {
 };
 
 // The MX scale tensors, as the launchers hand them down: sfa[M][K/32] and sfb[N][K/32] in
-// ue8m0 with row stride `ld` = K / 32 bytes. Null `a` means per-tensor mode.
+// ue8m0 with row stride `ld` = K / 32 bytes, or, `tiled`, the same bytes in the tiled layout
+// (mx_tile_word below) with `ld` = K bytes per 32-row group. Null `a` means per-tensor mode.
 struct MxScales {
     const unsigned char* a = nullptr;
     const unsigned char* b = nullptr;
     int ld = 0;
+    bool tiled = false;
 };
+
+// The tiled layout (kernels.h, FP8_MX_TILED): groups of 32 rows outermost, K inside, and per
+// group and 128 k one 128-byte block of 32 words, a word being a row's 4 scale bytes for those
+// 128 k (k-block j in byte j, the word the mma takes as is). Row r of the group (r = g + 8 t +
+// 16 h, g < 8) has word 4 g + 2 t + h, so that a 32-row warp tile reads its words for one
+// stage as 32 consecutive words, lane (g, c) the word of row g + 8 (c & 1) + 16 (c >> 1),
+// which is the register the mma wants with thread-id c >> 1, and a 32-column one as 16
+// consecutive 8-byte pairs, lane (g, c) the words of columns g + 8 (c & 1) and that + 16, the
+// registers of two pairs of n8 tiles with thread-id c & 1. Both are one conflict-free shared
+// load per 32 rows, and a stage's words for BM rows are BM / 32 blocks of 128 bytes K bytes
+// apart: one 2-D TMA box.
+__host__ __device__ constexpr int mx_tile_word(int r) {
+    return 4 * (r & 7) + 2 * ((r >> 3) & 1) + ((r >> 4) & 1);
+}
+
+// Byte offset of (row, k-block kb) in a tiled scale tensor of K / 32 k-blocks per row.
+__host__ __device__ constexpr size_t mx_tile_offset(int row, int kb, int K) {
+    return static_cast<size_t>(row >> 5) * K + static_cast<size_t>(kb >> 2) * 128 +
+           mx_tile_word(row & 31) * 4 + (kb & 3);
+}
 
 // The scale words of one stage, held the way the block-scaled mma reads them. The
 // instruction takes one .b32 register per lane per operand and reads, with thread-id 0, the
@@ -88,6 +110,56 @@ struct MxFrag {
     unsigned a[C::MT];
     unsigned b[C::NT];
 };
+
+// The same words read from the tiled layout with both thread-ids (mx_tile_word): register u
+// of A serves A tiles 2u (thread-id 0) and 2u + 1 (thread-id 1), register p of B the n8 tiles
+// 2p and 2p + 1, so a stage takes MT / 2 + NT / 2 registers instead of MT + NT.
+template <class C>
+struct MxTileFrag {
+    static_assert(C::WROWS % 32 == 0 && C::WCOLS % 32 == 0, "warp tiles of whole 32-row groups");
+    unsigned a[C::MT / 2];
+    unsigned b[C::NT / 2];
+};
+
+// One stage's words out of the stage's copy of the tiled layout in shared memory: `sa` holds
+// the BM / 32 blocks of the block's rows of A, `sb` the BN / 32 of its columns of Bt, 128
+// bytes each. MT / 2 4-byte loads and NT / 4 8-byte loads per lane, each one wavefront.
+template <class C>
+__device__ __forceinline__ void mx_tile_words(MxTileFrag<C>& f, const unsigned char* sa,
+                                              const unsigned char* sb, int wm, int wn, int lane) {
+    const int g = lane >> 2;
+    const int c = lane & 3;
+    const int wa = 4 * g + 2 * (c & 1) + (c >> 1);  // row g + 8 (c & 1) + 16 (c >> 1)
+    const int wb = 4 * g + 2 * (c & 1);             // columns g + 8 (c & 1), + 16
+#pragma unroll
+    for (int u = 0; u < C::MT / 2; ++u)
+        f.a[u] = *reinterpret_cast<const unsigned*>(sa + (wm * C::WROWS / 32 + u) * 128 + wa * 4);
+#pragma unroll
+    for (int u = 0; u < C::NT / 4; ++u) {
+        const uint2 v =
+            *reinterpret_cast<const uint2*>(sb + (wn * C::WCOLS / 32 + u) * 128 + wb * 4);
+        f.b[2 * u] = v.x;
+        f.b[2 * u + 1] = v.y;
+    }
+}
+
+// The block-scaled mma of tile (mi, nj) with the words of either form. mi and nj are
+// constants once the caller's loops are unrolled, so the thread-id branches fold.
+template <int BID, class C>
+__device__ __forceinline__ void mx_mma(float (&d)[4], const unsigned (&a)[4],
+                                       const unsigned (&b)[2], const MxFrag<C>& f, int mi, int nj) {
+    mma_e4m3_16832_mx<BID>(d, a, b, f.a[mi], f.b[nj]);
+}
+template <int BID, class C>
+__device__ __forceinline__ void mx_mma(float (&d)[4], const unsigned (&a)[4],
+                                       const unsigned (&b)[2], const MxTileFrag<C>& f, int mi,
+                                       int nj) {
+    const unsigned sa = f.a[mi >> 1], sb = f.b[nj >> 1];
+    if ((mi & 1) == 0 && (nj & 1) == 0) mma_e4m3_16832_mx<BID, 0, 0>(d, a, b, sa, sb);
+    if ((mi & 1) == 0 && (nj & 1) == 1) mma_e4m3_16832_mx<BID, 0, 1>(d, a, b, sa, sb);
+    if ((mi & 1) == 1 && (nj & 1) == 0) mma_e4m3_16832_mx<BID, 1, 0>(d, a, b, sa, sb);
+    if ((mi & 1) == 1 && (nj & 1) == 1) mma_e4m3_16832_mx<BID, 1, 1>(d, a, b, sa, sb);
+}
 
 // Where the words come from. A row's scales for SFW consecutive words (SFW * 128 k, SPC
 // stages) are one SFW * 4-byte chunk, and the warp fetches the chunks of its WROWS rows of A
@@ -134,24 +206,40 @@ __device__ __forceinline__ void mx_load_chunk(unsigned (&w)[SFW], const unsigned
     }
 }
 
+// The same chunk out of the tiled layout: a row's consecutive words are 128 bytes apart there,
+// so it is SFW 4-byte loads, which a warp's 32 rows of one group make 128 contiguous bytes.
+template <int SFW>
+__device__ __forceinline__ void mx_load_chunk_tiled(unsigned (&w)[SFW], const unsigned char* p) {
+#pragma unroll
+    for (int i = 0; i < SFW; ++i) w[i] = *reinterpret_cast<const unsigned*>(p + i * 128);
+}
+
 // Fetches the chunks of the group of SPC stages that starts at k-tile kt (a multiple of
 // SPC). `mx` points at the tile's first rows; A rows past m_valid read row 0 (their data is
 // zero-filled), and a warp tile narrower than 32 rows or columns has its spare lanes read a
-// row again rather than branch.
-template <class C, int SFW>
+// row again rather than branch. TILED: `mx` is in the tiled layout and points at the group of
+// the tile's first row, which is a multiple of 32.
+template <class C, int SFW, bool TILED = false>
 __device__ __forceinline__ void mx_fetch(MxChunk<C, SFW>& ch, const MxScales& mx, int kt, int wm,
                                          int wn, int lane, int m_valid) {
     using Ch = MxChunk<C, SFW>;
     const int off = kt * (C::BK / 32);  // byte offset of this group's first k-block
 #pragma unroll
     for (int j = 0; j < Ch::A_LOADS; ++j) {
-        const int r = wm * C::WROWS + min(j * 32 + lane, C::WROWS - 1);
-        mx_load_chunk<SFW>(ch.a[j], mx.a + static_cast<size_t>(r < m_valid ? r : 0) * mx.ld + off);
+        int r = wm * C::WROWS + min(j * 32 + lane, C::WROWS - 1);
+        r = r < m_valid ? r : 0;
+        if constexpr (TILED)
+            mx_load_chunk_tiled<SFW>(ch.a[j], mx.a + mx_tile_offset(r, off, mx.ld));
+        else
+            mx_load_chunk<SFW>(ch.a[j], mx.a + static_cast<size_t>(r) * mx.ld + off);
     }
 #pragma unroll
     for (int j = 0; j < Ch::B_LOADS; ++j) {
         const int n = wn * C::WCOLS + min(j * 32 + lane, C::WCOLS - 1);
-        mx_load_chunk<SFW>(ch.b[j], mx.b + static_cast<size_t>(n) * mx.ld + off);
+        if constexpr (TILED)
+            mx_load_chunk_tiled<SFW>(ch.b[j], mx.b + mx_tile_offset(n, off, mx.ld));
+        else
+            mx_load_chunk<SFW>(ch.b[j], mx.b + static_cast<size_t>(n) * mx.ld + off);
     }
 }
 
@@ -211,12 +299,11 @@ __device__ __forceinline__ void mx_loop(int nkt, int lane, Stage&& stage, Fetch&
 
 // One k32 step of the warp tile out of a stage whose A rows start at `as` and Bt rows at `bs`
 // (both BK bytes per row, swizzled): MT ldmatrix.x4 for A, NT/2 for B, MT x NT mma. In MX
-// mode the mma takes the stage's scale words, byte KK / 32 of them; KK is a compile-time
-// constant so that the byte selector is the immediate the instruction wants.
-template <class C, bool MX, int KK>
+// mode the mma takes the stage's scale words (MxFrag or MxTileFrag), byte KK / 32 of them; KK
+// is a compile-time constant so that the byte selector is the immediate the instruction wants.
+template <class C, bool MX, int KK, class F>
 __device__ __forceinline__ void mma_step(const unsigned char* as, const unsigned char* bs, int wm,
-                                         int wn, int lane, typename C::Acc& acc,
-                                         const MxFrag<C>& mx) {
+                                         int wn, int lane, typename C::Acc& acc, const F& mx) {
     constexpr int kk = KK;
     constexpr int BK = C::BK, MT = C::MT, NT = C::NT, WROWS = C::WROWS, WCOLS = C::WCOLS;
     unsigned afrag[MT][4];
@@ -249,7 +336,7 @@ __device__ __forceinline__ void mma_step(const unsigned char* as, const unsigned
 #pragma unroll
         for (int nj = 0; nj < NT; ++nj) {
             if constexpr (MX)
-                mma_e4m3_16832_mx<KK / 32>(acc[mi][nj], afrag[mi], bfrag[nj], mx.a[mi], mx.b[nj]);
+                mx_mma<KK / 32>(acc[mi][nj], afrag[mi], bfrag[nj], mx, mi, nj);
             else
                 mma_e4m3_16832(acc[mi][nj], afrag[mi], bfrag[nj]);
         }
@@ -257,10 +344,9 @@ __device__ __forceinline__ void mma_step(const unsigned char* as, const unsigned
 }
 
 // The BK / 32 k32 steps of one stage.
-template <class C, bool MX>
+template <class C, bool MX, class F>
 __device__ __forceinline__ void mma_stage(const unsigned char* as, const unsigned char* bs, int wm,
-                                          int wn, int lane, typename C::Acc& acc,
-                                          const MxFrag<C>& mx) {
+                                          int wn, int lane, typename C::Acc& acc, const F& mx) {
     mma_step<C, MX, 0>(as, bs, wm, wn, lane, acc, mx);
     mma_step<C, MX, 32>(as, bs, wm, wn, lane, acc, mx);
     if constexpr (C::BK >= 128) {
@@ -275,8 +361,9 @@ __device__ __forceinline__ void mma_stage(const unsigned char* as, const unsigne
 // of 0) and Bt rows bn..bn+BN must exist (N % BN == 0). `smem` is the STAGES-deep tile buffer
 // (C::SMEM bytes). The pipeline is drained on return. In MX mode `mx` holds the scale
 // tensors (whole, not offset), kt_begin is a multiple of the group length and the k-loop
-// runs a group of SPC stages per iteration with the next group's chunks in flight.
-template <class C, bool MX, int SFW>
+// runs a group of SPC stages per iteration with the next group's chunks in flight; TILED, they
+// are in the tiled layout and bm and bn are multiples of 32.
+template <class C, bool MX, int SFW, bool TILED = false>
 __device__ __forceinline__ void mainloop(const unsigned char* __restrict__ A,
                                          const unsigned char* __restrict__ Bt, int K, int bm,
                                          int bn, int m_valid, int kt_begin, int nkt,
@@ -356,10 +443,15 @@ __device__ __forceinline__ void mainloop(const unsigned char* __restrict__ A,
         MxFrag<C> none;
         for (int kt = 0; kt < nkt; ++kt) stage(kt, none);
     } else {
-        mx.a += static_cast<size_t>(bm) * mx.ld;
-        mx.b += static_cast<size_t>(bn) * mx.ld;
+        if constexpr (TILED) {
+            mx.a += static_cast<size_t>(bm >> 5) * mx.ld;
+            mx.b += static_cast<size_t>(bn >> 5) * mx.ld;
+        } else {
+            mx.a += static_cast<size_t>(bm) * mx.ld;
+            mx.b += static_cast<size_t>(bn) * mx.ld;
+        }
         mx_loop<C, SFW>(nkt, lane, stage, [&](MxChunk<C, SFW>& ch, int kt) {
-            mx_fetch<C, SFW>(ch, mx, kt_begin + kt, wm, wn, lane, m_valid);
+            mx_fetch<C, SFW, TILED>(ch, mx, kt_begin + kt, wm, wn, lane, m_valid);
         });
     }
     cp_async_wait<0>();

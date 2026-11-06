@@ -27,7 +27,11 @@
 // consumer warps fetching their scale chunks a group of stages ahead, as variants 1 and 2 do
 // (fp8gemm_tile.cuh, MxChunk): the plan then counts chunk groups instead of stages, so every
 // piece starts and ends on a group boundary and the fixup is unchanged. Its route is
-// route_rule_mx, from the same sweep in MX mode.
+// route_rule_mx, from the same sweep in MX mode. With the scales in the tiled layout
+// (FP8_MX_TILED) the producer copies a stage's scales with the stage, one more box per
+// operand into a ring of STAGES - 1 slots that the consumers hand back as soon as they hold
+// the words, and the consumers read them with MT / 2 + NT / 4 shared loads per stage instead
+// of fetching chunks and shuffling; the plan counts stages again.
 
 #include <algorithm>
 #include <atomic>
@@ -58,37 +62,69 @@ using hgemm_sk::st_release_gpu;
 constexpr int ITEM_DEPTH = 2;     // pieces the producer may publish ahead of the consumers
 constexpr int FIXUP_BARRIER = 1;  // named barrier id for the consumer threads
 
+// The scale modes of the kernel: per-tensor, MX with row-major scales (the consumer warps
+// fetch chunks and shuffle), MX with tiled scales (copied with the stage).
+enum : int { PER_TENSOR = 0, MX_ROWS = 1, MX_TILED = 2 };
+
+// The tiled mode's scale ring: STAGES - 1 slots of one stage's scales, BM + BN words of 4
+// bytes. Every tile here is at 96 KB of stages, and STAGES slots (3 KB, a 32nd of them) would
+// leave no room for the barriers in the 99 KB a block may take. STAGES - 1 is enough because
+// a warp hands its slot back early in the stage, after its first k32 step: when the producer
+// reuses the slot of stage s - STAGES + 1 for stage s, the stage it waits for anyway,
+// s - STAGES, has been consumed and s - STAGES + 1 has started.
+template <class C, int MODE>
+struct SfRing {
+    static constexpr int SLOTS = MODE == MX_TILED ? (C::STAGES > 1 ? C::STAGES - 1 : 1) : 0;
+    static constexpr int A_BYTES = C::BM * 4;  // BM / 32 blocks of 128 bytes
+    static constexpr int SLOT = (C::BM + C::BN) * 4;
+    static constexpr int BYTES = SLOTS * SLOT;
+};
+
 // The dynamic region: the stages (1 KB aligned, the swizzle is keyed on the absolute
-// address), the item ring, then full/empty barriers per stage and per ring slot, rounded to a
-// whole KB so a second block on the SM starts aligned too.
-template <class C>
+// address), the scale ring of the tiled mode, the item ring, then full/empty barriers per
+// stage and per ring slot and the scale ring's empty barriers, rounded to a whole KB so a
+// second block on the SM starts aligned too.
+template <class C, int MODE = PER_TENSOR>
 constexpr int smem_bytes() {
-    return (C::SMEM + ITEM_DEPTH * 16 + (2 * C::STAGES + 2 * ITEM_DEPTH) * 8 + 1023) / 1024 * 1024;
+    using R = SfRing<C, MODE>;
+    return (C::SMEM + R::BYTES + ITEM_DEPTH * 16 + (2 * C::STAGES + 2 * ITEM_DEPTH + R::SLOTS) * 8 +
+            1023) /
+           1024 * 1024;
 }
 
-template <int BM, int BN, int BK, int STAGES, int WM, int WN, int MIN_BLOCKS, bool MX, int SFW>
+// tmSA / tmSB are the tiled scale tensors as [groups][K] bytes with a box of 128 bytes by
+// BM / 32 (BN / 32) groups, used in MX_TILED mode only.
+template <int BM, int BN, int BK, int STAGES, int WM, int WN, int MIN_BLOCKS, int MODE, int SFW>
 __global__ void __launch_bounds__((WM * WN + 1) * 32, MIN_BLOCKS)
     fp8gemm_v3_kernel(const __grid_constant__ CUtensorMap tmA,
-                      const __grid_constant__ CUtensorMap tmB, __nv_bfloat16* __restrict__ Cout,
+                      const __grid_constant__ CUtensorMap tmB,
+                      const __grid_constant__ CUtensorMap tmSA,
+                      const __grid_constant__ CUtensorMap tmSB, __nv_bfloat16* __restrict__ Cout,
                       int M, int N, int K, const float* __restrict__ scale_a,
                       const float* __restrict__ scale_b, fp8gemm_tile::MxScales mx, Params p) {
     using C = fp8gemm_tile::Cfg<BM, BN, BK, STAGES, WM, WN>;
+    using R = SfRing<C, MODE>;
+    constexpr bool MX = MODE != PER_TENSOR, TILED = MODE == MX_TILED;
     static_assert(BK == 64 || BK == 128, "the TMA swizzles cover 64 B and 128 B rows");
-    // In MX mode a k-step of the plan (p.KT, the pieces, the flags) is one group of SPC
-    // stages, the unit the scale chunks are fetched in; per-tensor mode has SPC = 1.
-    constexpr int SPC = MX ? fp8gemm_tile::MxChunk<C, SFW>::SPC : 1;
+    static_assert(!TILED || BK == 128, "a tiled scale block is 128 k, one stage");
+    // With row-major MX scales a k-step of the plan (p.KT, the pieces, the flags) is one group
+    // of SPC stages, the unit the scale chunks are fetched in; the other modes have SPC = 1.
+    constexpr int SPC = MODE == MX_ROWS ? fp8gemm_tile::MxChunk<C, SFW>::SPC : 1;
     static_assert(C::A_STAGE % 1024 == 0 && C::STAGE % 1024 == 0, "stages on swizzle spans");
     constexpr int CONSUMER_WARPS = WM * WN;
     constexpr int CONSUMERS = CONSUMER_WARPS * 32;
     constexpr int A_STAGE = C::A_STAGE, STAGE_BYTES = C::STAGE;
     constexpr int WROWS = C::WROWS, MT = C::MT, NT = C::NT;
+    constexpr int SR = R::SLOTS > 0 ? R::SLOTS : 1;  // the modulus of the scale ring
 
     extern __shared__ __align__(1024) unsigned char smem[];
-    int4* items = reinterpret_cast<int4*>(smem + STAGES * STAGE_BYTES);
+    unsigned char* sf_ring = smem + STAGES * STAGE_BYTES;
+    int4* items = reinterpret_cast<int4*>(sf_ring + R::BYTES);
     uint64_t* full_bar = reinterpret_cast<uint64_t*>(items + ITEM_DEPTH);
     uint64_t* empty_bar = full_bar + STAGES;
     uint64_t* item_full = empty_bar + STAGES;
     uint64_t* item_empty = item_full + ITEM_DEPTH;
+    uint64_t* sf_empty = item_empty + ITEM_DEPTH;
     if (smem_u32(smem) % 1024 != 0) __trap();
 
     const int tid = threadIdx.x;
@@ -106,6 +142,8 @@ __global__ void __launch_bounds__((WM * WN + 1) * 32, MIN_BLOCKS)
             mbar_init(&item_full[i], 1);
             mbar_init(&item_empty[i], CONSUMER_WARPS);
         }
+#pragma unroll
+        for (int i = 0; i < R::SLOTS; ++i) mbar_init(&sf_empty[i], CONSUMER_WARPS);
         fence_mbar_init();
     }
     __syncthreads();  // the only block-wide barrier in the kernel
@@ -115,6 +153,10 @@ __global__ void __launch_bounds__((WM * WN + 1) * 32, MIN_BLOCKS)
         if (lane == 0) {
             prefetch_tensormap(&tmA);
             prefetch_tensormap(&tmB);
+            if constexpr (TILED) {
+                prefetch_tensormap(&tmSA);
+                prefetch_tensormap(&tmSB);
+            }
             unsigned g_kt = 0;   // k-tiles issued so far, across pieces
             unsigned n_pub = 0;  // pieces published so far
             auto piece = [&](int tile, int kb, int ke) {
@@ -132,8 +174,19 @@ __global__ void __launch_bounds__((WM * WN + 1) * 32, MIN_BLOCKS)
                     const int s = g_kt % STAGES;
                     const unsigned use_s = g_kt / STAGES;
                     if (g_kt >= STAGES) mbar_wait(&empty_bar[s], (use_s - 1) & 1);
-                    mbar_arrive_expect_tx(&full_bar[s], STAGE_BYTES);
                     unsigned char* as = smem + s * STAGE_BYTES;
+                    if constexpr (TILED) {
+                        // The stage's scales on the same barrier: 128 bytes (128 k) of each
+                        // of the block's 32-row groups of A and of Bt.
+                        const int q = g_kt % SR;
+                        if (g_kt >= SR) mbar_wait(&sf_empty[q], (g_kt / SR - 1) & 1);
+                        mbar_arrive_expect_tx(&full_bar[s], STAGE_BYTES + R::SLOT);
+                        unsigned char* ss = sf_ring + q * R::SLOT;
+                        tma_load_2d(ss, &tmSA, &full_bar[s], kt * 128, bm / 32);
+                        tma_load_2d(ss + R::A_BYTES, &tmSB, &full_bar[s], kt * 128, bn / 32);
+                    } else {
+                        mbar_arrive_expect_tx(&full_bar[s], STAGE_BYTES);
+                    }
                     tma_load_2d(as, &tmA, &full_bar[s], kt * BK, bm);            // BM rows x BK
                     tma_load_2d(as + A_STAGE, &tmB, &full_bar[s], kt * BK, bn);  // BN rows x BK
                 }
@@ -193,11 +246,33 @@ __global__ void __launch_bounds__((WM * WN + 1) * 32, MIN_BLOCKS)
     const fp8gemm_tile::MxFrag<C> none{};
 
     // One k-tile out of stage S (a constant in the unrolled loop below), with the stage's
-    // scale words in MX mode.
-    auto consume = [&](int S, unsigned parity, const fp8gemm_tile::MxFrag<C>& words) {
+    // scale words in MX mode: handed in with row-major scales, read from scale slot q (the
+    // k-tile's count modulo SR) with tiled ones, which the warp releases as soon as it holds
+    // them.
+    auto consume = [&](int S, unsigned parity, unsigned q, const fp8gemm_tile::MxFrag<C>& words) {
         mbar_wait(&full_bar[S], parity);
         const unsigned char* as = smem + S * STAGE_BYTES;
-        fp8gemm_tile::mma_stage<C, MX>(as, as + A_STAGE, wm, wn, lane, acc, words);
+        if constexpr (TILED) {
+            // The slot goes back after the first k32 step, whose mma has consumed the words,
+            // with the proxy fence the stage release has too. With one slot (128x256) the
+            // copy engine refills it the moment the last warp arrives: handed back straight
+            // after the loads, with no fence, the forced 128x256 tile gave wrong outputs in 3
+            // of 6 runs of the M = 2048 and 4096 rows of Llama 3 8B and Qwen 3 32B, and in
+            // none of 6 this way.
+            fp8gemm_tile::MxTileFrag<C> f;
+            const unsigned char* ss = sf_ring + q * R::SLOT;
+            const unsigned char* bs = as + A_STAGE;
+            fp8gemm_tile::mx_tile_words<C>(f, ss, ss + R::A_BYTES, wm, wn, lane);
+            fp8gemm_tile::mma_step<C, true, 0>(as, bs, wm, wn, lane, acc, f);
+            fence_proxy_async_smem();
+            __syncwarp();
+            if (lane == 0) mbar_arrive(&sf_empty[q]);
+            fp8gemm_tile::mma_step<C, true, 32>(as, bs, wm, wn, lane, acc, f);
+            fp8gemm_tile::mma_step<C, true, 64>(as, bs, wm, wn, lane, acc, f);
+            fp8gemm_tile::mma_step<C, true, 96>(as, bs, wm, wn, lane, acc, f);
+        } else {
+            fp8gemm_tile::mma_stage<C, MX>(as, as + A_STAGE, wm, wn, lane, acc, words);
+        }
         // ldmatrix read the stage through the generic proxy, the refill comes through the
         // async proxy: fence, then one arrive per warp hands the stage back.
         fence_proxy_async_smem();
@@ -217,19 +292,19 @@ __global__ void __launch_bounds__((WM * WN + 1) * 32, MIN_BLOCKS)
             for (int j = 0; j < NT; ++j)
 #pragma unroll
                 for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.f;
-        if constexpr (!MX) {
+        if constexpr (MODE != MX_ROWS) {
             // Whole rounds of the ring unrolled, so every stage address and barrier is an
             // immediate; a piece that starts or ends inside a round runs those k-tiles one by
-            // one.
+            // one. The scale slot (tiled mode) is the k-tile's count modulo SR.
             while (n > 0) {
                 if (n >= STAGES && g_kt % STAGES == 0) {
                     const unsigned parity = (g_kt / STAGES) & 1;
                     fp8gemm_tile::static_for<STAGES>(
-                        [&](auto st) { consume(st.value, parity, none); });
+                        [&](auto st) { consume(st.value, parity, (g_kt + st.value) % SR, none); });
                     g_kt += STAGES;
                     n -= STAGES;
                 } else {
-                    consume(static_cast<int>(g_kt % STAGES), (g_kt / STAGES) & 1, none);
+                    consume(static_cast<int>(g_kt % STAGES), (g_kt / STAGES) & 1, g_kt % SR, none);
                     ++g_kt;
                     --n;
                 }
@@ -263,14 +338,14 @@ __global__ void __launch_bounds__((WM * WN + 1) * 32, MIN_BLOCKS)
                     fp8gemm_tile::static_for<SPC>([&](auto i) {
                         fp8gemm_tile::MxFrag<C> f;
                         fp8gemm_tile::mx_words<C, SFW, i.value>(f, cur, lane);
-                        consume(i.value % STAGES, (round + i.value / STAGES) & 1, f);
+                        consume(i.value % STAGES, (round + i.value / STAGES) & 1, 0, f);
                     });
                     g_kt += SPC;
                 } else {
                     fp8gemm_tile::static_for<SPC>([&](auto i) {
                         fp8gemm_tile::MxFrag<C> f;
                         fp8gemm_tile::mx_words<C, SFW, i.value>(f, cur, lane);
-                        consume(static_cast<int>(g_kt % STAGES), (g_kt / STAGES) & 1, f);
+                        consume(static_cast<int>(g_kt % STAGES), (g_kt / STAGES) & 1, 0, f);
                         ++g_kt;
                     });
                 }
@@ -480,15 +555,15 @@ void plan(Params& p, hgemm_sk::Workspace& w, int M, int N, int K, int BM, int BN
     p.epoch = w.epoch;
 }
 
-template <int BM, int BN, int BK, int STAGES, int WM, int WN, int MIN_BLOCKS, bool MX = false,
+template <int BM, int BN, int BK, int STAGES, int WM, int WN, int MIN_BLOCKS, int MODE = PER_TENSOR,
           int SFW = 2>
 int resident_blocks() {
     using C = fp8gemm_tile::Cfg<BM, BN, BK, STAGES, WM, WN>;
-    constexpr int bytes = smem_bytes<C>();
+    constexpr int bytes = smem_bytes<C, MODE>();
     constexpr int threads = (WM * WN + 1) * 32;
     static int resident = 0;
     if (resident == 0) {
-        auto kernel = fp8gemm_v3_kernel<BM, BN, BK, STAGES, WM, WN, MIN_BLOCKS, MX, SFW>;
+        auto kernel = fp8gemm_v3_kernel<BM, BN, BK, STAGES, WM, WN, MIN_BLOCKS, MODE, SFW>;
         SPARK_CUDA_CHECK(
             cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
         int per_sm = 0;
@@ -499,41 +574,57 @@ int resident_blocks() {
     return resident;
 }
 
-template <int BM, int BN, int BK, int STAGES, int WM, int WN, int MIN_BLOCKS, bool MX, int SFW>
+template <int BM, int BN, int BK, int STAGES, int WM, int WN, int MIN_BLOCKS, int MODE, int SFW>
 void launch_mode(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout, int M, int N,
                  int K, const float* scale_a, const float* scale_b, fp8gemm_tile::MxScales mx,
                  cudaStream_t stream, const Knobs& k) {
     using C = fp8gemm_tile::Cfg<BM, BN, BK, STAGES, WM, WN>;
-    constexpr int bytes = smem_bytes<C>();
+    constexpr int bytes = smem_bytes<C, MODE>();
     constexpr int threads = (WM * WN + 1) * 32;
-    constexpr int SPC = MX ? fp8gemm_tile::MxChunk<C, SFW>::SPC : 1;
+    constexpr int SPC = MODE == MX_ROWS ? fp8gemm_tile::MxChunk<C, SFW>::SPC : 1;
     constexpr CUtensorMapSwizzle swz =
         BK == 64 ? CU_TENSOR_MAP_SWIZZLE_64B : CU_TENSOR_MAP_SWIZZLE_128B;
     const CUtensorMap tmA = make_tensor_map_2d_u8(A, M, K, BM, BK, swz);
     const CUtensorMap tmB = make_tensor_map_2d_u8(Bt, N, K, BN, BK, swz);
+    // The tiled scales as [groups][K] bytes, a box of 128 bytes by the block's groups; rows of
+    // A past the last group are zero-filled like the rows of A past M. The other modes pass
+    // the operand maps, unused.
+    CUtensorMap tmSA = tmA, tmSB = tmB;
+    if constexpr (MODE == MX_TILED) {
+        tmSA =
+            make_tensor_map_2d_u8(mx.a, cdiv(M, 32), K, BM / 32, 128, CU_TENSOR_MAP_SWIZZLE_NONE);
+        tmSB = make_tensor_map_2d_u8(mx.b, N / 32, K, BN / 32, 128, CU_TENSOR_MAP_SWIZZLE_NONE);
+    }
     static hgemm_sk::Workspace w;  // one per tile configuration and mode
     Params p;
     plan(p, w, M, N, K, BM, BN, BK, SPC,
-         resident_blocks<BM, BN, BK, STAGES, WM, WN, MIN_BLOCKS, MX, SFW>(), k);
-    fp8gemm_v3_kernel<BM, BN, BK, STAGES, WM, WN, MIN_BLOCKS, MX, SFW>
-        <<<p.grid, threads, bytes, stream>>>(tmA, tmB, Cout, M, N, K, scale_a, scale_b, mx, p);
+         resident_blocks<BM, BN, BK, STAGES, WM, WN, MIN_BLOCKS, MODE, SFW>(), k);
+    fp8gemm_v3_kernel<BM, BN, BK, STAGES, WM, WN, MIN_BLOCKS, MODE, SFW>
+        <<<p.grid, threads, bytes, stream>>>(tmA, tmB, tmSA, tmSB, Cout, M, N, K, scale_a, scale_b,
+                                             mx, p);
 }
 
 // MX mode fetches 16-byte scale chunks when every row stride is 16-byte aligned (K % 512
-// == 0), else 8-byte ones, as variants 1 and 2 (fp8gemm_tile::MxChunk).
+// == 0), else 8-byte ones, as variants 1 and 2 (fp8gemm_tile::MxChunk). Tiled scales need a
+// 128-byte BK (route: tile_fits).
 template <int BM, int BN, int BK, int STAGES, int WM, int WN, int MIN_BLOCKS>
 void launch(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16* Cout, int M, int N,
             int K, const float* scale_a, const float* scale_b, fp8gemm_tile::MxScales mx,
             cudaStream_t stream, const Knobs& k) {
-    if (mx.a == nullptr)
-        launch_mode<BM, BN, BK, STAGES, WM, WN, MIN_BLOCKS, false, 2>(A, Bt, Cout, M, N, K, scale_a,
-                                                                      scale_b, mx, stream, k);
-    else if (K % 512 == 0)
-        launch_mode<BM, BN, BK, STAGES, WM, WN, MIN_BLOCKS, true, 4>(A, Bt, Cout, M, N, K, scale_a,
-                                                                     scale_b, mx, stream, k);
-    else
-        launch_mode<BM, BN, BK, STAGES, WM, WN, MIN_BLOCKS, true, 2>(A, Bt, Cout, M, N, K, scale_a,
-                                                                     scale_b, mx, stream, k);
+    if (mx.a == nullptr) {
+        launch_mode<BM, BN, BK, STAGES, WM, WN, MIN_BLOCKS, PER_TENSOR, 2>(
+            A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream, k);
+    } else if (mx.tiled) {
+        if constexpr (BK == 128)
+            launch_mode<BM, BN, BK, STAGES, WM, WN, MIN_BLOCKS, MX_TILED, 2>(
+                A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream, k);
+    } else if (K % 512 == 0) {
+        launch_mode<BM, BN, BK, STAGES, WM, WN, MIN_BLOCKS, MX_ROWS, 4>(
+            A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream, k);
+    } else {
+        launch_mode<BM, BN, BK, STAGES, WM, WN, MIN_BLOCKS, MX_ROWS, 2>(
+            A, Bt, Cout, M, N, K, scale_a, scale_b, mx, stream, k);
+    }
 }
 
 using LaunchFn = void (*)(const unsigned char*, const unsigned char*, __nv_bfloat16*, int, int, int,
@@ -574,8 +665,9 @@ struct Route {
     int tile;
 };
 
-bool tile_fits(const TileConfig& t, int N, int K) {
-    return N % t.bn == 0 && K % t.bk == 0;
+// Tiled MX scales take the 128-byte tiles only: a scale block is 128 k.
+bool tile_fits(const TileConfig& t, int N, int K, bool tiled = false) {
+    return N % t.bn == 0 && K % t.bk == 0 && (!tiled || t.bk == 128);
 }
 
 // The per-shape rule, from the forced-tile sweep over the 120 model shapes
@@ -657,11 +749,11 @@ int invariant_tile(int M, int N, int K) {
     return best;
 }
 
-Route choose(int M, int N, int K, bool mx) {
+Route choose(int M, int N, int K, bool mx, bool tiled = false) {
     const int r = route_slot().load(std::memory_order_relaxed);
     if (r == FP8GEMM_V3_ROUTE_LEGACY || M <= 64) return {Route::OLD, 0};
     if (r >= 0 && r < NUM_TILES) {
-        if (tile_fits(TILES[r], N, K)) return {Route::TILE, r};
+        if (tile_fits(TILES[r], N, K, mx && tiled)) return {Route::TILE, r};
         return {Route::OLD, 0};
     }
     return mx ? route_rule_mx(M, N, K) : route_rule(M, N, K);
@@ -674,7 +766,7 @@ Route choose(int M, int N, int K, bool mx) {
 bool fp8gemm_tma_sk(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* Bt, __nv_bfloat16* C, int M, int N,
                     int K, const float* scale_a, const float* scale_b, fp8gemm_tile::MxScales mx,
                     cudaStream_t stream) {
-    const v3::Route r = v3::choose(M, N, K, mx.a != nullptr);
+    const v3::Route r = v3::choose(M, N, K, mx.a != nullptr, mx.tiled);
     if (r.kind == v3::Route::OLD) return false;
     v3::TILES[r.tile].launch(reinterpret_cast<const unsigned char*>(A),
                              reinterpret_cast<const unsigned char*>(Bt), C, M, N, K, scale_a,
@@ -718,12 +810,12 @@ int fp8gemm_v3_num_tiles() {
     return v3::NUM_TILES;
 }
 
-const char* fp8gemm_v3_route_name(int M, int N, int K, bool mx) {
+const char* fp8gemm_v3_route_name(int M, int N, int K, bool mx, bool tiled) {
     if (M <= 0 || N % 64 != 0 || K % 64 != 0 || (mx && K % 256 != 0)) return "unsupported";
-    const v3::Route r = v3::choose(M, N, K, mx);
+    const v3::Route r = v3::choose(M, N, K, mx, tiled);
     if (r.kind == v3::Route::OLD) {
         if (M <= 64) return "v1 decode";
-        return fp8gemm_tma_supports(M, N, K) ? "v2" : "v1";
+        return !(mx && tiled) && fp8gemm_tma_supports(M, N, K) ? "v2" : "v1";
     }
     return v3::TILES[r.tile].name;
 }
