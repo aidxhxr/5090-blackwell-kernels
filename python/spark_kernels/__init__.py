@@ -7,6 +7,8 @@ Ops (all run on the current CUDA stream, all accept float32 or bfloat16 unless n
 
     rmsnorm(x, w, eps=1e-6, variant=-1)      RMSNorm over the last dim
     add_rmsnorm_(x, resid, w, eps=1e-6)      resid += x; return rmsnorm(resid)  (bf16, in place)
+    rmsnorm_fp8(x, w, eps=1e-6)              fp8_quantize(rmsnorm(x, w), "row") in one launch
+    add_rmsnorm_fp8_(x, resid, w, eps=1e-6)  the same after resid += x (bf16, in place)
     swiglu(gate, up, variant=-1)             silu(gate) * up
     softmax(x, variant=-1)                   softmax over the last dim, fp32 math
     sample(logits, temperature, top_k, top_p, seed, offset, variant=-1)
@@ -83,6 +85,7 @@ from .ops import (
     W1Weight,
     W4Weight,
     add_rmsnorm_,
+    add_rmsnorm_fp8_,
     attention,
     attention_bwd,
     attention_fp8,
@@ -105,6 +108,7 @@ from .ops import (
     quantize_fp8,
     quantize_kv_cache,
     rmsnorm,
+    rmsnorm_fp8,
     rope_append_,
     rope_append_paged_,
     sample,
@@ -127,6 +131,7 @@ __all__ = [
     "W1Weight",
     "W4Weight",
     "add_rmsnorm_",
+    "add_rmsnorm_fp8_",
     "attention",
     "attention_bwd",
     "attention_fp8",
@@ -152,6 +157,7 @@ __all__ = [
     "quantize_kv_cache",
     "reference",
     "rmsnorm",
+    "rmsnorm_fp8",
     "rope_append_",
     "rope_append_paged_",
     "sample",
