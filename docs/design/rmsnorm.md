@@ -20,6 +20,7 @@ input exactly once.
 | 3 | one 256-thread block per row | parallelism for very wide rows |
 | 4 | 32–1024-thread group per row, row held in registers | single pass: `x` is read once |
 | fused | add+RMSNorm, same single-pass design as variant 4 | removes a full pass over the activations |
+| fp8 | both norms writing the e4m3 row and its per-token scale | removes `fp8_quantize` and the bf16 row on the fp8-tok path |
 
 ### Variant 0: one thread per row (why it is slow)
 
@@ -104,11 +105,52 @@ rounded to bf16 before it is squared so the stored residual and the normalized v
 bit-for-bit, matching PyTorch's `(resid + x).rms_norm(...)` in bf16. Rows wider than 32,768
 elements use the older two-pass warp-per-row kernel.
 
+### Into fp8 for the next GEMM
+
+On the engine's fp8-tok path every norm feeds a projection that wants e4m3 rows with one scale
+per token. As two ops, `add_rmsnorm_` writes the bf16 row, then `fp8_quantize(h, "row")` reads
+it back, takes its amax and writes the e4m3 bytes and the scale: two launches and a bf16 row
+that lives for one kernel. `add_rmsnorm_fp8_` and `rmsnorm_fp8` are the fused add and variant 4
+with the quantizer moved into the tail of the kernel. After the normalize each thread rounds
+its values to bf16, exactly as the bf16 kernel stores them, and keeps them in registers. The
+group reduces their amax (a second reduction on its own shared array, so the two need no
+barrier between them), thread 0 of the group writes the power-of-two scale, and every thread
+converts its values to e4m3 and stores 8 bytes per vector. Per element that is 7 bytes instead
+of 11 for the add form (read x and resid, write resid and q; the two ops also write h and read
+it back) and 3 instead of 7 for the plain norm.
+
+The output is the two ops' bits, not something close to them:
+
+- the sum of squares is the bf16 kernel's, element for element: the same group size (picked
+  from `cols` only), the same loop order, the same fp32 FMAs and `rsqrtf`;
+- the values quantized are the bf16 values that kernel would have stored (round to nearest
+  even), widened back to fp32, which is exact;
+- the scale and the e4m3 conversion are the same two functions. `pow2_scale` and `store8`
+  moved out of `fp8quant.cu` into `src/kernels/fp8quant.cuh`, which both files include. The
+  amax is a max, so a different reduction tree (a group of 32 to 1,024 threads instead of
+  `fp8_quantize`'s 256-thread block) still gives the same number.
+
+The tests compare the bytes, the scales and the updated residual with `torch.equal` on every
+group size, a ragged row (2,056 columns, 257 vectors over 128 threads), the widest row the
+registers take (32,768), an all-zero row and weight scales of 2^-100 and 2^60. Only the
+single-pass kernel exists in fp8: a row over 32,768 elements or unaligned storage raises
+instead of falling back, because the fallback kernels reduce in another order and would not
+match.
+
+It is batch invariant for the same reason the norm is: one group per row, sized from `cols`,
+so a row's bits don't depend on how many rows came with it. `scripts/check_invariance.py`
+has both ops (same bits at 1, 8, 32 and 256 rows), and the batch-invariant engine keeps the
+fusion on. `SparkModel.fuse_norm_fp8 = False` runs the two ops instead; with the
+batch-invariant rungs (none of them splits K) the engine's logits are `torch.equal`
+both ways, at prefill and at decode.
+
 ## Memory-traffic formulas (used for the GB/s column)
 
 ```
 rmsnorm      bytes = 2 · rows · cols · sizeof(T) + cols · sizeof(T)
 add_rmsnorm  bytes = 4 · rows · cols · sizeof(T) + cols · sizeof(T)
+add_rmsnorm_fp8_  bytes = 7 · rows · cols   (two ops: 11 · rows · cols)
+rmsnorm_fp8       bytes = 3 · rows · cols   (two ops:  7 · rows · cols)
 GB/s         = bytes / (median_ms · 1e-3) / 1e9
 % of peak    = GB/s / 1792     (RTX 5090; 273 on the GB10)
 ```
@@ -194,3 +236,45 @@ than 16 do.
 | | 4096×4096 | 0.0316 | 4254 | 237.4% (L2) | 1.03× |
 | | 4096×8192 | 0.1791 | 1499 | 83.6% | 1.02× |
 | | 16384×8192 | 0.7116 | 1509 | 84.2% | 1.24× |
+
+| fp8 norms, hidden 4096 | rows | `add_rmsnorm_fp8_` us | `add_rmsnorm_` + `fp8_quantize` us | speedup | `rmsnorm_fp8` us | `rmsnorm` + `fp8_quantize` us | speedup |
+|---|---|---|---|---|---|---|---|
+| | 1 | 2.81 | 3.88 | 1.38x | 2.35 | 3.48 | 1.48x |
+| | 8 | 3.27 | 4.50 | 1.38x | 2.66 | 3.88 | 1.46x |
+| | 64 | 3.41 | 4.69 | 1.38x | 2.77 | 3.99 | 1.44x |
+| | 512 | 4.42 | 6.49 | 1.47x | 3.59 | 5.67 | 1.58x |
+| | 2048 | 14.40 | 21.11 | 1.47x | 7.96 | 15.28 | 1.92x |
+| | 8192 | 153.60 | 226.97 | 1.48x | 22.33 | 106.00 | 4.75x |
+
+From `results/norm_fp8.jsonl` (`scripts/bench_norm_fp8.py --part op`): 20 calls captured in one
+CUDA graph, the median of 50 replays divided by 20, so a row is what a graphed decode step pays
+per call. The inputs are not rotated, as in the engine: up to 2048 rows everything stays in L2.
+
+- **1 to 64 rows is a launch and two reductions, not bytes.** The fused add costs 0.16 to 0.28
+  us more than `add_rmsnorm_` alone (2.81 against 2.65 us at one row) and saves the whole
+  `fp8_quantize` launch, 1.53 to 1.63 us in a graph. Eager, where each op also pays the host's
+  launch path, the two ops are 7.15 to 7.32 us and the fused one 4.17 to 4.30, 1.70 to 1.72x.
+- **From 2048 rows it is bytes.** The fused add at 2048 rows (14.40 us) is faster than
+  `add_rmsnorm_` alone (15.77): it writes one byte per element where that writes two. At 8192
+  rows its 235 MB take 153.6 us, 1,529 GB/s, the copy roof.
+- **The 4.75x at 8192 rows is the L2.** `rmsnorm_fp8` only reads x (64 MB), which stays in the
+  96 MB L2 between calls, so it runs at 4,508 GB/s by the traffic model; the two ops also write
+  and read back a 64 MB h, which pushes x out. The engine runs `rmsnorm_fp8` once per forward
+  (layer 0's attention norm, on the embeddings); the add form is the one it runs everywhere
+  else.
+
+| fp8-tok engine, 8 layers | batch | decode ms/step, two ops | fused | prefill tok/s, two ops | fused |
+|---|---|---|---|---|---|
+| | 1 | 2.086 | 2.069 | 119,418 | 119,884 |
+| | 8 | 2.234 | 2.215 | 134,043 | 135,930 |
+| | 32 | 2.481 | 2.463 | 132,092 | 135,010 |
+| | 64 | 3.007 | 2.987 | 129,569 | 132,135 |
+
+`scripts/bench_norm_fp8.py --part engine`: bench_serve's static batches (prompts log-uniform
+in 64 to 2048 tokens, 64 new tokens each, greedy), random weights, bf16 cache, CUDA graphs,
+the two modes alternated three times on one model and the median of each kept. The three runs
+of a mode agreed within 3 us a step. Decode drops 17 to 19 us a step (0.6 to 0.8%): 16 norms
+at 1.1 to 1.2 us each, what the graph rows above say. Prefill gains 0.4% at 884 tokens and 1.4
+to 2.2% from 6,073 up, where the norms move bytes. An fp8-tok step still runs `fp8_quantize`
+before o and down and a row-scale multiply after every projection; those are not part of this.
+
