@@ -738,6 +738,72 @@ The no-window path did not move: old and new binary interleaved in one hold, the
 rows of the earlier table within 0.6% in the first round and 0.1% in the second (1.678 /
 1.678, 6.350 / 6.349, 1.723 / 1.725 and 0.807 / 0.807 ms).
 
+### Dv inside the band kernel
+
+With the band kernel the 32K, `W = 128` backward is the preprocess, 0.355 ms, and the band
+kernel, 1.598. The preprocess only writes `{L log2(e), Dv}` per row now (the zeroing went with
+the dQ buffer), so it is a whole launch and a full read of O and dO for one float per row, and
+the band kernel already has every dO tile in shared memory. The band kernel can do that work
+itself, and then the backward is one launch. It is the default with `D = 64` and off with
+`D = 128`, because that is how it measured; `SPARK_ATTN_BWD_BAND_DV = 0` turns it off, `= 1`
+takes it at both head sizes.
+
+The catch is who needs what. A warp's 16 keys meet all the rows of a Q tile, so every warp
+needs Dv for every row before it forms dS^T, and the only thing that makes the warps wait for
+each other in this kernel is the dS^T buffers. So either every warp sums every row (8x the
+work), or the warps split the rows and something orders the writes before the reads. The
+versions I built, 32/8 heads, `D = 128`, `W = 128`, the whole backward in ms, with the
+preprocess path in the same hold of the GPU each time:
+
+| version | 32K | 8K |
+|---|---|---|
+| preprocess + band kernel | 1.940 to 1.959 | 0.584 to 0.589 |
+| a warp forms `(L, Dv)` of 4 rows of the next Q tile, O and L from global memory, dO from the stage, in the preprocess's lane order (the same bits); one more mbarrier per stage, waited on before the exponentials | 2.089 | 0.627 |
+| the rows two Q tiles ahead, O, dO and L all from global memory, written before the warp arrives on the dS^T barrier, so the barriers already there order them: no new wait, but 108 bytes of spill stores a thread | 2.249 | 0.680 to 0.681 |
+| L by TMA with the stage, so only Dv is waited for, and only just before dS^T | 2.062 to 2.073 | 0.617 to 0.620 |
+| the same with `D / 16` lanes a row: 16 columns a lane and a 3-step butterfly, where the preprocess's order needs 5 steps for each of the 4 rows | 1.990 to 2.001 | 0.591 to 0.594 |
+| and Dv kept in a block-private slot for the query tile's second key tile, so O is read once | 1.990 to 1.994 | 0.593 to 0.595 |
+
+The fifth row is what the kernel runs. Its Dv sums in another order than the preprocess's, so
+the gradients are not the preprocess path's bits, but they are the same bits every run, in both
+modes. With sinks the kernel also writes the rows to the preprocess's workspace from the block
+that finishes each query tile, and the sink gradient runs after the kernel instead of before. L
+needs a row stride of a multiple of 16 bytes for the tensor map, so a length that is no
+multiple of 4 keeps the preprocess.
+
+Where the time goes, on the fourth row's version at 32K, with wrong answers, timing only:
+without the wait for the Dv rows 2.025 to 2.030, without the O loads (Dv from dO alone) 1.960
+to 1.968, level with the two launches. Reading O once instead of twice (the last row) gained
+0.006 ms at 32K and nothing at 8K, so it is not the bytes. It is a global load landing between
+a warp's products and its dS^T store on every tile, and every warp waiting on the slowest one's
+rows. Nsight on the first version (with L prefetched into L2) at 8K: 191M instructions against
+132M, an L2 hit rate of 47.0% against 51.9%, DRAM at 68% of peak against 58%, the kernel 684 µs
+against 563 at ncu's clocks.
+
+gpt-oss's heads (`D = 64`, 64-row Q tiles) go the other way: the kernel wins at every length I
+ran (ms, `W = 128`, the two paths alternated in the same holds):
+
+| 64/8 heads, `D = 64` | preprocess + band | Dv in the band kernel | |
+|---|---|---|---|
+| 8K | 0.556 | **0.537** | 3.4% |
+| 8K, sinks | 0.568 | **0.557** | 1.9% |
+| 16K | 1.005 | **0.951** | 5.4% |
+| 16K, sinks | 1.027 | **0.984** | 4.2% |
+| 32K, sinks | 1.948 | **1.874** | 3.8% |
+
+and on 32/8 heads, `D = 128`, in another hold: 0.585 against 0.591 at 8K, 1.048 against 1.046
+at 16K, 1.941 against 1.992 at 32K. A tile's products and its Dv sums are the same size at both
+head sizes (128 keys by 64 rows by 64 against 128 by 32 by 128, and 4096 products for the rows
+either way); why the `D = 64` kernel hides the load and the `D = 128` one does not, I have not
+profiled. Forced past 128 keys, where the band is not the default, it loses more, since a query
+tile sees three key tiles and its rows are formed three times: 3.569 against 3.387 ms at
+`W = 256`, 12.70 against 11.44 at `W = 1024`, both at 32K. The default rows there run the atomic
+path and did not move (3.117 / 3.119 and 7.417 / 7.399 ms, preprocess / knob on).
+`scripts/bench_attention_window.py --only=bwd`, run as is and with `SPARK_ATTN_BWD_BAND_DV=0`
+(both appended to `results/attention_window_torch.jsonl`, the rows record the knob as
+`band_dv`): gpt-oss's heads at 8K 0.569 ms against 0.586 with sinks and 0.552 against 0.573
+without, and the ten `D = 128` rows within 0.7% of each other.
+
 ## What remains
 
 - **The dQ round trip.** The preprocess (46 µs at 4096 tokens, mostly the zeroing) and the
@@ -747,12 +813,14 @@ rows of the earlier table within 0.6% in the first round and 0.1% in the second 
   the dQ tiles whose last contributor it was without a fence per tile. Under windows of up
   to 128 keys the band kernel finishes it with neither, since a query tile's key tiles run
   on one block; a full causal row sees every key tile before it, so that does not carry over.
-- **The band, next.** The preprocess is now 0.355 of the 1.95 ms at 32K tokens and
-  `W = 128`, reading O and dO once more only for `Dv = dO . O`; the band kernel could form
-  `Dv` for the query tiles it first touches, a key tile ahead. A rule from the halo's share
-  of a block's work instead of the tile count would take `W = 64` at 4K. From 129 to 256 keys
-  the halo is a whole key tile per block; a halo that runs S, dP and the dQ product, three
-  of the five, and not the dV and dK it drops, has not been built.
+- **The band, next.** Dv inside the band kernel is in for `D = 64` and off for `D = 128`
+  (above). What would take the O load off the warps' path is O in shared memory a stage
+  ahead, by TMA with Q and dO; the 99 KB is full (K 32 KB, three 16 KB stages, two 8 KB dS^T
+  buffers), so that means two stages of Q, dO and O instead of three of Q and dO, which has
+  not been tried. A rule from the halo's share of a block's work instead of the tile count
+  would take `W = 64` at 4K. From 129 to 256 keys the halo is a whole key tile per block; a
+  halo that runs S, dP and the dQ product, three of the five, and not the dV and dK it
+  drops, has not been built.
 - **Deterministic with the split.** The deterministic mode turns the split off because the
   slices add. Slices that each write their own fp32 partial, summed in a fixed order by the
   conversion kernel, would keep it bitwise reproducible and bring the non-causal and GQA rows
