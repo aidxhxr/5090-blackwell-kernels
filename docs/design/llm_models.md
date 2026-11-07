@@ -103,10 +103,18 @@ first launch of the TMA GEMM (variants 5 and 6, the default for prefill shapes) 
 3.4 GiB of device memory outside torch's allocator, at M = 1024 as at M = 8192. The
 pre-TMA Stream-K kernel (variant 4) takes 45 MB, and the decode path (M <= 64) never
 launches the TMA kernel. `cuobjdump` shows 8 bytes of stack and no local memory for the TMA
-kernels, so it is not a local-memory reservation, and it is not module loading: with
-`CUDA_MODULE_LOADING=EAGER` the first launch still takes 3.3 GiB. I did not find what
-allocates it. It is a fixed cost, so it only matters when the cache is sized to the last
-gigabyte.
+kernels, and it is not module loading: with `CUDA_MODULE_LOADING=EAGER` the first launch
+still takes 3.3 GiB. It is a fixed cost, so it only matters when the cache is sized to the
+last gigabyte.
+
+Found later: it was a stack reservation after all, just not for the kernel's own frame. The
+TMA loads named their destination `.shared::cluster`, ptxas compiled that to the hardware
+copy plus a call to a driver routine for a destination in another block, and the first
+launch of any kernel with that call raised the per-thread stack limit from 1,024 to 14,608
+bytes. The loads name `.shared::cta` now, and at 4096³ the first launch of variant 5 takes
+0 MiB and variant 6 64 MiB, the same as variant 4 (docs/design/hgemm.md, "First-launch
+memory"). I have not rerun the 100K prompt on the default GEMMs: the card has about 14 GiB
+free next to the other processes on it now, less than the weights.
 
 The fix on the engine side: `SparkModel(prefill_variant=4)` runs the prefill GEMMs on
 variant 4 and leaves decode on the default. With that, a 4096-token chunk and

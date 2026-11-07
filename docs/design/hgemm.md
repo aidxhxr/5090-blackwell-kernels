@@ -1429,6 +1429,122 @@ split at 80 rows is faster than the decode kernel at 64 (11.0 against 13.1 µs o
 projection, 19.6 against 23.4 on the DeepSeek expert up). The decode kernel's own split-K
 has float atomics; whether this split should take M ≤ 64 on narrow N is unmeasured.
 
+## First-launch memory
+
+The first launch of variant 5 or 6 used to take about 3.4 GiB of device memory that torch's
+allocator never saw, once per process (llm_models.md found it at prefill, serving.md on the
+grouped GEMM). It was the thread stack, and the TMA loads asked for it.
+
+**Where it goes.** I put `cudaMemGetInfo` around every step of a standalone program (the
+module load through `cudaFuncGetAttributes`, `cudaFuncSetAttribute`, the tensor map encode,
+the launch, the sync, a second launch) and read `cudaDeviceGetLimit` before and after. All of
+it lands at the first launch, before the sync, and the stack limit moves with it: 1,024 bytes
+per thread before, 14,608 after. The printf FIFO (8,355,840) and the malloc heap (8,388,608)
+don't move. Then I built kernels of variant 5's shape (288 threads, 65 KB of dynamic smem,
+one block per SM, grid 170) with one feature each:
+
+| kernel | ptxas stack frame | first launch takes | stack limit after |
+|---|---|---|---|
+| smem stores only | 0 B | 0 MiB | 1,024 |
+| with the 1 KB alignment check and its `__trap` | 0 B | 0 | 1,024 |
+| with an mbarrier: init, plain arrive, `try_wait` | 0 B | 0 | 1,024 |
+| with two `__grid_constant__ CUtensorMap` parameters, unused or prefetched | 0 B | 0 | 1,024 |
+| mbarrier and one `cp.async.bulk.tensor.2d` into `.shared::cluster` | 8 B | 3,386 | 14,608 |
+| mbarrier and one 1-D `cp.async.bulk` into `.shared::cluster`, no tensor map | 0 B | 3,386 | 14,608 |
+| the same two copies into `.shared::cta` | 0 B | 0 | 1,024 |
+
+So it is not the tensor map, the mbarriers, `__trap` or the kernel's own frame (the 1-D copy
+has none and pays the same). It is the copy into `.shared::cluster`, and it doesn't depend on
+the grid: 1, 170 and 1,000 blocks take the same 3,386 MiB.
+
+**Why.** The SASS of the 1-D copy compares the block bits of the destination address with
+`SR_CgaCtaId`. If the box is for this block it runs `UBLKCP`, the hardware copy. If not it
+calls `__cuda_syscall_cp_async_bulk_unicast`, a routine the driver supplies, and the kernel's
+ELF lists it (`EIATTR_EXTERNS`, `EIATTR_SYSCALL_OFFSETS`). The tensor copies call
+`__cuda_syscall_cp_async_bulk_tensor_2d_tile_unicast` and the 3-D twin. Our kernels never
+take that branch, every box goes to the block's own smem, but the call is in the code, and at
+the first launch of a kernel that has one the driver raises the stack limit to 14,608 bytes
+and reserves the memory for it. 3,386 MiB is 13,597 bytes for each of 170 x 1,536 threads,
+close to the limit but not equal to it; I don't know the driver's exact formula. The 8 bytes
+of stack that cuobjdump showed for the TMA kernels (llm_models.md) go away with the call, so
+they were its frame, not the reservation. `.shared::cta` says the destination is this
+block's, and ptxas emits the plain `UTMALDG` or `UBLKCP` with no compare and no call.
+
+**Capping doesn't work.** `cudaDeviceSetLimit(cudaLimitStackSize, 1024)` after the launch
+gives all 3,386 MiB back, and the next launch of the same kernel takes it again and puts the
+limit back at 14,608. So the fix had to be in the kernels.
+
+**The fix.** `tma_load_2d`, `tma_load_3d` and `bulk_load` in `include/spark/common.cuh`, and
+the private bulk load of `cross_entropy.cu`, name `.shared::cta`. In the CMake libraries
+(`cuobjdump -elf`, kernels whose `EIATTR_EXTERNS` has one of the syscalls) that takes it from
+209 of 758 kernels (83 of 511 in `spark_kernels`, 126 of 247 in `spark_kernels_fp8`) to 38:
+
+- the six cluster configurations of `fp8gemm_cl_kernel` and the eight of fp4gemm v2, which
+  use `tma_load_2d_multicast` and have to stay `.shared::cluster`. That one compiles to
+  `__cuda_syscall_cp_async_bulk_tensor_2d_tile_multicast`, and the SASS has no multicast TMA
+  instruction at all, which fits the 20,000 times slower that fp8gemm.md measured for it; I
+  didn't profile that further.
+- the 24 TMA kernels of the attention backward (16 key-tile, 4 persistent, 4 band), whose
+  private 1-D bulk load of the (L, Dv) rows I left as it was. With `.shared::cta` there,
+  backward variant 3 failed three of the four D = 128 cases of `test_attention_bwd` (dQ off
+  by 0.80 against a tolerance of 0.022 at S = 200) and passed every D = 64 one; run as part
+  of the whole file, the S = 200 case hung instead. The copy's SASS has the same `UBLKCP`,
+  destination, barrier and 256-byte size as the hardware branch of the cluster form, so my
+  guess is a race in the kernel that the different schedule exposes, but I haven't found
+  it. Its first launch still takes 3,516 MiB (`attention_with_grad` and a backward at H 8/4,
+  S = 1024, D = 128, measured like the test below).
+
+Registers are unchanged (variant 5's two configurations 94 and 126, the grouped GEMM's 101
+to 158) and the stack frame goes from 8 bytes to 0. A `.shared::cta` load is still right
+inside a cluster, since it names the block's own smem: fp8gemm's configurations 11 (1x1) and
+12 (2x1) with `SPARK_FP8GEMM_NOMC=1`, plain loads under cluster launches, match cuBLASLt bit
+for bit at 4096x4096x1024. The parity tests of the TMA kernels pass (test_gemm,
+test_grouped_gemm, test_attention, test_attention_window, test_attention_fp8,
+test_attention_bwd, test_cross_entropy, test_fp8gemm, test_fp4gemm, test_moe_layer,
+test_batch_invariant).
+
+The library's entry points, one per process, `cudaMemGetInfo` around the first call and its
+sync (hgemm at 4096³, the grouped GEMM at T = 2048, E = 8, N = 2048, K = 1024, attention at
+B = 1, H_q = 16, H_kv = 8, S = 4096, D = 128, causal):
+
+| first call | before | after |
+|---|---|---|
+| hgemm variant 4 (cp.async, the control) | 64 MiB, stack 1,024 | 64 MiB, stack 1,024 |
+| hgemm variant 5 | 3,496 MiB, stack 14,608 | 0 MiB, stack 1,024 |
+| hgemm variant 6 | 3,560 MiB, stack 14,608 | 64 MiB, stack 1,024 |
+| grouped GEMM bf16 | 3,508 MiB, stack 14,608 | 12 MiB, stack 1,024 |
+| attention variant 3 (cp.async) | 110 MiB, stack 1,024 | 0 MiB, stack 1,024 |
+| attention variant 5 | 3,506 MiB, stack 14,640 | 0 MiB, stack 1,024 |
+
+The 64 MiB of variants 4 and 6 are there with or without the fix (the Stream-K kernels
+allocate their fixup slots at the first call). The 110 MiB of attention variant 3 is a
+second, smaller cost of the same thing: variant 3 has no bulk copy, but it lives in
+`attention.cu` next to variants 4 to 6, and loading a module with the syscalls in it took 110
+MiB before and nothing after. 3,496 = 3,386 + 110.
+
+`tests/test_first_launch.py` runs hgemm 5 and 6, the grouped GEMM, attention 5 and
+cross-entropy variant 3 with its backward, each in a fresh process, and requires the first
+call to take under 256 MiB outside torch's allocator. Against an older build of the
+extension (from before the fix, without the grouped GEMM and cross-entropy) the probe
+measures 3,496 to 3,520 MiB on the three ops it has; with the fix 0 to 134 MiB, the most on
+cross-entropy (lazy module loading and its workspaces; I didn't split it further).
+
+Speed, one lock hold, before and after alternated twice, mean of the two medians:
+
+| kernel, shape | before ms | after ms |
+|---|---|---|
+| hgemm v5, 4096³ | 0.5736 | 0.5756 |
+| hgemm v6, 4096³ | 0.5550 | 0.5552 |
+| hgemm v6, 8192³ | 4.5517 | 4.5446 |
+| hgemm v6, 4096×11008×4096 | 1.5262 | 1.5285 |
+| grouped bf16, qwen3 T = 2048 | 0.3039 | 0.3039 |
+| grouped bf16, mixtral T = 2048 | 2.2748 | 2.2707 |
+| attention v5, H 32/8, S = 4096, D = 128, causal | 0.5894 | 0.5877 |
+| fp8gemm v3, 8192³ | 1.4952 | 1.4940 |
+
+Every row is within 0.4%, in both directions. The fast path was always the hardware copy;
+the fix only takes out a compare and a branch the producer lane never took.
+
 ## Correctness
 
 Inputs uniform in [-1, 1]. cuBLAS (`cublasGemmEx`, `CUBLAS_COMPUTE_32F`, bf16 in/out) is the

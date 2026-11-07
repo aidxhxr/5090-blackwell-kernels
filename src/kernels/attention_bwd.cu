@@ -931,7 +931,10 @@ __device__ __forceinline__ int box_off(int row, int ch) {
     return (ch >> 3) * (ROWS * BOX) + row * BOX + ((ch & 7) ^ (row & 7)) * 8;
 }
 
-// 1-D bulk copy global -> shared, completion counted on `bar` (bytes a multiple of 16).
+// 1-D bulk copy global -> shared, completion counted on `bar` (bytes a multiple of 16). This
+// one stays .shared::cluster, so the kernels that use it still pay the 3.3 GiB first launch
+// of common.cuh's note. With .shared::cta, variant 3 failed three of the four D = 128 cases of
+// test_attention_bwd (dQ 0.80 off at S = 200) and passed at D = 64; I have not found why.
 __device__ __forceinline__ void bulk_load(void* smem_dst, const void* src, unsigned bytes,
                                           uint64_t* bar) {
     asm volatile(

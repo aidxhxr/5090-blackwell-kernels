@@ -477,12 +477,15 @@ the default.
   configuration after the capture allocates that configuration's workspace and moves
   nothing a graph points at.
 
-**Memory.** The grouped GEMM is a TMA kernel at every size, and its first launch takes
+**Memory.** The grouped GEMM is a TMA kernel at every size, and its first launch took
 3.31 GiB of device memory outside torch's allocator, plain or gathered, lazy or eager module
 loading. That is the cost llm_models.md found on hgemm's TMA variants, which the dense
 decode path never launches; the MoE decode path does, at the first step. With about 15 GB
 of the card free (other processes hold the rest), that and the experts left room for two
-layers of either model below.
+layers of either model below. It was the stack the driver reserves for a routine that ptxas
+puts behind a TMA load into `.shared::cluster`; with `.shared::cta` the grouped GEMM's first
+launch takes 12 MiB (docs/design/hgemm.md, "First-launch memory"). The layer counts
+below were measured before that, and I have not rerun them.
 
 **Correctness.** The router logits of the two models agree to a bf16 ulp or so (the MLP
 inputs differ by 0.23% relative in the first layer), so a token whose k-th and k+1-th
