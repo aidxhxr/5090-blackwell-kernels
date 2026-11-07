@@ -426,6 +426,28 @@ registers is all a nine-warp block gets here, and next to 128 accumulators even 
 words spill. Details in [fp8gemm.md, "Model shapes"](docs/design/fp8gemm.md), rows in
 `results/fp8gemm_models.json`.
 
+I ran the four worst of those under Nsight next to cuBLASLt. cuBLASLt runs the same 128x128x128
+tile, whole tiles under cluster launch control and never a K split, so it is the wave-quantized
+one: on the 70B down projection at 256 tokens 42 of the 170 SMs never start. Ours keeps every
+SM busy, and cuBLASLt takes 5 to 23.5% more cycles than ours on three of the four, but the card
+sits at its 600 W limit at these sizes, and the idle SMs buy cuBLASLt a 10% higher clock (2.22
+against 2.00 to 2.03 GHz). The one that was level in cycles, the Qwen 3 32B gate/up, paid for
+the Stream-K split: the tail plus a full wave cut in four K-passes, 13% more L2 bytes in
+fixups, the tensor pipe 80% busy per active cycle against 86%. With tiled scales the queue now
+hands out whole tiles when the last wave is nearly full. That is 9 of the 120 shapes, 1.031x
+faster on them:
+
+| M x N x K | what it is | cuBLASLt MXFP8 | Stream-K | whole tiles |
+|---|---|---|---|---|
+| 256 x 28672 x 8192 | Llama 3 70B gate/up, 256 tokens | 203.5 us | 100.1%, 102.8% | 104.2%, 107.6% |
+| 512 x 25600 x 5120 | Qwen 3 32B gate/up, 512 tokens | 221.6 us | 100.9%, 98.7% | 103.5%, 103.6% |
+| 1024 x 10240 x 8192 | Llama 3 70B qkv | 269.0 us | 98.2%, 104.3% | 103.3%, 106.2% |
+| 128 x 128256 x 4096 | Llama 3 8B lm_head | 356.0 us | 98.6%, 98.1% | 100.8%, 101.0% |
+
+% of cuBLASLt MXFP8 in two pairs of sweeps, `results/fp8gemm_mx_queue.jsonl`. The 90 to 94.5%
+of the 2026-11-05 sweep did not come back today, with or without the change (98.7 to 111.1%
+on those four in every run), and 2 to 4 shapes stay below cuBLASLt, at 98.3 to 99.9%.
+
 ## the fp4 GEMM
 
 fp4 is the densest format the tensor cores here take, and NVFP4 is the one Blackwell inference

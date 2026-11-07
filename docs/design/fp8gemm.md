@@ -1016,6 +1016,120 @@ What lost or is left:
   4096³ (97.8%), 4096x5120x2304 (93.1%) and four at 99.3 to 99.9%. Two run slower than the
   old route (128x128256x4096, 102.3% to 99.8%, and 4096x5120x2304, 93.6% to 93.1%).
 
+### The rows below cuBLASLt, in Nsight
+
+Source: `Knobs::whole_queue` and the queue branch of `plan` in `fp8gemm_tma_sk.cu`, the rows of
+`results/fp8gemm_mx_queue.jsonl` (measured 2026-11-06, `--models --mode=mx --layout=tiled
+--iters=20`; `v3tl-sk` is the same build with `SPARK_FP8GEMM_V3_WHOLE_QUEUE=0`).
+
+I took the four worst of those 11, the Llama 3 70B gate/up and down at 256 tokens and the Qwen
+3 32B ones at 512, and ran each under Nsight Compute next to cuBLASLt: one launch of each from
+`bench_fp8gemm --m --n --k --variant=3 --mode=mx --layout=tiled`, caches flushed,
+`--clock-control base`. ncu's base clock still moved between 1.66 and 1.83 GHz from launch to
+launch, so cycles are what to compare.
+
+**What cuBLASLt runs.** The same kernel on all four:
+`cutlass3x_sm120_bstensorop_s16832gemm_block_scaled_ue8m0xe4m3_ue8m0xe4m3_f32_bf16_bf16_128x128x128_1x1x1_0_tnn_align16`,
+a 128x128x128 tile with no cluster, 384 threads at 168 registers, 82 KB of shared memory, one
+block per SM. The grid is one CTA per tile, (2, 224) at 256 x 28672, under cluster launch
+control: with more tiles than SMs only 170 CTAs start (`sm__ctas_launched`), and each takes
+whole tiles until they run out. It never splits K. So cuBLASLt is the one that is
+wave-quantized. At 256 x 28672 x 8192 its 448 tiles are 2.64 waves and the first SM goes idle
+at 308 K cycles of 470 K; the down projections are 128 and 160 tiles, 0.75 and 0.94 of a
+wave, and 42 and 10 SMs never start.
+
+| | 256 x 28672 x 8192 | 256 x 8192 x 28672 | 512 x 25600 x 5120 | 512 x 5120 x 25600 |
+|---|---|---|---|---|
+| cuBLASLt CTAs (grid) | 170 (448) | 128 | 170 (800) | 160 |
+| our plan | queue: 170 whole, 278 in K-passes | static, 170 ranges | queue: 510 whole, 290 in K-passes | static, 170 ranges |
+| cycles, cuBLASLt / ours | 469.8 K / 447.2 K | 523.3 K / 423.7 K | 495.2 K / 499.2 K | 494.1 K / 459.8 K |
+| cuBLASLt's cycles over ours | 105.1% | 123.5% | 99.2% | 107.5% |
+| SM active least / most, cuBLASLt | 308 K / 459 K | 0 / 510 K | 385 K / 486 K | 0 / 491 K |
+| SM active least / most, ours | 410 K / 442 K | 383 K / 414 K | 461 K / 492 K | 411 K / 438 K |
+| tensor pipe per active cycle, cuBLASLt / ours | 86.5% / 80.9% | 91.3% / 86.5% | 85.6% / 80.0% | 88.3% / 90.1% |
+| L2 bytes, cuBLASLt / ours | 0.98 / 1.11 GB | 0.97 / 1.00 GB | 1.11 / 1.25 GB | 1.09 / 1.11 GB |
+| ours: `lg_throttle` / `membar` stall | 0.51 / 0.33 | 0.09 / 0.07 | 0.56 / 0.31 | 0.11 / 0.08 |
+
+The stalls are cycles per issued instruction; cuBLASLt has 0.00 for both everywhere.
+
+So, the issue's three questions. cuBLASLt picks the tile we pick. Ours is not wave-quantized:
+every SM is busy to within 6 to 8% of the busiest on all four. And the Stream-K split does not
+leave the tail idle; it costs while it runs. On the two gate/up shapes the operands are past L2
+and there are more than two waves, so the plan is the queue: whole tiles, then a Stream-K
+region of the tail plus one full wave, 278 of 448 tiles and 290 of 800, each cut in four
+K-passes (a half, a quarter, an eighth, an eighth) with a fixup of a 64 KB fp32 slot between
+them. That is the 13% more L2 bytes at 512 tokens, the `lg_throttle` and `membar` stalls (the
+slot stores and the `__threadfence` before the flag) that the static shapes barely have, and a
+tensor pipe 80% busy per active cycle against cuBLASLt's 86%. The static shapes, one range per
+block, are ahead in cycles; the gate/ups are level.
+
+**The power cap.** cuBLASLt takes 5.1 to 23.5% more cycles than ours on three of the four, and
+the 120-shape sweeps had the four at 98.7 to 106.5% in time. Both kernels run at the card's 600
+W limit here. nvidia-smi through 6,000 back-to-back launches of each at 256 x 8192 x 28672 read
+600 W for both, and 2.22 to 2.23 GHz for cuBLASLt's 128 blocks against 2.00 to 2.03 GHz for
+ours on 170 SMs; that run had ours at 104.0% in time. Under the cap a busy SM costs watts and
+an idle one does not, so cuBLASLt's 42 idle SMs buy it 10% more clock, and a cycle saved by
+keeping more SMs busy is worth less than it looks.
+
+**Whole tiles from the queue.** So give the gate/ups cuBLASLt's schedule. Forced on all 31
+queue-mode shapes (`SPARK_FP8GEMM_V3_MIN_PASS=100000`, one pass per tile, one pair of sweeps)
+it lost, 0.973x on the geometric mean of the 31: from 1.048x at 256 x 28672 x 8192 to 0.803x at
+1024 x 8192 x 28672, whose 512 tiles are 3.01 waves and become 4. The rows fit a Stream-K tile
+costing about a quarter of a whole one on top, so the rule takes whole tiles when the last wave
+leaves fewer than a quarter as many blocks idle as there are Stream-K tiles, and K is at most
+64 k-steps (the one deeper shape it would take, 2048 x 5120 x 25600, ran 0.990x). Tiled MX mode
+only, the only mode I measured it in; `SPARK_FP8GEMM_V3_WHOLE_QUEUE` is -1 for the rule, 0
+never, 1 always. It takes 9 of the 120 shapes. Two pairs of sweeps, Stream-K and rule back to
+back, the second pair in the other order:
+
+| M x N x K | what it is | cuBLASLt MXFP8 | Stream-K | whole tiles | speedup |
+|---|---|---|---|---|---|
+| 128 x 28672 x 8192 | Llama 3 70B gate/up, 128 tokens | 169.4 us | 106.6%, 105.6% | 108.6%, 108.6% | 1.021x |
+| 256 x 28672 x 8192 | same, 256 tokens | 203.5 us | 100.1%, 102.8% | 104.2%, 107.6% | 1.033x |
+| 1024 x 10240 x 8192 | Llama 3 70B qkv | 269.0 us | 98.2%, 104.3% | 103.3%, 106.2% | 1.060x |
+| 512 x 25600 x 5120 | Qwen 3 32B gate/up, 512 tokens | 221.6 us | 100.9%, 98.7% | 103.5%, 103.6% | 1.044x |
+| 2048 x 25600 x 5120 | same, 2048 tokens | 840.1 us | 100.9%, 101.4% | 104.3%, 105.1% | 1.044x |
+| 4096 x 25600 x 5120 | same, 4096 tokens | 1.74 ms | 103.6%, 103.6% | 103.0%, 103.1% | 1.001x |
+| 128 x 128256 x 4096 | Llama 3 8B lm_head | 356.0 us | 98.6%, 98.1% | 100.8%, 101.0% | 1.028x |
+| 256 x 128256 x 4096 | same | 439.5 us | 100.0%, 103.2% | 104.9%, 104.4% | 1.041x |
+| 4096 x 128256 x 4096 | same | 7.24 ms | 106.3%, 106.0% | 107.1%, 106.8% | 1.008x |
+
+cuBLASLt's time is the first sweep's; the speedup is ours over both pairs. All 9 move up,
+1.031x on the geometric mean; the other 111 run the same plan as before and read 1.000x (the 22
+other queue-mode shapes) and 0.997x (the 89 static ones). Over the 120 that is 120.8% to 120.8%
+and 119.6% to 120.2%, inside the sweep-to-sweep noise, with 6 and 5 shapes below cuBLASLt
+before and 4 and 2 after.
+
+Nsight again with the rule, against cuBLASLt in the same session: at 512 x 25600 x 5120, 473.7
+K cycles (499.2 K before), 103.8% of cuBLASLt's, the tensor pipe 88.9% busy per active cycle
+(80.0%), 1.13 GB of L2 (1.25). At 256 x 28672 x 8192 the cycles barely move, 444.1 K against
+447.2 K, because the tail now idles a third of a wave the way cuBLASLt's does; but the SMs are
+active 379 K cycles on average instead of 427 K, the tensor pipe is 91.1% busy per active cycle
+(80.9%), L2 moves 1.00 GB (1.11), `membar` goes to 0 and `lg_throttle` to 0.17 (the bf16
+stores), and in time it is the 1.033x above. Under the cap the idle tail is free and the fixups
+were not.
+
+**What did not come back.** The 90.2 to 94.5% of the 2026-11-05 sweep. The same build without
+the rule today: 102.2 to 111.1% on the four in the single-shape bench (Gaussian inputs
+quantized with the MX recipe, where the model sweep fills uniform e4m3 and random scales), 98.7
+to 110.2% in the 11-05 configuration (`--tiles`, both layouts, on those two weights only), 98.7
+to 106.5% over three 120-shape sweeps. The other three named in the issue, 1024 x 14336 x 4096,
+4096³ and 4096 x 5120 x 2304, static shapes the rule does not touch, read 103.3 to 107.7% in
+all five sweeps of today. Ours took 222.9 us at 256 x 28672 x 8192 in the 11-05 sweep and 195
+to 204 us today, against a cuBLASLt at 211 us then and 201 to 212 us today; I don't know what
+was different in that session, and I did not try to reproduce it.
+
+**What is left.** With the rule, the shapes below cuBLASLt are 4 and 2 in the two sweeps, at
+98.3 to 99.9%, and which ones changes between sweeps. Two are in both: 256 x 4096 x 14336
+(98.3%, 99.5%) and 256 x 8192 x 28672 (99.9%, 99.6%), where cuBLASLt takes 23.5% more cycles
+and a 10% higher clock. Both are down projections at 256 tokens on static ranges, 64 and 128
+tiles over 170 blocks. Copying cuBLASLt's grid there does not help: with
+`SPARK_FP8GEMM_V3_MIN_SHARE=100000` the plan runs one block per tile at 256 x 8192 x 28672
+(128) and 512 x 5120 x 25600 (160), and 128 blocks of half tiles at 256 x 4096 x 14336 (its
+even two-way split for a card mostly idle), and against the 170 ranges that ran 1.008x, 0.983x
+and 0.943x, two runs each in the single-shape bench. The idle SMs are cheap for cuBLASLt, not
+free time for us; what is left there is the energy per tile, which I have not looked at.
+
 ### The engine
 
 `quant.FP8Linear` (the engine's `fp8` and `fp8-tok` weights) calls `sk.fp8gemm` with the
@@ -1054,7 +1168,8 @@ Open:
   with tiled scales") takes 4096³ from 98.5% to 107.2% of cuBLASLt MXFP8 and the model
   shapes from 111.8% to 118.1%. Open: the 128x256 tile, which the per-tensor rule runs on the
   large grids and MX mode cannot hold in the 168 registers a nine-warp block gets (an eight-warp
-  block, the producer's lane inside a consumer warp, would get 255); the 11 shapes still below
-  cuBLASLt; per-channel bf16 scales in the epilogue are a smaller rung.
+  block, the producer's lane inside a consumer warp, would get 255); the 2 to 4 shapes still
+  below cuBLASLt at 98.3 to 99.9% ("The rows below cuBLASLt, in Nsight": the power cap, not
+  the schedule); per-channel bf16 scales in the epilogue are a smaller rung.
 - **The decode launch.** 13.2 µs single launch against 11.3 back to back for 16 MB: the 2 µs
   that CUDA graphs or a persistent decoder kernel would take back.

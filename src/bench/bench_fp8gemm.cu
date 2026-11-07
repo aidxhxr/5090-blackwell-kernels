@@ -5,6 +5,7 @@
 //   ./bench_fp8gemm --m=4096 --n=4096 --k=4096 --variant=1 --iters=50 --mode=mx
 //   ./bench_fp8gemm --models[=llama3-8b] [--ms=128,512] [--tiles] [--mode=mx]   # model shapes
 //   ./bench_fp8gemm --mode=mx --layout=tiled  # MX scales in fp8gemm_mx's tiled layout
+//   SPARK_FP8GEMM_V3_WHOLE_QUEUE=0 ./bench_fp8gemm --models --tag=-sk  # rows "MxNxK@v3tl-sk"
 //
 // C = scale_a * scale_b * A[M,K] * Bt[N,K]^T, e4m3 in, bf16 out. cuBLASLt's fp8 path only takes
 // this layout (A row-major, B column-major, both K-contiguous), so the reference is timed on
@@ -474,7 +475,7 @@ struct ModelCand {
 // One weight at every M of `ms`. Returns false on a correctness failure.
 bool run_models_weight(cudaStream_t stream, const spark::bench::ModelWeight& w,
                        const std::vector<int>& ms, bool mx, bool tiles, int iters, bool rows_l,
-                       bool tiled_l) {
+                       bool tiled_l, const std::string& tag) {
     const int N = w.N, K = w.K, KB = K / 32;
     const int max_m = *std::max_element(ms.begin(), ms.end());
     const size_t nB = static_cast<size_t>(N) * K;  // bytes
@@ -622,7 +623,7 @@ bool run_models_weight(cudaStream_t stream, const spark::bench::ModelWeight& w,
             row.kernel = "fp8gemm_models";
             row.dtype = mx ? "mxfp8" : "e4m3";
             row.variant = c.variant;
-            row.shape = shape + "@" + c.label;
+            row.shape = shape + "@" + c.label + tag;
             row.median_ms = t.median_ms;
             row.min_ms = t.min_ms;
             row.tflops = flops / (t.median_ms * 1e-3) / 1e12;
@@ -696,6 +697,8 @@ int run(int argc, char** argv) {
     bool all_ok = true;
     if (args.has("models")) {
         // --models[=<model substring>] [--ms=128,256,...] [--mode=tensor|mx|both] [--tiles]
+        // [--tag=<suffix>]: the suffix goes on every row's label, to tell sweeps of one build
+        // under different SPARK_FP8GEMM_V3_* knobs apart.
         const std::string filter = args.get("models", "1");
         const std::vector<int> ms =
             spark::bench::parse_int_list(args.get("ms", "128,256,512,1024,2048,4096"));
@@ -705,7 +708,7 @@ int run(int argc, char** argv) {
                 if (filter != "1" && std::string(w.model).find(filter) == std::string::npos)
                     continue;
                 all_ok = run_models_weight(stream, w, ms, mx, args.has("tiles"), iters, rows_l,
-                                           tiled_l) &&
+                                           tiled_l, args.get("tag", "")) &&
                          all_ok;
             }
         }
