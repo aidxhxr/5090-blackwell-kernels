@@ -40,10 +40,10 @@
 //              and K/V stages as the next loads of one running sequence, so the block prologue
 //              is paid once per SM and the next item's Q is in flight during the current one's
 //              last tiles. Tail split kept for the non-causal shapes; the same decode paths.
-//   variant 6: variant 5 with 128-key tiles: K and V in stages of their own, the producer on
-//              lane 0 of warp 0 polling the empty barriers at D = 128 (the fragments do not fit
-//              the nine-warp register cap), the causal diagonal cut to the 16-key blocks each
-//              warp's rows reach. The same decode paths.
+//   variant 6: variant 5 with 128-key tiles: K and V in stages of their own, the producer
+//              back on lane 0 of warp 0 at D = 128 with variant 5's blocking inline scheme (the
+//              fragments do not fit the nine-warp register cap), the causal diagonal cut to the
+//              16-key blocks each warp's rows reach. The same decode paths.
 //
 // Local attention (attention_window_bf16): a sliding window of W keys, causal and aligned to
 // the last key (query i at key position i + S_kv - S_q sees keys p - W < j <= p), and sink
@@ -2069,8 +2069,8 @@ void launch(const bf16* Q, const bf16* K, const bf16* V, bf16* O, int B, int H_q
 // rows x 128 keys (16 n8 accumulators, 64 registers), so the work around the two products (the
 // row max and its shuffles, the O rescale, the barrier waits) is paid once per 128 keys instead
 // of once per 64, and each product phase is twice as long for the other warp of the scheduler
-// to hide a softmax under. It measured slower than variant 5 on every prefill shape, 3 to 5% at
-// D = 128 and 10% at D = 64 (docs/design/attention.md, "Variant 6"), so the default stays
+// to hide a softmax under. It measured slower than variant 5 on every prefill shape, 4 to 6% at
+// D = 128 and 11% at D = 64 (docs/design/attention.md, "Variant 6"), so the default stays
 // variant 5 (attention_default_variant). What changes to make room:
 //   * K and V are separate loads into stages of one 128 x D tile each (32 KB at D = 128, the
 //     size of the Q tile), so the three stages of variant 5 still fit the 99 KB: the load
