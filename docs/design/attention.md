@@ -1414,9 +1414,10 @@ at 16K and 1024: the queue already evens the items out, and the split adds a com
 - **Decode with more rows per K/V head** (8 heads x 8 tokens, speculative decoding) on the
   flash-decoding kernel: two or four m16 tiles per warp instead of one, which the register
   budget (64 accumulators per m16 tile at `D = 128`) allows twice over.
-- **Local attention, the rest.** The backward takes no window or sinks, so training a
-  gpt-oss-style model is not covered (the sink's own gradient is
-  `-sum_i P_i,sink (dO_i . O_i)`, one more row reduction). `attention_fp8` has no window.
+- **Local attention, the rest.** The backward takes the window and the sinks, d(sinks)
+  included, and under windows of up to 128 keys finishes dQ without the fp32 round trip
+  ([attention_bwd.md](attention_bwd.md#the-band-kernel-dq-without-the-round-trip)).
+  `attention_fp8` has no window.
   The engine and the layer run Llama-shaped models only, so no model here uses the options
   yet. At `W = 128` the kernel is at 89% of the copy roof on `D = 128` but about 73% on
   gpt-oss's `D = 64` rows, where a key costs half the products and the same softmax, so it

@@ -14,10 +14,12 @@ DRAM, as bench_attention does. Paged decode (`sk.paged_decode(window=W)`) agains
 batch without a window: 16 sequences of 32K tokens and the ragged mix of
 docs/design/serving.md (one 32K sequence among fifty of 500). The backward (`--only=bwd`,
 "attention_bwd_window" rows): `sk.attention_bwd(window=W)` at 8K and 32K tokens with windows
-of 128, 512 and 4096 against our own full causal backward, torch's full causal backward
-(flash, through SDPA) and `torch.autograd.grad` through the compiled flex_attention with the
-window's block mask; gpt-oss's heads with sinks against ours without them (flex's sink
-correction is on the output and has no backward of its own).
+of 128, 256, 512, 1024 and 4096 against our own full causal backward, torch's full causal
+backward (flash, through SDPA) and `torch.autograd.grad` through the compiled flex_attention
+with the window's block mask; gpt-oss's heads with sinks against ours without them (flex's
+sink correction is on the output and has no backward of its own). Each row records
+SPARK_ATTN_BWD_BAND ("band"; null when unset, the default rule): run once as is and once
+with SPARK_ATTN_BWD_BAND=0 for the path before the band kernel.
 
     PYTHONPATH=python python scripts/bench_attention_window.py
         [--only=prefill|decode|sinks|paged|bwd] [--s=4096,16384,32768]
@@ -33,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import sys
 from pathlib import Path
@@ -293,7 +296,8 @@ def bwd(sk, add, S, windows, Hq=32, Hkv=8, D=128, sink=False):
         ours_ms = time_ms(ours)
         flops = 10.0 * Hq * pairs(S, S, W) * D
         add(dict(kernel="attention_bwd_window", shape=f"b1_hq{Hq}_hkv{Hkv}_s{S}_d{D}_causal",
-                 window=W, sinks=sink, ours_ms=ours_ms, ours_full_ms=full_ms, flex_ms=flex_ms,
+                 window=W, sinks=sink, band=os.environ.get("SPARK_ATTN_BWD_BAND"),
+                 ours_ms=ours_ms, ours_full_ms=full_ms, flex_ms=flex_ms,
                  flash_full_causal_ms=flash_full_ms, ours_nosink_ms=nosink_ms,
                  tflops=flops / ours_ms / 1e9,
                  flex_tflops=flops / flex_ms / 1e9 if flex_ms else None, max_err_vs_flex=err))
@@ -334,7 +338,7 @@ def main() -> int:
         paged(sk, add, [32768] * 16, 128, Hq=64, Hkv=8, D=64, sink=True)
     if args.only in (None, "bwd"):
         for S in (8192, 32768):
-            bwd(sk, add, S, (128, 512, 4096))
+            bwd(sk, add, S, (128, 256, 512, 1024, 4096))
         bwd(sk, add, 8192, (128,), Hq=64, Hkv=8, D=64, sink=True)
     with open(args.out, "a") as f:
         for r in rows:

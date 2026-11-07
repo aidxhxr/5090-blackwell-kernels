@@ -67,7 +67,8 @@ kernel unchanged and the preprocess 11 µs faster.
 | 3 | variant 2's tile and products with the block barrier gone: Q, dO and (L, Dv) by TMA into three mbarrier stages issued by one lane, and the dS double buffer handed between warps by full / empty mbarriers | the barrier that started all eight warps in phase, so both warps of a scheduler reached their exponentials and dS at once |
 
 `deterministic=True` (variants 1 to 3) replaces the dQ atomics with a separate pass; its own
-section is below.
+section is below. Under a window of up to 128 keys variant 3 does neither: the band kernel
+finishes dQ inside the key-tile kernel, in both modes (the end of the window section).
 
 ### Variant 0
 
@@ -590,10 +591,152 @@ against our 66 to 214, and the gap is widest at the wide window, where ours runs
 kernel's rate. The gradients agree with flex's to 3.1e-2 at most (the forward check's
 tolerance, 3% of the largest entry; bf16 outputs on both sides). On gpt-oss's heads (64/8,
 D = 64, W = 128) with the sinks, 0.636 ms against 0.623 without them, the sink's gradient
-included. What remains for the window is the per-block start and the dQ
-round trip, both of which the full causal shapes hide: a window-aware choice between the two
-dQ modes would take the deterministic pass at `W <= 128`, and the zeroing plus conversion of
-the accumulator, about 1 GB at 32K tokens, is a third of that row's time.
+included. What remained for the window was the per-block start and the dQ round trip, both of
+which the full causal shapes hide. The band kernel below takes the round trip out at
+`W <= 128`.
+
+### The band kernel: dQ without the round trip
+
+At `W = 128` and 32K tokens the backward took 2.61 ms and the key-tile kernel was only 1.39 of
+it. nsys, 32/8 heads, `D = 128`, variant 3:
+
+| path | preprocess | dQ | key-tile kernel | total |
+|---|---|---|---|---|
+| atomic | 0.696 ms, the zeroing included | 0.511 the conversion | 1.389 | 2.61 |
+| deterministic | 0.355 | 1.215 the dQ pass | 0.897 without the dQ product | 2.50 |
+| band | 0.355 | | 1.598 | 1.95 |
+
+(Totals are the bench's medians, launch gaps included.)
+
+The fp32 accumulator is 512 MB at 32K tokens: zeroed, added into twice, read back and
+converted. The deterministic pass has none of that, but it recomputes S and dP in 128-row
+blocks over 64-key tiles, and under a 128-key window about half the pairs it computes are
+masked.
+
+Under a window of at most 128 keys a 32-row query tile sees the keys of two key tiles (three
+when `S_q < S_kv` shifts the diagonal off the 128-key grid). So its dQ is two products, and if
+the same block runs both key tiles one after the other, the first product can wait in memory
+nobody else touches until the second one arrives. That is the band kernel
+(`bwd_kv_band_kernel`: variant 3's tile, products and mbarrier rings, the persistent
+kernel's loop over items):
+
+- a block owns a contiguous range of key tiles, K/V head major, and runs them in order;
+- a query tile's dQ product adds the carry, the fp32 sum of the earlier key tiles' products,
+  from a slot of a block-private buffer that the same thread wrote, so no fence or barrier
+  has to order it. On the last key tile the query tile sees, the sum goes out as bf16 dQ;
+  before that, back to the slot;
+- a block whose range starts inside a head first runs a halo: the key tiles before its range
+  that its first query tiles see (one at `W <= 128`), for those query tiles only, dK and dV
+  dropped. The block before drops those query tiles' dQ instead of storing it, so every
+  query tile is finished by exactly one block and no block waits on another;
+- dK and dV of a key tile belong to one block and go out as bf16, no split.
+
+Every dQ element is a sum in key-tile order on one thread, so both modes give the same bits
+every run, and `deterministic=True` costs nothing here. The halo is the price: at `W = 128`,
+16 Q-tile iterations per block, a twenty-fourth of a block's work at 32K tokens and a third
+at 4K.
+
+How it got from a first version slower than the old path to the table above (the whole
+backward, `W = 128`):
+
+| step | 32K ms | 8K ms |
+|---|---|---|
+| first version: walk head major, each carry loaded where it is added | 2.519 | 0.718 |
+| walk query tile major, dead carry lines discarded, carry prefetched to L1 | 2.244 | 0.669 |
+| the whole carry loaded at the top of the dQ product | 1.987 | 0.596 |
+| the L1 prefetch taken out | 1.942 | 0.583 |
+
+(The last row still had the L2 policies below on; off, it measured the same.)
+
+The first version's kernel took 2.17 ms against the atomic kernel's 1.39. Nsight: an L2 hit
+rate of 34% against 51%, and 8 cycles stalled on the long scoreboard per issued instruction
+against 1.1. Head major, a carry is written in one key tile and read back about one key tile
+later, some 170 µs, and the hit rate says most carries had left the L2 by then. With the
+group's heads inner the read comes 16 iterations after the write, half a key tile, the least
+an order inside a key tile allows. A slot's lines are dead after its last read, and without
+`discard.global.L2` on them they went back to DRAM: 2.03 ms against 1.94 at 32K. Then the
+loads: the compiler had each of the eight carry loads of a dQ product wait for the store
+before it, since it cannot tell the bf16 dQ store from the next slot, and the adds waiting on
+them were a quarter of all stall samples. Loaded together at the top of the dQ product they
+are in flight under its 32 `mma`. The L1 prefetch never landed: the kernel's global loads hit
+L1 9.7% of the time, since 102 KB of shared memory leaves about 25 KB of L1, and taking the
+prefetch out saved its instructions, 3 to 4%. Loading the carry into registers a whole tile
+ahead instead spilled (36 bytes stored, 68 loaded per thread) and took 2.04 ms.
+
+Two more, one taken out again and one kept because it measured:
+
+- **L2 policies**: `evict_last` on the carry stores, `evict_first` on the dQ, dK and dV
+  stores and on the last load of a Q and dO tile. DRAM traffic went from 1.39 GB read and
+  765 MB written to 1.07 GB and 511 MB, the hit rate from 59% to 69%, and the time did not
+  move (with and without, two rounds each: 1.936 / 1.932 against 1.934 / 1.934 ms at 32K,
+  0.586 / 0.585 against 0.582 / 0.581 at 8K). The kernel is not waiting on DRAM, so they
+  are out.
+- **The cut.** Blocks get their ranges by bisection on the largest block's Q-tile
+  iterations, its halo included, instead of an even share of the tiles: 3% faster at 6K
+  tokens (0.473 against 0.488 ms, 2 or 3 tiles a block, most with a halo), 1% at 16K, the
+  same at 8K and 32K. At 6K it is the difference between a win and a tie.
+
+The shipped kernel is 1.598 ms at 32K, 0.21 ms more than the atomic key-tile kernel, for the
+0.85 ms of zeroing and conversion it removes. It runs the halo's 4% more iterations, and its
+dQ product still waits on the carry: 13% of the stall samples are warps waiting on a dS^T
+buffer's empty barrier, that is on the slowest warp's dQ product two tiles back, against 7%
+in the atomic kernel. DRAM: 1.44 GB read, 787 MB written.
+
+`bench_attention_bwd`, variant 3, the old path (`SPARK_ATTN_BWD_BAND=0`) in both modes against
+the band (`=1` forces it above 128 keys), 32/8 heads, `D = 128`, ms, medians of 30 at 8K and
+20 at 32K (10 from 1024 keys), every row checked against the CPU reference:
+
+| W | 8K atomic | 8K deterministic | 8K band | 32K atomic | 32K deterministic | 32K band |
+|---|---|---|---|---|---|---|
+| 128 | 0.636 | 0.656 | **0.588** | 2.608 | 2.496 | **1.951** |
+| 256 | 0.793 | 0.901 | 0.925 | 3.135 | 3.538 | 3.403 |
+| 512 | 1.143 | 1.436 | 1.772 | 4.569 | 5.644 | 5.819 |
+| 1024 | 1.846 | 2.478 | 4.124 | 7.460 | 9.940 | 11.454 |
+| 4096 | 4.942 | 7.105 | 35.50 | 23.94 | 34.77 | 60.09 |
+
+1.34x the atomic path at 32K and 1.08x at 8K, 1.28x and 1.12x the deterministic pass. At 256
+keys a query tile sees three key tiles and a block's halo is as much work as one of its own
+tiles; from there the halo grows with the window and the band loses badly. The band times
+are the same in both modes (1.955 ms deterministic at 32K, 0.588 at 8K).
+
+By length at `W = 128` (key tiles of 128 per SM on 170 SMs):
+
+| shape | tiles / SM | atomic | deterministic | band |
+|---|---|---|---|---|
+| 32/8 heads, 4K tokens | 1.5 | **0.314** | 0.345 | 0.327 |
+| 32/8 heads, 2 x 2K | 1.5 | **0.316** | 0.348 | 0.326 |
+| 32/8 heads, 6K | 2.3 | 0.488 | 0.531 | **0.473** |
+| 32/8 heads, 8K | 3 | 0.636 | 0.656 | **0.588** |
+| 32/8 heads, 16K | 6 | 1.312 | 1.271 | **1.053** |
+| 32/8 heads, 32K | 12 | 2.608 | 2.496 | **1.951** |
+| 64/8 heads, D = 64, sinks, 4K | 1.5 | **0.324** | 0.393 | 0.325 |
+| the same, 8K | 3 | 0.622 | 0.741 | **0.570** |
+| the same, 16K | 6 | 1.274 | 1.501 | **1.031** |
+| 32/8 heads, 4K, W = 64 | 1.5 | 0.270 | 0.270 | 0.234 |
+
+So the rule (`use_band`): a window of at most 128 keys, and in the atomic mode at least two
+key tiles per SM; the deterministic mode takes the band at any length, since it beat the
+deterministic pass on every row. `SPARK_ATTN_BWD_BAND` forces it either way. What the rule
+leaves: `W = 64` at 4K, where the halo is half as big and the band takes 13% less time, but
+the tile count keeps the atomic path.
+
+Against flex (`scripts/bench_attention_window.py --only=bwd`, run as is and with
+`SPARK_ATTN_BWD_BAND=0`, one session; ms):
+
+| W | 8K before | 8K now | flex | flex / now | 32K before | 32K now | flex | flex / now |
+|---|---|---|---|---|---|---|---|---|
+| 128 | 0.642 | **0.587** | 1.120 | 1.91x | 2.616 | **1.938** | 4.339 | 2.24x |
+| 256 | 0.793 | 0.795 | 1.486 | 1.87x | 3.143 | 3.141 | 5.895 | 1.88x |
+| 512 | 1.142 | 1.143 | 2.224 | 1.95x | 4.577 | 4.575 | 8.998 | 1.97x |
+| 1024 | 1.846 | 1.845 | 3.654 | 1.98x | 7.500 | 7.498 | 15.096 | 2.01x |
+| 4096 | 4.915 | 4.907 | 10.097 | 2.06x | 24.06 | 24.06 | 49.55 | 2.06x |
+
+The rows from 256 keys up run the same path as before and match it to 0.3%. The gradients
+agree with flex's as closely as before (7.8e-3 at 8K, 3.1e-2 at 32K). gpt-oss's
+heads at 8K with sinks: 0.585 ms against 0.637 before, 0.574 without the sinks against 0.623.
+The no-window path did not move: old and new binary interleaved in one hold, the four causal
+rows of the earlier table within 0.6% in the first round and 0.1% in the second (1.678 /
+1.678, 6.350 / 6.349, 1.723 / 1.725 and 0.807 / 0.807 ms).
 
 ## What remains
 
@@ -601,7 +744,15 @@ the accumulator, about 1 GB at 32K tokens, is a third of that row's time.
   conversion (43 µs) are 5 to 6% of a causal 4096 backward. Finishing dQ inside the kernel
   lost to `__threadfence()`; what has not been tried is a release-ordered counter
   (`red.release.gpu`) or a persistent grid where a block that finished a key tile can finish
-  the dQ tiles whose last contributor it was without a fence per tile.
+  the dQ tiles whose last contributor it was without a fence per tile. Under windows of up
+  to 128 keys the band kernel finishes it with neither, since a query tile's key tiles run
+  on one block; a full causal row sees every key tile before it, so that does not carry over.
+- **The band, next.** The preprocess is now 0.355 of the 1.95 ms at 32K tokens and
+  `W = 128`, reading O and dO once more only for `Dv = dO . O`; the band kernel could form
+  `Dv` for the query tiles it first touches, a key tile ahead. A rule from the halo's share
+  of a block's work instead of the tile count would take `W = 64` at 4K. From 129 to 256 keys
+  the halo is a whole key tile per block; a halo that runs S, dP and the dQ product, three
+  of the five, and not the dV and dK it drops, has not been built.
 - **Deterministic with the split.** The deterministic mode turns the split off because the
   slices add. Slices that each write their own fp32 partial, summed in a fixed order by the
   conversion kernel, would keep it bitwise reproducible and bring the non-causal and GQA rows
