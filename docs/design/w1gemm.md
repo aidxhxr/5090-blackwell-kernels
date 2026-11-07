@@ -344,7 +344,7 @@ Twenty launches between one event pair, us per launch: what a decode step's laun
 back to back see, without the 1 to 3 us a lone launch spends being scheduled (the single
 launches above also come in steps of about 2 us on this machine, which the chains do not).
 These are what `results/w1gemm.json` holds since 2026-11-06, and that day's run is within
-2.3% of every v1, v2, v3 and bf16 cell here.
+2.6% of every v1, v2, v3 and bf16 cell here (bf16 at 64 x 5120 x 2304, 2 bits, is the 2.6%).
 
 | shape | bits | M | floor | v1 | v2 | v3 | v3 GB/s | % of roof | bf16 `hgemm` | int4 `w4gemm` | v3 vs int4 |
 |---|---|---|---|---|---|---|---|---|---|---|---|
