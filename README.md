@@ -1235,10 +1235,14 @@ from 64K on.
 | 64K | 9.33 s | 9.83 s | 66.5 | out of memory |
 | 100K | 20.6 s | 19.1 s | 56.5 | out of memory |
 
-100K is the one loss, and it has a cause I haven't found yet. The first launch of the TMA
-GEMMs takes 3.4 GiB of device memory outside torch's allocator. Next to 15 GiB of weights and
-a 12 GiB cache, that doesn't fit, so the 100K run uses the Stream-K GEMM for prefill. Details in
-[docs/design/llm_models.md](docs/design/llm_models.md).
+100K is the one loss. The first launch of the TMA GEMMs took 3.4 GiB of device memory outside
+torch's allocator. Next to 15 GiB of weights and a 12 GiB cache, that doesn't fit, so the 100K
+run uses the Stream-K GEMM for prefill. Details in
+[docs/design/llm_models.md](docs/design/llm_models.md). The 3.4 GiB turned out to be a stack
+reservation for a driver routine that ptxas puts behind every TMA load into `.shared::cluster`;
+the loads name `.shared::cta` now and the first launch takes none of it
+([docs/design/hgemm.md](docs/design/hgemm.md), "First-launch memory"). The 100K row has not
+been rerun on the TMA GEMMs.
 
 ## experiments for the DGX Spark
 

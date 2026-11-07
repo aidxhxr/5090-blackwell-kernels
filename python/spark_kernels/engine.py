@@ -302,9 +302,10 @@ class SparkModel:
 
     `prefill_variant` is the hgemm variant of the prefill GEMMs, the bf16 projections and a
     bf16 lm_head (decode steps and the quantized GEMMs are not affected). 4 keeps the prefill
-    off the TMA kernels, whose first launch takes 3.4 GiB of device memory outside torch's
-    allocator: what a 100K-token cache next to the bf16 weights on a 32 GB card does not
-    have (docs/design/llm_models.md).
+    off the TMA kernels, whose first launch used to take 3.4 GiB of device memory outside
+    torch's allocator, what a 100K-token cache next to the bf16 weights on a 32 GB card did
+    not have (docs/design/llm_models.md). Since the TMA loads name .shared::cta it takes
+    none of that (docs/design/hgemm.md, "First-launch memory").
 
     `batch_invariant` (default: the SPARK_BATCH_INVARIANT environment variable, off) runs
     the kernels whose bits for a row do not depend on the batch: hgemm variant 7 for every
