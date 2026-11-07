@@ -989,11 +989,12 @@ __device__ __forceinline__ void stage_partial(const float (&acc)[C::P_NT][4], un
     }
 }
 
-// Bulk copies with an L2 policy.
+// Bulk copies with an L2 policy. The load names its destination as .shared::cta, like the
+// loads in common.cuh, so the kernel carries no syscall and no 3.3 GiB first launch.
 __device__ __forceinline__ void bulk_load_hint(void* smem_dst, const void* gmem_src, unsigned bytes,
                                                uint64_t* bar, unsigned long long pol) {
     asm volatile(
-        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], "
+        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], "
         "[%1], %2, [%3], %4;\n" ::"r"(smem_u32(smem_dst)),
         "l"(gmem_src), "r"(bytes), "r"(smem_u32(bar)), "l"(pol)
         : "memory");

@@ -386,6 +386,15 @@ __device__ __forceinline__ void mma_e2m1_16864_mxf4(float (&)[4], const unsigned
 // are both satisfied. Consumers wait on the phase parity: a barrier alternates between phase 0
 // and phase 1 every time it completes, and try_wait.parity P returns once the phase with
 // parity P has completed, so the n-th use of a barrier waits on parity n & 1.
+//
+// The loads below name their destination as .shared::cta, not .shared::cluster (all but the
+// multicast one further down, which has to). Given a .shared::cluster address, ptxas on
+// sm_120 checks whether it is this block's and, if not, calls a driver routine
+// (__cuda_syscall_cp_async_bulk_tensor_2d_tile_unicast, its 3d twin, or
+// __cuda_syscall_cp_async_bulk_unicast). A kernel that contains such a call makes the driver
+// raise the per-thread stack limit from 1,024 to 14,608 bytes at its first launch, which on
+// the 5090 takes 3.3 GiB of device memory for the rest of the process
+// (docs/design/hgemm.md, "First-launch memory").
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ unsigned smem_u32(const void* p) {
     return static_cast<unsigned>(__cvta_generic_to_shared(p));
@@ -436,7 +445,7 @@ __device__ __forceinline__ void mbar_wait(uint64_t* bar, unsigned parity) {
 __device__ __forceinline__ void tma_load_2d(void* smem_dst, const CUtensorMap* map, uint64_t* bar,
                                             int c0, int c1) {
     asm volatile(
-        "cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes"
+        "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes"
         " [%0], [%1, {%3, %4}], [%2];\n" ::"r"(smem_u32(smem_dst)),
         "l"(reinterpret_cast<uint64_t>(map)), "r"(smem_u32(bar)), "r"(c0), "r"(c1)
         : "memory");
@@ -447,7 +456,7 @@ __device__ __forceinline__ void tma_load_2d(void* smem_dst, const CUtensorMap* m
 __device__ __forceinline__ void tma_load_3d(void* smem_dst, const CUtensorMap* map, uint64_t* bar,
                                             int c0, int c1, int c2) {
     asm volatile(
-        "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes"
+        "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes"
         " [%0], [%1, {%3, %4, %5}], [%2];\n" ::"r"(smem_u32(smem_dst)),
         "l"(reinterpret_cast<uint64_t>(map)), "r"(smem_u32(bar)), "r"(c0), "r"(c1), "r"(c2)
         : "memory");
@@ -457,7 +466,7 @@ __device__ __forceinline__ void tma_load_3d(void* smem_dst, const CUtensorMap* m
 __device__ __forceinline__ void bulk_load(void* smem_dst, const void* gmem_src, unsigned bytes,
                                           uint64_t* bar) {
     asm volatile(
-        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, "
+        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, "
         "[%3];\n" ::"r"(smem_u32(smem_dst)),
         "l"(gmem_src), "r"(bytes), "r"(smem_u32(bar))
         : "memory");
@@ -544,7 +553,10 @@ __device__ __forceinline__ void mbar_wait_poll(uint64_t* bar, unsigned parity) {
 // tma_load_2d into every block of `mask` (bit i = cluster rank i): the box lands at the same
 // smem offset in each, and each one's barrier at the offset of `bar` counts its bytes.
 // Measured on the RTX 5090: correct, but about 20,000 times slower than tma_load_2d, even with
-// a mask of only the issuing block (docs/design/fp8gemm.md). Do not use it on sm_120.
+// a mask of only the issuing block (docs/design/fp8gemm.md). Do not use it on sm_120. ptxas
+// compiles it to a call to __cuda_syscall_cp_async_bulk_tensor_2d_tile_multicast (the SASS
+// has no multicast TMA instruction), so a kernel that uses it also pays the 3.3 GiB first
+// launch above.
 __device__ __forceinline__ void tma_load_2d_multicast(void* smem_dst, const CUtensorMap* map,
                                                       uint64_t* bar, int c0, int c1,
                                                       unsigned short mask) {
