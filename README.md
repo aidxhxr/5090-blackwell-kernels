@@ -417,13 +417,14 @@ cycles drop 12%: the chunk loads and the shuffles were latency, not issue slots.
 | 4096 x 128256 x 4096 | Llama 3 8B lm_head | 7.29 ms | 99.3% | 107.1% |
 
 % of cuBLASLt MXFP8, both layouts in one session. Over all 120 shapes the geometric mean goes
-from 111.8% to 118.1% (117.7 to 118.3% over four sweeps), and the shapes below cuBLASLt from
-47 to 11; 38 of the 47 from the sweep before are at or above it now. 4096³ runs 723 TFLOPS,
-107.2% of cuBLASLt's MXFP8 kernel, against 665 with row-major scales. What is still below is
-the 70B gate/up and down at 256 tokens and the Qwen 3 32B ones at 512 (90 to 94.5%), three
-more at 93 to 98%, and four at 99.3 to 99.9%. The 128x256 tile still sits out MX mode: 168
-registers is all a nine-warp block gets here, and next to 128 accumulators even six scale
-words spill. Details in [fp8gemm.md, "Model shapes"](docs/design/fp8gemm.md), rows in
+from 111.8% to 118.1% (117.7 to 118.3% over four sweeps), and the shapes below cuBLASLt from 47
+to 11; 38 of the 47 from the sweep before are at or above it now. What is still below is the
+70B gate/up and down at 256 tokens and the Qwen 3 32B ones at 512 (90 to 94.5%), three more at
+93 to 98%, and four at 99.3 to 99.9%. 4096³ is one of the three, at 97.8%: this sweep rotates
+Bt past the L2. The default sweep doesn't, and there 4096³ runs 723 TFLOPS, 107.2% of
+cuBLASLt's MXFP8 kernel, against 665 with row-major scales. The 128x256 tile still sits out MX
+mode: 168 registers is all a nine-warp block gets here, and next to 128 accumulators even six
+scale words spill. Details in [fp8gemm.md, "Model shapes"](docs/design/fp8gemm.md), rows in
 `results/fp8gemm_models.json`.
 
 ## the fp4 GEMM
