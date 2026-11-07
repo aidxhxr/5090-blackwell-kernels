@@ -150,6 +150,8 @@ def check_row_ops(sk, rows, ms):
 
     _check(rows, "add_rmsnorm_fp8_", -1, "4096", add_norm_fp8, ms)
     _check(rows, "swiglu", -1, "2x4096", lambda m: sk.swiglu(x[:m], d[:m]), ms)
+    _check(rows, "swiglu_fp8", -1, "2x4096",
+           lambda m: fp8_bytes(*sk.swiglu_fp8(x[:m], d[:m])), ms)
 
 
 def _cache(lens, fp8, seed=0):

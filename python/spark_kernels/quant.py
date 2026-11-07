@@ -23,7 +23,8 @@ fp8-tok cannot hand fp8gemm a per-row scale (its scales are per tensor), so it m
 the bf16 output by the row scales afterwards: one more launch, and one more bf16 rounding.
 An fp8-tok projection right after a norm can skip its quantizer: `FP8Linear.gemm` takes the
 e4m3 rows and scales that rmsnorm_fp8 and add_rmsnorm_fp8_ write (the engine does this for
-qkv and gate/up), the same bytes fp8_quantize makes of the norm's bf16 output.
+qkv and gate/up), the same bytes fp8_quantize makes of the norm's bf16 output. The down
+projection takes swiglu_fp8's the same way.
 
 `set_batch_invariant(True)` switches a projection to the GEMM rung whose bits for a row do
 not depend on M (docs/design/batch_invariant.md): w4gemm variant 3 for int4, fp8gemm
@@ -128,7 +129,7 @@ class FP8Linear:
     def gemm(self, q: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
         """The product for an activation already quantized the way `__call__` quantizes it:
         (q, s) of fp8_quantize(a, "row") with per_token, or of rmsnorm_fp8 / add_rmsnorm_fp8_
-        (the same bits, the norm before the projection writing them itself), and of
+        / swiglu_fp8 (the same bits, the op before the projection writing them itself), and of
         fp8_quantize(a, "tensor") without."""
         if self.per_token:
             return sk.fp8gemm(q, self.wt, self.one, self.sw, self.variant).mul_(s)

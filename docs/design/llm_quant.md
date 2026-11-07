@@ -244,7 +244,8 @@ perplexity gain I would not pay it; a per-row scale in fp8gemm's epilogue would 
 The quantizer in front of qkv and gate/up is gone, though: the norm before each writes the
 e4m3 rows and their scales itself (`add_rmsnorm_fp8_`, `rmsnorm_fp8`), the same bytes as
 `fp8_quantize`, which takes 17 to 19 us off an 8-layer decode step
-([rmsnorm.md](rmsnorm.md)).
+([rmsnorm.md](rmsnorm.md)). The one in front of down is gone too: `swiglu_fp8` writes those
+rows, 7 to 11 us more ([swiglu.md](swiglu.md)).
 
 ### A CUDA graph bug the engine found
 

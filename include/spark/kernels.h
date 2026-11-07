@@ -77,6 +77,15 @@ void swiglu_strided_f32(const float* gate, const float* up, float* out, int64_t 
 void swiglu_strided_bf16(const __nv_bfloat16* gate, const __nv_bfloat16* up, __nv_bfloat16* out,
                          int64_t rows, int64_t cols, int64_t ld_gate, int64_t ld_up,
                          cudaStream_t stream);
+// The strided form straight into fp8, for an fp8 GEMM with a scale per token (the down
+// projection): q [rows][cols] e4m3 bytes and scales [rows] fp32 are what fp8_quantize(FP8Q_ROW)
+// makes of the bf16 output of swiglu_strided_bf16 on the same gate and up, bit for bit, and
+// that bf16 row is never written. One launch, a block per row with the row in registers:
+// cols % 8 == 0 and cols <= 32768, ld_gate and ld_up multiples of 8, gate and up 16-byte
+// aligned, q 8-byte aligned (q's rows are cols apart).
+void swiglu_fp8_bf16(const __nv_bfloat16* gate, const __nv_bfloat16* up, unsigned char* q,
+                     float* scales, int64_t rows, int64_t cols, int64_t ld_gate, int64_t ld_up,
+                     cudaStream_t stream);
 
 // ---- Row-wise softmax --------------------------------------------------------------------
 // out[r, :] = softmax(x[r, :]) computed in fp32.

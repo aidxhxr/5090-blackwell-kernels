@@ -92,6 +92,18 @@ def swiglu(gate: torch.Tensor, up: torch.Tensor, variant: int = -1) -> torch.Ten
     return _C.swiglu(gate, up, variant)
 
 
+def swiglu_fp8(gate: torch.Tensor, up: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """`fp8_quantize(swiglu(gate, up), "row")` in one launch: (q, scale), q float8_e4m3fn
+    [rows, cols] and scale float32 [rows, 1], the same bits as the two ops (each product is
+    rounded to bf16 as swiglu stores it, then quantized as fp8_quantize does, in registers).
+
+    bfloat16 only. gate and up are 2-D with contiguous rows and may be strided, like the
+    halves `gu[:, :I]` and `gu[:, I:]` of a fused gate|up projection, read in place. cols a
+    multiple of 8 and at most 32768, every row 16-byte aligned.
+    """
+    return _C.swiglu_fp8(gate, up)
+
+
 def softmax(x: torch.Tensor, variant: int = -1) -> torch.Tensor:
     """Softmax over the last dim with fp32 max/sum (online softmax for variants >= 1)."""
     return _C.softmax(x, variant)

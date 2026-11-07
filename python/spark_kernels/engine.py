@@ -332,6 +332,10 @@ class SparkModel:
     # before them (rmsnorm_fp8, add_rmsnorm_fp8_) instead of a bf16 row and fp8_quantize: the
     # same bits, one launch and one pass over the row fewer per norm. False runs the two ops.
     fuse_norm_fp8 = True
+    # fp8-tok: the down projection takes its e4m3 rows and scales from swiglu_fp8 instead of a
+    # bf16 row from swiglu and fp8_quantize: the same bits, one launch and the bf16 row fewer.
+    # False runs the two ops.
+    fuse_swiglu_fp8 = True
 
     def __init__(self, weights: ModelWeights, rope: RoPE, weights_format: str = "bf16",
                  keep_bf16: bool = False, head_format: str = "bf16", prefill_variant: int = -1,
@@ -535,13 +539,21 @@ class SparkModel:
             return lin(sk.rmsnorm(x, w_norm, EPS))
         return lin(sk.add_rmsnorm_(delta, x, w_norm, EPS))  # x += delta, then the norm
 
+    def _swiglu_linear(self, lin, gu: torch.Tensor) -> torch.Tensor:
+        """lin(swiglu(gate, up)) on the two halves of the gate|up output gu; fp8-tok with
+        `fuse_swiglu_fp8` hands lin swiglu_fp8's e4m3 rows (FP8Linear.gemm)."""
+        gate, up = gu[:, :INTERMEDIATE], gu[:, INTERMEDIATE:]
+        if self.fuse_swiglu_fp8 and self.format == "fp8-tok":
+            return lin.gemm(*sk.swiglu_fp8(gate, up))
+        return lin(sk.swiglu(gate, up))
+
     def _layers_quant(self, x: torch.Tensor, b: Batch, cache: PagedKVCache, decode: bool):
         delta = None  # the previous layer's down output, not yet added to x
         for layer, (w, lin) in enumerate(zip(self.w.layers, self.lin, strict=True)):
             qkv = self._norm_linear(lin["qkv"], x, delta, w.attn_norm)
             o = self._attention(qkv, x, b, cache, layer, decode)
             gu = self._norm_linear(lin["gate_up"], x, lin["o"](o), w.mlp_norm)
-            delta = lin["down"](sk.swiglu(gu[:, :INTERMEDIATE], gu[:, INTERMEDIATE:]))
+            delta = self._swiglu_linear(lin["down"], gu)
             if self.trace is not None:
                 self.trace.append(x + delta)
         if delta is not None:
