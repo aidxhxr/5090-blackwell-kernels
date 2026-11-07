@@ -664,6 +664,10 @@ void rope_append_paged_fp8(const __nv_bfloat16* qkv, const float* cos, const flo
 //            during the current one's last tiles. The tail split stays on for the non-causal
 //            shapes, where the queue alone cannot fix 1,024 equal tiles on 170 SMs; same
 //            decode paths as variant 3
+// variant 6: variant 5 with 128-key tiles: K and V in stages of their own, and at D = 128
+//            the producer back on lane 0 of warp 0, because S, O and Q's fragments no longer
+//            fit the nine-warp register cap. Opt-in: slower than variant 5 on every prefill
+//            shape measured (docs/design/attention.md, "Variant 6"); same decode paths
 //
 // `lse`, when not null, receives the natural-log log-sum-exp of every row of scaled scores,
 // fp32 [B, H_q, S_q]: lse_i = log(sum_j exp(q_i . k_j / sqrt(D))), the quantity the backward
@@ -678,8 +682,8 @@ void attention_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_b
                     bool causal, int variant, cudaStream_t stream, float* lse = nullptr,
                     int kv_cap = 0);
 int attention_num_variants();
-// The variant a caller should run, the one variant -1 means in the bindings: 5. A rung above it
-// can then be opt-in.
+// The variant a caller should run: 5. Variant 6 is opt-in, slower than variant 5 on every
+// prefill shape measured, so the highest variant number is not the default here.
 int attention_default_variant();
 bool attention_supports(int S_q, int S_kv, int D, int variant);
 
