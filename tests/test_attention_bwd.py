@@ -366,3 +366,60 @@ def test_attention_bwd_band_matches_variant0(sk, shape):
         assert torch.equal(x, y) and torch.equal(x, z)
     for got, want, name in zip(a, ref, ("dq", "dk", "dv", "dsinks"), strict=False):
         _assert_grad_close(got, want.float(), name)
+
+
+# The band kernel can take L by TMA and form Dv itself, with no preprocess (the default with
+# D = 64, SPARK_ATTN_BWD_BAND_DV=1 forces it, =0 turns it off). Its Dv sums in another order, so
+# it is checked against the preprocess path to the gradient tolerance, and against itself bit
+# for bit. The knob is read once per process, so each
+# side runs in its own: few key tiles and many, a window on and off the tile grid, a shifted
+# diagonal, a window of one key, both head sizes, sinks, both modes, and a length that is no
+# multiple of 4 (L's rows then have no 16-byte stride and the preprocess runs)
+BAND_DV = [(1, 2, 2, 300, 300, 128, 64, 0, 1), (1, 4, 1, 200, 1000, 128, 100, 1, 1),
+           (2, 8, 2, 700, 700, 64, 1, 1, 1), (1, 8, 2, 513, 513, 64, 128, 1, 1),
+           (1, 32, 8, 8192, 8192, 128, 128, 0, 0), (1, 32, 8, 6000, 8200, 128, 100, 1, 0),
+           (2, 16, 4, 6000, 6000, 64, 128, 1, 1)]
+
+_BAND_DV_RUN = """
+import sys
+import torch
+import spark_kernels as sk
+
+grads = []
+for B, Hq, Hkv, Sq, Skv, D, W, sink, det in {shapes!r}:
+    g = torch.Generator(device="cuda").manual_seed(0)
+    q = torch.randn(B, Hq, Sq, D, device="cuda", dtype=torch.bfloat16, generator=g)
+    k = torch.randn(B, Hkv, Skv, D, device="cuda", dtype=torch.bfloat16, generator=g)
+    v = torch.randn(B, Hkv, Skv, D, device="cuda", dtype=torch.bfloat16, generator=g)
+    do = torch.randn(B, Hq, Sq, D, device="cuda", dtype=torch.bfloat16, generator=g)
+    sinks = torch.linspace(-1, 3, Hq, device="cuda") if sink else None
+    out, lse = sk.attention_fwd(q, k, v, causal=True, window=W, sinks=sinks)
+    kw = dict(causal=True, variant=3, window=W, sinks=sinks, deterministic=bool(det))
+    a = sk.attention_bwd(q, k, v, out, do, lse, **kw)
+    b = sk.attention_bwd(q, k, v, out, do, lse, **kw)
+    assert all(torch.equal(x, y) for x, y in zip(a, b, strict=True))
+    grads.append([t.cpu() for t in a])
+torch.save(grads, sys.argv[1])
+"""
+
+
+def test_attention_bwd_band_dv_matches_the_preprocess(sk, tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    if 3 not in _variants():
+        pytest.skip("variant 3 not built")
+    code = _BAND_DV_RUN.format(shapes=BAND_DV)
+    got = {}
+    for dv in ("0", "1"):
+        e = {k: v for k, v in os.environ.items() if not k.startswith("SPARK_ATTN_BWD")}
+        path = tmp_path / f"dv{dv}.pt"
+        subprocess.run([sys.executable, "-c", code, str(path)],
+                       env={**e, "SPARK_ATTN_BWD_BAND_DV": dv}, check=True)
+        got[dv] = torch.load(path)
+    for shape, a, b in zip(BAND_DV, got["0"], got["1"], strict=True):
+        for x, y, name in zip(a, b, ("dq", "dk", "dv", "dsinks"), strict=False):
+            _assert_grad_close(y, x.float(), f"{shape} {name}")
+        if shape[3] % 4:
+            assert all(torch.equal(x, y) for x, y in zip(a, b, strict=True)), shape
