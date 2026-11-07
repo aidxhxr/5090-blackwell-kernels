@@ -18,8 +18,9 @@ help:
 	@echo "bench      run every bench_* binary, write results/*.json and results/env.txt (GPU state)"
 	@echo "bench-cpu  build and run bench_cpu (the Arm cores alone, no CUDA) into results/cpu.json"
 	@echo "results    docs/RESULTS.md, results/headline.md, results/roofline.png"
-	@echo "regress    a fresh bench run against the committed rows, exit 1 on a slowdown:"
+	@echo "regress    a fresh bench run against the committed rows, fails on a slowdown:"
 	@echo "           make regress FRESH=run.json [AGAINST=results/x.json] [REV=HEAD] [THRESHOLD=5]"
+	@echo "           [ARGS='--floor-us 1'] (make exits 2 when it fails; the script itself exits 1)"
 	@echo "python     pip install -e . (PyTorch extension)"
 	@echo "test       install the extension, then pytest parity tests for every variant"
 	@echo "lint       ruff + clang-format --dry-run, same checks as CI"
@@ -56,9 +57,9 @@ REV ?=
 THRESHOLD ?= 5
 regress:
 	@test -n "$(FRESH)" || { echo "usage: make regress FRESH=<bench output>" \
-		"[AGAINST=...] [REV=HEAD] [THRESHOLD=5]" >&2; exit 2; }
+		"[AGAINST=...] [REV=HEAD] [THRESHOLD=5] [ARGS=...]" >&2; exit 2; }
 	python3 scripts/check_regress.py $(FRESH) --threshold $(THRESHOLD) \
-		$(if $(AGAINST),--against $(AGAINST)) $(if $(REV),--rev $(REV))
+		$(if $(AGAINST),--against $(AGAINST)) $(if $(REV),--rev $(REV)) $(ARGS)
 
 python:
 	pip install -e . --no-build-isolation -v
