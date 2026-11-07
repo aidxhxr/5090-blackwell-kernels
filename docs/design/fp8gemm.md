@@ -855,7 +855,166 @@ What lost:
   gate/up weights at 93 to 99.7%, the other large grids at 83 to 99.9%, 31 of the 47 at 95%
   and up. This is the MX kernel's own cost, 8 to 10% against the per-tensor kernel where
   cuBLASLt's tiled scales cost it 3% ("MX at 90%" below), on shapes where the per-tensor
-  variant 3 is itself at 95 to 113%.
+  variant 3 is itself at 95 to 113%. The tiled scales of the next section take 38 of them
+  to cuBLASLt or past it.
+
+### MX mode with tiled scales
+
+Source: the `MX_TILED` mode of `fp8gemm_v3_kernel` and its scale ring (`SfRing`),
+`fp8gemm_tile::mx_tile_word`, `MxTileFrag` and `mx_tile_words`, `FP8_MX_TILED` in
+`kernels.h`, and the `v3tl` rows of `results/fp8gemm_models.json` (measured 2026-11-05,
+`--mode=mx --tiles --iters=20`, which also holds that session's row-major rows).
+
+The row-major path stops at 112% of cuBLASLt MXFP8 because of what the consumer warps do
+for their scales: a group of stages ahead, chunk loads from global memory into a second
+register set, and per stage one shuffle per m16 and n8 tile, eight for the 128x128 tile's
+64x32 warp tile, plus 12 moves per group. cuBLASLt takes its scales in a tiled layout and has
+them copied. This does the same: a layout in which a stage's scales for a block's rows are
+one TMA box, and in which each lane's scale register is one aligned word of shared memory.
+
+**The layout.** Groups of 32 rows outermost (rows padded to a multiple of 32), K inside, and
+per group and 128 k one block of 128 bytes: 32 words, each a row's 4 scale bytes for those
+128 k, k-block j in byte j. Row r = g + 8t + 16h of the group (g < 8) has word 4g + 2t + h.
+The order comes from the instruction's thread-id ("The operand layout, as measured"): with
+thread-id 1 it reads A rows g and g + 8 from lanes 4g + 2 and 4g + 3 and B column g from lane
+4g + 1, so one register can serve two m16 tiles of A or two n8 tiles of B, which the
+row-major path, on thread-id 0 only, never used. Lane (g, c) then holds row g + 8 (c & 1) of
+A tile 2u + (c >> 1), word 4g + 2 (c & 1) + (c >> 1) here: a 32-row slice of a warp tile is
+its 32 words, one 4-byte load per lane, 128 contiguous bytes, one wavefront. For B, lane
+(g, c) holds column g + 8 (c & 1) of the n8 tiles 2p + (c & 1) of both pairs p of a 32-column
+slice, words 4g + 2 (c & 1) and the next one: one 8-byte load, lanes c = 2 and 3 reading what
+0 and 1 read, one wavefront. Per stage the 64x32 warp tile does two 4-byte loads and one
+8-byte load where the row-major path did eight shuffles, and holds 4 scale registers instead
+of 8 plus two chunk sets.
+
+cuBLASLt's own layout (128-row tiles, rows r, r + 32, r + 64 and r + 96 in one 16-byte line)
+does not fit this kernel: the 64 rows of a 64x128 or 128x64 block are 8 of every 16 bytes of
+a tile there, which no TMA box covers (a box's inner extent is a multiple of 16 bytes), and a
+64-row warp tile's 8-byte A loads would hit each bank pair four times. The bytes are the same
+in both, a permutation apart; the bench builds both from the same scales.
+
+**The copies.** The scale tensor is a [groups][K] byte matrix to `make_tensor_map_2d_u8`, with
+a box of 128 bytes by BM / 32 groups for sfa and BN / 32 for sfb. The producer issues both
+per stage, at (kt x 128, bm / 32) and (kt x 128, bn / 32), on the stage's full barrier, whose
+byte count grows by (BM + BN) x 4; groups past the last row of A are zero-filled like the
+rows of A past M. The plan counts stages again: every stage brings its own scales, so a
+Stream-K piece can start on any stage, and the chunk groups of the row-major path go away.
+
+**The ring.** Every tile is 96 KB of stages, and a scale slot per stage is (BM + BN) x 4
+bytes, a 32nd of that: 3 KB more is exactly the 99 KB a block may take, with nothing left
+for the barriers and the item ring. So the scales get a ring of STAGES - 1 slots with an
+empty barrier each, and a warp hands its slot back early, after the first k32 step of the
+stage. When the producer refills slot s mod (STAGES - 1) for stage s, the stage it waits for
+anyway, s - STAGES, is done and s - STAGES + 1 has started, so the copies still run STAGES - 1
+stages ahead. The first version handed the slot back straight after the shared loads, with
+no proxy fence. The forced 128x256 tile, the only one with a single slot, which the copy
+engine refills the moment the last warp arrives, then gave wrong outputs in 3 of 6 runs of
+the M = 2048 and 4096 rows of Llama 3 8B and Qwen 3 32B, on the widest shapes. Handed back
+after the first step's mma, which has consumed the words, and behind `fence.proxy.async`
+like the stage release, it passed 6 of 6. The tiles with two and three slots never failed.
+
+Registers and stack, `cuobjdump -res-usage`, 288 threads:
+
+| tile | per-tensor | MX row-major, 8- / 16-byte chunks | MX tiled |
+|---|---|---|---|
+| 0: 128x256 bk128 s2 | 168 / 16 B | 168 / 312 B, 168 / 448 B | 168 / 160 B |
+| 1: 128x128 bk128 s3 | 164 / 8 B | 162 / 8 B, 168 / 8 B | 160 / 8 B |
+| 3: 128x64 bk128 s4 | 96 / 8 B | 126 / 8 B, 127 / 8 B | 99 / 8 B |
+| 4: 64x128 bk128 s4 | 96 / 8 B | 126 / 8 B, 126 / 8 B | 99 / 8 B |
+
+Tile 2 (64-byte stages, two blocks per SM) takes no tiled scales, a scale block being 128 k;
+forced, it runs variant 1. 128x256 still spills. 168 registers is the most a 288-thread block
+gets on this card: nine warps on four schedulers put three on one of them, and a scheduler
+has 16,384 registers, 170 per thread for 96 threads. The tile's 128 accumulators leave no
+room for even its six scale words.
+
+Variants 0, 1 and 4 take the tiled layout where they read row-major scales: variant 0 its two
+bytes per k32 step at the tiled offset; variant 1 its chunks as SFW 4-byte loads 128 bytes
+apart instead of one SFW x 4-byte load, the shuffles unchanged (tiled scales always take
+8-byte chunks, SFW = 2); variant 4 runs variant 1. Variant 2 refuses them.
+`fp8_quantize(x, "mx_tiled")` writes the scales tiled in the same launch (the padding rows get
+scale byte 0), `reference.to_mx_tiled` repacks row-major ones, and `sk.fp8gemm` takes either,
+told apart by the shape: [rows, K/32] or [groups, K/128, 128].
+
+**Measured.** The 120 model shapes, one session, both layouts on the same buffers against
+cuBLASLt's MXFP8 kernel, geometric mean of cuBLASLt time over ours; "oracle" is the best
+tiled row per shape:
+
+| M | shapes | row-major | tiled | tiled oracle | below cuBLASLt, row-major | tiled |
+|---|---|---|---|---|---|---|
+| 128 | 20 | 131.6% | 133.0% | 133.4% | 1 | 1 |
+| 256 | 20 | 120.1% | 125.4% | 125.6% | 7 | 2 |
+| 512 | 20 | 112.5% | 119.8% | 119.9% | 6 | 2 |
+| 1024 | 20 | 106.8% | 113.0% | 113.1% | 9 | 3 |
+| 2048 | 20 | 102.4% | 110.9% | 110.9% | 9 | 1 |
+| 4096 | 20 | 100.3% | 108.4% | 108.4% | 15 | 2 |
+| all | 120 | 111.8% | 118.1% | 118.2% | 47 | 11 |
+
+Four sweeps of the same build read 111.4 to 112.1% row-major and 117.7 to 118.3% tiled, with
+46 or 47 shapes below cuBLASLt row-major and 11 to 13 tiled. Per shape in this one, tiled is
+5.7% faster on the geometric mean, more than 3% faster on 83 shapes, within 3% on 35 and more
+than 3% slower on 2 (256x2048x768, 183.0% to 163.0%, and 4096x5120x2304, 97.3% to 93.1%);
+which small shapes land in that last list changes from sweep to sweep. Of the 47 shapes
+below cuBLASLt in the 2026-10-30 sweep, 38 are at or above it now (36 to 38 over the four).
+The rule's pick is the fastest tiled row on 109 of the 120 and the oracle is 0.1% above it, so
+the MX rule stays as it is for both layouts. Selected rows:
+
+| M x N x K | what it is | cuBLASLt MXFP8 | row-major | tiled |
+|---|---|---|---|---|
+| 128 x 4096 x 4096 | Llama 3 8B q_proj, 128 tokens | 26.5 us | 144.9% | 144.7% |
+| 256 x 4096 x 4096 | same, 256 tokens | 33.9 us | 150.1% | 164.5% |
+| 512 x 4096 x 4096 | same, 512 tokens | 35.8 us | 101.7% | 116.4% |
+| 512 x 4096 x 14336 | Llama 3 8B down, 512 tokens | 105.2 us | 105.0% | 114.4% |
+| 1024 x 10240 x 8192 | Llama 3 70B qkv | 287.4 us | 89.1% | 99.9% |
+| 4096 x 14336 x 4096 | Llama 3 8B gate/up | 785.5 us | 94.6% | 103.8% |
+| 4096 x 25600 x 5120 | Qwen 3 32B gate/up | 1.75 ms | 94.2% | 101.8% |
+| 4096 x 128256 x 4096 | Llama 3 8B lm_head | 7.29 ms | 99.3% | 107.1% |
+| 512 x 768 x 2048 | Qwen 3 30B-A3B expert | 21.4 us | 210.7% | 208.7% |
+
+The 128-token rows do not move: the 64-wide tiles lost 27 registers but were not short of
+them, and a 128-token grid is bound by its few blocks, not by their stages. The square and
+Llama shapes of the default sweep (`bench_fp8gemm --mode=mx --layout=both --variant=3
+--iters=50`, operands not rotated): 4096³ runs 723 TFLOPS tiled, 107.2% of cuBLASLt MXFP8,
+against 665 and 98.5% row-major; 8192³ 683 against 635 (104.7% against 97.4%);
+4096x4096x11008 689 against 620; 4096x11008x4096 687 against 619. The decode shapes run
+variant 1's decode kernels, whose tiled fetch costs nothing measurable: 15.0 us in both
+layouts at 1x4096x4096, 15.0 against 15.1 at 64x4096x4096 and 34.0 against 33.5 at
+64x4096x11008 (row-major against tiled).
+
+Nsight Compute at 4096³, one launch of the 128x128 tile in each layout (clocks not locked):
+
+| metric | row-major | tiled |
+|---|---|---|
+| duration, SM clock | 254.3 us at 2.06 GHz | 233.0 us at 1.97 GHz |
+| SM cycles | 533,865 | 469,237 |
+| tensor pipe active | 79.3% | 88.4% |
+| executed instructions | 46.99 M | 46.66 M |
+| global load instructions / sectors | 232 K / 6.61 M | 37.5 K / 0.35 M |
+| L1 hit rate | 57.8% | 63.8% |
+| L2 sectors | 39.0 M | 37.3 M |
+| shared-memory load instructions | 20 K | 807 K |
+| stall: `long_scoreboard` (cycles per issue) | 1.40 | 0.81 |
+| stall: `short_scoreboard` | 0.67 | 0.18 |
+| stall: `mio_throttle` | 0.69 | 0.32 |
+| stall: `math_pipe_throttle` / `wait` | 6.12 / 4.16 | 6.00 / 4.25 |
+| registers | 168 | 160 |
+
+The instruction count does not move: the chunk loads, shuffles and moves of the row-major
+path come to about as many instructions as the shared loads, the fence and the arrive that
+replace them. Their latency is what goes. The chunk loads were the `long_scoreboard` stall
+and the shuffles the `short_scoreboard` and `mio_throttle` ones, and with them gone the
+kernel takes 12% fewer cycles and the tensor pipe goes from 79 to 88% busy.
+
+What lost or is left:
+
+- **128x256 with tiled scales.** It spills 160 bytes and runs 74 to 104% of cuBLASLt MXFP8
+  on the 62 shapes where the per-tensor rule would take it, 0.79x of the tiled 128x128 on the
+  geometric mean (row-major it ran 45 to 75%). The register cap above is the whole reason.
+- **The rule.** One miss over 3%: 128x2048x768 runs 164.4% on 128x64 and 169.8% on 64x128.
+- **Still below cuBLASLt, 11 shapes.** The Llama 3 70B gate/up and down at 256 tokens (94.5%,
+  94.4%), the Qwen 3 32B gate/up and down at 512 (90.2%, 94.4%), 1024x14336x4096 (96.0%),
+  4096³ (97.8%), 4096x5120x2304 (93.1%) and four at 99.3 to 99.9%. Two run slower than the
+  old route (128x128256x4096, 102.3% to 99.8%, and 4096x5120x2304, 93.6% to 93.1%).
 
 ### The engine
 
@@ -864,7 +1023,11 @@ default variant, so every prefill step of more than 64 tokens now runs variant 3
 (M <= 64) still run variant 1's decode kernels; `mxfp8` weights take the MX rule. Not
 measured end to end. A row's bits now depend on M through the tile and the split, as they
 did before through variant 1's tile choice and atomic tail; for M > 64 they no longer depend
-on the run. `tests/test_quant.py` passes on the new default.
+on the run. `tests/test_quant.py` passes on the new default. `quant.MXFP8Linear` keeps both
+scale tensors tiled since the tiled layout went in (the weight's repacked once, the
+activations' written by `fp8_quantize(x, "mx_tiled")`), so `mxfp8` prefill runs the tiled
+path and decode variant 1's decode kernels with the tiled fetch; not measured end to end
+either, and `tests/test_quant.py` and `tests/test_batch_invariant.py` pass.
 
 ## What was done and what remains
 
@@ -874,7 +1037,8 @@ instruction that doubles the fp32-accumulate rate, found in cuBLASLt's SASS and 
 1,014 TFLOPS; the three rungs, with v2 at 99 to 139% of cuBLASLt on the shapes it takes and
 the decode shapes at the 16 MB single-launch floor, 112 to 141% of cuBLASLt; MX mode on
 every rung, with the scale operand layout measured and the scales fetched by the consumer
-warps, on the Stream-K kernel too, 111.8% of cuBLASLt MXFP8 over the 120 model shapes.
+warps, on the Stream-K kernel too, 111.8% of cuBLASLt MXFP8 over the 120 model shapes, and
+118.1% with the scales tiled and copied a box per stage.
 
 Open:
 
@@ -883,15 +1047,14 @@ Open:
   path on sm_120.
 - **Stream-K.** Done in per-tensor mode: variant 3 ("Model shapes"), 129.1% of cuBLASLt over
   the 120 model shapes against 103.8% for the old default, and in MX mode, 111.8% of
-  cuBLASLt MXFP8 against 91.6%. Open there: the lm_head at 256 tokens (85.9%), and the
-  deep-K shapes where variant 2's data-parallel waves still win in both modes.
-- **MX at 90%.** The MX mode costs 8 to 10% on the large shapes against the per-tensor
-  kernel where cuBLASLt's MXFP8 kernel costs it 3%: eight shuffles per stage on the MIO
-  queue the `ldmatrix` traffic already fills, and the chunk loads. cuBLASLt takes its scales
-  in a tiled layout (128 rows by 4 k-blocks in 512 contiguous bytes, the layout torch calls
-  `SWIZZLE_32_4_4`) that one TMA box or two `ldmatrix`-shaped shared loads serve; a
-  row-major `[rows][K/32]` operand cannot be moved that way. Taking the tiled layout as an
-  input option, or repacking the scales once per call, is the way past 90%, and per-channel
-  bf16 scales in the epilogue are a smaller rung.
+  cuBLASLt MXFP8 against 91.6% (118.1% with tiled scales). Open there: the lm_head at 256
+  tokens (85.9%), and the deep-K shapes where variant 2's data-parallel waves still win in
+  both modes.
+- **MX at 90%.** Done for the 128x128 and 64-wide tiles: the tiled scale layout ("MX mode
+  with tiled scales") takes 4096³ from 98.5% to 107.2% of cuBLASLt MXFP8 and the model
+  shapes from 111.8% to 118.1%. Open: the 128x256 tile, which the per-tensor rule runs on the
+  large grids and MX mode cannot hold in the 168 registers a nine-warp block gets (an eight-warp
+  block, the producer's lane inside a consumer warp, would get 255); the 11 shapes still below
+  cuBLASLt; per-channel bf16 scales in the epilogue are a smaller rung.
 - **The decode launch.** 13.2 µs single launch against 11.3 back to back for 16 MB: the 2 µs
   that CUDA graphs or a persistent decoder kernel would take back.
