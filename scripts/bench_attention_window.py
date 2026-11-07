@@ -19,7 +19,9 @@ backward (flash, through SDPA) and `torch.autograd.grad` through the compiled fl
 with the window's block mask; gpt-oss's heads with sinks against ours without them (flex's
 sink correction is on the output and has no backward of its own). Each row records
 SPARK_ATTN_BWD_BAND ("band"; null when unset, the default rule): run once as is and once
-with SPARK_ATTN_BWD_BAND=0 for the path before the band kernel.
+with SPARK_ATTN_BWD_BAND=0 for the path before the band kernel. It also records
+SPARK_ATTN_BWD_BAND_DV ("band_dv"; null when unset, the band kernel forming Dv itself at
+D = 64 and after the preprocess at D = 128, "0" for the preprocess at both).
 
     PYTHONPATH=python python scripts/bench_attention_window.py
         [--only=prefill|decode|sinks|paged|bwd] [--s=4096,16384,32768]
@@ -297,7 +299,8 @@ def bwd(sk, add, S, windows, Hq=32, Hkv=8, D=128, sink=False):
         flops = 10.0 * Hq * pairs(S, S, W) * D
         add(dict(kernel="attention_bwd_window", shape=f"b1_hq{Hq}_hkv{Hkv}_s{S}_d{D}_causal",
                  window=W, sinks=sink, band=os.environ.get("SPARK_ATTN_BWD_BAND"),
-                 ours_ms=ours_ms, ours_full_ms=full_ms, flex_ms=flex_ms,
+                 band_dv=os.environ.get("SPARK_ATTN_BWD_BAND_DV"), ours_ms=ours_ms,
+                 ours_full_ms=full_ms, flex_ms=flex_ms,
                  flash_full_causal_ms=flash_full_ms, ours_nosink_ms=nosink_ms,
                  tflops=flops / ours_ms / 1e9,
                  flex_tflops=flops / flex_ms / 1e9 if flex_ms else None, max_err_vs_flex=err))

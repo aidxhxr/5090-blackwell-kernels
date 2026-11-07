@@ -933,7 +933,10 @@ than before (2.62 ms in the same session, when flex was 1.66x behind), 8K 1.09x 
 gpt-oss's heads with sinks take 0.585 ms at 8K against 0.637. It gives the same bits every
 run, so `deterministic=True` costs nothing there. Below two key tiles per SM (4K tokens on
 these heads) the halo a block replays is a third of its work and the atomic path stays; past
-128 keys the band loses. The no-window rows did not move (within 0.6%, old and new binary
+128 keys the band loses. With `D = 64` (gpt-oss's heads) the band kernel also forms
+`Dv = dO . O` itself, so that backward is one launch with no preprocess, 1.9 to 5.4% faster
+from 8K to 32K tokens; with `D = 128` the same lost 2.6% at 32K and stays off
+(`SPARK_ATTN_BWD_BAND_DV`). The no-window rows did not move (within 0.6%, old and new binary
 interleaved in one hold of the GPU). The numbers and what remains are in [the design
 note](docs/design/attention_bwd.md#the-band-kernel-dq-without-the-round-trip).
 

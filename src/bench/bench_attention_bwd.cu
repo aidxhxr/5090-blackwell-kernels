@@ -8,6 +8,8 @@
 //                                                          # a sliding window and sink logits
 //   ./bench_attention_bwd --sweep=window                   # the window sweep (variant 3)
 //   SPARK_ATTN_BWD_BAND=0 ./bench_attention_bwd ...        # no band kernel under a window
+//   SPARK_ATTN_BWD_BAND_DV=0 ./bench_attention_bwd ...     # the band kernel after the preprocess
+//   SPARK_ATTN_BWD_BAND_DV=1 ./bench_attention_bwd ...     # Dv in the band kernel at D = 128 too
 //
 // Setup per shape: Q, K uniform in [-2, 2], V and dO in [-1, 1] (bf16), then the forward
 // (variant 5, the default rung) with its log-sum-exp output gives O and L. The rows time the

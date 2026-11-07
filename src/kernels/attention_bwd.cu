@@ -18,7 +18,8 @@
 // Every variant first runs a preprocess kernel: Dv per query row, L converted to the log2
 // domain, both stored as one float2 per row in a padded workspace (rows past S_q are {0, 0}:
 // a zero-filled Q row and dO row then give P = 1 against dO = 0 and dP = 0, which adds nothing
-// to any gradient), and the fp32 dQ buffer zeroed when the variant accumulates into it.
+// to any gradient), and the fp32 dQ buffer zeroed when the variant accumulates into it. With
+// D = 64 the band kernel below does that work itself.
 //
 //   variant 0: one warp per query row for dQ, one warp per key row for dK and dV, shuffle
 //              reductions per score. Reference.
@@ -944,14 +945,17 @@ __device__ __forceinline__ void bulk_load(void* smem_dst, const void* src, unsig
 // The five products' per-warp part of one Q tile (S^T, P^T, dP^T, dV, dS^T, dK) for the warp's
 // 16 keys: dk and dv accumulate, and pa returns dS^T packed as bf16 A fragments for the dS^T
 // store. qs and dos are the tile's Q and dO in the TMA box layout, lds its (L, Dv) rows, vf the
-// warp's V fragments. Shared by variant 3 and its persistent form.
-template <int D, int BQ, bool EARLY, bool WIN>
+// warp's V fragments. Shared by variant 3 and its persistent form. With LDW lds is the band
+// kernel's: the tile's L (natural log, by TMA) and then its Dv (written by the warps), and the
+// warp waits for the Dv on `ldbar` only before it forms dS^T.
+template <int D, int BQ, bool EARLY, bool WIN, bool LDW = false>
 __device__ __forceinline__ void tile_grads(const bf16* Ks, const bf16* qs, const bf16* dos,
                                            const float* lds, const unsigned (&vf)[D / 16][4],
                                            float (&dk)[D / 8][4], float (&dv)[D / 8][4],
                                            unsigned (&pa)[BQ / 16][4], int lane, int arow, int g,
                                            int c2, int q0, int kw0, int S_kv, bool kv_tail,
-                                           int causal, float scale_log2, int off, int window) {
+                                           int causal, float scale_log2, int off, int window,
+                                           uint64_t* ldbar = nullptr, unsigned ldph = 0) {
     constexpr int KT = D / 16, DT = D / 8, NQ = BQ / 8, QK = BQ / 16;
     float s[NQ][4], dp_[NQ][4];
 #pragma unroll
@@ -975,14 +979,27 @@ __device__ __forceinline__ void tile_grads(const bf16* Ks, const bf16* qs, const
     // P^T of n8 tile n in place, and the tile's Dv. Lane (g, c) holds keys g (e = 0, 1)
     // and g + 8 (e = 2, 3) against rows 8n + 2c (e even) and 8n + 2c + 1 (e odd).
     float dvec[NQ][2];
+    if constexpr (LDW) {  // read after the wait below
+#pragma unroll
+        for (int n = 0; n < NQ; ++n) dvec[n][0] = dvec[n][1] = 0.f;
+    }
     auto expo = [&](int n) {
-        const float4 l4 = *reinterpret_cast<const float4*>(lds + 2 * (n * 8 + c2));
-        s[n][0] = ex2(fmaf(s[n][0], scale_log2, -l4.x));
-        s[n][1] = ex2(fmaf(s[n][1], scale_log2, -l4.z));
-        s[n][2] = ex2(fmaf(s[n][2], scale_log2, -l4.x));
-        s[n][3] = ex2(fmaf(s[n][3], scale_log2, -l4.z));
-        dvec[n][0] = l4.y;
-        dvec[n][1] = l4.w;
+        if constexpr (LDW) {
+            const float2 l2 = *reinterpret_cast<const float2*>(lds + n * 8 + c2);
+            const float lx = l2.x * kLog2e, ly = l2.y * kLog2e;  // the preprocess's product
+            s[n][0] = ex2(fmaf(s[n][0], scale_log2, -lx));
+            s[n][1] = ex2(fmaf(s[n][1], scale_log2, -ly));
+            s[n][2] = ex2(fmaf(s[n][2], scale_log2, -lx));
+            s[n][3] = ex2(fmaf(s[n][3], scale_log2, -ly));
+        } else {
+            const float4 l4 = *reinterpret_cast<const float4*>(lds + 2 * (n * 8 + c2));
+            s[n][0] = ex2(fmaf(s[n][0], scale_log2, -l4.x));
+            s[n][1] = ex2(fmaf(s[n][1], scale_log2, -l4.z));
+            s[n][2] = ex2(fmaf(s[n][2], scale_log2, -l4.x));
+            s[n][3] = ex2(fmaf(s[n][3], scale_log2, -l4.z));
+            dvec[n][0] = l4.y;
+            dvec[n][1] = l4.w;
+        }
     };
     auto mask = [&]() {
         if ((causal && q0 + off < kw0 + 15) || kv_tail ||
@@ -1039,6 +1056,15 @@ __device__ __forceinline__ void tile_grads(const bf16* Ks, const bf16* qs, const
         pa[kq][1] = pack_bf16x2(s[2 * kq][2], s[2 * kq][3]);
         pa[kq][2] = pack_bf16x2(s[2 * kq + 1][0], s[2 * kq + 1][1]);
         pa[kq][3] = pack_bf16x2(s[2 * kq + 1][2], s[2 * kq + 1][3]);
+    }
+    if constexpr (LDW) {
+        mbar_wait(ldbar, ldph);
+#pragma unroll
+        for (int n = 0; n < NQ; ++n) {
+            const float2 d2 = *reinterpret_cast<const float2*>(lds + BQ + n * 8 + c2);
+            dvec[n][0] = d2.x;
+            dvec[n][1] = d2.y;
+        }
     }
     // dV += P^T dO; with EARLY, dS^T = P^T (dP^T - Dv) of n8 tile n is formed after
     // step n * STEPS / NQ of it (P^T is already packed in pa).
@@ -1669,6 +1695,18 @@ __global__ void __launch_bounds__(THREADS, 1)
 // is query tile major (the group's heads inner), which puts the carry's read half a key tile
 // after its write, the least this order allows. The loop, the stage and dS^T rings across
 // items and the per-item K and V loads are the persistent kernel's.
+//
+// With DV the kernel does the preprocess's work too, so the backward is one launch. L
+// comes with each stage by TMA from the forward's own rows. Dv = dO . O: after its products
+// of Q tile J a warp loads its rows of O for tile J + 1 (the producer prefetched them into
+// L2 with the stage), sums them against the dO that stage already holds, D / 16 lanes a
+// row, and writes them to the stage's Dv slots; every warp waits for all of them (dv_full)
+// just before it forms dS^T of tile J + 1. Against the preprocess and this kernel loading
+// its rows it measured 1.9 to 5.4% faster with 64-row tiles (D = 64) and up to 2.6% slower
+// with 32-row ones (D = 128), so use_band_dv takes it for D = 64. The sums are cheap; what
+// costs is a global load landing between a warp's products and its dS^T store on every
+// tile, and every warp waiting on the slowest one's rows (a version without the O loads
+// tied, docs/design/attention_bwd.md).
 // ---------------------------------------------------------------------------------------
 
 // Drop the 128-byte line at `p` (128-byte aligned) from L2 without writing it back: its
@@ -1741,13 +1779,16 @@ __device__ __forceinline__ BandItem band_item(const Sched& s, const BandBlock& b
     return w;
 }
 
-template <int D, int BQ, bool EARLY>
+template <int D, int BQ, bool EARLY, bool DV>
 __global__ void __launch_bounds__(THREADS, 1)
     bwd_kv_band_kernel(const __grid_constant__ CUtensorMap tmQ,
-                       const __grid_constant__ CUtensorMap tmO, const bf16* __restrict__ K,
+                       const __grid_constant__ CUtensorMap tmO,
+                       const __grid_constant__ CUtensorMap tmL, const bf16* __restrict__ K,
                        const bf16* __restrict__ V, const float2* __restrict__ ld,
                        bf16* __restrict__ dQ, bf16* __restrict__ dK, bf16* __restrict__ dV, int S_q,
-                       int S_kv, float scale_log2, float scale, Sched sched, Band band) {
+                       int S_kv, float scale_log2, float scale, Sched sched, Band band,
+                       const bf16* __restrict__ O, const float* __restrict__ lse,
+                       float2* __restrict__ ld_out) {
     using C = Cfg<D, BQ, true>;
     constexpr int CH = D / 8, KT = D / 16, DT = D / 8, QK = BQ / 16;
     constexpr int BOXES = D / BOX;
@@ -1762,6 +1803,8 @@ __global__ void __launch_bounds__(THREADS, 1)
     uint64_t* empty = full + STAGES;
     uint64_t* ds_full = empty + STAGES;
     uint64_t* ds_empty = ds_full + 2;
+    uint64_t* dv_full = ds_empty + 2;  // DV: every warp wrote its Dv rows of the stage
+    static_assert(3 * STAGES + 4 <= 16, "barrier slots");
 
     const int tid = threadIdx.x;
     const int lane = tid & 31, warp = tid >> 5;
@@ -1774,6 +1817,7 @@ __global__ void __launch_bounds__(THREADS, 1)
         for (int s = 0; s < STAGES; ++s) {
             mbar_init(&full[s], 1);
             mbar_init(&empty[s], WARPS);
+            if constexpr (DV) mbar_init(&dv_full[s], THREADS);
         }
 #pragma unroll
         for (int i = 0; i < 2; ++i) {
@@ -1783,6 +1827,7 @@ __global__ void __launch_bounds__(THREADS, 1)
         fence_mbar_init();
         prefetch_tensormap(&tmQ);
         prefetch_tensormap(&tmO);
+        if constexpr (DV) prefetch_tensormap(&tmL);
     }
     __syncthreads();
 
@@ -1798,14 +1843,21 @@ __global__ void __launch_bounds__(THREADS, 1)
         const int bh = w.bh0 + u % sched.group;
         const int q0 = (w.qt_lo + u / sched.group) * BQ;
         unsigned char* dst = stages + s * C::STAGE_BYTES;
-        mbar_arrive_expect_tx(&full[s], C::STAGE_BYTES + C::LD_BYTES);
+        mbar_arrive_expect_tx(&full[s], C::STAGE_BYTES + (DV ? BQ * 4 : C::LD_BYTES));
 #pragma unroll
         for (int bx = 0; bx < BOXES; ++bx) {
             tma_load_3d(dst + bx * BQ * BOX * 2, &tmQ, &full[s], bx * BOX, q0, bh);
             tma_load_3d(dst + C::QT_BYTES + bx * BQ * BOX * 2, &tmO, &full[s], bx * BOX, q0, bh);
         }
-        bulk_load(lds_base + s * (C::LD_BYTES / 4), ld + static_cast<size_t>(bh) * sched.S_pad + q0,
-                  C::LD_BYTES, &full[s]);
+        if constexpr (DV) {
+            tma_load_2d(lds_base + s * (C::LD_BYTES / 4), &tmL, &full[s], q0, bh);
+            const int rows = min(BQ, S_q - q0);
+            prefetch_l2(O + (static_cast<size_t>(bh) * S_q + q0) * D,
+                        static_cast<unsigned>(rows) * D * 2);
+        } else {
+            bulk_load(lds_base + s * (C::LD_BYTES / 4),
+                      ld + static_cast<size_t>(bh) * sched.S_pad + q0, C::LD_BYTES, &full[s]);
+        }
     };
     auto produce_upto = [&](int U_end) {
         int u = pr->issued;
@@ -1820,6 +1872,59 @@ __global__ void __launch_bounds__(THREADS, 1)
         }
         pr->issued = u;
     };
+
+    // DV: the Dv rows warp * RPW .. of Q tile J (iteration u of item x) into its stage's
+    // slots; with ld_out (sinks) also {L log2(e), Dv} to the workspace from the block that
+    // finishes the query tile, for the sink gradient. ld_issue loads O, ld_finish waits for
+    // the stage's dO and L and writes the rows. A warp's RPW rows at once: D / 16 lanes a row,
+    // 16 columns (two 16-byte chunks) a lane, a butterfly over the row's lanes.
+    constexpr int RPW = BQ / WARPS, LPR = D / 16;
+    static_assert(RPW * LPR == 32, "one row per D / 16 lanes");
+    const int rl = lane / LPR, cl = lane % LPR;  // the lane's row of the warp's, its chunk pair
+    uint4 o_raw[2];
+    auto ld_issue = [&](const BandItem& x, int u) {
+        const int bh = x.bh0 + u % sched.group, q0 = (x.qt_lo + u / sched.group) * BQ;
+        const int q = q0 + warp * RPW + rl;
+        const uint4* src =
+            reinterpret_cast<const uint4*>(O + (static_cast<size_t>(bh) * S_q + q) * D) + 2 * cl;
+        o_raw[0] = q < S_q ? src[0] : make_uint4(0, 0, 0, 0);
+        o_raw[1] = q < S_q ? src[1] : make_uint4(0, 0, 0, 0);
+    };
+    auto ld_finish = [&](const BandItem& x, int u, int J) {
+        const int st = J % STAGES;
+        const int bh = x.bh0 + u % sched.group, qt = x.qt_lo + u / sched.group;
+        const int last = min(sched.kv_tiles - 1, (qt * BQ + BQ - 1 + off) / BN);
+        mbar_wait(&full[st], (J / STAGES) & 1);
+        const bf16* dos = reinterpret_cast<const bf16*>(stages + st * C::STAGE_BYTES) + BQ * D;
+        float* lds = lds_base + st * (C::LD_BYTES / 4);
+        const int rr = warp * RPW + rl, q = qt * BQ + rr;
+        float dot = 0.f;
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const uint4 dv4 = *reinterpret_cast<const uint4*>(dos + box_off<BQ>(rr, 2 * cl + h));
+            const unsigned* ow = reinterpret_cast<const unsigned*>(&o_raw[h]);
+            const unsigned* dw = reinterpret_cast<const unsigned*>(&dv4);
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const float2 a =
+                    __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ow[e]));
+                const float2 b =
+                    __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&dw[e]));
+                dot = fmaf(a.x, b.x, dot);
+                dot = fmaf(a.y, b.y, dot);
+            }
+        }
+#pragma unroll
+        for (int m = LPR / 2; m > 0; m >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, m);
+        if (cl == 0) {
+            lds[BQ + rr] = dot;
+            if (ld_out != nullptr && last == x.kt && q < S_q)
+                ld_out[static_cast<size_t>(bh) * sched.S_pad + q] =
+                    make_float2(lds[rr] * kLog2e, dot);
+        }
+        mbar_arrive(&dv_full[st]);
+    };
+    int ld_next = 0;  // DV: the first Q tile of the block whose rows are not written yet
 
     int U0 = 0;  // loads (= Q tiles) of the block before this item
     for (int k = 0; k < n_items; ++k) {
@@ -1977,11 +2082,19 @@ __global__ void __launch_bounds__(THREADS, 1)
             const bf16* dos = qs + BQ * D;
             const float* lds = lds_base + st * (C::LD_BYTES / 4);
             unsigned pa[QK][4];
+            if constexpr (DV) {
+                if (ld_next == J) {  // the block's first Q tile, or one after an empty item
+                    ld_issue(w, it);
+                    ld_finish(w, it, J);
+                    ld_next = J + 1;
+                }
+            }
             mbar_wait(&full[st], (J / STAGES) & 1);
             const bool dead = q0 + BQ - 1 + off < kw0 || kw0 + 15 <= q0 + off - window;
             if (!dead) {
-                tile_grads<D, BQ, EARLY, true>(Ks, qs, dos, lds, vf, dk, dv, pa, lane, arow, g, c2,
-                                               q0, kw0, S_kv, kv_tail, 1, scale_log2, off, window);
+                tile_grads<D, BQ, EARLY, true, DV>(Ks, qs, dos, lds, vf, dk, dv, pa, lane, arow, g,
+                                                   c2, q0, kw0, S_kv, kv_tail, 1, scale_log2, off,
+                                                   window, &dv_full[st], (J / STAGES) & 1);
             } else {
 #pragma unroll
                 for (int kq = 0; kq < QK; ++kq)
@@ -1991,6 +2104,19 @@ __global__ void __launch_bounds__(THREADS, 1)
             fence_proxy_async_smem();
             __syncwarp();
             if (lane == 0) mbar_arrive(&empty[st]);
+
+            // DV: the rows of the next Q tile, its loads in flight under the dS^T store.
+            BandItem wn = w;
+            int un = -1;
+            if constexpr (DV) {
+                if (it + 1 < n_it) {
+                    un = it + 1;
+                } else if (k + 1 < n_items) {
+                    wn = band_item<BQ>(sched, bb, k + 1);
+                    if (wn.nq > 0) un = 0;
+                }
+                if (un >= 0) ld_issue(wn, un);
+            }
 
             const int buf = J & 1;
             if (J >= 2) mbar_wait(&ds_empty[buf], ((J >> 1) - 1) & 1);
@@ -2004,6 +2130,12 @@ __global__ void __launch_bounds__(THREADS, 1)
                 *reinterpret_cast<unsigned*>(dSs + ds_off<BQ>(r0 + 8, 2 * kq + 1) + c2) = pa[kq][3];
             }
             mbar_arrive(&ds_full[buf]);
+            if constexpr (DV) {
+                if (un >= 0) {
+                    ld_finish(wn, un, J + 1);
+                    ld_next = J + 2;
+                }
+            }
             if (it >= 1) dq_product(it - 1);
             if (tid == 0) produce_upto(J + 3);
         }
@@ -2296,6 +2428,20 @@ bool use_band(int window, bool deterministic, long long tiles) {
     if (window <= 0) return false;
     if (v >= 0) return v != 0;
     return window <= kvt::BN && (deterministic || tiles >= 2LL * num_sms());
+}
+
+// Whether the band kernel forms Dv itself, with no preprocess, at head size D. Measured at
+// W = 128 against the preprocess and the kernel loading its rows: 1.9 to 5.4% faster on
+// gpt-oss's heads (64 / 8, D = 64) from 8K to 32K tokens with and without sinks; on 32 / 8
+// heads with D = 128 2.6% slower at 32K, 1% at 8K, level at 16K. SPARK_ATTN_BWD_BAND_DV = 0
+// never, 1 at both head sizes.
+bool use_band_dv(int D) {
+    static int v = -2;
+    if (v == -2) {
+        const char* e = std::getenv("SPARK_ATTN_BWD_BAND_DV");
+        v = e != nullptr ? (std::atoi(e) != 0) : -1;
+    }
+    return v >= 0 ? v != 0 : D == 64;
 }
 
 int env_split() {
@@ -2593,12 +2739,15 @@ void band_ranges(const kv::Sched& s, int BQ, int max_blocks, kvt::Band& bd) {
     cache.emplace(key, bd);
 }
 
-template <int D, int BQ, bool EARLY>
-void launch_kv_band(const Args& a, cudaStream_t stream) {
+// With DV the kernel takes L from `lse` and forms Dv from O itself, and writes the rows to
+// `ld_out` when it is not null (the sink gradient reads them).
+template <int D, int BQ, bool EARLY, bool DV>
+void launch_kv_band(const Args& a, const bf16* O, const float* lse, float2* ld_out,
+                    cudaStream_t stream) {
     using C = kvt::Cfg<D, BQ, true>;
     constexpr int bytes = C::SMEM + 128;  // and the producer's state
     static_assert(sizeof(kvt::BandProd) <= 128 && bytes <= 99 * 1024, "");
-    auto kernel = kvt::bwd_kv_band_kernel<D, BQ, EARLY>;
+    auto kernel = kvt::bwd_kv_band_kernel<D, BQ, EARLY, DV>;
     static bool opted = false;
     if (!opted) {
         SPARK_CUDA_CHECK(
@@ -2610,13 +2759,18 @@ void launch_kv_band(const Args& a, cudaStream_t stream) {
         make_tensor_map_3d_bf16(a.Q, D, a.S_q, BHq, kvt::BOX, BQ, CU_TENSOR_MAP_SWIZZLE_128B);
     const CUtensorMap tmO =
         make_tensor_map_3d_bf16(a.dO, D, a.S_q, BHq, kvt::BOX, BQ, CU_TENSOR_MAP_SWIZZLE_128B);
+    // L as [B * H_q][S_q] fp32 rows, a box of one row of BQ (S_q a multiple of 4).
+    const CUtensorMap tmL = DV ? make_tensor_map_2d(CU_TENSOR_MAP_DATA_TYPE_FLOAT32, 4, lse, BHq,
+                                                    a.S_q, 1, BQ, CU_TENSOR_MAP_SWIZZLE_NONE)
+                               : tmQ;
     int ws_tiles = 0, items = 0;
     const kv::Sched s = build_sched(a, kvt::BN, BQ, D, false, stream, ws_tiles, items);
     kvt::Band bd;
     band_ranges(s, BQ, std::min(num_sms(), kvt::kBandMaxBlocks), bd);
     bd.carry = buffer<float>(g_band, static_cast<size_t>(bd.G) * s.group * bd.R * BQ * D);
-    kernel<<<bd.G, kvt::THREADS, bytes, stream>>>(tmQ, tmO, a.K, a.V, a.ld, a.dQ, a.dK, a.dV, a.S_q,
-                                                  a.S_kv, a.scale_log2, a.scale, s, bd);
+    kernel<<<bd.G, kvt::THREADS, bytes, stream>>>(tmQ, tmO, tmL, a.K, a.V, a.ld, a.dQ, a.dK, a.dV,
+                                                  a.S_q, a.S_kv, a.scale_log2, a.scale, s, bd, O,
+                                                  lse, ld_out);
     SPARK_CHECK_LAUNCH();
 }
 
@@ -2690,6 +2844,9 @@ void attention_bwd_window_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K,
         variant == 3 &&
         use_band(window, deterministic, static_cast<long long>(B) * H_kv * cdiv(S_kv, kvt::BN));
     const bool atomic_dq = variant >= 1 && !deterministic && !band;
+    // and with D = 64 forms Dv itself, L by TMA from the forward's rows (their stride a
+    // 16-byte multiple): no preprocess, the sink gradient after it.
+    const bool band_dv = band && use_band_dv(D) && S_q % 4 == 0 && is_aligned16(lse);
 
     Args a;
     a.Q = Q;
@@ -2716,7 +2873,7 @@ void attention_bwd_window_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K,
     const bool persist = variant == 3 && atomic_dq && !a.win() && env_persist();
     a.counter = persist ? buffer<int>(g_ctr, 1) : nullptr;
 
-    {
+    if (!band_dv) {
         constexpr int threads = 256;
         const int grid = cdiv(rows_pad, threads / 32);
         const int vec = env_zero4() ? 1 : 0;
@@ -2728,10 +2885,12 @@ void attention_bwd_window_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K,
                 O, dO, lse, ld, a.dq_acc, a.counter, S_q, S_pad, rows_pad, vec);
         SPARK_CHECK_LAUNCH();
     }
-    if (sinks != nullptr) {
+    auto dsink = [&]() {
+        if (sinks == nullptr) return;
         bwd_dsink_kernel<<<H_q, 256, 0, stream>>>(ld, sinks, dsinks, B, H_q, S_q, S_pad);
         SPARK_CHECK_LAUNCH();
-    }
+    };
+    if (!band_dv) dsink();
 
     auto run = [&](auto d, auto w) {
         constexpr int DD = decltype(d)::value;
@@ -2763,11 +2922,17 @@ void attention_bwd_window_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K,
                 const bool early = use_early(S_q);
                 if (band) {
                     if constexpr (WIN) {
-                        if (early)
-                            launch_kv_band<DD, BQ, true>(a, stream);
+                        float2* ld_out = sinks != nullptr ? ld : nullptr;
+                        if (band_dv && early)
+                            launch_kv_band<DD, BQ, true, true>(a, O, lse, ld_out, stream);
+                        else if (band_dv)
+                            launch_kv_band<DD, BQ, false, true>(a, O, lse, ld_out, stream);
+                        else if (early)
+                            launch_kv_band<DD, BQ, true, false>(a, O, lse, nullptr, stream);
                         else
-                            launch_kv_band<DD, BQ, false>(a, stream);
+                            launch_kv_band<DD, BQ, false, false>(a, O, lse, nullptr, stream);
                     }
+                    if (band_dv) dsink();
                 } else if (persist) {
                     if constexpr (!WIN) {
                         if (early)
