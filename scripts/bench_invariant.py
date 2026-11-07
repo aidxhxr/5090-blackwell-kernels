@@ -3,6 +3,7 @@
 
     python scripts/bench_invariant.py --part kernels   # hgemm 6 vs 7, paged ops 1 vs 2
     python scripts/bench_invariant.py --part quant     # fp8gemm 3 vs 4, w4gemm 2 vs 3, fp8 cache
+    python scripts/bench_invariant.py --part w4        # w4gemm 2 vs 3 on both of 3's routes
     python scripts/bench_invariant.py --part engine    # decode ms/step and prefill tok/s
     python scripts/bench_invariant.py --part engine --weights-format int4 --kv-format fp8
 
@@ -17,13 +18,18 @@ The quant rows do the same for the quantized rungs: fp8gemm variant 3 (the defau
 4 and w4gemm variant 2 against 3 on the same projections, and paged_decode and
 attention_varlen variant 1 against 2 on an e4m3 cache.
 
+The w4 rows time w4gemm variant 2 against variant 3 on each of its routes: the four-warp
+shapes at every M (the route before the class-order tiles) and the rule, which runs the
+class-order tiles from 17 rows; the two routes' outputs must be the same bits.
+
 The engine rows are scripts/bench_serve.py's static batches (prompts log-uniform in 64..2048,
 --new tokens each, greedy) on the same random weights, once with the default kernels and once
 with Engine(batch_invariant=True). --layers defaults to 8 of Llama-3-8B's 32, so the weights,
 the 1 GB lm_head and the cache stay under 10 GB; a step's layer part scales with the layer
 count, the lm_head part does not. --weights-format and --kv-format pick the quantized
 engine (quant.INVARIANT_FORMATS, the fp8 cache): one model, quantized once, switched between
-the modes.
+the modes. The mode invariant_four_warps is invariant with w4gemm variant 3 on its four-warp
+route, what the int4 engine ran before the class-order tiles.
 """
 
 from __future__ import annotations
@@ -165,6 +171,58 @@ def bench_quant_gemm(sk, ms, iters, rows):
         torch.cuda.empty_cache()
 
 
+def bench_w4_routes(sk, ms, iters, rows):
+    """w4gemm variant 2 against variant 3 on its four-warp route and on the rule."""
+    if not ms:
+        return
+    prev = sk._C.w4gemm_v3_route()
+
+    def v3(a, w4, route):
+        sk._C.w4gemm_v3_set_route(route)
+        try:
+            return sk.w4gemm(a, w4, variant=3)
+        finally:
+            sk._C.w4gemm_v3_set_route(prev)
+
+    for name, k, n in GEMMS:
+        g = torch.Generator(device="cuda").manual_seed(0)
+        w = torch.empty(k, n, device="cuda", dtype=torch.bfloat16).normal_(
+            0, 1 / math.sqrt(k), generator=g)
+        ncopy = copies_for(k * n // 2) if max(ms) <= 64 else 1
+        w4s = [sk.W4Weight.quantize(w) for _ in range(ncopy)]
+        del w
+        for m in ms:
+            if name == "lm_head" and m > 2048:
+                continue
+            a = torch.randn(m, k, device="cuda").to(torch.bfloat16)
+            c2, rule, four = sk.w4gemm(a, w4s[0], variant=2), v3(a, w4s[0], -1), v3(a, w4s[0], -2)
+            assert torch.allclose(c2[:64].float(), rule[:64].float(), atol=3e-2, rtol=3e-2)
+            assert torch.equal(rule, four), f"{name} at {m}: the routes differ"
+            del c2, rule, four
+            t = {"v2": time_ms(rotating(lambda i, a=a, w4s=w4s: sk.w4gemm(
+                a, w4s[i % len(w4s)], variant=2)), iters)}
+            for key, route in (("four", -2), ("v3", -1)):
+                sk._C.w4gemm_v3_set_route(route)
+                try:
+                    t[key] = time_ms(rotating(lambda i, a=a, w4s=w4s: sk.w4gemm(
+                        a, w4s[i % len(w4s)], variant=3)), iters)
+                finally:
+                    sk._C.w4gemm_v3_set_route(prev)
+            flops = 2.0 * m * n * k
+            rows.append({"kind": "w4gemm_routes", "gemm": name, "M": m, "N": n, "K": k,
+                         "copies": ncopy, "same_bits": True, "v2_ms": t["v2"],
+                         "v3_four_warps_ms": t["four"], "v3_ms": t["v3"],
+                         "v3_over_v2": t["v3"] / t["v2"],
+                         "four_warps_over_v2": t["four"] / t["v2"],
+                         "v2_tflops": flops / t["v2"] / 1e9, "v3_tflops": flops / t["v3"] / 1e9,
+                         "v3_route": sk._C.w4gemm_v3_route_name(m, n, k)})
+            print(f"w4gemm  {name:8s} {m:5d} x {n:6d} x {k:5d}: v2 {t['v2'] * 1e3:9.1f} us  "
+                  f"v3 four-warp {t['four'] * 1e3:9.1f} us  v3 {t['v3'] * 1e3:9.1f} us  "
+                  f"v3/v2 {t['v3'] / t['v2']:.3f}", file=sys.stderr)
+        del w4s
+        torch.cuda.empty_cache()
+
+
 H_Q, H_KV, D, PAGE = 32, 8, 128, 16
 
 
@@ -266,8 +324,13 @@ def bench_engine(args, rows):
     # one model for both modes: the quantized projections are made once (the bf16 copies are
     # freed) and the mode is switched on it before each engine is built around it
     model = E.SparkModel(weights, rope, weights_format=fmt)
+    import spark_kernels as sk
+
+    route = sk._C.w4gemm_v3_route()
     for mode in modes:
-        inv = mode == "invariant"
+        inv = mode.startswith("invariant")
+        # the four-warp route for the whole mode: the decode graphs are captured with it
+        sk._C.w4gemm_v3_set_route(-2 if mode == "invariant_four_warps" else route)
         eng = E.Engine(model, args.layers, max_batch=max(batches), max_seq=max_seq,
                        cache_bytes=cache_bytes, prefill_tokens=args.prefill_tokens, graphs=True,
                        kv_format=kv, batch_invariant=inv)
@@ -311,11 +374,12 @@ def bench_engine(args, rows):
                   f"{st.preempted} preempted", file=sys.stderr)
         del eng
         torch.cuda.empty_cache()
+    sk._C.w4gemm_v3_set_route(route)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--part", choices=("kernels", "gemm", "attention", "quant", "engine"),
+    ap.add_argument("--part", choices=("kernels", "gemm", "attention", "quant", "w4", "engine"),
                     default="kernels")
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--ms", default="1,8,32,64,128,512,2048,4096", help="hgemm M values")
@@ -348,6 +412,10 @@ def main() -> int:
         bench_quant_gemm(sk, [m for m in ms if m <= 64], args.iters, rows)
         bench_quant_gemm(sk, [m for m in ms if m > 64], max(10, args.iters // 5), rows)
         bench_paged(sk, args.iters, rows, fp8=True)
+    if args.part == "w4":
+        ms = [int(x) for x in args.ms.split(",") if x]
+        bench_w4_routes(sk, [m for m in ms if m <= 64], args.iters, rows)
+        bench_w4_routes(sk, [m for m in ms if m > 64], max(10, args.iters // 5), rows)
     if args.part == "engine":
         bench_engine(args, rows)
     out = Path(args.out)

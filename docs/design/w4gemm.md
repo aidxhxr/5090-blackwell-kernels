@@ -2,7 +2,7 @@
 
 `C[M,N] = A[M,K] · dequant(W)[K,N]`, row-major, bf16 activations and output, int4 weights
 with one bf16 scale (and optionally one zero point) per 128 consecutive k of a column, fp32
-accumulation. Source: `src/kernels/w4gemm.cu` (the three rungs and the launcher),
+accumulation. Source: `src/kernels/w4gemm.cu` (the four rungs and the launcher),
 `src/kernels/w4gemm_quant.cu` (quantizer and repack), `src/kernels/w4gemm_internal.cuh`
 (the packed layout, the k order, the dequant). Bench: `bench_w4gemm` (checks the quantizer
 bit for bit against a CPU copy, every variant against cuBLAS on the dequantized weights,
@@ -53,6 +53,7 @@ at 128.
 | 0 | one thread per output, scalar dequant from the packed layout (`w4::locate`), fp32 FMA | baseline |
 | 1 | one warp per 16-column strip and 8 tokens over the whole K; per 128-k group a lane loads 2 x 16 bytes of weights and 4 x 16 bytes of activations straight into registers, 8 lop3 dequants, 8 `mma.sync` | the tensor cores and 128-bit loads; nothing staged, nothing loaded ahead |
 | 2 | the block shape picked per call: M = 1, four warps along K on a 6-stage `cp.async` pipeline with one activation row staged; M <= 16, independent warps with the weights of the next 4 groups in flight in registers, four or eight along K, or one per strip when N is wide; M > 16, 64 or 128-column tiles with warps along N and M sharing staged activations on a Stream-K grid; K split across blocks through a self-resetting fp32 workspace | bytes in flight, SM fill, wave fit, and the tensor-bound regime |
+| 3 | batch invariant: the four-warp shapes up to 16 rows, variant 2's wide tiles in the class order above, K cut only between the four chains | a row's bits do not depend on M ([below](#batch-invariant-variant-3)) |
 
 ## The repacked layout
 
@@ -355,8 +356,161 @@ tests hold the quantizer to half a step plus the bf16 rounding of the product (0
 step), 0.6 for the asymmetric code, whose rounded zero point and rounded-down scale can clip
 the top code by a further 0.06.
 
+## Batch invariant: variant 3
+
+`Engine(batch_invariant=True)` needs a row of C to come out with the same bits whatever M is
+([batch_invariant](batch_invariant.md)). So the order an output element is summed in can't
+depend on M, on the tile M picks, or on how K is cut up. Variant 2 cuts K twice: across the
+warps of a block (WK picked by M and N) and across blocks (atomics into the workspace, or
+Stream-K pieces).
+
+The first variant 3 fixed the order by running variant 2's shapes with four warps along K at
+every M, with no K split across blocks. Warp w accumulates the groups w, w + 4, w + 8, ...
+from zero and the block adds the four partials in warp order. Up to 16 rows those are the
+shapes variant 2 picks anyway. Above that they are the wrong shapes: a block with four warps
+along K has a quarter of its warps along N, and from 32 rows on they cost 1.02 to 1.68x of
+variant 2 (the "four-warp" column below).
+
+### The class order
+
+That order belongs to the element, not to the warps. Call the groups w, w + 4, w + 8, ...
+class w. An element is four chains, one per class, each a run of k16 steps from a zero
+accumulator, added `(((0 + p0) + p1) + p2) + p3`. One warp can compute exactly that: walk a
+tile's groups class by class (0, 4, 8, ..., then 1, 5, 9, ..., and so on), and at the end of
+each class add the accumulators into a running sum and clear them. That costs one more set of
+accumulators, not four. With it, any of variant 2's wide tiles with one warp along K gives
+the bits of the four-warp shapes, at any M.
+
+In the code it is a template flag on the pipelined kernel (`CLS`): the stage loader maps a
+position in the tile's order to its group (`class_group`), and the compute loop folds the
+accumulators at each class end. Entries 15 to 19 of the table are variant 2's Stream-K tiles
+(entries 8 to 12) in the class order. The 128 x 32 one takes 168 registers in the symmetric
+build and 128 with zero points, no spills.
+
+### A K split that keeps the bits
+
+Whole tiles leave the last wave partly empty, which is what Stream-K is there to fix. The
+class order allows one K split: cut a tile into its four classes. Each piece runs one class
+into its own fp32 slot (four BM x BN slots per cut tile), and the block that completes the
+tile's group count adds the four slots in class order from zero and converts
+(`combine_classes`). Those are the adds the four-warp block does in shared memory. The piece
+of class w stores `0 + p_w`, which is `p_w` unless `p_w` is -0, and a running sum is never -0
+in round to nearest (x + y is -0 only when both are), so adding `0 + p_w` gives the bits of
+adding `p_w`. Every slot is written before it is read, so only the tile's counter has to go
+back to zero.
+
+The plan (`class_plan`): whole tiles for the full waves of the resident blocks, the last
+partial wave cut into pieces. Which tiles are whole only changes when an output is finished,
+never its bits, so the schedule can follow the SM count or anything else.
+
+### Which tile, which schedule
+
+`bench_w4gemm --sweep=invariant` runs v2, v3 on both of its routes, and each class-order tile
+under each schedule (every tile whole, every tile in four pieces, the plan) on the four Llama
+projections, and compares every output with the four-warp route's bits. Single launches,
+weights rotated past L2, median of 30 (20 from 512 rows), at 32 to 4096 rows. All 420
+class-order rows of the final sweep carry the four-warp bits, and so did all 420 of an
+earlier one with the first plan. Rows in `results/w4gemm_invariant.jsonl`. Two projections, us,
+in bold what the rule runs:
+
+| projection, M | four-warp | v2 | 64 x 32, plan | 128 x 32, whole | 128 x 32, pieces | 128 x 32, plan |
+|---|---|---|---|---|---|---|
+| o, 32 | 15.3 | 15.2 | **13.3** | 41.9 | 15.3 | 16.0 |
+| o, 64 | 27.6 | 21.4 | 23.5 | 43.9 | 21.3 | **21.4** |
+| o, 128 | 41.8 | 31.6 | 37.8 | 43.9 | 37.7 | **37.6** |
+| o, 256 | 78.8 | 53.2 | 62.0 | 62.4 | 60.3 | **60.3** |
+| o, 512 | 136.1 | 95.9 | 109.6 | 119.8 | 105.2 | **101.3** |
+| down, 32 | 48.2 | 29.8 | **35.7** | 140.3 | 41.8 | 41.8 |
+| down, 64 | 81.9 | 50.2 | 66.5 | 146.2 | 58.3 | **58.2** |
+| down, 128 | 130.0 | 85.0 | 115.3 | 146.3 | 109.3 | **109.2** |
+| down, 256 | 255.0 | 160.5 | 201.5 | 209.8 | 189.3 | **189.3** |
+| down, 512 | 443.3 | 306.5 | 379.8 | 412.6 | 334.7 | **330.7** |
+
+What it says:
+
+* **Whole tiles only pay with many waves.** At 32 to 128 rows o has 32 to 128 tiles of
+  128 x 32 for 170 SMs, and one whole tile of K = 4096 takes 42 to 44 us however few of
+  them run. Cut into four, o at 64 rows is 21.3 us, level with v2.
+* **The plan is the fastest of the three** wherever it differs from both others, at every
+  point of the sweep from 32 to 4096 rows on all four projections. Where it cuts every tile it
+  is the four-pieces launch, and the two runs of that launch differ by up to 0.6 us (15.3
+  and 16.0 on o at 32 rows). The first plan cut the last wave only when that took fewer
+  quarter waves than running it whole. o and down at 256 rows, 256 tiles on 340 slots (86
+  SMs with two), then ran whole: 62.4 and 209.8 us against 60.3 and 189.3 cut.
+* **64 x 32 where 128 x 32's pieces do not reach the SMs.** o and down at 32 rows have 32
+  tiles of 128 x 32, 128 pieces for 170 SMs: 16.0 against 13.3 on o, 41.8 against 35.7 on
+  down. Everywhere else 128 x 32 is as fast or faster. The 8-warp 128 x 32 and the 64-row
+  tiles (entries 15, 18 and 19) were never the fastest.
+
+So `pick_invariant`: from 17 rows the class-order 128 x 32 tile on the plan, or 64 x 32 when
+four pieces per 128 x 32 tile come to fewer blocks than SMs; up to 16 rows, and on an N that
+64 does not divide, the four-warp shapes. `w4gemm_v3_set_route(-2)` (or
+`SPARK_W4_V3_ROUTE=-2`) puts the four-warp shapes back at every M and changes no bit, and
+`w4gemm_v3_route_name(M, N, K)` says what runs. `tests/test_batch_invariant.py` checks that on
+four shapes, symmetric and asymmetric: the rule, the four-warp route and every class-order
+tile under every schedule give the same bits, and an int4 engine on the four-warp route alone
+gets the logits of one on the rule in 32 slots. `tests/test_w4gemm.py` runs every class-order
+tile under every schedule against the reference, including K = 384 (three groups, never cut)
+and K = 1152 (classes of 3, 2, 2 and 2 groups).
+
+The symmetric 128 x 32 class tile fits two blocks per SM; the asymmetric one, with 128 more
+bytes of zero points per stage, fits one, as variant 2's Stream-K tile of the same shape
+does. The plan counts the asymmetric tile's slots on its own (at 512 x 4096 x 4096: 340 whole
+tiles and 172 cut symmetric, 510 and 2 asymmetric). I did not time the asymmetric rows.
+
+### Results
+
+`scripts/bench_invariant.py --part w4`, us per call (ten launches back to back between
+events, median of 50 samples at M <= 64 and of 10 above; weights rotated past L2 at
+M <= 64), v2 / v3 on the four-warp route / v3:
+
+| M | qkv 4096 x 6144 | o 4096 x 4096 | gate_up 4096 x 28672 | down 14336 x 4096 | lm_head 4096 x 128256 |
+|---|---|---|---|---|---|
+| 1 | 10.5 / 10.5 / 10.5 | 8.1 / 7.9 / 8.1 | 36.9 / 40.3 / 40.3 | 21.3 / 21.2 / 21.2 | 158.1 / 163.9 / 163.9 |
+| 8 | 10.7 / 10.7 / 10.7 | 8.5 / 8.3 / 8.3 | 38.2 / 38.9 / 38.9 | 24.9 / 24.2 / 24.2 | 158.3 / 159.3 / 159.4 |
+| 32 | 16.8 / 17.1 / 20.3 | 13.5 / 14.6 / 12.5 | 53.2 / 71.3 / 52.1 | 29.0 / 48.8 / 34.1 | 217.3 / 327.0 / 202.8 |
+| 64 | 26.4 / 37.7 / 29.1 | 20.9 / 25.7 / 20.0 | 91.7 / 140.5 / 89.0 | 49.4 / 81.2 / 57.4 | 383.3 / 618.0 / 380.9 |
+| 128 | 41.1 / 60.1 / 44.8 | 30.1 / 40.8 / 35.9 | 163.2 / 216.2 / 167.9 | 84.1 / 130.3 / 108.2 | 742.1 / 952.8 / 730.1 |
+| 256 | 74.3 / 99.7 / 78.1 | 52.1 / 78.3 / 58.9 | 317.8 / 425.8 / 319.0 | 160.3 / 257.9 / 187.7 | 1,475 / 1,875 / 1,426 |
+| 512 | 139.6 / 193.9 / 142.1 | 95.9 / 136.0 / 100.2 | 632.6 / 835.3 / 636.9 | 308.8 / 447.3 / 332.9 | 2,938 / 3,720 / 2,817 |
+| 2048 | 535.6 / 715.3 / 534.7 | 357.7 / 482.8 / 359.9 | 2,520 / 3,318 / 2,499 | 1,229 / 1,605 / 1,247 | 11,857 / 14,802 / 11,169 |
+| 4096 | 1,080 / 1,426 / 1,072 | 718.8 / 951.5 / 715.4 | 5,081 / 6,620 / 4,986 | 2,585 / 3,572 / 2,625 | |
+
+Up to 8 rows nothing changed (the same shapes; gate_up and lm_head at one row keep the 4 to
+9% the four-warp shape costs there). From 512 rows v3 is 0.94 to 1.08x of v2, where the
+four-warp route is 1.25 to 1.45x, and on lm_head it is ahead of v2 at every M from 32. At 32
+and 64 rows, the decode steps of 32 and 64 slots, the four projections add up to 119.0 and
+195.6 us against v2's 112.4 and 188.3: 5.9% and 3.8% more, where the four-warp route was 35%
+and 51% more. What still costs is qkv at 32 rows (20.3 against 16.8, and the four-warp shape
+does 17.1 there), down at 32 and 64 (1.18 and 1.16x), and o and down at 128 and 256
+(1.13 to 1.29x). Four pieces is the finest cut the class order allows, and Stream-K cuts
+finer.
+
+The engine, `bench_invariant.py --part engine --weights-format int4`, 8 of the 32 layers,
+the same random weights and static batches as batch_invariant.md, default / invariant /
+invariant on the four-warp route:
+
+| cache, batch | decode ms/step | prefill tok/s |
+|---|---|---|
+| bf16, 1 | 1.425 / 1.493 / 1.494 | 48,421 / 48,539 / 37,711 |
+| bf16, 8 | 1.587 / 1.578 / 1.578 | 50,619 / 51,511 / 35,930 |
+| bf16, 32 | 2.083 / 2.172 / 2.412 | 49,473 / 48,758 / 29,772 |
+| bf16, 64 | 3.157 / 3.173 / 3.869 | 48,980 / 48,496 / 30,175 |
+| fp8, 1 | 1.425 / 1.528 / 1.527 | 48,733 / 48,288 / 37,828 |
+| fp8, 8 | 1.541 / 1.586 / 1.584 | 50,778 / 51,087 / 35,854 |
+| fp8, 32 | 1.919 / 2.055 / 2.290 | 49,422 / 48,106 / 29,760 |
+| fp8, 64 | 2.806 / 2.862 / 3.564 | 48,437 / 47,842 / 30,119 |
+
+On the bf16 cache invariance cost 16 and 23% of a decode step at 32 and 64 slots on the
+four-warp route and costs 4.3 and 0.5% now; prefill went from 22 to 40% fewer tokens per
+second to within 2% of the default either way. At one slot both routes run the same shapes,
+so the 5 to 7% there is the invariant attention and the one-row GEMMs of the table above.
+
 ## Not done
 
+* Variant 3 at 128 to 256 rows on o and down, 1.13 to 1.29x of variant 2. Four class pieces
+  is the finest cut that keeps the bits; a finer one needs more chains per element, which
+  means other bits at every M and eight warps along K at decode.
 * The fused epilogues of `hgemm` (bias, activation, residual, SwiGLU on interleaved gate/up
   columns). The int4 layer still runs `swiglu` and the residual adds as separate kernels.
 * The tensor-bound regime (M >= 64): 16% of the roof and 0.8 to 0.96x of `hgemm` at M = 256.
