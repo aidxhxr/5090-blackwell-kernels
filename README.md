@@ -1388,7 +1388,11 @@ either side. It exits 1 on a slowdown; `--update` merges the run into the commit
 back-to-back runs on 2026-11-05 agreed within 5% on all 223 rows of `bench_hgemm --models
 --ms=128,1024`, the window sweep, decode_spark and w1moe_decode. rmsnorm and softmax had one row
 each past 5%, both under a microsecond, and bench_w1gemm 8 of 184, all variants 0 and 2;
-`--floor-us 1` leaves 5 of those 8 and none of the others.
+`--floor-us 1` leaves 5 of those 8 and none of the others. bench_w1gemm's rows were single
+launches, which on this card come in modes about 2 us apart that shift between runs; they are
+chains of 20 launches now. Any two of four such runs on 2026-11-06 agree within 4.5% on all
+184 rows (1.5% on the dense ones); any two of four single-launch runs that evening had 7 to 42
+rows past 5% ([the note](docs/design/w1gemm.md#timing)).
 
 ## from python
 
