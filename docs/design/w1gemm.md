@@ -295,14 +295,15 @@ for bit as `w1gemm` on those rows, which `tests/test_w1gemm.py` checks.
 
 ## Results
 
-RTX 5090, 2026-10-23, `bench_w1gemm --chain=20` (rows in `results/w1gemm.json`): random
-weights quantized on the GPU and checked bit for bit against the CPU quantizer, every
-variant checked against a CPU product on the dequantized matrix (all pass), the weights
-rotated past L2. The floor is the shape's bytes (packed bits, scales, activations, output)
-over the 1,532 GB/s copy roof. The bf16 column is `hgemm` variant 6 on the dequantized
-weights, the int4 column `w4gemm` variant 2 on the same weights at int4.
+RTX 5090, 2026-10-23, `bench_w1gemm --chain=20`: random weights quantized on the GPU and
+checked bit for bit against the CPU quantizer, every variant checked against a CPU product on
+the dequantized matrix (all pass), the weights rotated past L2. The floor is the shape's
+bytes (packed bits, scales, activations, output) over the 1,532 GB/s copy roof. The bf16
+column is `hgemm` variant 6 on the dequantized weights, the int4 column `w4gemm` variant 2 on
+the same weights at int4.
 
-Single launches, median of 50, us. The JSON rows are these.
+Single launches, median of 50, us. These were the JSON rows until 2026-11-06, and they did
+not repeat ([Timing](#timing)); the rows are the chains below now.
 
 | shape | bits | M | floor | v0 | v1 | v2 | v3 | bf16 `hgemm` | int4 `w4gemm` |
 |---|---|---|---|---|---|---|---|---|---|
@@ -342,6 +343,8 @@ Single launches, median of 50, us. The JSON rows are these.
 Twenty launches between one event pair, us per launch: what a decode step's launches queued
 back to back see, without the 1 to 3 us a lone launch spends being scheduled (the single
 launches above also come in steps of about 2 us on this machine, which the chains do not).
+These are what `results/w1gemm.json` holds since 2026-11-06, and that day's run is within
+2.3% of every v1, v2, v3 and bf16 cell here.
 
 | shape | bits | M | floor | v1 | v2 | v3 | v3 GB/s | % of roof | bf16 `hgemm` | int4 `w4gemm` | v3 vs int4 |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -401,7 +404,8 @@ What the tables say:
 The grouped form, DeepSeek V4.1 Flash's two expert GEMMs over 384 experts of random codes,
 T tokens routed to 6 distinct experts each, the T x 6 rows sorted, chains of 20 (us per
 launch); the floor is the distinct experts' bytes at the copy roof, the loop one `w1gemm`
-launch per routed expert (single-launch timing):
+launch per routed expert (single-launch timing). The 2026-11-06 rows are within 1.7% of v1 to
+v3 here, and their ref_ms is the loop chained, 0.2 to 5.4% under this column:
 
 | GEMM | bits | T | experts | floor | v1 | v2 | v3 | per-expert loop |
 |---|---|---|---|---|---|---|---|---|
@@ -427,6 +431,69 @@ pay the offsets scan and the ring's fill. The gate|up GEMM has 40 groups a strip
 every T by more than the down GEMM loses, so a layer's routed path is faster on variant 3 at
 every T measured, and the default stays the top rung. Fixing the down shape means more
 strips a block (the scan paid once) or fewer registers; not done.
+
+## Timing
+
+The JSON rows used to be single launches, the median of 50 (of 10 for variant 0, of 5 for the
+grouped variant 0), and two runs of the bench did not agree with each other. The first
+two-run test of `check_regress.py` (2026-11-05, in the README) had 8 of 184 rows more than 5%
+apart, all variants 0 and 2. On 2026-11-06, two runs in two lock holds one after the other:
+41 of 184, up to 32% (variant 3 at 2 x 5120 x 2304, 5.18 to 6.85 us), and the bf16 reference
+moved up to 11% on the same rows. The chains of 20 the same two runs printed on stderr were
+within 2.8% on all 144.
+
+400 lone launches of one kernel, each between its own event pair, 1 bit, us:
+
+| kernel | shape | median | where the samples are |
+|---|---|---|---|
+| empty | | 1.28 | 326 in 1.0 to 1.5, 67 in 1.5 to 3 |
+| v2 | 1 x 5120 x 2304 | 7.36 | 313 in 7.0 to 7.5, 47 in 9.0 to 9.5 |
+| v2, minutes later | 1 x 5120 x 2304 | 7.39 | 230 in 7.0 to 7.5, 77 in 9.0 to 9.5 |
+| v1 | 1 x 5120 x 2304 | 13.41 | 23 in 11.0 to 11.5, 328 in 13.0 to 14.0 |
+| hgemm v6 | 1 x 2304 x 5120 | 17.50 | 194 in 17.0 to 17.5, 100 in 19.0 to 19.5 |
+
+So a lone launch lands in one of a few modes about 2 us apart, and how many land in each
+moves within minutes. While the lower mode holds more than half, the median sits in it; when
+the upper one does, the median jumps a whole step. That is the second run's +1.7 us on rows of
+5 to 9 us, the reference's included. I did not pin down what the upper mode is. The start
+event fires on an idle stream, so the time includes the wait for the launch itself: an empty
+kernel is 1.28 us alone and 1.30 us a launch in a chain the host feeds, 0.67 us a launch when
+the chain is queued behind a 300 us spin kernel. Queuing a lone launch behind a spin kernel
+takes the host out of it and is worse. Events queued behind work are stamped on a 2.048 us
+grid on this card: v3 at 1 x 5120 x 2304 had its three quartiles at 6.144 us (3 x 2.048) and
+377 of 400 samples in 6.0 to 6.5.
+
+Twenty launches between one event pair have neither problem: after the first one the host is
+ahead of the GPU, and the end stamp's grid is 0.1 us a launch. v3 at 1 x 5120 x 2304 is 3.95
+us a launch host-fed and 3.99 with a 300 us spin in front, every pair between 3.88 and 4.25;
+the host only sets the pace below about 1.3 us a launch, and the fastest row here is 4.0. The
+grouped variant 0 had a second problem: its 5 launches were 5 of the 16 routings, the min
+and the median 14.5 us apart at T = 1 down (74.5 and 89.0), and the row moved 13.5% between
+the runs. A chain of 20 goes through all 16.
+
+Since 2026-11-06 every row is a chain: the median and min per launch of 20 launches between
+one event pair over 20 pairs, variant 0 too, with ref_ms (hgemm, and the grouped rows'
+per-expert loop) timed the same way. The single-launch medians are on stderr, and
+`--chain=1` gives the old rows. A run takes 47 to 79 s against 19 to 31 s, waits for the GPU
+lock included. The same two-run test, the same evening, rows more than x% apart:
+
+| rows | runs | > 2% | > 3% | > 5% | largest | largest ref_ms |
+|---|---|---|---|---|---|---|
+| single launches | two back to back | 78 | 65 | 41 | 32.1% | 11.1% |
+| chains of 20 | two back to back | 1 | 0 | 0 | 2.1% | 0.5% |
+| single launches | two, a chain run between them | 18 | 11 | 7 | 12.0% | 8.1% |
+| chains of 20 | two, a single run between them | 1 | 1 | 0 | 4.4% | 0.5% |
+
+Any two of the four chain runs: none past 5%, the largest 4.5%, the dense rows within 1.5%.
+The largest moves are grouped ones, variant 1 at T = 16 down in one run (114.3 against 109.2
+us) and variant 0 up to 2.5%. Any two of the four single-launch runs: 7 to 42 rows past 5%.
+`results/w1gemm.json` is the first chain run, and `check_regress.py` passes the other three
+against it. Against the single-launch rows it replaced, 88 rows are more than 5% faster
+(on the dense rows of variants 1 to 3 a chain is 0.6 to 5.8 us a launch under a lone launch)
+and 4 slower: the grouped variant 0 at T = 1 gate|up, 15% at both widths, now over all 16
+routings, its 2-bit T = 4 down, and the 2-bit gate|up at T = 16 on variant 3, 430 us a launch
+in the chain against 408 alone. That one is near the roof (1,230 GB/s), and on a few of the
+big grouped rows a launch right behind another is 2 to 5% slower than one alone.
 
 ## What is next
 
