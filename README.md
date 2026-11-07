@@ -704,6 +704,25 @@ touched, 3.3x the dense step at 8 and 3.8 to 4.3x at 32 and 64. Details in
 [docs/design/serving.md](docs/design/serving.md); `scripts/bench_engine_moe.py`,
 `results/engine_moe.json`, `tests/test_engine_moe.py`.
 
+The model's shape is a config now (`engine.ModelConfig`: hidden, query and K/V heads,
+head_dim, MLP width, eps), Llama-3-8B's by default, so Qwen3-30B-A3B runs on its own
+attention: hidden 2048, 32 query heads over 4 K/V heads, so a q projection of 2048 -> 4096
+and 8 query heads per K/V head. No kernel needed a change. Against TorchModel the logits
+are 0.53% off at prefill and 0.51 to 0.54% at decode (rerouted rows set aside), and the
+Llama default runs the same step to 0.1% on the GPU before and after. Decode ms/step with
+graphs / eager, same setup as above:
+
+| batch | Qwen3-30B-A3B, 2 layers | 4 layers |
+|---|---|---|
+| 1 | 0.307 / 0.317 | 0.512 / 0.529 |
+| 8 | 0.814 / 0.825 | 1.523 / 1.542 |
+| 32 | 1.515 / 1.526 | 2.931 / 2.950 |
+| 64 | 1.748 / 1.759 | 3.382 / 3.402 |
+
+A layer adds 0.10 ms at one token (114 MB read at 1,162 GB/s) and the graph saves 3.2% there,
+more than on the Llama-shaped models because the host's time to issue a step is half the
+GPU's. `tests/test_engine_config.py` has the other shapes.
+
 ## attention
 
 Fused scaled-dot-product attention, forward, bf16 in and out, fp32 math. Head sizes 64 and

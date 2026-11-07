@@ -1,5 +1,5 @@
-"""The serving engine on MoE models: two layers of the engine's attention with experts in
-place of the dense MLP, a small vocabulary. SparkModel (MoELayer) against TorchModel
+"""The serving engine on MoE models: two layers of attention with experts in place of the
+dense MLP, a small vocabulary. SparkModel (MoELayer) against TorchModel
 (moe_layer.torch_moe) on the same weights, a packed prefill then teacher-forced decode steps;
 the engine's CUDA-graph decode against its eager decode token for token, with prompts long
 enough that a prefill runs a grouped GEMM tile no decode bucket uses after the capture; and
@@ -17,9 +17,13 @@ N_LAYERS, VOCAB = 2, 1024
 
 # A Mixtral-like top-2 of 8 experts, wide enough (inter > 2048) that a prefill past 24 rows
 # per expert writes the permuted copy instead of gathering, and a Qwen-like top-8 of 64
-# narrow ones, always gathered.
+# narrow ones, always gathered, both on Llama-3-8B's attention; and Qwen3-30B-A3B's own
+# layer (128 experts of 768, top-8) on its own attention (engine.QWEN3_30B_A3B: hidden 2048,
+# 32 query heads over 4 K/V heads).
 CONFIGS = [ML.MoELayerConfig("mixtral-like", hidden=4096, inter=2304, experts=8, top_k=2),
-           ML.MoELayerConfig("qwen-like", hidden=4096, inter=256, experts=64, top_k=8)]
+           ML.MoELayerConfig("qwen-like", hidden=4096, inter=256, experts=64, top_k=8),
+           ML.QWEN3_30B_A3B]
+MODELS = {ML.QWEN3_30B_A3B.name: E.QWEN3_30B_A3B}  # the rest: E.LLAMA3_8B
 
 # Both models compute their MLP inputs to within a bf16 rounding of each other, so a token
 # whose k-th and k+1-th router logits are that close can go to a different expert in one of
@@ -33,7 +37,8 @@ TIE = 0.05
 def moe_weights(request):
     if not torch.cuda.is_available():
         pytest.skip("CUDA GPU required")
-    return E.ModelWeights.random(N_LAYERS, VOCAB, seed=2, moe=request.param)
+    return E.ModelWeights.random(N_LAYERS, VOCAB, seed=2, moe=request.param,
+                                 config=MODELS.get(request.param.name, E.LLAMA3_8B))
 
 
 def _rel(a, b):

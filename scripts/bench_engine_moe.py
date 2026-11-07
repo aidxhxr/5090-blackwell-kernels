@@ -3,17 +3,20 @@
 graphs and without, at batch 1, 8, 32 and 64, next to the dense model of the same layers.
 Appends JSON lines to results/engine_moe.json and prints a table.
 
-    python scripts/bench_engine_moe.py                     # mixtral, qwen-like and dense
+    python scripts/bench_engine_moe.py                     # every model below
     python scripts/bench_engine_moe.py --models qwen-like --batches 1,8
 
-Models, each --layers layers of the engine's attention (Llama-3-8B's, which is also
-Mixtral's) and a --vocab-token embedding and lm_head, random bf16 weights:
+Models, each --layers layers of attention and a --vocab-token embedding and lm_head, random
+bf16 weights. The attention is Llama-3-8B's (which is also Mixtral's) except for qwen3:
 
     mixtral     Mixtral 8x7B's MoE layer: 8 experts of 4096 -> 14336, top-2, so a token runs
                 twice the dense MLP's columns
     qwen-like   64 experts of 4096 -> 1792, top-8 (Qwen3-235B-A22B's routing at half its
                 experts): the 8 experts a token runs are 14336 columns, the dense MLP's, so
                 the active parameters are the dense model's
+    qwen3       Qwen3-30B-A3B's layer on its own attention (engine.QWEN3_30B_A3B): hidden
+                2048, 32 query heads over 4 K/V heads of 128, 128 experts of 2048 -> 768,
+                top-8
     dense       Llama-3-8B's layer, the 14336-wide MLP
 
 A static row is scripts/bench_serve.py's: B prompts log-uniform in --min-prompt..--max-prompt
@@ -49,30 +52,36 @@ sys.path.insert(0, str(ROOT / "python"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 OUT = ROOT / "results" / "engine_moe.json"
-MODELS = ("mixtral", "qwen-like", "dense")
+MODELS = ("mixtral", "qwen-like", "qwen3", "dense")
 
 
 def moe_config(name: str):
-    from spark_kernels.moe_layer import MIXTRAL_8X7B, MoELayerConfig
+    from spark_kernels.moe_layer import MIXTRAL_8X7B, QWEN3_30B_A3B, MoELayerConfig
 
     if name == "mixtral":
         return MIXTRAL_8X7B
     if name == "qwen-like":
         return MoELayerConfig("qwen-like", hidden=4096, inter=1792, experts=64, top_k=8)
+    if name == "qwen3":
+        return QWEN3_30B_A3B
     return None
+
+
+def model_config(name: str):
+    from spark_kernels import engine as E
+
+    return E.QWEN3_30B_A3B if name == "qwen3" else E.LLAMA3_8B
 
 
 def step_bytes_one_token(model, cfg) -> int:
     """Weight bytes a one-token step reads: the attention projections, the MLP a token runs
     (its top_k experts and the router, or the dense MLP), the lm_head."""
-    from spark_kernels import engine as E
-
     w = model.w
     attn = sum((lw.w_qkv.numel() + lw.w_o.numel()) * 2 for lw in w.layers)
     if cfg is None:
         mlp = sum((lw.w_gate_up.numel() + lw.w_down.numel()) * 2 for lw in w.layers)
     else:
-        mlp = len(w.layers) * (cfg.top_k * cfg.expert_bytes() + cfg.experts * E.HIDDEN * 2)
+        mlp = len(w.layers) * (cfg.top_k * cfg.expert_bytes() + cfg.experts * cfg.hidden * 2)
     return attn + mlp + w.lm_head.numel() * 2
 
 
@@ -134,17 +143,17 @@ def main() -> int:
     dev = torch.cuda.get_device_name()
     batches = [int(x) for x in args.batches.split(",") if x]
     max_seq = args.max_prompt + max(args.new, 256) + 16
-    rope = RoPE(max_seq)
     cache_bytes = int(args.cache_gb * (1 << 30))
     buckets = [x for x in E.BUCKETS if x <= max(batches)]
     rows = []
     for name in [m for m in args.models.split(",") if m]:
-        cfg = moe_config(name)
-        weights = E.ModelWeights.random(args.layers, args.vocab, moe=cfg)
-        model = E.SparkModel(weights, rope, prefill_variant=4)
+        cfg, mc = moe_config(name), model_config(name)
+        weights = E.ModelWeights.random(args.layers, args.vocab, moe=cfg, config=mc)
+        model = E.SparkModel(weights, RoPE(max_seq, head_dim=mc.head_dim), prefill_variant=4)
         base = {"device": dev, "kernel": "engine_moe", "model": name, "layers": args.layers,
                 "vocab": args.vocab, "weight_bytes": model.weight_bytes(),
-                "step_bytes_1tok": step_bytes_one_token(model, cfg)}
+                "step_bytes_1tok": step_bytes_one_token(model, cfg), "hidden": mc.hidden,
+                "heads": mc.n_heads, "kv_heads": mc.n_kv_heads}
         if cfg is not None:
             base.update(experts=cfg.experts, top_k=cfg.top_k, inter=cfg.inter)
         print(f"{name}: {args.layers} layers, {base['weight_bytes'] / 1e9:.2f} GB of weights, "

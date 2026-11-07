@@ -176,13 +176,13 @@ def llama3_inv_freq(inv_freq: torch.Tensor, scaling: dict) -> torch.Tensor:
 
 class RoPE:
     """cos and sin tables for positions 0..max_pos-1 in the rotate-half convention Llama
-    uses (the first half of the head pairs with the second half), fp32. `scaling` is a
-    config's rope_scaling dict; rope_type "llama3" (Llama 3.1 and later) is the one
-    supported, None or rope_type "default" is plain RoPE."""
+    uses (the first half of the head pairs with the second half), fp32, [max_pos, head_dim].
+    `scaling` is a config's rope_scaling dict; rope_type "llama3" (Llama 3.1 and later) is
+    the one supported, None or rope_type "default" is plain RoPE."""
 
     def __init__(self, max_pos: int, device="cuda", theta: float = ROPE_THETA,
-                 scaling: dict | None = None):
-        inv_freq = 1.0 / (theta ** (torch.arange(0, HEAD_DIM, 2, device=device).float() / HEAD_DIM))
+                 scaling: dict | None = None, head_dim: int = HEAD_DIM):
+        inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
         kind = scaling.get("rope_type", scaling.get("type", "default")) if scaling else "default"
         if kind == "llama3":
             inv_freq = llama3_inv_freq(inv_freq, scaling)
@@ -190,8 +190,8 @@ class RoPE:
             raise ValueError(f"rope_type {kind!r} is not supported")
         self.inv_freq = inv_freq
         pos = torch.arange(max_pos, device=device).float()
-        freqs = torch.outer(pos, inv_freq)  # [max_pos, 64]
-        emb = torch.cat([freqs, freqs], dim=-1)  # [max_pos, 128]
+        freqs = torch.outer(pos, inv_freq)  # [max_pos, head_dim / 2]
+        emb = torch.cat([freqs, freqs], dim=-1)  # [max_pos, head_dim]
         self.cos = emb.cos()
         self.sin = emb.sin()
 
