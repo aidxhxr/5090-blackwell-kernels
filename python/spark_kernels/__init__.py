@@ -10,6 +10,7 @@ Ops (all run on the current CUDA stream, all accept float32 or bfloat16 unless n
     rmsnorm_fp8(x, w, eps=1e-6)              fp8_quantize(rmsnorm(x, w), "row") in one launch
     add_rmsnorm_fp8_(x, resid, w, eps=1e-6)  the same after resid += x (bf16, in place)
     swiglu(gate, up, variant=-1)             silu(gate) * up
+    swiglu_fp8(gate, up)                     fp8_quantize(swiglu(gate, up), "row") in one launch
     softmax(x, variant=-1)                   softmax over the last dim, fp32 math
     sample(logits, temperature, top_k, top_p, seed, offset, variant=-1)
                                              one token per row of bf16 logits (temperature,
@@ -116,6 +117,7 @@ from .ops import (
     sgemm,
     softmax,
     swiglu,
+    swiglu_fp8,
     w1_quantize,
     w1gemm,
     w1gemm_moe,
@@ -165,6 +167,7 @@ __all__ = [
     "sgemm",
     "softmax",
     "swiglu",
+    "swiglu_fp8",
     "w1_quantize",
     "w1gemm",
     "w1gemm_moe",

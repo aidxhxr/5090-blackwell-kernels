@@ -219,6 +219,27 @@ Tensor swiglu(const Tensor& gate, const Tensor& up, int variant) {
     return out;
 }
 
+// silu(gate) * up written as fp8_quantize(h, "row") writes the bf16 h: (e4m3 [rows, cols],
+// fp32 scales [rows, 1]). gate and up are 2-D with contiguous rows, strided or not, as the
+// strided swiglu reads the halves of a fused gate|up projection.
+std::tuple<Tensor, Tensor> swiglu_fp8(const Tensor& gate, const Tensor& up) {
+    TORCH_CHECK(gate.is_cuda() && up.is_cuda(), "gate and up must be CUDA tensors");
+    TORCH_CHECK(gate.scalar_type() == at::kBFloat16 && up.scalar_type() == at::kBFloat16,
+                "swiglu_fp8 supports bfloat16 only");
+    TORCH_CHECK(gate.dim() == 2 && gate.sizes() == up.sizes(),
+                "swiglu_fp8 expects 2-D gate and up of the same shape");
+    TORCH_CHECK(gate.stride(1) == 1 && up.stride(1) == 1, "swiglu_fp8 needs contiguous rows");
+    const c10::cuda::CUDAGuard guard(gate.device());
+    const int64_t rows = gate.size(0), cols = gate.size(1);
+    Tensor q = at::empty({rows, cols}, gate.options().dtype(at::kFloat8_e4m3fn));
+    Tensor scales = at::empty({rows, 1}, gate.options().dtype(at::kFloat));
+    if (rows == 0) return {q, scales};
+    spark::swiglu_fp8_bf16(bf16_ptr(gate), bf16_ptr(up), static_cast<unsigned char*>(q.data_ptr()),
+                           scales.data_ptr<float>(), rows, cols, rows > 1 ? gate.stride(0) : cols,
+                           rows > 1 ? up.stride(0) : cols, current_stream(gate));
+    return {q, scales};
+}
+
 Tensor softmax(const Tensor& x, int variant) {
     check_cuda_contig(x, "x");
     check_float_or_bf16(x, "x");
@@ -2011,6 +2032,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "silu(gate) * up (2-D gate and up with contiguous rows may be strided: the halves "
           "of a fused gate|up projection)",
           py::arg("gate"), py::arg("up"), py::arg("variant") = -1);
+    m.def("swiglu_fp8", &swiglu_fp8,
+          "silu(gate) * up as fp8_quantize(.., 'row') of it: (e4m3, fp32 scale per row), bf16 "
+          "2-D gate and up with contiguous rows (may be strided)",
+          py::arg("gate"), py::arg("up"));
     m.def("softmax", &softmax, "softmax over the last dim (fp32 math)", py::arg("x"),
           py::arg("variant") = -1);
     m.def("sample", &sample,
