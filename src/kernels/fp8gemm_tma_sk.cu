@@ -31,7 +31,8 @@
 // (FP8_MX_TILED) the producer copies a stage's scales with the stage, one more box per
 // operand into a ring of STAGES - 1 slots that the consumers hand back as soon as they hold
 // the words, and the consumers read them with MT / 2 + NT / 4 shared loads per stage instead
-// of fetching chunks and shuffling; the plan counts stages again.
+// of fetching chunks and shuffling; the plan counts stages again, and in queue mode it hands
+// out whole tiles only when the last wave is nearly full (plan, "whole queue").
 
 #include <algorithm>
 #include <atomic>
@@ -422,6 +423,9 @@ struct Knobs {
     int min_pass = 4;       // queue mode: no K-pass shorter than this
     int static_waves = 2;   // static ranges up to this many waves (always when in L2)
     int group = -1;         // raster group: > 0 fixed, -1 the L2-footprint rule
+    // Queue mode with tiled MX scales: whole tiles instead of the Stream-K region when the
+    // last wave is nearly full (plan, "whole queue"). -1 the rule, 0 never, 1 always.
+    int whole_queue = -1;
     // Every tile whole, never a K split (variant 4, batch invariant, hgemm_sk::Knobs's flag
     // of the same name): one block per tile when they fit in one wave, else whole tiles from
     // the queue. An output element is then one chain of k32 steps from k = 0 to K.
@@ -429,7 +433,7 @@ struct Knobs {
 };
 
 // Sweep overrides, read once: SPARK_FP8GEMM_V3_MIN_SHARE, _MIN_SHARE_128, _MIN_PASS,
-// _STATIC_WAVES and _GROUP. SPARK_FP8GEMM_V3_ROUTE is the initial route
+// _STATIC_WAVES, _GROUP and _WHOLE_QUEUE. SPARK_FP8GEMM_V3_ROUTE is the initial route
 // (fp8gemm_v3_set_route).
 const Knobs& knobs() {
     static Knobs k;
@@ -445,6 +449,7 @@ const Knobs& knobs() {
         k.min_pass = geti("SPARK_FP8GEMM_V3_MIN_PASS", k.min_pass);
         k.static_waves = geti("SPARK_FP8GEMM_V3_STATIC_WAVES", k.static_waves);
         k.group = geti("SPARK_FP8GEMM_V3_GROUP", k.group);
+        k.whole_queue = geti("SPARK_FP8GEMM_V3_WHOLE_QUEUE", k.whole_queue);
     }
     return k;
 }
@@ -532,6 +537,17 @@ void plan(Params& p, hgemm_sk::Workspace& w, int M, int N, int K, int BM, int BN
         p.passes = 1;
         while ((p.KT >> p.passes) > k.min_pass) ++p.passes;
         p.sk_iters = 0;
+        // Whole queue: every tile whole from the queue, cuBLASLt's schedule. A Stream-K tile
+        // (three fixups of a 64 KB slot on the 128x128 tile) cost about a quarter of a tile
+        // more than a whole one in the tiled MX sweep, so whole tiles win when the last wave
+        // leaves fewer than a quarter as many blocks idle as there are Stream-K tiles, with K
+        // up to 64 k-steps: 256x28672x8192 (448 tiles, 62 idle, 278 Stream-K) 1.03x,
+        // 512x25600x5120 1.04x. Forced on 1024x8192x28672 (512 tiles, 168 idle) 0.80x.
+        const long long idle = static_cast<long long>(cdiv(p.tiles, p.grid)) * p.grid - p.tiles;
+        if (k.whole_queue > 0 || (k.whole_queue < 0 && p.KT <= 64 && 4 * idle < sk_tiles)) {
+            sk_tiles = 0;
+            p.dp_tiles = p.tiles;
+        }
     }
     const int g = k.group > 0 ? k.group : raster_group(p.grid, p.tiles_m, BM, BN, K);
     p.group = std::max(1, std::min(g, p.tiles_m));
@@ -596,9 +612,11 @@ void launch_mode(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16*
         tmSB = make_tensor_map_2d_u8(mx.b, N / 32, K, BN / 32, 128, CU_TENSOR_MAP_SWIZZLE_NONE);
     }
     static hgemm_sk::Workspace w;  // one per tile configuration and mode
+    Knobs kk = k;
+    if constexpr (MODE != MX_TILED) kk.whole_queue = 0;  // measured with tiled scales only
     Params p;
     plan(p, w, M, N, K, BM, BN, BK, SPC,
-         resident_blocks<BM, BN, BK, STAGES, WM, WN, MIN_BLOCKS, MODE, SFW>(), k);
+         resident_blocks<BM, BN, BK, STAGES, WM, WN, MIN_BLOCKS, MODE, SFW>(), kk);
     fp8gemm_v3_kernel<BM, BN, BK, STAGES, WM, WN, MIN_BLOCKS, MODE, SFW>
         <<<p.grid, threads, bytes, stream>>>(tmA, tmB, tmSA, tmSB, Cout, M, N, K, scale_a, scale_b,
                                              mx, p);
