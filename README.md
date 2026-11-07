@@ -1261,6 +1261,25 @@ make ncu              # Nsight Compute on the top rungs of every ladder, needs r
 ./build/bench_attention --b=1 --hq=32 --hkv=8 --sq=1 --skv=131072 --d=128
 ```
 
+To check a rerun against the committed rows I use `scripts/check_regress.py`:
+
+```bash
+./build/bench_w1gemm --chain=20 > /tmp/w1gemm.json
+make regress FRESH=/tmp/w1gemm.json                  # against results/w1gemm.json
+./build/bench_decode_spark | make regress FRESH=- AGAINST=results/decode_spark.json
+make regress FRESH=results/moe_layer.json REV=HEAD   # a results file the rerun overwrote
+```
+
+It matches rows on every field that isn't a measurement (kernel, dtype, variant, shape, impl,
+tokens, ...), compares median_ms for the C++ benches and the times and rates of the scripts'
+rows (a rate as the time it implies), prints the rows more than 5% slower or faster with
+ref_ms's change next to each (when cuBLAS moved too, it was the box), and the rows missing on
+either side. It exits 1 on a slowdown; `--update` merges the run into the committed file. Two
+back-to-back runs on 2026-11-05 agreed within 5% on all 223 rows of `bench_hgemm --models
+--ms=128,1024`, the window sweep, decode_spark and w1moe_decode. rmsnorm and softmax had one row
+each past 5%, both under a microsecond, and bench_w1gemm 8 of 184, all variants 0 and 2;
+`--floor-us 1` leaves 5 of those 8 and none of the others.
+
 ## from python
 
 ```python
