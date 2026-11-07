@@ -450,9 +450,9 @@ instantiation (`o` is 64 floats, plus 32 for Q, 8 for a K row and 16 for the V r
 `ModelWeights.random(n_layers, vocab, moe=cfg)` draws a model whose MLPs are experts:
 `ModelWeights.experts` holds one `MoEWeights` per layer (router, w13 with the gate rows then
 the up rows, w2: the checkpoint layout moe_layer.md uses) and the layers' `w_gate_up` and
-`w_down` are None. `cfg` is any `MoELayerConfig` of hidden 4096, the engine's attention
-being Llama-3-8B's, which is also Mixtral 8x7B's. The dense path is untouched and stays
-the default.
+`w_down` are None. `cfg` is any `MoELayerConfig` of the model's hidden: 4096 on the default
+Llama-3-8B attention, which is also Mixtral 8x7B's, and 2048 on Qwen3-30B-A3B's (Model
+shapes, below). The dense path is untouched and stays the default.
 
 - `SparkModel` builds an `MoELayer` per layer at construction (the interleaved w13 its
   SwiGLU epilogue reads) and frees the checkpoint-layout w13 unless `keep_bf16`, so the
@@ -544,9 +544,110 @@ the whole batch, costs 0.86 to 1.03 ms. That is the MoE decode tax at small batc
 graph does nothing about it.
 
 **Not done.** fp8 or int4 experts in the engine (the layer has no quantized path yet), batch
-invariance for the MoE layers, an MoE checkpoint loader (`hf.py` loads Llama-shaped
-models only), and other hidden sizes: the engine's attention is fixed at Llama-3-8B's
-shape, so Qwen3-30B-A3B (hidden 2048) cannot run as it is.
+invariance for the MoE layers, and an MoE checkpoint loader (`hf.py` loads Llama-shaped
+models only). Other hidden sizes run now: the next section.
+
+## Model shapes
+
+The engine had Llama-3-8B's shape baked in (layer.py's constants: hidden 4096, 32 query
+heads over 8 K/V heads of 128), so Qwen3-30B-A3B could not run in it, though its MoE layer
+already ran on the grouped GEMM: hidden 2048, 32 query heads over 4 K/V heads of 128. The
+shape is now a `ModelConfig` the weights carry (`ModelWeights.random(config=...)`,
+`ModelWeights.config`): hidden, `n_heads`, `n_kv_heads`, `head_dim`, the dense MLP width
+and the norms' eps. `SparkModel`, `TorchModel`, `PagedKVCache` (`[pages, H_kv, page,
+head_dim]`) and `Engine` take theirs from it, and `RoPE(..., head_dim=)` builds the tables.
+`LLAMA3_8B`, the default, is the old shape. `QWEN3_30B_A3B` sits next to it.
+
+Qwen3's shape changes two things. The attention is n_heads x head_dim = 4096 wide on a
+2048-wide residual, so q is 2048 -> 4096 and o 4096 -> 2048, and nothing in the layer can
+take the attention width to be hidden. And a K/V head has 8 query heads instead of 4.
+
+What each kernel needs, checked when the model is built (`ModelConfig.check`), so a shape
+that does not fit is refused with the reason instead of failing inside a launch:
+
+- `rmsnorm`: any width; `add_rmsnorm_` a multiple of 8, and the fp8 norms (fp8-tok weights)
+  at most 32768.
+- `hgemm` with its fused epilogues (the residual adds, the SwiGLU): N and K multiples of 64.
+  Qwen3's are qkv 2048 -> 5120, o 4096 -> 2048 and lm_head 2048 -> V.
+- `rope_append_paged_`: head_dim a multiple of 16, H_q a multiple of H_kv.
+- `paged_decode` and `attention_varlen`: head_dim 64 or 128. `paged_decode` takes at most 16
+  query heads per K/V head, since variant 1 puts a group's heads in one m16 tile of rows (the
+  invariant variant 2 of both has the same limit). Qwen3's group of 8 fills half the tile,
+  Llama's 4 a quarter.
+- the MoE layer: its own config, of the model's hidden.
+
+None of them needed a change.
+
+**Correctness.** `tests/test_engine_config.py` runs two layers of a dense model on Qwen3's
+attention (with its config's 6144-wide MLP) and of one with 64-wide heads in groups of 8
+(hidden 1024, 16 heads over 2), and `tests/test_engine_moe.py` has Qwen3-30B-A3B's own 128
+experts on its attention as a third model. SparkModel against TorchModel as the tests do it
+(two layers, vocabulary 1024, a packed prefill of four prompts, 302 tokens, then three
+teacher-forced decode steps of four rows), relative error of the logits:
+
+| model | cache | prefill | decode steps |
+|---|---|---|---|
+| Llama-3-8B (the default) | bf16 | 0.71% | 0.69 to 0.71% |
+| Llama-3-8B | e4m3 | 1.06% | 1.03 to 1.07% |
+| Qwen3-30B-A3B attention, dense MLP | bf16 | 0.68% | 0.71 to 0.73% |
+| Qwen3-30B-A3B attention, dense MLP | e4m3 | 1.10% | 1.00 to 1.09% |
+| Qwen3-30B-A3B, 128 experts, top-8 | bf16 | 0.53% | 0.51 to 0.54% |
+| Qwen3-30B-A3B, 128 experts, top-8 | e4m3 | 0.97% | 0.94 to 1.02% |
+
+On the MoE model the rerouted rows are set aside as in the MoE section: 14 of the 302
+prefill tokens went to another expert somewhere in the two layers (34 on the e4m3 cache),
+none of them a row whose logits are compared, and one decode row in twelve. Graphed and
+eager decode give the same tokens on all three shapes.
+
+**The default did not move.** The engine as it was (4b3c497) and this one in one process, on
+the same weights, alternated three times in one lock hold: eight Llama-3-8B layers,
+vocabulary 128,256, `scripts/bench_engine_moe.py`'s step alone (GPU time of the captured
+step, host time to issue it eagerly, every slot empty) and bench_serve's static batches with
+graphs (64 new tokens, prompts log-uniform in 64 to 2048), ms, medians:
+
+| batch | step GPU, before / after | step host | static decode ms/step |
+|---|---|---|---|
+| 1 | 2.924 / 2.926 | 0.261 / 0.260 | 2.945 / 2.947 |
+| 8 | 2.947 / 2.950 | 0.261 / 0.260 | 3.091 / 3.091 |
+| 32 | 2.969 / 2.968 | 0.268 / 0.269 | 3.618 / 3.619 |
+| 64 | 3.187 / 3.189 | 0.266 / 0.270 | 5.485 / 5.482 |
+
+The GPU time agrees to 0.1% and the host's to 3 us. On the batch-invariant kernels, whose
+bits do not change from run to run, the two engines give the same logits bit for bit for
+every token of four requests, on a bf16 and an e4m3 cache, and so does TorchModel. On the
+default kernels the tokens are the same and the logits differ in the low bits, by as much
+as the old engine differs from itself between two runs (hgemm's decode kernel adds its K
+slices with fp32 atomics, hgemm.md). The random weights are the same for a seed.
+
+**Measured** (`scripts/bench_engine_moe.py --models qwen3,dense`, the MoE section's setup:
+vocabulary 32,000, 0.5 GB of cache, static batches, decode ms/step with graphs / eager).
+Qwen3-30B-A3B is its own layer on its own attention: two layers are 2.75 GB of weights and a
+one-token step reads 0.359 GB of them; four layers are 5.25 GB and 0.586 GB. The dense rows
+ran in the same lock hold and are the MoE section's again to within 5 us.
+
+| B | qwen3, 2 layers | qwen3, 4 layers | dense, 2 layers |
+|---|---|---|---|
+| 1 | 0.307 / 0.317 | 0.512 / 0.529 | 0.741 / 0.748 |
+| 8 | 0.814 / 0.825 | 1.523 / 1.542 | 0.781 / 0.788 |
+| 32 | 1.515 / 1.526 | 2.931 / 2.950 | 0.858 / 0.865 |
+| 64 | 1.748 / 1.759 | 3.382 / 3.402 | 1.027 / 1.034 |
+
+| bucket | qwen3 2 layers, GPU / host ms | qwen3 4 layers |
+|---|---|---|
+| 1 | 0.293 / 0.151 | 0.489 / 0.272 |
+| 8 | 0.796 / 0.161 | 1.478 / 0.290 |
+| 32 | 1.466 / 0.167 | 2.791 / 0.302 |
+| 64 | 1.634 / 0.177 | 3.172 / 0.300 |
+
+Going from two layers to four, a Qwen3 layer adds 0.10 ms to a one-token decode step and
+0.82 ms to a 64-token one (64 tokens make 512 picks over its 128 experts). At one token
+that is 0.098 ms of GPU time for the 114 MB a layer reads, 1,162 GB/s. The graph saves 10 to
+20 us a step, 3.2 to 3.3% at one token and 0.6% at 64. That is more than on the
+Llama-shaped models, because a Qwen3 layer is small: at one token the host takes 51 to 56%
+of the GPU's time to issue the step, where it takes 11% on the dense model. It is still
+behind the GPU, so eager keeps it busy. Not run: the whole 48 layers (58 GB of bf16
+experts), and Qwen3's QK norm (a per-head RMSNorm on q and k before RoPE, which this layer
+does not have).
 
 ## Correctness
 
@@ -563,10 +664,13 @@ shape, so Qwen3-30B-A3B (hidden 2048) cannot run as it is.
   of four prompts, then three teacher-forced decode steps, logits within 2% relative error),
   and graph against eager decode token for token under continuous batching, with every page
   back on the free list at the end.
-- `tests/test_engine_moe.py`: the same two checks on two MoE models (a top-2 of 8 experts
-  wide enough to take the permuted copy at prefill, a top-8 of 64 narrow ones), the
-  rerouted rows set aside as the MoE section says, plus what SparkModel does to the experts'
-  weights and what it refuses.
+- `tests/test_engine_moe.py`: the same two checks on three MoE models (a top-2 of 8 experts
+  wide enough to take the permuted copy at prefill, a top-8 of 64 narrow ones, and
+  Qwen3-30B-A3B's 128 experts on its own attention), the rerouted rows set aside as the MoE
+  section says, plus what SparkModel does to the experts' weights and what it refuses.
+- `tests/test_engine_config.py`: the same two checks on two dense models of other shapes
+  (Qwen3-30B-A3B's attention, and 64-wide heads in groups of 8) on both cache formats, plus
+  the default config and the shapes the kernels refuse (Model shapes, above).
 - The fp8 cache's checks are listed in its section above.
 - `bench_paged` validates every variant against a CPU double-precision reference: every row of
   up to eight sequences per decode batch and 256 sampled rows per prefill batch.
