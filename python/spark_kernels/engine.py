@@ -4,7 +4,7 @@ package's kernels; and the same model in plain PyTorch for comparison.
 
 The pieces (docs/design/serving.md):
 
-    PagedKVCache   K and V of every layer as [n_layers, num_pages, 8, page, 128] bf16, a free
+    PagedKVCache   K and V of every layer as [n_layers, num_pages, H_kv, page, D] bf16, a free
                    list of page ids, one reserved scratch page that padding tokens write into;
                    kv_format="fp8" stores them as e4m3 with a fixed scale per (layer, kv head)
     SparkModel     prefill(batch, cache) and decode(batch, cache) -> logits, on rmsnorm,
@@ -69,10 +69,16 @@ Weights: `ModelWeights.random()` draws every matrix on the GPU. w_gate_up is sto
 interleaved layout of `interleave_gate_up` (gate_j at column 2j, up_j at 2j + 1), the layout
 `hgemm_swiglu` takes; the torch model reads the same tensor as its two strided halves.
 `ModelWeights.random(moe=cfg)` draws a mixture-of-experts model instead: the same attention,
-and in every layer the experts of `cfg` (a `moe_layer.MoELayerConfig` of hidden 4096, e.g.
-Mixtral 8x7B's own layer) where the dense MLP was. SparkModel runs them with
+and in every layer the experts of `cfg` (a `moe_layer.MoELayerConfig` of the model's hidden,
+e.g. Mixtral 8x7B's own layer) where the dense MLP was. SparkModel runs them with
 `moe_layer.MoELayer`, whose forward never waits on the host, so the decode graphs capture the
 experts too; TorchModel runs `moe_layer.torch_moe`.
+
+The shapes are a `ModelConfig` (hidden, query and K/V heads, head_dim, the dense MLP width,
+the norms' eps) that the weights carry: `ModelWeights.random(config=QWEN3_30B_A3B,
+moe=moe_layer.QWEN3_30B_A3B)` is Qwen3-30B-A3B's layer (hidden 2048, 32 query heads over 4
+K/V heads, 128 experts of 768, top-8). The default, LLAMA3_8B, is the shape above, and the
+models, the cache and the engine take theirs from the weights.
 """
 
 from __future__ import annotations
@@ -91,11 +97,8 @@ from .layer import (
     HEAD_DIM,
     HIDDEN,
     INTERMEDIATE,
-    KV_WIDTH,
     N_HEADS,
     N_KV_HEADS,
-    Q_WIDTH,
-    QKV_WIDTH,
     LayerWeights,
     RoPE,
 )
@@ -115,27 +118,95 @@ def cdiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
+@dataclass(frozen=True)
+class ModelConfig:
+    """The shape of the decoder: a residual stream of `hidden`, `n_heads` query heads over
+    `n_kv_heads` K/V heads of `head_dim`, a dense SwiGLU MLP of `intermediate` (an MoE
+    model's experts bring their own and leave it unused), RMSNorm with `eps`. The q
+    projection is hidden -> n_heads * head_dim, which does not have to be hidden: Qwen3's
+    is 2048 -> 4096. LLAMA3_8B, layer.py's shape, is the default everywhere."""
+
+    name: str = "llama3-8b"
+    hidden: int = HIDDEN
+    n_heads: int = N_HEADS
+    n_kv_heads: int = N_KV_HEADS
+    head_dim: int = HEAD_DIM
+    intermediate: int = INTERMEDIATE
+    eps: float = EPS
+
+    @property
+    def q_width(self) -> int:
+        return self.n_heads * self.head_dim
+
+    @property
+    def kv_width(self) -> int:
+        return self.n_kv_heads * self.head_dim
+
+    @property
+    def qkv_width(self) -> int:
+        return self.q_width + 2 * self.kv_width
+
+    def check(self, kernels: bool = True) -> None:
+        """Raises ValueError for a shape the models cannot run: query heads that are not a
+        multiple of the K/V heads, and with `kernels` (SparkModel) what the kernels need on
+        top: head_dim 64 or 128 and at most 16 query heads per K/V head (paged_decode and
+        attention_varlen), hidden and intermediate multiples of 64 (hgemm's fused epilogues
+        take N and K multiples of 64) and hidden at most 32768 (the fp8 norms)."""
+        if min(self.hidden, self.n_heads, self.n_kv_heads, self.head_dim) < 1:
+            raise ValueError(f"{self.name}: every size must be >= 1, got {self}")
+        if self.n_heads % self.n_kv_heads:
+            raise ValueError(f"{self.name}: {self.n_heads} query heads are not a multiple of "
+                             f"{self.n_kv_heads} K/V heads")
+        if not kernels:
+            return
+        if self.head_dim not in (64, 128):
+            raise ValueError(f"{self.name}: the attention kernels take head_dim 64 or 128, got "
+                             f"{self.head_dim}")
+        if self.n_heads // self.n_kv_heads > 16:
+            raise ValueError(f"{self.name}: paged_decode takes at most 16 query heads per K/V "
+                             f"head, got {self.n_heads // self.n_kv_heads}")
+        if self.hidden % 64 or self.intermediate % 64 or self.hidden > 32768:
+            raise ValueError(f"{self.name}: hgemm's fused epilogues need hidden and "
+                             "intermediate multiples of 64 (and the fp8 norms hidden <= 32768), "
+                             f"got {self.hidden} and {self.intermediate}")
+
+
+LLAMA3_8B = ModelConfig()
+# Qwen3-30B-A3B's attention: hidden 2048, 32 query heads over 4 K/V heads of 128 (8 per
+# group), so q is 2048 -> 4096 and o 4096 -> 2048. All 48 of its layers are MoE (128
+# experts of 768, top-8: moe_layer.QWEN3_30B_A3B); 6144 is the dense MLP width its config
+# gives
+QWEN3_30B_A3B = ModelConfig("qwen3-30b-a3b", hidden=2048, n_heads=32, n_kv_heads=4,
+                            head_dim=128, intermediate=6144, eps=1e-6)
+
+
 @dataclass
 class ModelWeights:
-    """bf16 weights of the whole model in hgemm's [K, N] layout. With `experts` (one
-    MoEWeights per layer, in the checkpoint layout moe_layer.py describes) every layer's MLP
-    is those experts, and the layers' w_gate_up and w_down are None."""
+    """bf16 weights of the whole model in hgemm's [K, N] layout, of the shape `config`
+    (Llama-3-8B's by default). With `experts` (one MoEWeights per layer, in the checkpoint
+    layout moe_layer.py describes) every layer's MLP is those experts, and the layers'
+    w_gate_up and w_down are None."""
 
-    embed: torch.Tensor  # [V, 4096]
+    embed: torch.Tensor  # [V, hidden]
     layers: list[LayerWeights]  # w_gate_up interleaved (see the module docstring)
-    final_norm: torch.Tensor  # [4096]
-    lm_head: torch.Tensor  # [4096, V]
+    final_norm: torch.Tensor  # [hidden]
+    lm_head: torch.Tensor  # [hidden, V]
     experts: list[MoEWeights] | None = None
+    config: ModelConfig = LLAMA3_8B
 
     @staticmethod
     def random(n_layers: int = N_LAYERS, vocab: int = VOCAB, device="cuda",
-               seed: int = 0, moe: MoELayerConfig | None = None) -> ModelWeights:
+               seed: int = 0, moe: MoELayerConfig | None = None,
+               config: ModelConfig = LLAMA3_8B) -> ModelWeights:
         """N(0, 1/K) projections and 1 + 0.1 N(0, 1) norms, as LayerWeights.random, drawn on
-        the GPU (14 GB of layer weights take seconds there and minutes on the CPU). With
-        `moe` each layer gets that config's experts (MoEWeights.random, its own seed per
-        layer) and no dense MLP."""
-        if moe is not None and moe.hidden != HIDDEN:
-            raise ValueError(f"the experts take the model's hidden size {HIDDEN}, got {moe.hidden}")
+        the GPU (14 GB of layer weights take seconds there and minutes on the CPU), in the
+        shapes of `config`. With `moe` each layer gets that config's experts
+        (MoEWeights.random, its own seed per layer) and no dense MLP."""
+        c = config
+        c.check(kernels=False)
+        if moe is not None and moe.hidden != c.hidden:
+            raise ValueError(f"the experts take the model's hidden size {c.hidden}, got "
+                             f"{moe.hidden}")
         g = torch.Generator(device=device).manual_seed(seed)
         dense = moe is None
 
@@ -147,17 +218,18 @@ class ModelWeights:
             return torch.empty(n, device=device, dtype=torch.bfloat16).normal_(
                 1.0, 0.1, generator=g)
 
-        layers = [LayerWeights(attn_norm=norm(HIDDEN), w_qkv=proj(HIDDEN, QKV_WIDTH),
-                               w_o=proj(Q_WIDTH, HIDDEN), mlp_norm=norm(HIDDEN),
-                               w_gate_up=proj(HIDDEN, 2 * INTERMEDIATE) if dense else None,
-                               w_down=proj(INTERMEDIATE, HIDDEN) if dense else None)
+        d, inter = c.hidden, c.intermediate
+        layers = [LayerWeights(attn_norm=norm(d), w_qkv=proj(d, c.qkv_width),
+                               w_o=proj(c.q_width, d), mlp_norm=norm(d),
+                               w_gate_up=proj(d, 2 * inter) if dense else None,
+                               w_down=proj(inter, d) if dense else None)
                   for _ in range(n_layers)]
         experts = None if dense else [MoEWeights.random(moe, device, seed=(seed << 16) + i)
                                       for i in range(n_layers)]
-        embed = torch.empty(vocab, HIDDEN, device=device, dtype=torch.bfloat16).normal_(
+        embed = torch.empty(vocab, d, device=device, dtype=torch.bfloat16).normal_(
             0.0, 1.0, generator=g)
-        return ModelWeights(embed=embed, layers=layers, final_norm=norm(HIDDEN),
-                            lm_head=proj(HIDDEN, vocab), experts=experts)
+        return ModelWeights(embed=embed, layers=layers, final_norm=norm(d),
+                            lm_head=proj(d, vocab), experts=experts, config=c)
 
     def bytes(self) -> int:
         rest = self.embed.numel() * 2 + self.lm_head.numel() * 2 + self.final_norm.numel() * 2
@@ -174,7 +246,8 @@ KV_FORMATS = ("bf16", "fp8")
 
 class PagedKVCache:
     """K and V of every layer in pages of `page` tokens: k[l] and v[l] are the
-    [num_pages, 8, page, 128] caches the kernels take. The last page is scratch: padding
+    [num_pages, H_kv, page, head_dim] caches the kernels take, H_kv and head_dim from
+    `config` (Llama-3-8B's 8 and 128 by default). The last page is scratch: padding
     tokens of a captured decode step write there and nothing reads it. `table` (pages.py)
     keeps the other pages: the free list, a hold count per page, and the full prompt pages
     registered for prefix caching.
@@ -182,7 +255,7 @@ class PagedKVCache:
     kv_format="fp8" stores K and V as float8_e4m3fn, half the bytes per token, element x of kv
     head h of layer l as e4m3(x / scale[l, h]). The scales are fixed for the life of the cache,
     since a page written at one step is read with the same scale at every later one: k_scale
-    and v_scale [n_layers, 8] float32, 1.0 unless given (an uncalibrated default: e4m3's
+    and v_scale [n_layers, H_kv] float32, 1.0 unless given (an uncalibrated default: e4m3's
     normal range 2^-6 to 448 holds Llama-class K and V as they are, with 3 mantissa bits of
     relative precision; vLLM also uses 1.0 when a checkpoint carries no scales). A calibrated
     scale is amax / 448 per head, measured on representative prompts; scales(l) is what the
@@ -190,12 +263,13 @@ class PagedKVCache:
 
     def __init__(self, n_layers: int, num_pages: int, page: int = PAGE, device="cuda",
                  kv_format: str = "bf16", k_scale: torch.Tensor | None = None,
-                 v_scale: torch.Tensor | None = None):
+                 v_scale: torch.Tensor | None = None, config: ModelConfig = LLAMA3_8B):
         if num_pages < 2:
             raise ValueError("need at least two pages (one is scratch)")
         if kv_format not in KV_FORMATS:
             raise ValueError(f"kv_format must be one of {KV_FORMATS}, got {kv_format!r}")
-        shape = (n_layers, num_pages, N_KV_HEADS, page, HEAD_DIM)
+        hkv = config.n_kv_heads
+        shape = (n_layers, num_pages, hkv, page, config.head_dim)
         self.kv_format = kv_format
         self.k_scale = self.v_scale = None
         if kv_format == "fp8":
@@ -204,11 +278,11 @@ class PagedKVCache:
                 torch.float8_e4m3fn)
             self.v = torch.zeros(shape, device=device, dtype=torch.uint8).view(
                 torch.float8_e4m3fn)
-            ones = torch.ones(n_layers, N_KV_HEADS, device=device, dtype=torch.float32)
+            ones = torch.ones(n_layers, hkv, device=device, dtype=torch.float32)
             self.k_scale = ones.clone() if k_scale is None else k_scale.to(
-                device, torch.float32).reshape(n_layers, N_KV_HEADS).contiguous()
+                device, torch.float32).reshape(n_layers, hkv).contiguous()
             self.v_scale = ones.clone() if v_scale is None else v_scale.to(
-                device, torch.float32).reshape(n_layers, N_KV_HEADS).contiguous()
+                device, torch.float32).reshape(n_layers, hkv).contiguous()
         else:
             if k_scale is not None or v_scale is not None:
                 raise ValueError("k_scale and v_scale are for kv_format='fp8'")
@@ -228,8 +302,9 @@ class PagedKVCache:
         return self.table.available()
 
     @staticmethod
-    def page_bytes(n_layers: int, page: int = PAGE, kv_format: str = "bf16") -> int:
-        return 2 * n_layers * N_KV_HEADS * page * HEAD_DIM * (1 if kv_format == "fp8" else 2)
+    def page_bytes(n_layers: int, page: int = PAGE, kv_format: str = "bf16",
+                   config: ModelConfig = LLAMA3_8B) -> int:
+        return 2 * n_layers * config.kv_width * page * (1 if kv_format == "fp8" else 2)
 
     def scales(self, layer: int) -> dict[str, torch.Tensor]:
         """The keyword arguments the paged ops take for this layer's cache: its k_scale and
@@ -270,7 +345,8 @@ class Batch:
 def _rope_tokens(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     """x [T, H, D] rotated per token by cos, sin [T, D] (rotate-half), fp32 math."""
     xf = x.float()
-    rot = torch.cat([-xf[..., HEAD_DIM // 2:], xf[..., :HEAD_DIM // 2]], dim=-1)
+    h = x.shape[-1] // 2
+    rot = torch.cat([-xf[..., h:], xf[..., :h]], dim=-1)
     return (xf * cos[:, None] + rot * sin[:, None]).to(x.dtype)
 
 
@@ -282,6 +358,12 @@ def _gather_fp8(c: torch.Tensor, scale: torch.Tensor, table: torch.Tensor) -> to
     x = x8.view(torch.float8_e4m3fn).float() * scale.view(-1, 1, 1, 1, 1)
     h, b, npg, page, d = x.shape
     return x.to(torch.bfloat16).view(h, b, npg * page, d)
+
+
+def _check_rope(rope: RoPE, config: ModelConfig) -> None:
+    if rope.cos.shape[1] != config.head_dim:
+        raise ValueError(f"the RoPE tables are for head_dim {rope.cos.shape[1]}, the model's is "
+                         f"{config.head_dim}: build them with RoPE(..., head_dim=)")
 
 
 class SparkModel:
@@ -325,7 +407,13 @@ class SparkModel:
     does a dense one. Each MoELayer keeps the interleaved gate/up copy its epilogue reads, and
     the checkpoint-layout w13 of `weights.experts` is freed (set to None) unless `keep_bf16`;
     `dequantized()` gives it back for a reference model. bf16 weights only, and no
-    batch_invariant: the grouped GEMM picks its tile from the rows per expert."""
+    batch_invariant: the grouped GEMM picks its tile from the rows per expert.
+
+    The shapes are `weights.config` (ModelConfig, Llama-3-8B's unless the weights say
+    otherwise): the norms run over its hidden, the GEMMs take its widths, and the RoPE, the
+    paged append and the attention take its head counts and head_dim. ModelConfig.check
+    refuses at construction a shape one of those kernels cannot take, and `rope` must have
+    tables of its head_dim."""
 
     context_prefill = True  # prefill rows may continue a cached context (attention_varlen)
     # fp8-tok: the qkv and gate/up projections take their e4m3 rows and scales from the norm
@@ -348,11 +436,16 @@ class SparkModel:
                                      "the whole batch, and fp4gemm has no invariant rung)")
         self.batch_invariant = bool(batch_invariant)
         self.w = weights
+        self.config = c = weights.config
+        c.check()
+        _check_rope(rope, c)
         self.moe: list[MoELayer] | None = None
         if weights.experts is not None:
             if weights_format != "bf16" or self.batch_invariant:
                 raise ValueError("the MoE layers take bf16 weights on the default kernels: no "
                                  "quantized weights_format and no batch_invariant")
+            if any(e.cfg.hidden != c.hidden for e in weights.experts):
+                raise ValueError(f"the experts must take the model's hidden size {c.hidden}")
             self.moe = []
             for e in weights.experts:
                 self.moe.append(MoELayer(e))  # its own interleaved copy of w13
@@ -361,7 +454,7 @@ class SparkModel:
             torch.cuda.empty_cache()
         self.rope = rope
         self.prefill_variant = prefill_variant
-        # set to a list to collect the residual stream [T, 4096] after every layer (a parity
+        # set to a list to collect the residual stream [T, hidden] after every layer (a parity
         # check against another implementation reads it); None, the default, costs nothing
         self.trace: list[torch.Tensor] | None = None
         self.format = weights_format
@@ -414,17 +507,18 @@ class SparkModel:
         if self.lin is None:
             return ModelWeights(embed=self.w.embed, layers=self.w.layers,
                                 final_norm=self.w.final_norm, lm_head=head,
-                                experts=self._experts())
+                                experts=self._experts(), config=self.config)
+        inter = self.config.intermediate
         layers = []
         for lw, d in zip(self.w.layers, self.lin, strict=True):
             gu = d["gate_up"].dequantize()
             layers.append(LayerWeights(
                 attn_norm=lw.attn_norm, w_qkv=d["qkv"].dequantize(), w_o=d["o"].dequantize(),
                 mlp_norm=lw.mlp_norm,
-                w_gate_up=sk.interleave_gate_up(gu[:, :INTERMEDIATE], gu[:, INTERMEDIATE:]),
+                w_gate_up=sk.interleave_gate_up(gu[:, :inter], gu[:, inter:]),
                 w_down=d["down"].dequantize()))
         return ModelWeights(embed=self.w.embed, layers=layers, final_norm=self.w.final_norm,
-                            lm_head=head)
+                            lm_head=head, config=self.config)
 
     def _experts(self) -> list[MoEWeights] | None:
         """weights.experts with each w13 in the checkpoint layout, rebuilt from the
@@ -461,8 +555,9 @@ class SparkModel:
     def _attention(self, qkv, x, b: Batch, cache: PagedKVCache, layer: int, decode: bool):
         kc, vc, sc = cache.k[layer], cache.v[layer], cache.scales(layer)
         av = 2 if self.batch_invariant else -1  # the paged ops' batch-invariant rung
+        c = self.config
         q = sk.rope_append_paged_(qkv, self.rope.cos, self.rope.sin, b.positions, b.slots,
-                                  kc, vc, N_HEADS, N_KV_HEADS, **sc)
+                                  kc, vc, c.n_heads, c.n_kv_heads, **sc)
         if decode:
             o = sk.paged_decode(q, kc, vc, b.block_table, b.seq_lens, av, **sc)
         elif b.n_dec:
@@ -470,7 +565,7 @@ class SparkModel:
         else:
             o = sk.attention_varlen(q, kc, vc, b.cu_seqlens, b.seq_lens, b.block_table,
                                     variant=av, **sc)
-        return o.view(x.shape[0], Q_WIDTH)
+        return o.view(x.shape[0], c.q_width)
 
     def _layers(self, x: torch.Tensor, b: Batch, cache: PagedKVCache, decode: bool):
         if self.lin is not None:
@@ -478,12 +573,13 @@ class SparkModel:
         if self.moe is not None:
             return self._layers_moe(x, b, cache, decode)
         v = self._gemm_variant(decode)
+        eps = self.config.eps
         for layer, w in enumerate(self.w.layers):
-            h = sk.rmsnorm(x, w.attn_norm, EPS)
+            h = sk.rmsnorm(x, w.attn_norm, eps)
             qkv = sk.hgemm(h, w.w_qkv, v)
             o = self._attention(qkv, x, b, cache, layer, decode)
             sk.hgemm(o, w.w_o, v, residual=x, out=x)
-            h2 = sk.rmsnorm(x, w.mlp_norm, EPS)
+            h2 = sk.rmsnorm(x, w.mlp_norm, eps)
             a = sk.hgemm_swiglu(h2, w.w_gate_up, v)
             sk.hgemm(a, w.w_down, v, residual=x, out=x)
             if self.trace is not None:
@@ -494,16 +590,17 @@ class SparkModel:
         """The layer loop with an MoELayer as each MLP: its output is added to x by the next
         layer's attention norm, and after the last layer by a plain add."""
         v = self._gemm_variant(decode)
+        eps = self.config.eps
         delta = None
         for layer, (w, moe) in enumerate(zip(self.w.layers, self.moe, strict=True)):
             if delta is None:
-                h = sk.rmsnorm(x, w.attn_norm, EPS)
+                h = sk.rmsnorm(x, w.attn_norm, eps)
             else:
-                h = sk.add_rmsnorm_(delta, x, w.attn_norm, EPS)  # x += delta, then the norm
+                h = sk.add_rmsnorm_(delta, x, w.attn_norm, eps)  # x += delta, then the norm
             qkv = sk.hgemm(h, w.w_qkv, v)
             o = self._attention(qkv, x, b, cache, layer, decode)
             sk.hgemm(o, w.w_o, v, residual=x, out=x)
-            delta = moe(sk.rmsnorm(x, w.mlp_norm, EPS))
+            delta = moe(sk.rmsnorm(x, w.mlp_norm, eps))
             if self.trace is not None:
                 self.trace.append(x + delta)
         if delta is not None:
@@ -527,21 +624,23 @@ class SparkModel:
     def _norm_linear(self, lin, x: torch.Tensor, delta, w_norm: torch.Tensor) -> torch.Tensor:
         """lin(rmsnorm(x) * w_norm), after `x += delta` unless delta is None; fp8-tok with
         `fuse_norm_fp8` hands lin the norm's own e4m3 rows (FP8Linear.gemm)."""
+        eps = self.config.eps
         if self.fuse_norm_fp8 and self.format == "fp8-tok":
             if delta is None:
-                return lin.gemm(*sk.rmsnorm_fp8(x, w_norm, EPS))
-            return lin.gemm(*sk.add_rmsnorm_fp8_(delta, x, w_norm, EPS))
+                return lin.gemm(*sk.rmsnorm_fp8(x, w_norm, eps))
+            return lin.gemm(*sk.add_rmsnorm_fp8_(delta, x, w_norm, eps))
         if delta is None:
-            return lin(sk.rmsnorm(x, w_norm, EPS))
-        return lin(sk.add_rmsnorm_(delta, x, w_norm, EPS))  # x += delta, then the norm
+            return lin(sk.rmsnorm(x, w_norm, eps))
+        return lin(sk.add_rmsnorm_(delta, x, w_norm, eps))  # x += delta, then the norm
 
     def _layers_quant(self, x: torch.Tensor, b: Batch, cache: PagedKVCache, decode: bool):
         delta = None  # the previous layer's down output, not yet added to x
+        inter = self.config.intermediate
         for layer, (w, lin) in enumerate(zip(self.w.layers, self.lin, strict=True)):
             qkv = self._norm_linear(lin["qkv"], x, delta, w.attn_norm)
             o = self._attention(qkv, x, b, cache, layer, decode)
             gu = self._norm_linear(lin["gate_up"], x, lin["o"](o), w.mlp_norm)
-            delta = lin["down"](sk.swiglu(gu[:, :INTERMEDIATE], gu[:, INTERMEDIATE:]))
+            delta = lin["down"](sk.swiglu(gu[:, :inter], gu[:, inter:]))
             if self.trace is not None:
                 self.trace.append(x + delta)
         if delta is not None:
@@ -549,7 +648,7 @@ class SparkModel:
         return x
 
     def _logits(self, x: torch.Tensor, variant: int = -1) -> torch.Tensor:
-        h = sk.rmsnorm(x, self.w.final_norm, EPS)
+        h = sk.rmsnorm(x, self.w.final_norm, self.config.eps)
         return self.head(h) if self.head is not None else sk.hgemm(h, self.w.lm_head, variant)
 
     def warm_workspaces(self, max_m: int = GRAPH_MAX) -> None:
@@ -564,20 +663,21 @@ class SparkModel:
         w = self.w.layers[0]
         v = self._gemm_variant(True)
         dev = self.w.embed.device
+        c = self.config
         for m in range(max_m, 0, -1):
-            x = torch.zeros(m, HIDDEN, device=dev, dtype=torch.bfloat16)
+            x = torch.zeros(m, c.hidden, device=dev, dtype=torch.bfloat16)
             if self.lin is not None:  # the quantized projections keep their own workspaces
                 lin = self.lin[0]
                 lin["qkv"](x)
-                lin["o"](x.new_zeros(m, Q_WIDTH))
+                lin["o"](x.new_zeros(m, c.q_width))
                 lin["gate_up"](x)
-                lin["down"](x.new_zeros(m, INTERMEDIATE))
+                lin["down"](x.new_zeros(m, c.intermediate))
             else:
                 sk.hgemm(x, w.w_qkv, v)
-                sk.hgemm(x.new_zeros(m, Q_WIDTH), w.w_o, v, residual=x, out=x.clone())
+                sk.hgemm(x.new_zeros(m, c.q_width), w.w_o, v, residual=x, out=x.clone())
                 if self.moe is None:
                     sk.hgemm_swiglu(x, w.w_gate_up, v)
-                    sk.hgemm(x.new_zeros(m, INTERMEDIATE), w.w_down, v, residual=x,
+                    sk.hgemm(x.new_zeros(m, c.intermediate), w.w_down, v, residual=x,
                              out=x.clone())
             if self.head is not None:
                 self.head(x)
@@ -601,10 +701,10 @@ class TorchModel:
     """The same model in PyTorch on the same weights and the same paged cache layout. The
     attention is F.scaled_dot_product_attention: per prompt (causal, enable_gqa) at prefill,
     and at decode over each sequence's pages gathered (one copy) to the longest length in the
-    batch with a length mask. At decode the 4 query heads of a K/V head are passed as 4 query
-    rows of that head, so SDPA sees plain multi-head attention with a mask (with enable_gqa
-    and the mask it was 1.7 to 2.5x slower on batched steps; docs/design/serving.md has both
-    measured). `compile=True` puts
+    batch with a length mask. At decode the query heads of a K/V head (4 in Llama-3-8B) are
+    passed as that many query rows of that head, so SDPA sees plain multi-head attention
+    with a mask (with enable_gqa and the mask it was 1.7 to 2.5x slower on batched steps;
+    docs/design/serving.md has both measured). `compile=True` puts
     the pre-attention part (norm, qkv GEMM, RoPE) and the post-attention part (o GEMM,
     residual, norm, MLP, residual) of a decode step's layer
     under torch.compile (max-autotune-no-cudagraphs, static shapes: one compilation per batch
@@ -619,13 +719,16 @@ class TorchModel:
 
     With MoE weights the MLP is `moe_layer.torch_moe`, transformers' experts loop with the
     routing weights and each token's sum in fp32, eager even with `compile` (the loop reads
-    the experts hit back to the host)."""
+    the experts hit back to the host). The shapes are `weights.config`, as in SparkModel."""
 
     def __init__(self, weights: ModelWeights, rope: RoPE, compile: bool = False):
         if weights.experts is not None and any(e.w13 is None for e in weights.experts):
             raise ValueError("a SparkModel freed these experts' w13: build it with keep_bf16 "
                              "or pass its dequantized() weights")
         self.w = weights
+        self.config = weights.config
+        self.config.check(kernels=False)
+        _check_rope(rope, self.config)
         self.rope = rope
         self.trace: list[torch.Tensor] | None = None  # see SparkModel.trace
         self.pre_d, self.post_d = self._pre, self._post
@@ -634,26 +737,26 @@ class TorchModel:
             self.pre_d = torch.compile(self._pre, dynamic=False, mode=mode)
             self.post_d = torch.compile(self._post, dynamic=False, mode=mode)
 
-    @staticmethod
-    def _pre(x, attn_norm, w_qkv, cos, sin):
-        T = x.shape[0]
-        h = F.rms_norm(x, (HIDDEN,), attn_norm, EPS)
+    def _pre(self, x, attn_norm, w_qkv, cos, sin):
+        c, T = self.config, x.shape[0]
+        qw, kw = c.q_width, c.kv_width
+        h = F.rms_norm(x, (c.hidden,), attn_norm, c.eps)
         qkv = h @ w_qkv
-        q = qkv[:, :Q_WIDTH].view(T, N_HEADS, HEAD_DIM)
-        k = qkv[:, Q_WIDTH:Q_WIDTH + KV_WIDTH].view(T, N_KV_HEADS, HEAD_DIM)
-        v = qkv[:, Q_WIDTH + KV_WIDTH:].view(T, N_KV_HEADS, HEAD_DIM)
+        q = qkv[:, :qw].view(T, c.n_heads, c.head_dim)
+        k = qkv[:, qw:qw + kw].view(T, c.n_kv_heads, c.head_dim)
+        v = qkv[:, qw + kw:].view(T, c.n_kv_heads, c.head_dim)
         return _rope_tokens(q, cos, sin), _rope_tokens(k, cos, sin), v
 
-    @staticmethod
-    def _post(x, o, w_o, mlp_norm, w_gate_up, w_down):
+    def _post(self, x, o, w_o, mlp_norm, w_gate_up, w_down):
+        c = self.config
         x = x + o @ w_o
-        gu = F.rms_norm(x, (HIDDEN,), mlp_norm, EPS) @ w_gate_up
+        gu = F.rms_norm(x, (c.hidden,), mlp_norm, c.eps) @ w_gate_up
         return x + (F.silu(gu[:, 0::2]) * gu[:, 1::2]) @ w_down
 
-    @staticmethod
-    def _post_moe(x, o, w_o, mlp_norm, experts: MoEWeights):
+    def _post_moe(self, x, o, w_o, mlp_norm, experts: MoEWeights):
+        c = self.config
         x = x + o @ w_o
-        h = F.rms_norm(x, (HIDDEN,), mlp_norm, EPS)
+        h = F.rms_norm(x, (c.hidden,), mlp_norm, c.eps)
         return x + torch_moe(h, experts, acc_dtype=torch.float32)
 
     def _forward(self, x, b: Batch, cache: PagedKVCache, decode: bool):
@@ -673,6 +776,8 @@ class TorchModel:
             table = b.block_table[:, :npg].long()
         pre, post = (self.pre_d, self.post_d) if decode else (self._pre, self._post)
         fp8 = cache.kv_format == "fp8"
+        c = self.config
+        hkv, d = c.n_kv_heads, c.head_dim
         for layer, w in enumerate(self.w.layers):
             kc, vc = cache.k[layer], cache.v[layer]
             q, k, v = pre(x, w.attn_norm, w.w_qkv, cos, sin)
@@ -693,12 +798,12 @@ class TorchModel:
                 if fp8:
                     kk, vv = _gather_fp8(kc, ks, table), _gather_fp8(vc, vs, table)
                 else:
-                    kk = kc.transpose(0, 1)[:, table].view(N_KV_HEADS, B, npg * page, HEAD_DIM)
-                    vv = vc.transpose(0, 1)[:, table].view(N_KV_HEADS, B, npg * page, HEAD_DIM)
-                qg = q.view(B, N_KV_HEADS, N_HEADS // N_KV_HEADS, HEAD_DIM)
+                    kk = kc.transpose(0, 1)[:, table].view(hkv, B, npg * page, d)
+                    vv = vc.transpose(0, 1)[:, table].view(hkv, B, npg * page, d)
+                qg = q.view(B, hkv, c.n_heads // hkv, d)
                 o = F.scaled_dot_product_attention(qg, kk.transpose(0, 1), vv.transpose(0, 1),
                                                    attn_mask=mask)
-                o = o.reshape(T, Q_WIDTH)
+                o = o.reshape(T, c.q_width)
             else:
                 if b.chunked:
                     raise NotImplementedError("TorchModel prefills whole prompts only")
@@ -709,7 +814,7 @@ class TorchModel:
                     vs = v[t0:t0 + n].transpose(0, 1)[None]
                     o1 = F.scaled_dot_product_attention(qs, ks, vs, is_causal=True,
                                                         enable_gqa=True)
-                    outs.append(o1[0].transpose(0, 1).reshape(n, Q_WIDTH))
+                    outs.append(o1[0].transpose(0, 1).reshape(n, c.q_width))
                     t0 += n
                 o = torch.cat(outs)
             if self.w.experts is None:
@@ -721,7 +826,8 @@ class TorchModel:
         return x
 
     def _logits(self, x):
-        return F.rms_norm(x, (HIDDEN,), self.w.final_norm, EPS) @ self.w.lm_head
+        c = self.config
+        return F.rms_norm(x, (c.hidden,), self.w.final_norm, c.eps) @ self.w.lm_head
 
     def prefill(self, b: Batch, cache: PagedKVCache, all_logits: bool = False) -> torch.Tensor:
         x = self._forward(F.embedding(b.ids, self.w.embed), b, cache, decode=False)
@@ -833,8 +939,8 @@ class Engine:
     (SparkModel).
 
     `kv_format="fp8"` keeps the cache in e4m3 (PagedKVCache), twice the tokens for the same
-    `cache_bytes`; `kv_scales` = (k_scale, v_scale), [n_layers, 8] each, replaces the default
-    scales of 1.
+    `cache_bytes`; `kv_scales` = (k_scale, v_scale), [n_layers, H_kv] each, replaces the
+    default scales of 1. The cache takes its K/V heads and head_dim from `model.config`.
 
     `batch_invariant=True` (or False) switches the model to the batch-invariant kernels (or
     off them) before anything is captured; None keeps the model's setting (SparkModel reads
@@ -865,10 +971,11 @@ class Engine:
                 model.set_batch_invariant(batch_invariant)
         # a decode step runs a whole bucket, so the per-slot buffers are bucket sized
         max_batch = next(x for x in BUCKETS if x >= max_batch)
+        config = getattr(model, "config", LLAMA3_8B)  # the K/V heads and head_dim of the cache
         if num_pages is None:
             if cache_bytes is None:
                 raise ValueError("give num_pages or cache_bytes")
-            num_pages = cache_bytes // PagedKVCache.page_bytes(n_layers, page, kv_format)
+            num_pages = cache_bytes // PagedKVCache.page_bytes(n_layers, page, kv_format, config)
         rope_len = model.rope.cos.shape[0]
         if rope_len < max_seq:  # the rope kernel reads the table at any position it is given
             raise ValueError(f"the RoPE tables cover {rope_len} positions, max_seq is {max_seq}")
@@ -880,7 +987,8 @@ class Engine:
         self.spec = speculative
         self.model = model
         k_scale, v_scale = kv_scales if kv_scales is not None else (None, None)
-        self.cache = PagedKVCache(n_layers, num_pages, page, device, kv_format, k_scale, v_scale)
+        self.cache = PagedKVCache(n_layers, num_pages, page, device, kv_format, k_scale, v_scale,
+                                  config)
         self.page = page
         self.max_batch = max_batch
         self.max_seq = max_seq
