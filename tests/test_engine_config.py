@@ -1,10 +1,13 @@
 """The serving engine on shapes other than Llama-3-8B's (engine.ModelConfig): two layers of
 a dense model with Qwen3-30B-A3B's attention (hidden 2048, 32 query heads over 4 K/V heads,
 so the q projection is 2048 -> 4096 and 8 query heads share a K/V head) and of one with
-64-wide heads in groups of 8. SparkModel against TorchModel on the same weights (a packed
-prefill, then teacher-forced decode steps) on a bf16 and an e4m3 cache, the engine's graphed
-decode against its eager decode token for token, and the shapes the kernels refuse. The MoE
-Qwen3-30B-A3B shape (its 128 experts on this attention) runs in tests/test_engine_moe.py."""
+64-wide heads in groups of 8, without Qwen3's QK norm and with it (Qwen3's own config has
+it). SparkModel against TorchModel on the same weights (a packed prefill, then teacher-forced
+decode steps) on a bf16 and an e4m3 cache, the engine's graphed decode against its eager
+decode token for token, and the shapes the kernels refuse. The MoE Qwen3-30B-A3B shape (its
+128 experts on this attention) runs in tests/test_engine_moe.py."""
+
+import dataclasses
 
 import pytest
 import torch
@@ -16,7 +19,9 @@ N_LAYERS, VOCAB = 2, 1024
 
 CONFIGS = [E.QWEN3_30B_A3B,
            E.ModelConfig("d64-g8", hidden=1024, n_heads=16, n_kv_heads=2, head_dim=64,
-                         intermediate=2816, eps=1e-6)]
+                         intermediate=2816, eps=1e-6),
+           E.ModelConfig("d64-g8-qk", hidden=1024, n_heads=16, n_kv_heads=2, head_dim=64,
+                         intermediate=2816, eps=1e-6, qk_norm=True)]
 
 
 @pytest.fixture(scope="module", params=CONFIGS, ids=lambda c: c.name)
@@ -129,3 +134,36 @@ def test_refused_shapes(sk):
     with pytest.raises(ValueError, match="hidden"):
         E.ModelWeights.random(1, 256, config=CONFIGS[1],
                               moe=E.MoELayerConfig("x", 2048, 256, 8, 2))
+
+
+def _prefill(model, prompts):
+    eng = E.Engine(model, N_LAYERS, max_batch=8, max_seq=512, num_pages=128, graphs=False)
+    for p in prompts:
+        eng.submit(p, max_new=1)
+    return eng.model.prefill(eng._prefill_batch(eng._admit()), eng.cache)
+
+
+def test_qk_norm(sk):
+    """Qwen3's config has the QK norm and its random weights carry it, drawn after the rest,
+    which is the same for a seed with it or without. The norm changes the logits, and a model
+    whose config wants it refuses weights without it."""
+    c = E.QWEN3_30B_A3B
+    assert c.qk_norm and not E.LLAMA3_8B.qk_norm
+    on = E.ModelWeights.random(N_LAYERS, VOCAB, seed=7, config=c)
+    off = E.ModelWeights.random(N_LAYERS, VOCAB, seed=7,
+                                config=dataclasses.replace(c, qk_norm=False))
+    for a, b in zip(on.layers, off.layers, strict=True):
+        assert a.q_norm.shape == a.k_norm.shape == (c.head_dim,)
+        assert b.q_norm is None and b.k_norm is None
+        assert torch.equal(a.w_qkv, b.w_qkv) and torch.equal(a.w_down, b.w_down)
+    assert torch.equal(on.lm_head, off.lm_head) and torch.equal(on.embed, off.embed)
+    rope = _rope(on, 1024)
+    g = torch.Generator().manual_seed(1)
+    prompts = [torch.randint(0, VOCAB, (n,), generator=g) for n in (37, 200)]
+    a, b = _prefill(E.SparkModel(on, rope), prompts), _prefill(E.SparkModel(off, rope), prompts)
+    assert _rel(a, b) > 2e-2  # the tolerance the models are held to above
+    bad = dataclasses.replace(off, config=c)
+    with pytest.raises(ValueError, match="q_norm"):
+        E.SparkModel(bad, rope)
+    with pytest.raises(ValueError, match="q_norm"):
+        E.TorchModel(bad, rope)
