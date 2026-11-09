@@ -206,6 +206,42 @@ def test_fp8gemm_variant3_rejects_bad_routes(sk, v3_route):
         v3_route(-3)
 
 
+# Queue-mode shapes the whole-queue rule hands whole tiles (plan in fp8gemm_tma_sk.cu): the
+# 70B gate/up at 128, 256 and 512 tokens on 128x64, 128x128 and 128x256, and the 32B gate/up
+# at 1024 tokens. 1024 x 28672 x 8192 is a queue shape the rule leaves to Stream-K.
+FP8_SHAPES_WHOLE_QUEUE = [(128, 28672, 8192), (256, 28672, 8192), (512, 28672, 8192),
+                          (1024, 25600, 5120)]
+
+
+@pytest.mark.parametrize("shape", FP8_SHAPES_WHOLE_QUEUE, ids=lambda s: f"M{s[0]}_N{s[1]}_K{s[2]}")
+def test_fp8gemm_variant3_whole_queue_is_variant4(sk, v3_route, shape):
+    # Gaussian inputs: the fp32 sums are not exact, so a tile cut in K-passes gets other bits
+    # than one chain of k32 steps from k = 0 to K. Where the queue hands out whole tiles,
+    # variant 3 is that one chain, which is variant 4's whatever tile either picks.
+    a, b_t, sa, sb = _inputs(*shape, seed=11)
+    assert torch.equal(sk.fp8gemm(a, b_t, sa, sb, 3), sk.fp8gemm(a, b_t, sa, sb, 4))
+
+
+def test_fp8gemm_variant3_stream_k_queue_is_not_variant4(sk, v3_route):
+    # ... and where the rule keeps the Stream-K region, the K-passes show in the bits.
+    a, b_t, sa, sb = _inputs(1024, 28672, 8192, seed=11)
+    assert not torch.equal(sk.fp8gemm(a, b_t, sa, sb, 3), sk.fp8gemm(a, b_t, sa, sb, 4))
+
+
+def test_fp8gemm_variant3_whole_queue_exact_sums(sk, v3_route):
+    # Multiples of 1/16 at K <= 8192: every fp32 partial sum is exact, so whole tiles, the
+    # Stream-K region and cuBLASLt give the same bits, on every tile and by the rule.
+    for M, N, K in FP8_SHAPES_WHOLE_QUEUE + [(1024, 28672, 8192)]:
+        torch.manual_seed(M + K)
+        a = (torch.randint(-16, 17, (M, K), device="cuda") / 16.0).to(torch.float8_e4m3fn)
+        b_t = (torch.randint(-16, 17, (N, K), device="cuda") / 16.0).to(torch.float8_e4m3fn)
+        sa, sb = torch.tensor(0.75, device="cuda"), torch.tensor(1.5, device="cuda")
+        want = _reference(a, b_t, sa, sb)
+        for tile in [-1] + list(range(sk._C.fp8gemm_v3_num_tiles())):
+            v3_route(tile)
+            assert torch.equal(sk.fp8gemm(a, b_t, sa, sb, 3), want), (M, N, K, tile)
+
+
 # ---- MX mode: sfa [M, K/32] and sfb [N, K/32] ue8m0 block scales -------------------------
 # The same rungs and tile paths as above, on K a multiple of 256 (the MX requirement): both
 # scale chunk widths (K % 512 == 0 takes 16-byte chunks, K = 11008 or 256 + 512n the 8-byte
@@ -506,6 +542,16 @@ def test_fp8gemm_mx_tiled_same_bits_every_run(sk, v3_route):
         first = sk.fp8gemm(a, b_t, variant=3, sfa=ta, sfb=tb)
         for _ in range(3):
             assert torch.equal(sk.fp8gemm(a, b_t, variant=3, sfa=ta, sfb=tb), first), tile
+
+
+def test_fp8gemm_mx_tiled_whole_queue_is_variant4(sk, v3_route):
+    # The whole-queue rule with tiled scales: 256 x 28672 x 8192 is one of its shapes, on the
+    # 128x128 tile, and variant 3 there is variant 4's one chain, as in per-tensor mode.
+    _mx_supported(sk)
+    a, sfa, b_t, sfb = _mx_inputs(256, 28672, 8192, seed=11)
+    ta, tb = _mx_tiled(sk, sfa, sfb)
+    assert torch.equal(sk.fp8gemm(a, b_t, variant=3, sfa=ta, sfb=tb),
+                       sk.fp8gemm(a, b_t, variant=4, sfa=ta, sfb=tb))
 
 
 def test_fp8gemm_mx_tiled_quantized_activations(sk):

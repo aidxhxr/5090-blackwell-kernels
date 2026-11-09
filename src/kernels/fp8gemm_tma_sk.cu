@@ -31,8 +31,9 @@
 // (FP8_MX_TILED) the producer copies a stage's scales with the stage, one more box per
 // operand into a ring of STAGES - 1 slots that the consumers hand back as soon as they hold
 // the words, and the consumers read them with MT / 2 + NT / 4 shared loads per stage instead
-// of fetching chunks and shuffling; the plan counts stages again, and in queue mode it hands
-// out whole tiles only when the last wave is nearly full (plan, "whole queue").
+// of fetching chunks and shuffling; the plan counts stages again. In the two modes whose
+// k-step is one stage, per-tensor and tiled, the queue hands out whole tiles when the last
+// wave is nearly full (plan, "whole queue").
 
 #include <algorithm>
 #include <atomic>
@@ -423,8 +424,9 @@ struct Knobs {
     int min_pass = 4;       // queue mode: no K-pass shorter than this
     int static_waves = 2;   // static ranges up to this many waves (always when in L2)
     int group = -1;         // raster group: > 0 fixed, -1 the L2-footprint rule
-    // Queue mode with tiled MX scales: whole tiles instead of the Stream-K region when the
-    // last wave is nearly full (plan, "whole queue"). -1 the rule, 0 never, 1 always.
+    // Queue mode, per-tensor or with tiled MX scales: whole tiles instead of the Stream-K
+    // region when the last wave is nearly full (plan, "whole queue"). -1 the rule, 0 never, 1
+    // always.
     int whole_queue = -1;
     // Every tile whole, never a K split (variant 4, batch invariant, hgemm_sk::Knobs's flag
     // of the same name): one block per tile when they fit in one wave, else whole tiles from
@@ -543,6 +545,9 @@ void plan(Params& p, hgemm_sk::Workspace& w, int M, int N, int K, int BM, int BN
         // leaves fewer than a quarter as many blocks idle as there are Stream-K tiles, with K
         // up to 64 k-steps: 256x28672x8192 (448 tiles, 62 idle, 278 Stream-K) 1.03x,
         // 512x25600x5120 1.04x. Forced on 1024x8192x28672 (512 tiles, 168 idle) 0.80x.
+        // Per-tensor the same counts on its own tiles take 9 shapes too, 1.02x to 1.07x:
+        // 512x28672x8192 on 128x256 (448 tiles, 62 idle) 1.06x; forced on 2048x8192x8192
+        // (512 tiles of 128x256, 168 idle) 0.81x.
         const long long idle = static_cast<long long>(cdiv(p.tiles, p.grid)) * p.grid - p.tiles;
         if (k.whole_queue > 0 || (k.whole_queue < 0 && p.KT <= 64 && 4 * idle < sk_tiles)) {
             sk_tiles = 0;
@@ -613,7 +618,7 @@ void launch_mode(const unsigned char* A, const unsigned char* Bt, __nv_bfloat16*
     }
     static hgemm_sk::Workspace w;  // one per tile configuration and mode
     Knobs kk = k;
-    if constexpr (MODE != MX_TILED) kk.whole_queue = 0;  // measured with tiled scales only
+    if constexpr (MODE == MX_ROWS) kk.whole_queue = 0;  // k-steps of chunk groups: not measured
     Params p;
     plan(p, w, M, N, K, BM, BN, BK, SPC,
          resident_blocks<BM, BN, BK, STAGES, WM, WN, MIN_BLOCKS, MODE, SFW>(), kk);

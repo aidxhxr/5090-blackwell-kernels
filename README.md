@@ -448,6 +448,15 @@ faster on them:
 of the 2026-11-05 sweep did not come back today, with or without the change (98.7 to 111.1%
 on those four in every run), and 2 to 4 shapes stay below cuBLASLt, at 98.3 to 99.9%.
 
+The per-tensor path runs the same queue on the same gate/ups, so the same rule runs there now.
+It takes 9 of the 120 shapes again, 1.037x faster on them in two ABBA sweeps against Stream-K,
+and leaves the other 111 alone. 512 x 28672 x 8192 goes from 97.9 to 100.4% of cuBLASLt to
+104.0 to 106.2%, 1024 x 25600 x 5120 from 95.3 to 97.2% to 101.2 to 102.0%, and the 8B lm_head
+at 256 tokens from 88.7 to 90.1% to 91.3 to 91.9% (that one needed 200 iterations to call).
+Forced on every queue shape it loses overall, down to 0.80x where the last of four waves is
+nearly empty. Rows in `results/fp8gemm_tensor_queue.jsonl`, made by
+`scripts/fp8gemm_queue_abba.sh`.
+
 ## the fp4 GEMM
 
 fp4 is the densest format the tensor cores here take, and NVFP4 is the one Blackwell inference
