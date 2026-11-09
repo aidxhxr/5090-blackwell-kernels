@@ -1291,8 +1291,13 @@ to 19 us off a 2.07 to 2.99 ms decode step and adds 0.4 to 2.2% to prefill.
 The SwiGLU does the same for the down projection. `swiglu_fp8` keeps the products in registers
 and writes the e4m3 row and its scale, `torch.equal` to `swiglu` then `fp8_quantize`, and a
 decode step's few rows go to a cluster of 8 blocks each so a row's silu is not one SM's work.
-It is 1.18 to 1.45x the two ops from 1 to 512 rows in a CUDA graph and 1.52 to 1.97x at 4096
-rows. On 8 layers it takes 7 to 11 us off a decode step and adds 1.6 to 4.8% to prefill.
+The 5090 holds 41 clusters of 8 at once (ncu's Max Active Clusters), so the 42nd row starts a
+second wave: 42 to 64 rows of 14336 go to clusters of 4, the rest to one block a row, and up to
+128 rows the blocks are sized for one vector a thread, since so few rows are latency bound.
+That made 33 to 128 rows of 14336 1.13 to 1.51x faster than one block a row of the first
+version. It is 1.28 to 1.62x the two ops from 1 to 512 rows in a CUDA graph and 1.52 to 1.97x
+at 4096 rows. On 8 layers the first version took 7 to 11 us off a decode step and added 1.6 to
+4.8% to prefill.
 
 One thing the 96 MB L2 does to you: a 4096 x 1024 bf16 input is 8 MB and never leaves L2
 between timing iterations, so those rows in the full tables read 2 to 4 TB/s. They are L2
