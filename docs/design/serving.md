@@ -635,10 +635,11 @@ A layer with a q_norm or a bias its config did not announce, or a projection of 
 shape than the config's, is refused at load.
 
 The three checkpoints in ~/models, through 004c2cb's loader (the fixed shape) and this one,
-one after the other in one process: Llama-3-8B-Instruct, Llama-3.1-8B-Instruct (llama3 rope
+one after the other in one process, on 2026-11-08 with a one-off script that isn't in the
+repo (it diffs against a copy of the old hf.py): Llama-3-8B-Instruct, Llama-3.1-8B-Instruct (llama3 rope
 scaling) and Mistral-7B-Instruct-v0.3 (theta 1e6, a 32,768 vocabulary), the first 16 of
 their 32 layers (the whole model's 14.96 GiB does not fit in the 14.8 GiB the card has free
-next to its other tenants tonight). On each: the same ModelConfig fields, the same RoPE
+next to its other tenants that day). On each: the same ModelConfig fields, the same RoPE
 tables bit for bit, the same bytes in all 99 weight tensors, and an engine run of four
 prompts (17, 64, 300 and 1,000 random tokens, 32 greedy tokens each) gives the same 128
 tokens, the same decode logits bit for bit and the same prefill logits at all 1,381
@@ -648,7 +649,7 @@ positions, on the batch-invariant kernels and, in this run, on the default ones 
 over 4 (q is 1024 -> 2048, as in Qwen3), and runs them through `hf.load` and SparkModel
 against transformers' own fp32 forward: the logits at every position of a 37- and a
 100-token prompt are 0.54 to 0.55% off on the Llama and 0.55 to 0.56% on the Mistral
-(relative error per prompt).
+(relative error per prompt, measured the same day; the test itself only asserts under 2%).
 
 **Measured** (`scripts/bench_engine_moe.py --models qwen3,dense`, the MoE section's setup:
 vocabulary 32,000, 0.5 GB of cache, static batches, decode ms/step with graphs / eager).
