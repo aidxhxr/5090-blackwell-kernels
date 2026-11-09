@@ -63,13 +63,13 @@ def test_load_matches_hf_layout(tmp_path):
     assert torch.equal(w.embed.cpu(), t["model.embed_tokens.weight"])
 
 
-@pytest.mark.parametrize("bad", [dict(hidden_size=3584), dict(num_key_value_heads=4),
+@pytest.mark.parametrize("bad", [dict(hidden_size=3584), dict(num_key_value_heads=5),
                                  dict(rope_scaling={"rope_type": "yarn", "factor": 4.0}),
                                  dict(vocab_size=32001)])
 def test_config_refuses_other_shapes(tmp_path, bad):
     (tmp_path / "config.json").write_text(json.dumps(_config(**bad)))
     with pytest.raises(ValueError):
-        hf.ModelConfig.from_dir(tmp_path)
+        hf.HFConfig.from_dir(tmp_path)
 
 
 LLAMA31_SCALING = {"factor": 8.0, "high_freq_factor": 4.0, "low_freq_factor": 1.0,
@@ -79,7 +79,7 @@ LLAMA31_SCALING = {"factor": 8.0, "high_freq_factor": 4.0, "low_freq_factor": 1.
 def test_config_reads_llama3_rope_scaling(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps(_config(
         rope_scaling=LLAMA31_SCALING, max_position_embeddings=131072)))
-    cfg = hf.ModelConfig.from_dir(tmp_path)
+    cfg = hf.HFConfig.from_dir(tmp_path)
     assert cfg.rope_scaling == LLAMA31_SCALING and cfg.max_pos == 131072
 
 
