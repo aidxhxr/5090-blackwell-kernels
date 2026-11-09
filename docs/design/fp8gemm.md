@@ -1236,14 +1236,15 @@ to 5.6). At 128 tokens cuBLASLt waits on memory, `long_scoreboard` (5.2 to 5.5),
 **128 tokens: the DRAM roof.** Both read the 525 MB weight once at 92 to 94% of the roof with
 the tensor pipe 43% busy, and cuBLASLt finishes 1 to 2% sooner at 1.65 TB/s against 1.62 to 1.64.
 There is not much left. The other 64-wide tile, 64x128 forced, ran 1.009x and 1.012x in one
-ABBA (100.0% of cuBLASLt to 101.0%); this bench fills Gaussian inputs, where the model sweep's
-uniform fill had the default at 98.3 to 98.8%.
+ABBA (100.0% of cuBLASLt to 101.0%) in the single-shape bench, where the model sweep had the
+default at 98.3 to 98.8%; both fill uniform e4m3 in tensor mode, so the fill doesn't explain that.
 
 **256 tokens: the clock.** This is the gap. We take fewer cycles than cuBLASLt, 884 to 896 K against
 907 to 915 K, and lose in time because the card runs us at 2.13 to 2.20 GHz and cuBLASLt at 2.34 to
 2.38. Both keep the tensor pipe 85 to 88% busy and DRAM at 81 to 86%. I did not log power for these
-launches, but it is the pattern the MX gate/ups showed at the 600 W cap: the kernel that costs less
-per tile gets the clock, and ours spends more moving bytes, 36% more through L2 (2.23 GB against
+launches, so this is the likely cause, not a measured one: it is what 8192³ showed at the 600 W cap
+(Power, above), where the clock was the whole gap. The kernel that costs less per FLOP gets the
+clock, and ours spends more moving bytes, 36% more through L2 (2.23 GB against
 1.64) and 19 to 20% more instructions. The bytes follow from the tile: every tile reads its BM rows
 of activations and its BN rows of the weight, 0.5 MB per 128 rows, so through L2 go 2004 x (0.5 +
 0.5 MB) = 2.1 GB on our 128x128, 1002 x (1 + 0.5 MB) = 1.58 GB on cuBLASLt's 256x128 and 1002 x (0.5
