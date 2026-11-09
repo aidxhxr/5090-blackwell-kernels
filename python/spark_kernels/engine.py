@@ -78,7 +78,9 @@ The shapes are a `ModelConfig` (hidden, query and K/V heads, head_dim, the dense
 the norms' eps) that the weights carry: `ModelWeights.random(config=QWEN3_30B_A3B,
 moe=moe_layer.QWEN3_30B_A3B)` is Qwen3-30B-A3B's layer (hidden 2048, 32 query heads over 4
 K/V heads, 128 experts of 768, top-8). The default, LLAMA3_8B, is the shape above, and the
-models, the cache and the engine take theirs from the weights.
+models, the cache and the engine take theirs from the weights. A config with `qk_norm`
+(Qwen3's) RMS-normalizes every q and k head before RoPE with the layer's q_norm and k_norm
+weights: inside rope_append_paged_ in SparkModel, `ops.qk_norm_ref` in TorchModel.
 """
 
 from __future__ import annotations
@@ -124,7 +126,9 @@ class ModelConfig:
     `n_kv_heads` K/V heads of `head_dim`, a dense SwiGLU MLP of `intermediate` (an MoE
     model's experts bring their own and leave it unused), RMSNorm with `eps`. The q
     projection is hidden -> n_heads * head_dim, which does not have to be hidden: Qwen3's
-    is 2048 -> 4096. LLAMA3_8B, layer.py's shape, is the default everywhere."""
+    is 2048 -> 4096. `qk_norm` is Qwen3's per-head RMSNorm of q and k before RoPE (a
+    [head_dim] weight for q and one for k per layer, LayerWeights.q_norm and k_norm, with
+    `eps`). LLAMA3_8B, layer.py's shape, is the default everywhere."""
 
     name: str = "llama3-8b"
     hidden: int = HIDDEN
@@ -133,6 +137,7 @@ class ModelConfig:
     head_dim: int = HEAD_DIM
     intermediate: int = INTERMEDIATE
     eps: float = EPS
+    qk_norm: bool = False
 
     @property
     def q_width(self) -> int:
@@ -175,9 +180,9 @@ LLAMA3_8B = ModelConfig()
 # Qwen3-30B-A3B's attention: hidden 2048, 32 query heads over 4 K/V heads of 128 (8 per
 # group), so q is 2048 -> 4096 and o 4096 -> 2048. All 48 of its layers are MoE (128
 # experts of 768, top-8: moe_layer.QWEN3_30B_A3B); 6144 is the dense MLP width its config
-# gives
+# gives. Every Qwen3 layer has the QK norm
 QWEN3_30B_A3B = ModelConfig("qwen3-30b-a3b", hidden=2048, n_heads=32, n_kv_heads=4,
-                            head_dim=128, intermediate=6144, eps=1e-6)
+                            head_dim=128, intermediate=6144, eps=1e-6, qk_norm=True)
 
 
 @dataclass
@@ -201,7 +206,8 @@ class ModelWeights:
         """N(0, 1/K) projections and 1 + 0.1 N(0, 1) norms, as LayerWeights.random, drawn on
         the GPU (14 GB of layer weights take seconds there and minutes on the CPU), in the
         shapes of `config`. With `moe` each layer gets that config's experts
-        (MoEWeights.random, its own seed per layer) and no dense MLP."""
+        (MoEWeights.random, its own seed per layer) and no dense MLP. With `config.qk_norm`
+        each layer's q_norm and k_norm are drawn last, so the rest is the same for a seed."""
         c = config
         c.check(kernels=False)
         if moe is not None and moe.hidden != c.hidden:
@@ -228,8 +234,12 @@ class ModelWeights:
                                       for i in range(n_layers)]
         embed = torch.empty(vocab, d, device=device, dtype=torch.bfloat16).normal_(
             0.0, 1.0, generator=g)
-        return ModelWeights(embed=embed, layers=layers, final_norm=norm(d),
-                            lm_head=proj(d, vocab), experts=experts, config=c)
+        final_norm, lm_head = norm(d), proj(d, vocab)
+        if c.qk_norm:
+            for lw in layers:
+                lw.q_norm, lw.k_norm = norm(c.head_dim), norm(c.head_dim)
+        return ModelWeights(embed=embed, layers=layers, final_norm=final_norm, lm_head=lm_head,
+                            experts=experts, config=c)
 
     def bytes(self) -> int:
         rest = self.embed.numel() * 2 + self.lm_head.numel() * 2 + self.final_norm.numel() * 2
@@ -366,6 +376,13 @@ def _check_rope(rope: RoPE, config: ModelConfig) -> None:
                          f"{config.head_dim}: build them with RoPE(..., head_dim=)")
 
 
+def _check_qk_norm(weights: ModelWeights) -> None:
+    c = weights.config
+    for i, lw in enumerate(weights.layers):
+        if c.qk_norm and (lw.q_norm is None or lw.k_norm is None):
+            raise ValueError(f"{c.name} has qk_norm, layer {i} has no q_norm or k_norm")
+
+
 class SparkModel:
     """The model on this package's kernels. Per layer: rmsnorm, the qkv GEMM, RoPE + the
     paged append, attention (varlen at prefill, paged decode at decode), the o GEMM with the
@@ -439,6 +456,10 @@ class SparkModel:
         self.config = c = weights.config
         c.check()
         _check_rope(rope, c)
+        _check_qk_norm(weights)
+        # rope_append_paged_'s QK norm arguments per layer, none without qk_norm
+        self._qk = [dict(q_norm=lw.q_norm, k_norm=lw.k_norm, eps=c.eps) if c.qk_norm else {}
+                    for lw in weights.layers]
         self.moe: list[MoELayer] | None = None
         if weights.experts is not None:
             if weights_format != "bf16" or self.batch_invariant:
@@ -516,7 +537,7 @@ class SparkModel:
                 attn_norm=lw.attn_norm, w_qkv=d["qkv"].dequantize(), w_o=d["o"].dequantize(),
                 mlp_norm=lw.mlp_norm,
                 w_gate_up=sk.interleave_gate_up(gu[:, :inter], gu[:, inter:]),
-                w_down=d["down"].dequantize()))
+                w_down=d["down"].dequantize(), q_norm=lw.q_norm, k_norm=lw.k_norm))
         return ModelWeights(embed=self.w.embed, layers=layers, final_norm=self.w.final_norm,
                             lm_head=head, config=self.config)
 
@@ -557,7 +578,7 @@ class SparkModel:
         av = 2 if self.batch_invariant else -1  # the paged ops' batch-invariant rung
         c = self.config
         q = sk.rope_append_paged_(qkv, self.rope.cos, self.rope.sin, b.positions, b.slots,
-                                  kc, vc, c.n_heads, c.n_kv_heads, **sc)
+                                  kc, vc, c.n_heads, c.n_kv_heads, **sc, **self._qk[layer])
         if decode:
             o = sk.paged_decode(q, kc, vc, b.block_table, b.seq_lens, av, **sc)
         elif b.n_dec:
@@ -729,6 +750,7 @@ class TorchModel:
         self.config = weights.config
         self.config.check(kernels=False)
         _check_rope(rope, self.config)
+        _check_qk_norm(weights)
         self.rope = rope
         self.trace: list[torch.Tensor] | None = None  # see SparkModel.trace
         self.pre_d, self.post_d = self._pre, self._post
@@ -737,7 +759,7 @@ class TorchModel:
             self.pre_d = torch.compile(self._pre, dynamic=False, mode=mode)
             self.post_d = torch.compile(self._post, dynamic=False, mode=mode)
 
-    def _pre(self, x, attn_norm, w_qkv, cos, sin):
+    def _pre(self, x, attn_norm, w_qkv, cos, sin, q_norm=None, k_norm=None):
         c, T = self.config, x.shape[0]
         qw, kw = c.q_width, c.kv_width
         h = F.rms_norm(x, (c.hidden,), attn_norm, c.eps)
@@ -745,6 +767,8 @@ class TorchModel:
         q = qkv[:, :qw].view(T, c.n_heads, c.head_dim)
         k = qkv[:, qw:qw + kw].view(T, c.n_kv_heads, c.head_dim)
         v = qkv[:, qw + kw:].view(T, c.n_kv_heads, c.head_dim)
+        if c.qk_norm:  # Qwen3RMSNorm per head, before the rotation
+            q, k = sk.qk_norm_ref(q, q_norm, c.eps), sk.qk_norm_ref(k, k_norm, c.eps)
         return _rope_tokens(q, cos, sin), _rope_tokens(k, cos, sin), v
 
     def _post(self, x, o, w_o, mlp_norm, w_gate_up, w_down):
@@ -780,7 +804,7 @@ class TorchModel:
         hkv, d = c.n_kv_heads, c.head_dim
         for layer, w in enumerate(self.w.layers):
             kc, vc = cache.k[layer], cache.v[layer]
-            q, k, v = pre(x, w.attn_norm, w.w_qkv, cos, sin)
+            q, k, v = pre(x, w.attn_norm, w.w_qkv, cos, sin, w.q_norm, w.k_norm)
             if fp8:
                 # bytes in and out through uint8 views: indexed writes and gathers on a float8
                 # tensor are not implemented by every torch build
