@@ -684,7 +684,8 @@ void run_probe(cudaStream_t stream, const spark::bench::Args& args) {
     constexpr int kTopK = 6;
     const int bits = args.geti("bits", 2), N = args.geti("probe-n", 4608),
               K = args.geti("probe-k", 5120), T = args.geti("probe-t", 16);
-    const int L = std::max(2, args.geti("probe-len", 20)), P = args.geti("probe-chains", 20);
+    const int L = std::max(2, args.geti("probe-len", 20)),
+              P = std::max(1, args.geti("probe-chains", 20));
     const int n_routings = std::max(1, args.geti("routings", 16));
     const std::string gap = args.get("probe", "1") == "1" ? "" : args.get("probe", "");
     const bool alt = args.has("probe-alt");
