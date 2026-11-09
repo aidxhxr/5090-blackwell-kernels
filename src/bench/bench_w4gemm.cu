@@ -3,7 +3,7 @@
 //   ./bench_w4gemm                               # Llama-3-8B projections x M = 1, 4, 16, 64, 256
 //   ./bench_w4gemm --m=1 --n=4096 --k=4096 --variant=2 --iters=50
 //   ./bench_w4gemm --m=16 --n=28672 --k=4096 --asym   # asymmetric weights (zero points)
-//   ./bench_w4gemm --m=1 --n=4096 --k=4096 --chain=20 # also time 20 launches per event pair
+//   ./bench_w4gemm --m=1 --n=4096 --k=4096 --chain=1  # rows of single launches, as before
 //   ./bench_w4gemm --sweep=invariant [--ms=32,2048]    # variant 3's routes and class tiles
 //
 // For every weight shape the bench quantizes a random bf16 W [K, N] on the GPU
@@ -14,9 +14,13 @@
 // the final rounding differ).
 //
 // Timing: the packed weights (with their scales) are rotated over copies that exceed the
-// 96 MB L2, as a decode step reads every layer's weights once. ref_ms is the bf16 path this
+// 96 MB L2, as a decode step reads every layer's weights once. A row's time is per launch,
+// --chain=N launches (20 by default) between one event pair, median and min over 20 pairs
+// (spark::bench::time_chained): single launches of the decode rows moved by up to 8.6% between
+// two runs (docs/design/w4gemm.md, "Timing"). The single-launch median is still printed on
+// stderr, and --chain=1 makes the rows single launches again. ref_ms is the bf16 path this
 // op replaces, hgemm_bf16 variant 6 (its decode kernel for M <= 64) on the dequantized
-// weights, rotated the same way; cuBLAS on the same matrix is printed on stderr.
+// weights, rotated and timed the same way; cuBLAS on the same matrix is printed on stderr.
 // gbps = the traffic floor: A, the packed weights, the scales (and zeros), C, once each.
 //
 // stdout: one JSON object per row (collected by scripts/run_all_benches.sh)
@@ -254,16 +258,6 @@ Weight make_weight(int N, int K, bool asym, cudaStream_t stream) {
     return w;
 }
 
-// Per-launch time of `chain` launches between one event pair (median over `iters` pairs).
-double time_chain(const std::function<void()>& fn, cudaStream_t stream, int chain, int iters) {
-    const auto t = spark::bench::time_kernel(
-        [&] {
-            for (int i = 0; i < chain; ++i) fn();
-        },
-        stream, 3, iters);
-    return t.median_ms / chain;
-}
-
 std::vector<float> to_host_f32(const __nv_bfloat16* d, size_t n) {
     std::vector<__nv_bfloat16> h(n);
     SPARK_CUDA_CHECK(cudaMemcpy(h.data(), d, n * 2, cudaMemcpyDeviceToHost));
@@ -303,11 +297,11 @@ bool run_m(cublasHandle_t handle, cudaStream_t stream, const Weight& w, int M,
         else
             cublas_gemm(handle, dA, w.d(turn++), dC, M, N, K);
     };
-    const auto t_hgemm = spark::bench::time_kernel(bf16_gemm, stream, 5, iters);
-    const auto t_cublas = spark::bench::time_kernel(
-        [&] { cublas_gemm(handle, dA, w.d(turn++), dRef, M, N, K); }, stream, 5, iters);
-    double chain_hgemm = 0;
-    if (chain > 1) chain_hgemm = time_chain(bf16_gemm, stream, chain, iters);
+    using spark::bench::time_chained;
+    const auto t_hgemm = time_chained(bf16_gemm, stream, chain, 5, iters, iters);
+    const auto t_cublas = time_chained([&] { cublas_gemm(handle, dA, w.d(turn++), dRef, M, N, K); },
+                                       stream, chain, 5, iters, iters);
+    const double hgemm_ms = t_hgemm.row.median_ms, cublas_ms = t_cublas.row.median_ms;
 
     const std::string shape = std::to_string(M) + "x" + std::to_string(N) + "x" + std::to_string(K);
     const double bytes = 2.0 * nA + static_cast<double>(w.bytes_per_copy()) + 2.0 * nC;
@@ -328,12 +322,13 @@ bool run_m(cublasHandle_t handle, cudaStream_t stream, const Weight& w, int M,
         if (!ok)
             std::fprintf(stderr, "  FAIL variant %d shape %s: max_abs=%.4e tol=%.4e\n", v,
                          shape.c_str(), err.max_abs, tol);
-        const auto t = spark::bench::time_kernel(
+        const auto tt = time_chained(
             [&] {
                 spark::w4gemm_bf16(dA, w.p(turn), w.s(turn), w.z(turn), dC, M, N, K, v, stream);
                 ++turn;
             },
-            stream, 5, v == 0 ? std::min(iters, 10) : iters);
+            stream, chain, 5, iters, v == 0 ? std::min(iters, 10) : iters);
+        const auto& t = tt.row;
 
         spark::bench::Row row;
         row.kernel = "w4gemm";
@@ -344,30 +339,21 @@ bool run_m(cublasHandle_t handle, cudaStream_t stream, const Weight& w, int M,
         row.min_ms = t.min_ms;
         row.gbps = bytes / (t.median_ms * 1e-3) / 1e9;
         row.tflops = flops / (t.median_ms * 1e-3) / 1e12;
-        row.ref_ms = t_hgemm.median_ms;
+        row.ref_ms = hgemm_ms;
         row.max_abs_err = err.max_abs;
         row.max_rel_err = err.max_rel;
         row.ok = ok;
         spark::bench::print_row(row);
         std::fprintf(stderr,
-                     "    %.2fx the bf16 hgemm (%.1f us) | cuBLAS bf16 %.1f us | weights %.0f "
+                     "    %.2fx the bf16 hgemm (%.2f us) | cuBLAS bf16 %.2f us | weights %.0f "
                      "GB/s int4, %.0f GB/s as bf16\n",
-                     t_hgemm.median_ms / t.median_ms, t_hgemm.median_ms * 1e3,
-                     t_cublas.median_ms * 1e3, w.bytes_per_copy() / (t.median_ms * 1e-3) / 1e9,
+                     hgemm_ms / t.median_ms, hgemm_ms * 1e3, cublas_ms * 1e3,
+                     w.bytes_per_copy() / (t.median_ms * 1e-3) / 1e9,
                      2.0 * K * N / (t.median_ms * 1e-3) / 1e9);
-        if (chain > 1 && v > 0) {
-            const double c = time_chain(
-                [&] {
-                    spark::w4gemm_bf16(dA, w.p(turn), w.s(turn), w.z(turn), dC, M, N, K, v, stream);
-                    ++turn;
-                },
-                stream, chain, iters);
+        if (chain > 1)
             std::fprintf(stderr,
-                         "    %d launches per event pair: %.2f us per launch (%.0f GB/s), bf16 "
-                         "hgemm %.2f us, %.2fx\n",
-                         chain, c * 1e3, bytes / (c * 1e-3) / 1e9, chain_hgemm * 1e3,
-                         chain_hgemm / c);
-        }
+                         "    single launch: %.1f us | bf16 hgemm %.1f us | cuBLAS bf16 %.1f us\n",
+                         tt.single_ms * 1e3, t_hgemm.single_ms * 1e3, t_cublas.single_ms * 1e3);
         all_ok = all_ok && ok;
     }
     for (void* p : {static_cast<void*>(dA), static_cast<void*>(dC), static_cast<void*>(dRef)})
@@ -486,7 +472,7 @@ int run(int argc, char** argv) {
         ms = {1, 4, 16, 64, 256};
     }
     const int iters = args.geti("iters", 50);
-    const int chain = args.geti("chain", 1);
+    const int chain = spark::bench::chain_arg(args);
     std::vector<int> variants;
     if (args.has("variant"))
         variants.push_back(args.geti("variant", 2));

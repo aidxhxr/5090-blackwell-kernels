@@ -2,10 +2,16 @@
 //
 //   ./bench_softmax                       # rows=4096, cols in {128, 1024, 4096, 16384}, f32 + bf16
 //   ./bench_softmax --rows=4096 --cols=8192 --iters=200
+//   ./bench_softmax --chain=1             # rows of single launches
 //
 // Every variant is validated against a double-precision CPU reference; the
 // process exits 1 if any variant fails. ref_ms in the output is the naive
 // variant-0 time for the same shape, so speedups can be read off directly.
+//
+// A row's time is per launch, --chain=N launches (20 by default) between one event pair,
+// median and min over 20 pairs (spark::bench::time_chained). As single launches a row of
+// 5 us moved by 18% between two runs (docs/design/softmax.md, "Timing"). The single-launch
+// median is still printed on stderr.
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -24,6 +30,9 @@ using namespace spark;
 using namespace spark::bench;
 
 namespace {
+
+// --chain=N, see the top of the file.
+int g_chain = kChain;
 
 // ---- dtype helpers (host side) --------------------------------------------------------
 template <typename T>
@@ -117,8 +126,10 @@ bool run_shape(int rows, int cols, int iters, cudaStream_t stream) {
 
         // Timing. The naive variant is very slow on long rows: fewer iterations.
         const int it = (variant == 0) ? std::max(10, iters / 10) : iters;
-        const Timing t =
-            time_kernel([&]() { launch<T>(dx, dout, rows, cols, variant, stream); }, stream, 5, it);
+        const ChainedTiming tt =
+            time_chained([&]() { launch<T>(dx, dout, rows, cols, variant, stream); }, stream,
+                         g_chain, 5, iters, it);
+        const Timing& t = tt.row;
         if (variant == 0) ref_ms = t.median_ms;
 
         Row r;
@@ -135,6 +146,7 @@ bool run_shape(int rows, int cols, int iters, cudaStream_t stream) {
         r.max_rel_err = err.max_rel;
         r.ok = ok;
         print_row(r);
+        if (g_chain > 1) std::fprintf(stderr, "    single launch: %.1f us\n", tt.single_ms * 1e3);
         all_ok = all_ok && ok;
     }
 
@@ -153,6 +165,7 @@ int main(int argc, char** argv) {
 
         const int rows = args.geti("rows", 4096);
         const int iters = args.geti("iters", 100);
+        g_chain = chain_arg(args);
         std::vector<int> cols_list;
         if (args.has("cols")) {
             cols_list.push_back(args.geti("cols", 1024));

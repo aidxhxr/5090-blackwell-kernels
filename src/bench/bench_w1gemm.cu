@@ -281,29 +281,15 @@ std::vector<float> to_host_f32(const __nv_bfloat16* d, size_t n) {
 
 // --chain=N: the rows are N launches between one event pair, per launch (the time of a
 // decode step's launches queued back to back), for every variant and for the references.
-int g_chain = 20;
+int g_chain = spark::bench::kChain;
 
-// The time of one row: `row` is what the JSON gets, median and min per launch of g_chain
-// launches between one event pair over min(iters, 20) pairs, or with --chain=1 the single
-// launches below; `single_ms` is the median of `single_iters` single launches, for stderr.
-struct Times {
-    spark::bench::Timing row;
-    double single_ms = 0.0;
-};
+// The time of one row (spark::bench::time_chained): `row` is what the JSON gets, g_chain
+// launches per event pair or with --chain=1 the single launches; `single_ms` is the median
+// of `single_iters` single launches, for stderr.
+using Times = spark::bench::ChainedTiming;
 Times time_row(const std::function<void()>& fn, cudaStream_t stream, int warmup, int iters,
                int single_iters) {
-    Times t;
-    t.row = spark::bench::time_kernel(fn, stream, warmup, single_iters);
-    t.single_ms = t.row.median_ms;
-    if (g_chain == 1) return t;
-    t.row = spark::bench::time_kernel(
-        [&] {
-            for (int i = 0; i < g_chain; ++i) fn();
-        },
-        stream, 2, std::min(iters, 20));
-    t.row.median_ms /= g_chain;
-    t.row.min_ms /= g_chain;
-    return t;
+    return spark::bench::time_chained(fn, stream, g_chain, warmup, iters, single_iters);
 }
 
 // Runs every requested variant on one M against one weight. Returns false on a mismatch.
@@ -661,7 +647,7 @@ int run(int argc, char** argv) {
     const bool moe_only = args.has("moe"), dense = !moe_only;
     const bool moe = moe_only || (!custom && !args.has("no-moe"));
     const int iters = args.geti("iters", 50);
-    g_chain = std::max(1, args.geti("chain", 20));
+    g_chain = spark::bench::chain_arg(args);
     std::vector<int> variants;
     if (args.has("variant"))
         variants.push_back(args.geti("variant", 2));

@@ -204,13 +204,39 @@ ncu --set full -k regex:rmsnorm ./build/bench_rmsnorm --rows=16384 --cols=8192 -
 - `min_ms` sat within 2–3% of the median on every row of the run; the 300 ms clock ramp is
   enough for these short kernels, which never reach the 600 W limit.
 
+## Timing
+
+The rows used to be single launches, the median of 100. On 2026-11-08 I ran w1gemm's two-run
+test ([w1gemm](w1gemm.md#timing)) on this bench: two runs back to back in two lock holds,
+rows more than x% apart (55 rows), twice for each:
+
+| rows | pair | > 2% | > 3% | > 5% | largest | largest ref_ms |
+|---|---|---|---|---|---|---|
+| single launches | first | 8 | 6 | 6 | 12.5% | 0.6% |
+| single launches | second | 4 | 4 | 4 | 9.5% | 0.1% |
+| chains of 20 | first | 0 | 0 | 0 | 0.7% | 0.6% |
+| chains of 20 | second | 0 | 0 | 0 | 1.7% | 0.1% |
+
+Any two of the four chain runs are within 1.7% on every row; any two of the four single-launch
+runs have 2 to 6 rows past 5%, all of them rows under 20 µs. The six of the first pair are 4096
+x 1024 and 4096 x 2048, 7 to 11 µs: bf16 v1 at 4096 x 1024 was 7.17 µs in one run and 8.06 in
+the other, bf16 v3 at 4096 x 2048 10.78 and 9.47, f32 v2 at 4096 x 1024 9.50 and 10.50. Each is
+a step of 0.9 to 1.3 µs on the median, not a drift, like the lone launches in w1gemm's note. So
+the rows are chains now: the median and min per launch of 20 launches between one event pair
+over 20 pairs (`spark::bench::time_chained`), v0 and the fused add+RMSNorm too. The
+single-launch medians are on stderr and `--chain=1` gives the old rows. Against the
+single-launch rows of the same evening 23 of 55 chain rows are more than 5% faster and none
+slower: the rows under 20 µs lose 0.9 to 2.5 µs (bf16 v4 at 4096 x 1024 is 4.93 µs a launch in
+the chain, 7.26 alone), the rows over 100 µs are within 2.6%. The tables below are the older
+single-launch run.
+
 ## Results (RTX 5090)
 
-From `results/rmsnorm.json` (median of 100 iterations, CUDA 13.2, driver 595.58, no display)
-and `results/torch_comparison.json` (same shapes, PyTorch 2.14 eager). `% peak` is relative to
-1,792 GB/s; rows above 100% are L2-resident (input smaller than the 96 MB L2), the DRAM-bound
-rows are the last one per dtype. A GB10 table (relative to 273 GB/s) is added when the Spark
-has been benchmarked.
+From `results/rmsnorm.json` before it held chains (median of 100 single launches, CUDA 13.2,
+driver 595.58, no display) and `results/torch_comparison.json` (same shapes, PyTorch 2.14
+eager). `% peak` is relative to 1,792 GB/s; rows above 100% are L2-resident (input smaller than
+the 96 MB L2), the DRAM-bound rows are the last one per dtype. A GB10 table (relative to 273
+GB/s) is added when the Spark has been benchmarked.
 
 | dtype | rows×cols | v0 ms | v1 ms | v2 ms | v3 ms | v4 ms | best | GB/s | % of 1,792 | best / v0 | vs torch |
 |---|---|---|---|---|---|---|---|---|---|---|---|

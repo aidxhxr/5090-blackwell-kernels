@@ -271,6 +271,11 @@ take 21.5 us, 1,574 GB/s. Split-K was the cost, not the cure: every split-K vers
 flat 2 us over the unsplit kernel for the atomics, fence, counter and last-arriver chain, and
 the two memsets in front of the old kernel were another 2 to 3.
 
+The table is single launches. The 64-row ones moved between runs (23.6 to 25.3 us over four
+runs on 2026-11-08), so since then the bench times its decode rows as chains of 20 launches
+per event pair, cuBLAS too. A chain takes more off cuBLAS than off ours: v6 is 117% of it at
+16 x 4096 x 4096 that way, 103% on the 11008 shapes ([the note](docs/design/hgemm.md)).
+
 ## the fp8 GEMM
 
 C = scale_a * scale_b * A B^T with A as [M, K] and B^T as [N, K] in e4m3, both K-contiguous,
@@ -522,6 +527,11 @@ stop at 2.6 to 3.1x because a 9 to 23 us launch carries the same 1 to 3 us of la
 ramp as a 150 us one: a read-only probe of the same bytes needs 8.3 us single launch. The
 int4 GEMM is ahead of `hgemm` up to 96 tokens, level at 128, and behind at 256, where both are
 tensor-bound and the int4 tile does more work per weight.
+
+The table is single launches. Since 2026-11-08 the rows in `results/w4gemm.json` are chains
+of 20 launches per event pair, like w1gemm's: two pairs of single-launch runs had 3 and 1 of
+80 rows more than 5% apart (up to 13.6%, all decode rows), any two of four chain runs agree
+within 1.7% ([Timing](docs/design/w4gemm.md#timing)).
 
 In the decoder layer (`SparkLayer(..., int4=True)`, weights quantized once), the int4 layer
 takes 0.093 ms per decode step at 4,096 cached tokens against 0.298 for bf16, 3.2x, or 335
@@ -1291,6 +1301,13 @@ to 19 us off a 2.07 to 2.99 ms decode step and adds 0.4 to 2.2% to prefill.
 One thing the 96 MB L2 does to you: a 4096 x 1024 bf16 input is 8 MB and never leaves L2
 between timing iterations, so those rows in the full tables read 2 to 4 TB/s. They are L2
 numbers. The headline shapes are 256 MB and up for that reason.
+
+The rows under 20 us also moved between two runs as single launches: up to 6 of 55 rmsnorm rows
+and 3 of 32 softmax rows more than 5% apart, up to 18%, each a step on the median. Since
+2026-11-08 both benches time every row as a chain of 20 launches per event pair, like w1gemm's,
+and any two of four runs agree within 1.7% (rmsnorm) and 3.0% (softmax). The design notes have
+the numbers ([rmsnorm](docs/design/rmsnorm.md#timing),
+[softmax](docs/design/softmax.md#timing)).
 
 ## the fp32 GEMM
 

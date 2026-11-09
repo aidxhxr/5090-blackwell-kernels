@@ -169,12 +169,38 @@ the SM clock at 2.55 GHz, so durations are longer than in the bench):
   profiled variant.
 - `min_ms` sat within 2–4% of the median on every row of the run.
 
+## Timing
+
+The rows used to be single launches, the median of 100 (of 10 for v0). On 2026-11-08 I ran
+w1gemm's two-run test ([w1gemm](w1gemm.md#timing)) on this bench: two runs back to back in
+two lock holds, rows more than x% apart (32 rows), twice for each:
+
+| rows | pair | > 2% | > 3% | > 5% | largest | largest ref_ms |
+|---|---|---|---|---|---|---|
+| single launches | first | 1 | 1 | 1 | 18.0% | 1.6% |
+| single launches | second | 3 | 3 | 3 | 9.7% | 1.5% |
+| chains of 20 | first | 2 | 0 | 0 | 2.6% | 0.1% |
+| chains of 20 | second | 0 | 0 | 0 | 1.7% | 0.0% |
+
+In the first pair one row moved, but by a whole step: bf16 v3 at 4096 x 1024, 5.34 µs in one
+run and 6.30 in the other, and the other 31 were within 2%. The second pair moved the same row
+(5.60 and 6.14) and two more, f32 v1 at 4096 x 1024 and f32 v2 at 4096 x 128. Any two of the
+four chain runs are within 3.0%; any two of the four single-launch runs have 0 to 3 rows past
+5%. So the rows are chains now: the median and min per launch of 20 launches between one event
+pair over 20 pairs (`spark::bench::time_chained`), v0 too, so ref_ms is a chain as well. The
+single-launch medians are on stderr and `--chain=1` gives the old rows. The two chain rows past
+2% in the first pair are the fastest ones, 4096 x 128 on v3 at 1.55 to 1.69 µs a launch, near the 1.3 µs below
+which the host sets the pace (w1gemm's note). Against the single-launch rows of the same
+evening 16 of 32 are more than 5% faster and none slower: 4096 x 128 goes from 3.23 µs alone to
+1.55 (bf16) and 1.65 (f32) a launch, 4096 x 1024 bf16 v3 from 5.34 to 4.37, and the rows over
+100 µs are within 1%. The tables below are the older single-launch run.
+
 ## Results (RTX 5090)
 
-From `results/softmax.json` (median of 100 iterations, CUDA 13.2, driver 595.58, no display)
-and `results/torch_comparison.json` (PyTorch 2.14 eager `torch.softmax`). `% of 1,792 GB/s`
-above 100% means the shape is L2-resident; the 4096×16384 rows are DRAM-bound. A GB10 table
-(% of 273 GB/s) is added when the Spark has been benchmarked.
+From `results/softmax.json` before it held chains (median of 100 single launches, CUDA 13.2,
+driver 595.58, no display) and `results/torch_comparison.json` (PyTorch 2.14 eager
+`torch.softmax`). `% of 1,792 GB/s` above 100% means the shape is L2-resident; the 4096×16384
+rows are DRAM-bound. A GB10 table (% of 273 GB/s) is added when the Spark has been benchmarked.
 
 | dtype | rows×cols | v0 ms | v1 ms | v2 ms | v3 ms | best | GB/s | % of 1,792 GB/s | best / v0 | vs torch |
 |---|---|---|---|---|---|---|---|---|---|---|

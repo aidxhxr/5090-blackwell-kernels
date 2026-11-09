@@ -1,9 +1,15 @@
 // Benchmark + correctness check for RMSNorm and fused add+RMSNorm.
 //
 //   ./bench_rmsnorm [--rows=4096] [--cols=4096] [--iters=100]   (rows/cols: one shape)
+//   ./bench_rmsnorm --chain=1                                    # rows of single launches
 //
 // Every variant is validated against a double-precision CPU reference; the process
 // exits 1 if any check fails. JSON rows go to stdout, a human table to stderr.
+//
+// A row's time is per launch, --chain=N launches (20 by default) between one event pair,
+// median and min over 20 pairs (spark::bench::time_chained). As single launches the rows of
+// 7 to 11 us moved by up to 12.5% between two runs (docs/design/rmsnorm.md, "Timing"). The
+// single-launch median is still printed on stderr.
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -12,6 +18,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <exception>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -24,6 +31,16 @@ using namespace spark::bench;
 namespace {
 
 constexpr float kEps = 1e-6f;
+
+// --chain=N, see the top of the file.
+int g_chain = kChain;
+
+// Times one row and prints the single-launch median on stderr when the row is a chain.
+Timing time_row(const std::function<void()>& fn, int iters, cudaStream_t stream) {
+    const ChainedTiming t = time_chained(fn, stream, g_chain, 10, iters, iters);
+    if (g_chain > 1) std::fprintf(stderr, "    single launch: %.1f us\n", t.single_ms * 1e3);
+    return t.row;
+}
 
 // ---- host-side dtype helpers ----------------------------------------------------------------
 template <typename T>
@@ -112,8 +129,8 @@ bool bench_rmsnorm_dtype(int rows, int cols, int iters, cudaStream_t stream) {
         for (size_t i = 0; i < n; ++i) got[i] = HD::to_f32(hout[i]);
         const ErrorStats err = compare(got.data(), ref.data(), n);
 
-        const Timing t = time_kernel([&]() { HD::run(dx, dw, dout, rows, cols, variant, stream); },
-                                     stream, 10, iters);
+        const Timing t =
+            time_row([&]() { HD::run(dx, dw, dout, rows, cols, variant, stream); }, iters, stream);
         if (variant == 0) naive_ms = t.median_ms;
 
         Row row;
@@ -190,9 +207,9 @@ bool bench_add_rmsnorm(int rows, int cols, int iters, cudaStream_t stream) {
     const ErrorStats err_res = compare(got_resid.data(), ref_resid.data(), n);
 
     // Timing: resid accumulates in place across iterations, which is fine for timing
-    // (magnitude stays far below bf16 range for ~100 iterations of |x| <= 1).
-    const Timing t = time_kernel(
-        [&]() { add_rmsnorm_bf16(dx, dr, dw, dout, rows, cols, kEps, stream); }, stream, 10, iters);
+    // (magnitude stays far below bf16 range for the ~550 launches of a chained row, |x| <= 1).
+    const Timing t = time_row(
+        [&]() { add_rmsnorm_bf16(dx, dr, dw, dout, rows, cols, kEps, stream); }, iters, stream);
 
     // Traffic model: read x, read resid, write resid, write out, read w.
     const double bytes =
@@ -224,6 +241,7 @@ bool bench_add_rmsnorm(int rows, int cols, int iters, cudaStream_t stream) {
 int run(int argc, char** argv) {
     Args args(argc, argv);
     const int iters = args.geti("iters", 100);
+    g_chain = chain_arg(args);
     // Llama/Qwen hidden sizes at 4096 tokens, plus one shape whose input alone (256 MB bf16)
     // is bigger than the RTX 5090's 96 MB L2, so the headline row is DRAM-bound for certain.
     std::vector<std::pair<int, int>> shapes = {

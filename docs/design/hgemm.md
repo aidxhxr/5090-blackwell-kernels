@@ -352,6 +352,35 @@ same 23.5 µs, so the decode GEMM is now the weights and nothing else. cuBLAS ta
 30.8 µs on the 4096² shapes and 39.9 µs at M = 1 (its gemv path is slower than its GEMM path
 for bf16), so the rows read 125 to 170% of cuBLAS.
 
+Since 2026-11-08 the decode rows of the default sweep (M <= 64, B rotated past L2) are chains,
+as in [w1gemm](w1gemm.md#timing): the median and min per launch of 20 launches between one
+event pair over 20 pairs (`spark::bench::time_chained`), cuBLAS's ref_ms too. Every other row
+is still single launches, the single-launch medians are on stderr, and `--chain=1` gives the
+old decode rows. bench_w1gemm's rows became chains because lone launches of a few µs moved by
+up to 32% between two runs, hgemm v6 on its 1×2304×5120 reference too, so I ran the same
+two-run test on the six decode shapes here, every variant, two runs back to back in two lock
+holds, twice:
+
+| rows | pair | > 2% | > 3% | > 5% | largest | largest ref_ms |
+|---|---|---|---|---|---|---|
+| single launches | first | 0 | 0 | 0 | 1.5% | 4.3% |
+| single launches | second | 2 | 2 | 1 | 5.6% | 2.7% |
+| chains of 20 | first | 0 | 0 | 0 | 1.5% | 0.3% |
+| chains of 20 | second | 0 | 0 | 0 | 1.0% | 0.5% |
+
+Any two of the four chain runs are within 1.5% on every row. The first single-launch pair was
+clean, the second was not, and any two of the four single-launch runs have up to 3 rows past
+5%, all at 64×4096×4096: variants 3 to 7 came out anywhere from 23.6 to 25.3 µs (v3 25.34,
+25.22, 25.06 and 23.65 in the four runs). The other five shapes stayed within 2.2%. A chain is
+0.7 to 2.6 µs a launch under a lone one on variants 3 to 7 and 3.5 to 5.5 µs on cuBLAS, so the
+rows read less of cuBLAS than they did: v6 is 171% of it at 1×4096×4096 (175% single), 117% at
+16×4096×4096 (123%) and 103% on the two 11008 shapes (109%). The v6 chain rows land on the
+20-launch column of the table above: 21.4 and 21.5 µs at M = 1 and 16, 21.8 at 32, 22.7 at 64,
+55.1 at 16×11008×4096 and 57.6 at 64×4096×11008.
+
+Two single-launch runs of `--m=1 --n=2304 --k=5120` the same evening: v6 17.50 and 17.47 µs,
+all four rows within 0.2%. `results/hgemm.json` holds the decode rows of the first chain run.
+
 #### Nsight Compute
 
 `--launch-skip 1 --launch-count 1` on the timing launches (Nsight locks the clocks, so its

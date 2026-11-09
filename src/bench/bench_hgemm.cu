@@ -6,6 +6,13 @@
 //   ./bench_hgemm --m=16 --n=22016 --k=4096 --swiglu   # interleaved gate/up, C is [16][11008]
 //   ./bench_hgemm --models[=llama3-8b] [--ms=128,512] [--tiles]   # real projection shapes
 //   ./bench_hgemm --models --ms=128 --split=2,4,8 --tiles --v6only  # split-K sweep
+//   ./bench_hgemm --chain=1             # the decode rows as single launches, as before
+//
+// The decode rows of the default sweep and of --m/--n/--k (M <= 64, B rotated past L2) are
+// per launch, --chain=N launches (20 by default) between one event pair, median and min over
+// 20 pairs (spark::bench::time_chained), cuBLAS's ref_ms too: as single launches the
+// 64x4096x4096 rows moved by up to 7% between runs (docs/design/hgemm.md, "Decode"). Their
+// single-launch medians are printed on stderr. Every other row is single launches.
 //
 // Fused rows (--bias, --act=silu|gelu|relu, --residual, --accumulate for C += ..., --swiglu;
 // variant 6 unless --variant says otherwise) are validated against the fused math applied on
@@ -44,6 +51,9 @@
     } while (0)
 
 namespace {
+
+// --chain=N for the decode rows, see the top of the file.
+int g_chain = spark::bench::kChain;
 
 struct Shape {
     int M, N, K;
@@ -253,13 +263,17 @@ bool run_one(cublasHandle_t handle, cudaStream_t stream, const Shape& s, int var
                      M, N, K, err.max_abs, tol);
     }
 
-    // Timing. Each launch takes the next copy of B (see `copies` above).
+    // Timing. Each launch takes the next copy of B (see `copies` above); the decode rows are
+    // chains (see the top of the file).
     int turn = 0;
     auto next_b = [&] { return dB + static_cast<size_t>(turn++ % copies) * nB; };
-    const auto t_ref = spark::bench::time_kernel(
-        [&] { cublas_gemm(handle, dA, next_b(), dRef, M, N, K); }, stream, 5, iters);
-    const auto t_us = spark::bench::time_kernel(
-        [&] { spark::hgemm_bf16(dA, next_b(), dC, M, N, K, variant, stream); }, stream, 5, iters);
+    const int chain = copies > 1 ? g_chain : 1;
+    const auto c_ref = spark::bench::time_chained(
+        [&] { cublas_gemm(handle, dA, next_b(), dRef, M, N, K); }, stream, chain, 5, iters, iters);
+    const auto c_us = spark::bench::time_chained(
+        [&] { spark::hgemm_bf16(dA, next_b(), dC, M, N, K, variant, stream); }, stream, chain, 5,
+        iters, iters);
+    const auto &t_ref = c_ref.row, &t_us = c_us.row;
 
     const double flops = 2.0 * M * N * static_cast<double>(K);
     spark::bench::Row row;
@@ -280,6 +294,9 @@ bool run_one(cublasHandle_t handle, cudaStream_t stream, const Shape& s, int var
     std::fprintf(stderr, "    cuBLAS: %.2f TFLOPS | this kernel = %.1f%% of cuBLAS%s\n",
                  flops / (t_ref.median_ms * 1e-3) / 1e12, 100.0 * t_ref.median_ms / t_us.median_ms,
                  copies > 1 ? " | B rotated over copies that exceed L2 (DRAM-bound)" : "");
+    if (chain > 1)
+        std::fprintf(stderr, "    single launch: %.1f us | cuBLAS %.1f us\n", c_us.single_ms * 1e3,
+                     c_ref.single_ms * 1e3);
 
     SPARK_CUDA_CHECK(cudaFree(dA));
     SPARK_CUDA_CHECK(cudaFree(dB));
@@ -541,8 +558,8 @@ void fill_uniform_dev(__nv_bfloat16* p, size_t n, unsigned seed) {
 // --queued=<n>: each sample is n launches back to back between one pair of events, divided by
 // n. Single launches between events fall on a grid of about 2 us here, which hides the
 // differences a split-K sweep is after; queued launches overlap one launch's ramp-down with
-// the next one's start, so they read lower than single ones. For sweeps only: the rows of
-// the results files are single launches, like every other bench.
+// the next one's start, so they read lower than single ones. For sweeps only: the --models
+// rows of the results files are single launches.
 spark::bench::Timing time_queued(const std::function<void()>& fn, cudaStream_t stream, int n,
                                  int iters) {
     spark::bench::ramp_clocks(fn, stream);
@@ -720,6 +737,7 @@ int run(int argc, char** argv) {
                   {32, 4096, 4096},    {64, 4096, 4096},    {16, 11008, 4096},  {64, 4096, 11008}};
     }
     const int iters = args.geti("iters", 50);
+    g_chain = spark::bench::chain_arg(args);
     std::vector<int> variants;
     if (args.has("variant")) {
         variants.push_back(args.geti("variant", 0));

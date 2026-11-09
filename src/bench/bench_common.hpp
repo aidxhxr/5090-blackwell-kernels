@@ -6,7 +6,8 @@
 //
 // Flags understood by every bench through this header: --iters=N is read by each main();
 // --warmup=N overrides the per-call-site warmup count everywhere (0 also disables the
-// clock ramp, which is what scripts/profile_ncu.sh wants).
+// clock ramp, which is what scripts/profile_ncu.sh wants). The benches whose rows are
+// chains (time_chained below) also take --chain=N, and --chain=1 gives single launches.
 #pragma once
 
 #include <cuda_runtime.h>
@@ -195,6 +196,44 @@ struct Args {
         return false;
     }
 };
+
+// Opt-in chained timing, for benches whose rows are launches of a few us. A lone launch
+// between two events on an idle stream lands in one of a few modes about 2 us apart on the
+// 5090, and how many samples land in each moves from run to run, so the median of such a
+// row jumps a whole step between two runs (docs/design/w1gemm.md, "Timing"). N launches
+// between one event pair have neither problem: after the first the host is ahead of the
+// GPU. A bench opts in by timing its rows with time_chained and taking its N from
+// chain_arg, kChain by default; --chain=1 gives the single-launch rows back.
+constexpr int kChain = 20;
+constexpr int kChainPairs = 20;
+
+struct ChainedTiming {
+    Timing row;              // what the JSON gets
+    double single_ms = 0.0;  // median of the single launches, for stderr
+};
+
+// `row` is the median and min per launch of `chain` launches between one event pair over
+// min(iters, kChainPairs) pairs, or with chain = 1 the single launches; `single_ms` is the
+// median of `single_iters` single launches either way (timed first, after `warmup`).
+inline ChainedTiming time_chained(const std::function<void()>& fn, cudaStream_t stream, int chain,
+                                  int warmup, int iters, int single_iters) {
+    ChainedTiming t;
+    t.row = time_kernel(fn, stream, warmup, single_iters);
+    t.single_ms = t.row.median_ms;
+    if (chain <= 1) return t;
+    t.row = time_kernel(
+        [&] {
+            for (int i = 0; i < chain; ++i) fn();
+        },
+        stream, 2, std::min(iters, kChainPairs));
+    t.row.median_ms /= chain;
+    t.row.min_ms /= chain;
+    return t;
+}
+
+inline int chain_arg(const Args& args) {
+    return std::max(1, args.geti("chain", kChain));
+}
 
 // Device-info banner (stderr). Also records the device name, which print_row writes into
 // every JSON row so the results scripts know which machine's peaks to compare against.
