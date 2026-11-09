@@ -593,6 +593,12 @@ sign weights with a mean-abs scale are lossy on a checkpoint trained in higher p
 `scripts/eval_ppl.py` on the real weights is where that gets measured. Details, the floors per
 shape and what to measure first in [the design note](docs/design/w1gemm.md).
 
+The grouped launches near the roof are where the card's 600 W limit shows. The 2-bit gate|up
+of 16 tokens is 404 us a launch in the first tens of ms after the GPU idles and 430 once the
+power cap has the SM clock down from about 2,900 to 2,650 MHz, alone or back to back; under
+ncu a launch reads the same 504 to 534 MB behind another as alone. The rows and the note quote
+the 430 ([alone and back to back](docs/design/w1gemm.md#alone-and-back-to-back)).
+
 ## grouped GEMM for MoE prefill
 
 A prefill batch routed top-k over E experts is E GEMMs of different heights. Most code runs

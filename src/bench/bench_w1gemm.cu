@@ -7,6 +7,7 @@
 //   ./bench_w1gemm --moe                         # the grouped w1gemm_moe rows only
 //   ./bench_w1gemm --no-moe                      # the single-weight rows only
 //   ./bench_w1gemm --chain=1                     # rows of single launches, as before
+//   ./bench_w1gemm --probe=spin2 --probe-len=1000 --probe-rest=2000  # alone, back to back
 //
 // For every weight shape the bench quantizes a random bf16 W [K, N] on the GPU
 // (w1_quantize_bf16) at 1 and at 2 bits, checks the codes and scales bit for bit against the
@@ -44,6 +45,7 @@
 #include <cuda_bf16.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <exception>
@@ -51,6 +53,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "bench_common.hpp"
@@ -634,11 +637,199 @@ bool run_moe(cudaStream_t stream, const Experts& x, int T, const std::vector<int
     return all_ok;
 }
 
+// ---- --probe: one grouped launch alone and right behind another -------------------------
+// (docs/design/w1gemm.md, "Alone and back to back")
+
+// One warp spins for `ns` of %globaltimer and keeps the SM cycles it saw, so the clock
+// between two launches is out[1] / out[0] GHz.
+__global__ void probe_spin_kernel(long long ns, long long* out) {
+    long long t0, t1;
+    const long long c0 = clock64();
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    do {
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t1));
+    } while (t1 - t0 < ns);
+    const long long c1 = clock64();
+    if (threadIdx.x == 0) {
+        out[0] = t1 - t0;
+        out[1] = c1 - c0;
+    }
+}
+
+__global__ void probe_empty_kernel() {}
+
+// Reads n words through L2, so the next launch meets an L2 of clean lines it does not want.
+__global__ void probe_read_kernel(const uint4* p, size_t n, unsigned* sink) {
+    unsigned acc = 0;
+    for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+         i += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        const uint4 v = __ldcg(p + i);
+        acc ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+    if (acc == 0x9E3779B9u) *sink = acc;
+}
+
+// --probe[=gap]: the grouped GEMM of --probe-n x --probe-k (gate|up by default) at
+// --probe-t tokens and --bits (2 by default), variant 3, on the routings the rows use, timed
+// as lone launches (an event pair each, the host waiting on every one), as chains of 20
+// between one event pair (the row), and as --probe-chains chains of --probe-len launches
+// with an event pair around every launch and `gap` queued between two launches: nothing
+// (--probe alone), empty (an empty kernel), spin<us> (one warp spinning that long, which
+// also reads the SM clock), read (256 MB read through L2), memset (256 MB written, so L2 is
+// dirty) or host (the host waits on each launch); two join with a +, as in host+spin2.
+// --probe-alt alternates the output between two buffers, --probe-rest=<ms> idles the GPU
+// that long before the lone launches and before every chain (with --warmup=0 there is no
+// ramp in front of the lone launches either).
+void run_probe(cudaStream_t stream, const spark::bench::Args& args) {
+    constexpr int kTopK = 6;
+    const int bits = args.geti("bits", 2), N = args.geti("probe-n", 4608),
+              K = args.geti("probe-k", 5120), T = args.geti("probe-t", 16);
+    const int L = std::max(2, args.geti("probe-len", 20)),
+              P = std::max(1, args.geti("probe-chains", 20));
+    const int n_routings = std::max(1, args.geti("routings", 16));
+    const std::string gap = args.get("probe", "1") == "1" ? "" : args.get("probe", "");
+    const bool alt = args.has("probe-alt");
+    const int rows = T * kTopK;
+    Experts x = make_experts(args.geti("experts", 384), N, K, bits, stream);
+    std::vector<Routing> rs;
+    double distinct = 0.0;
+    for (int i = 0; i < n_routings; ++i) {
+        rs.push_back(make_routing(T, kTopK, x.E, 31 * T + i));
+        distinct += rs.back().distinct;
+    }
+    distinct /= n_routings;
+    const size_t nA = static_cast<size_t>(rows) * K, nC = static_cast<size_t>(rows) * N;
+    std::vector<__nv_bfloat16> hA(nA);
+    for (size_t i = 0; i < nA; ++i) hA[i] = __float2bfloat16((hash32(i) >> 8) * 0x1p-23f - 1.f);
+    __nv_bfloat16* dA = dmalloc<__nv_bfloat16>(nA);
+    SPARK_CUDA_CHECK(cudaMemcpy(dA, hA.data(), nA * 2, cudaMemcpyHostToDevice));
+    __nv_bfloat16* dC[2] = {dmalloc<__nv_bfloat16>(nC), dmalloc<__nv_bfloat16>(nC)};
+    const size_t nbuf = kRotate / 16;
+    uint4* buf = dmalloc<uint4>(nbuf);
+    SPARK_CUDA_CHECK(cudaMemset(buf, 1, kRotate));
+    unsigned* sink = dmalloc<unsigned>(1);
+    long long* clk = dmalloc<long long>(2 * static_cast<size_t>(L));
+    int turn = 0, out = 0;
+    auto gemm = [&] {
+        spark::w1gemm_moe_bf16(dA, x.packed, x.scales, rs[turn++ % n_routings].d_offsets, dC[out],
+                               x.E, N, K, bits, 3, stream, rows);
+        if (alt) out ^= 1;
+    };
+    // `gap` can join two with a +, e.g. host+spin5: the host waits, then the spin.
+    const size_t sp = gap.find("spin");
+    const int spin_us = sp == std::string::npos ? 0 : std::max(1, std::atoi(gap.c_str() + sp + 4));
+    auto has = [&](const char* g) { return gap.find(g) != std::string::npos; };
+    auto between = [&](int i) {
+        if (has("host")) SPARK_CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (has("empty")) probe_empty_kernel<<<1, 32, 0, stream>>>();
+        if (has("read")) probe_read_kernel<<<4 * 170, 256, 0, stream>>>(buf, nbuf, sink);
+        if (has("memset")) SPARK_CUDA_CHECK(cudaMemsetAsync(buf, i & 0xFF, kRotate, stream));
+        if (spin_us > 0) probe_spin_kernel<<<1, 32, 0, stream>>>(spin_us * 1000ll, clk + 2 * i);
+    };
+    const double floor_us = distinct * x.bytes_per_expert() / 1532e9 * 1e6;
+    std::fprintf(stderr,
+                 "probe: %d-bit %dx%d over %d experts, T=%d (%d rows, %.1f distinct experts), "
+                 "floor %.1f us; between two launches: %s%s\n",
+                 bits, K, N, x.E, T, rows, distinct, floor_us,
+                 gap.empty() ? "nothing" : gap.c_str(), alt ? ", two output buffers" : "");
+    auto med = [](std::vector<float> v) {
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    };
+    for (int i = 0; i < 3 * n_routings; ++i) gemm();
+    SPARK_CUDA_CHECK(cudaStreamSynchronize(stream));
+    const int rest_ms = args.geti("probe-rest", 0);
+    auto rest = [&] {
+        if (rest_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(rest_ms));
+    };
+
+    rest();
+    const auto lone = spark::bench::time_kernel(gemm, stream, 3, 5 * n_routings);
+    const auto chain = spark::bench::time_kernel(
+        [&] {
+            for (int i = 0; i < 20; ++i) gemm();
+        },
+        stream, 2, 20);
+    std::fprintf(stderr, "  lone launch: median %.1f us, min %.1f | chain of 20: %.1f, min %.1f\n",
+                 lone.median_ms * 1e3, lone.min_ms * 1e3, chain.median_ms * 1e3 / 20,
+                 chain.min_ms * 1e3 / 20);
+
+    std::vector<cudaEvent_t> ev(2 * L);
+    for (auto& e : ev) SPARK_CUDA_CHECK(cudaEventCreate(&e));
+    std::vector<std::vector<float>> at(L);
+    std::vector<float> mhz;
+    std::vector<long long> hclk(2 * L);
+    std::vector<std::vector<float>> at_mhz(L);
+    for (int p = 0; p < P; ++p) {
+        rest();
+        for (int i = 0; i < L; ++i) {
+            if (i > 0) between(i);
+            SPARK_CUDA_CHECK(cudaEventRecord(ev[2 * i], stream));
+            gemm();
+            SPARK_CUDA_CHECK(cudaEventRecord(ev[2 * i + 1], stream));
+        }
+        SPARK_CUDA_CHECK(cudaStreamSynchronize(stream));
+        for (int i = 0; i < L; ++i) {
+            float ms = 0.f;
+            SPARK_CUDA_CHECK(cudaEventElapsedTime(&ms, ev[2 * i], ev[2 * i + 1]));
+            at[i].push_back(ms * 1e3f);
+        }
+        if (spin_us > 0) {
+            SPARK_CUDA_CHECK(cudaMemcpy(hclk.data(), clk, hclk.size() * 8, cudaMemcpyDeviceToHost));
+            for (int i = 1; i < L; ++i) {
+                mhz.push_back(1e3f * hclk[2 * i + 1] / hclk[2 * i]);
+                at_mhz[i].push_back(mhz.back());
+            }
+        }
+    }
+    std::vector<float> tail;
+    for (int i = 1; i < L; ++i) tail.insert(tail.end(), at[i].begin(), at[i].end());
+    std::fprintf(stderr, "  chain of %d, an event pair a launch, median over %d chains, us:\n", L,
+                 P);
+    std::fprintf(stderr, "    launch 1: %.1f | 2: %.1f | 3: %.1f | 2 to %d: %.1f (min %.1f)",
+                 med(at[0]), med(at[1]), med(at[std::min(2, L - 1)]), L, med(tail),
+                 *std::min_element(tail.begin(), tail.end()));
+    if (L >= 40) {
+        std::vector<float> late;
+        for (int i = L / 2; i < L; ++i) late.insert(late.end(), at[i].begin(), at[i].end());
+        std::fprintf(stderr, " | %d to %d: %.1f", L / 2 + 1, L, med(late));
+    }
+    if (!mhz.empty()) std::fprintf(stderr, " | SM clock in the gaps %.0f MHz", med(mhz));
+    std::fprintf(stderr, "\n");
+    if (L >= 40) {
+        // Ten slices of the chain in launch order: is a launch slower the longer it has run?
+        std::fprintf(stderr, "    by tenth of the chain, us (SM MHz before the launch):");
+        for (int b = 0; b < 10; ++b) {
+            std::vector<float> tb, cb;
+            for (int i = std::max(1, b * L / 10); i < (b + 1) * L / 10; ++i) {
+                tb.insert(tb.end(), at[i].begin(), at[i].end());
+                cb.insert(cb.end(), at_mhz[i].begin(), at_mhz[i].end());
+            }
+            std::fprintf(stderr, " %.1f", med(tb));
+            if (!cb.empty()) std::fprintf(stderr, " (%.0f)", med(cb));
+        }
+        std::fprintf(stderr, "\n");
+    }
+    for (auto& e : ev) SPARK_CUDA_CHECK(cudaEventDestroy(e));
+    for (auto& r : rs) SPARK_CUDA_CHECK(cudaFree(r.d_offsets));
+    SPARK_CUDA_CHECK(cudaFree(dA));
+    SPARK_CUDA_CHECK(cudaFree(dC[0]));
+    SPARK_CUDA_CHECK(cudaFree(dC[1]));
+    SPARK_CUDA_CHECK(cudaFree(buf));
+    SPARK_CUDA_CHECK(cudaFree(sink));
+    SPARK_CUDA_CHECK(cudaFree(clk));
+    x.free_all();
+}
+
 }  // namespace
 
 int run(int argc, char** argv) {
     spark::bench::Args args(argc, argv);
     spark::bench::print_device_banner();
+    if (args.has("probe")) {
+        run_probe(nullptr, args);
+        return 0;
+    }
 
     struct WShape {
         int N, K;

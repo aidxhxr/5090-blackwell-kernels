@@ -493,7 +493,102 @@ against it. Against the single-launch rows it replaced, 88 rows are more than 5%
 and 4 slower: the grouped variant 0 at T = 1 gate|up, 15% at both widths, now over all 16
 routings, its 2-bit T = 4 down, and the 2-bit gate|up at T = 16 on variant 3, 430 us a launch
 in the chain against 408 alone. That one is near the roof (1,230 GB/s), and on a few of the
-big grouped rows a launch right behind another is 2 to 5% slower than one alone.
+big grouped rows a launch in a chain looked 2 to 5% slower than one alone. It is not the
+launch in front of it; it is the board's power limit, next.
+
+### Alone and back to back
+
+`bench_w1gemm --probe` runs that one GEMM (variant 3, the rows' 384 experts and 16 routings) as
+lone launches, as the rows' chains of 20, and as chains with an event pair around every launch
+and something queued between two launches, and with `spin` it reads the SM clock in the gap.
+2026-11-08, after the bench's 300 ms ramp, us a launch, the median of launches 2 to 20 over 20
+chains (every run in this section, with the command that printed it, is a row of
+`results/w1gemm_probe.jsonl`):
+
+| between two launches | us |
+|---|---|
+| nothing, one event pair around 20 launches (the row) | 430.7 |
+| nothing, an event pair a launch | 433.8 |
+| nothing, the output alternating between two buffers | 433.8 |
+| an empty kernel | 434.2 |
+| the host waiting on the launch | 433.0 |
+| lone launches, an event pair each (the same run) | 430.9 |
+| a 256 MB read through L2 (L2 cold for the next launch) | 446.5 |
+| a 256 MB memset (L2 full of dirty lines) | 460.8 |
+| one warp spinning 50 us (SM clock 2,841 MHz) | 423.9 |
+
+So in this process alone and back to back are the same launch. A second output buffer, an
+empty kernel or the host in between change nothing; a cold or a dirty L2 in front costs 3 and
+6%, and a GEMM that writes 0.88 MB leaves neither. The one gap that helps is idle time, and the
+clock it reads is why.
+
+Nsight Compute on two launches in a row of the probe's chains (launches 300 and 301 counting
+from 0, routings 12 and 13) and the lone launches of the same two routings (60 and 61), the
+clocks left alone except in the last column; `ncu` runs every launch on its own, so it cannot
+show one launch starting under the last one's tail (the table above covers that):
+
+| | chain N | chain N + 1 | lone, N's routing | lone, N + 1's | N, L2 flushed | N, clocks at base |
+|---|---|---|---|---|---|---|
+| duration | 437.7 us | 412.4 us | 439.6 us | 413.6 us | 460.5 us | 580.3 us |
+| SM clock | 2,768 MHz | 2,759 MHz | 2,760 MHz | 2,750 MHz | 2,791 MHz | 1,895 MHz |
+| DRAM read | 534.0 MB | 504.3 MB | 534.2 MB | 504.4 MB | 552.6 MB | 533.9 MB |
+| DRAM written | 0 | 0.37 MB | 0.001 MB | 0.27 MB | 3.95 MB | 0 |
+| L2 hit rate | 36.4% | 37.5% | 36.4% | 37.6% | 33.9% | 36.4% |
+| L2 read misses | 16.68 M | 15.76 M | 16.68 M | 15.76 M | 17.26 M | 16.68 M |
+| `dram__throughput` | 69.1% | 69.4% | 68.9% | 69.1% | 68.5% | 52.1% |
+
+(Misses in 32 B sectors; N and N + 1 differ because their routings pick different numbers of
+experts.) A launch reads its experts' bytes once from DRAM, alone or behind another: the misses
+are the weights and scales, the hits mostly the activation rows all 288 strips re-read. It
+writes at most 0.37 MB of its 0.88 MB output to DRAM, the rest stays in L2 until something
+evicts it. The L2 the launch in front leaves is worth 18.6 MB of reads and 5% against a flushed
+one (where the 3.95 MB written comes from I did not chase). At a locked 1,895 MHz the same
+launch is 580 us: 1.46x the clock buys 1.33x, so this kernel, at 70% of DRAM peak, still moves
+with the SM clock.
+
+From rest (2 s idle, no ramp), a chain of 1,000 launches with a 2 us spin between each two,
+us a launch and the SM clock before it, by tenth of the chain (a tenth of 1,000 launches is
+about 40 ms):
+
+| GEMM | first tenth | last tenth | slower |
+|---|---|---|---|
+| 2-bit gate\|up, T = 16 | 403.8 us, 2,897 MHz | 430.4 us, 2,672 MHz | 6.6% |
+| the same, the host waiting on each launch (400 launches) | 403.5, 2,915 | 421.9, 2,754 | 4.6% |
+| 1-bit gate\|up, T = 16 | 301.4, 2,948 | 308.9, 2,823 | 2.5% |
+| 2-bit down, T = 16 | 235.8, 2,948 | 241.7, 2,859 | 2.5% |
+| 2-bit gate\|up, T = 64 (300 launches) | 1,297.4, 2,957 | 1,341.8, 2,917 | 3.4% |
+
+The 2-bit gate|up at T = 16 goes 403.8, 416.1, 418.1, 424.3, 424.3, 425.3, 427.4, 428.4, 430.4,
+430.4 us by tenth, the clock 2,897 down to 2,672 MHz. Over 4,000 launches (1.7 s) it settles at
+430.8 to 431.8 us and 2,647 to 2,665 MHz from the sixth tenth on, and `nvidia-smi` in those
+seconds reads 596 and 600 W with the SW power cap up, at 54 and 55 C; the limit is 600 W, and
+idle the card sits at 2,977 MHz and 85 W. Lone launches with the host between lose the clock
+the same way, only more slowly, since the host's waits are idle time. At T = 64 the clock moved
+1.4% and the time 3.4%, so the SM clock is not all of it there; I did not find the rest.
+
+What sits in front of the lone launches decides their number, in a lone launch or a chain:
+
+| before the lone launches | lone | chain of 20 right after |
+|---|---|---|
+| 2 s idle, no ramp (three runs) | 402.2 to 404.2 us | 418.8 to 419.2 us |
+| 2 s idle, then the 300 ms ramp (two runs) | 428.6 to 428.7 | 428.5 to 428.6 |
+| `bench_w1gemm --moe --bits=2 --variant=3`, the per-expert loop's chains | 406.0 | 426.1 (min 407.3) |
+
+The bench times a row's single launches first, 50 of them in about 20 ms, and then its 20
+chains, about 190 ms of the GEMM at 1,230 GB/s. The single launches see the clock the
+per-expert loop in front of them left (it moves the same bytes at half the rate), and the
+chains pull it down as they go, so their min is the first pairs. The other grouped row that
+looked slower in a chain, the 2-bit gate|up at T = 64 (1,345.9 us chained, 1,306.0 single on
+2026-11-08), is the same story. I did not run the dense rows from rest; a rung's 400 chained
+launches there are about 20 ms of work or less.
+
+So the docs quote the chain: 430 us and 1,230 GB/s at T = 16, what this GEMM runs at once the
+board is at its 600 W, most of the way there within 200 ms of this load and all of it within a
+second, which is where a decode loop running these back to back would sit. 404 us is the same
+launch in the first tens of ms after the GPU was idle. A streaming store for the output
+(`__stcs`, `st.global.cs`, evict-first in the SASS) was 431.8 to 433.8 us a launch against
+433.8 in three runs each, as it should be at 0.37 MB written, so it stays out of the kernel.
+The only gap that helped is idle time, and that is not something a decode step has to spare.
 
 ## What is next
 
