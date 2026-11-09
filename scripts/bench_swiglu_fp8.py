@@ -19,9 +19,12 @@ gate|up) do not. Before timing, the fused op's bytes and scales are checked agai
 ops with torch.equal.
 
 The cluster rows (`kind: cluster_sweep`) are the op rows of swiglu_fp8 and the two ops once per
-size in --clusters, with SPARK_SWIGLU_FP8_CLUSTER set to it. The kernel reads that variable
-once, so each size runs in a process of its own (this script with --part op); the two ops'
-rows are timed again in each, next to the fused op they are compared with.
+size in --clusters, with SPARK_SWIGLU_FP8_CLUSTER set to it, and for each of those once per
+--rows-per (SPARK_SWIGLU_FP8_ROWS, rows to a cluster) and --vpts (SPARK_SWIGLU_FP8_VPT, the
+vectors a thread the block is sized for; 0 leaves both to the dispatch). The kernel reads the
+variables once, so each setting runs in a process of its own (this script with --part op); the
+two ops' rows are timed again in each, next to the fused op they are compared with. --tag
+adds a "tag" to every row, to tell one run of the same shapes from another.
 
 The engine rows are scripts/bench_serve.py's static batches (prompts log-uniform in 64..2048,
 --new tokens each, greedy) on an fp8-tok SparkModel of --layers of Llama-3-8B's layers with
@@ -140,20 +143,30 @@ def bench_op(args, rows_out):
 
 
 def bench_cluster(args, rows_out):
-    """The op rows of the fused op and the two ops, once per forced cluster size, each size in
-    its own process (the kernel reads SPARK_SWIGLU_FP8_CLUSTER once)."""
+    """The op rows of the fused op and the two ops, once per forced setting, each setting in
+    its own process (the kernel reads its variables once)."""
     for c in [int(v) for v in args.clusters.split(",") if v]:
-        with tempfile.TemporaryDirectory() as d:
-            out = Path(d) / "rows.jsonl"
-            cmd = [sys.executable, str(Path(__file__).resolve()), "--part", "op", "--pair-only",
-                   "--rows", args.rows, "--cols", args.cols, "--reps", str(args.reps),
-                   "--iters", str(args.iters), "--out", str(out)]
-            print(f"cluster {c}:", file=sys.stderr)
-            subprocess.run(cmd, check=True, env={**os.environ, "SPARK_SWIGLU_FP8_CLUSTER": str(c)})
-            for line in out.read_text().splitlines():
-                r = json.loads(line)
-                r.update(kind="cluster_sweep", cluster=c, iters=args.iters)
-                rows_out.append(r)
+        for rp in [int(v) for v in args.rows_per.split(",") if v]:
+            for vpt in [int(v) for v in args.vpts.split(",") if v]:
+                env = {k: v for k, v in os.environ.items() if not k.startswith("SPARK_SWIGLU_FP8")}
+                env["SPARK_SWIGLU_FP8_CLUSTER"] = str(c)
+                if rp > 1:
+                    env["SPARK_SWIGLU_FP8_ROWS"] = str(rp)
+                if vpt:
+                    env["SPARK_SWIGLU_FP8_VPT"] = str(vpt)
+                with tempfile.TemporaryDirectory() as d:
+                    out = Path(d) / "rows.jsonl"
+                    cmd = [sys.executable, str(Path(__file__).resolve()), "--part", "op",
+                           "--pair-only", "--rows", args.rows, "--cols", args.cols,
+                           "--reps", str(args.reps), "--iters", str(args.iters), "--out", str(out)]
+                    print(f"cluster {c}, {rp} rows to a cluster, vpt {vpt}:", file=sys.stderr)
+                    subprocess.run(cmd, check=True, env=env)
+                    for line in out.read_text().splitlines():
+                        r = json.loads(line)
+                        r.update(kind="cluster_sweep", cluster=c, iters=args.iters)
+                        if rp > 1 or vpt:
+                            r.update(rows_per_cluster=rp, vpt=vpt)
+                        rows_out.append(r)
 
 
 def bench_engine(args, rows_out):
@@ -215,6 +228,9 @@ def main() -> int:
     ap.add_argument("--reps", type=int, default=20, help="calls per graph / per sample")
     ap.add_argument("--iters", type=int, default=None, help="op: 50, cluster: 30")
     ap.add_argument("--clusters", default="1,2,4,8", help="cluster sizes the cluster part forces")
+    ap.add_argument("--rows-per", default="1", help="rows to a cluster the cluster part forces")
+    ap.add_argument("--vpts", default="0", help="vectors a thread the cluster part forces")
+    ap.add_argument("--tag", default=None, help="a tag added to every row")
     ap.add_argument("--pair-only", action="store_true",
                     help="op rows of swiglu_fp8 and the two ops only, not the pieces alone")
     ap.add_argument("--batches", default="1,8,32,64")
@@ -243,6 +259,8 @@ def main() -> int:
         bench_engine(args, rows)
     with open(args.out, "a") as f:
         for r in rows:
+            if args.tag:
+                r["tag"] = args.tag
             f.write(json.dumps(r) + "\n")
     print(f"{len(rows)} rows appended to {args.out}", file=sys.stderr)
     return 0
