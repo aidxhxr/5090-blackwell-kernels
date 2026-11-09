@@ -216,6 +216,11 @@ drift up to a tile apart.
 Shared memory is 96.9 KB at `D = 128` (32 KB of K, three 16 KB stages, three 256-byte L / Dv
 rows, two 8 KB dS^T buffers, the barriers), 252 registers with no spills.
 
+The (L, Dv) copy names its destination `.shared::cta`. As `.shared::cluster` it cost 3,504
+MiB at the first launch, and the switch exposed a ptxas miscompile of the block's work split,
+which is why a block divides by the split through `div_s1` (docs/design/hgemm.md, "The
+attention backward").
+
 Nsight Compute, 4096 tokens, `D = 128`, the key-tile kernel alone, one launch at the clock
 Nsight locks (2.53 GHz):
 
