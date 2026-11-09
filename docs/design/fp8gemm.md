@@ -1020,7 +1020,8 @@ What lost or is left:
 
 Source: `Knobs::whole_queue` and the queue branch of `plan` in `fp8gemm_tma_sk.cu`, the rows of
 `results/fp8gemm_mx_queue.jsonl` (measured 2026-11-06, `--models --mode=mx --layout=tiled
---iters=20`; `v3tl-sk` is the same build with `SPARK_FP8GEMM_V3_WHOLE_QUEUE=0`).
+--iters=20`; `v3tl-sk` is the same build with `SPARK_FP8GEMM_V3_WHOLE_QUEUE=0`; the second
+pair from row 241, made by `scripts/fp8gemm_queue_abba.sh <dir> mx-tiled`).
 
 I took the four worst of those 11, the Llama 3 70B gate/up and down at 256 tokens and the Qwen
 3 32B ones at 512, and ran each under Nsight Compute next to cuBLASLt: one launch of each from
@@ -1078,9 +1079,9 @@ it lost, 0.973x on the geometric mean of the 31: from 1.048x at 256 x 28672 x 81
 costing about a quarter of a whole one on top, so the rule takes whole tiles when the last wave
 leaves fewer than a quarter as many blocks idle as there are Stream-K tiles, and K is at most
 64 k-steps (the one deeper shape it would take, 2048 x 5120 x 25600, ran 0.990x). Tiled MX mode
-only, the only mode I measured it in; `SPARK_FP8GEMM_V3_WHOLE_QUEUE` is -1 for the rule, 0
-never, 1 always. It takes 9 of the 120 shapes. Two pairs of sweeps, Stream-K and rule back to
-back, the second pair in the other order:
+only at first, the only mode I measured it in (per-tensor mode since, in the next section);
+`SPARK_FP8GEMM_V3_WHOLE_QUEUE` is -1 for the rule, 0 never, 1 always. It takes 9 of the 120
+shapes. Two pairs of sweeps, Stream-K and rule back to back, the second pair in the other order:
 
 | M x N x K | what it is | cuBLASLt MXFP8 | Stream-K | whole tiles | speedup |
 |---|---|---|---|---|---|
@@ -1130,6 +1131,71 @@ even two-way split for a card mostly idle), and against the 170 ranges that ran 
 and 0.943x, two runs each in the single-shape bench. The idle SMs are cheap for cuBLASLt, not
 free time for us; what is left there is the energy per tile, which I have not looked at.
 
+### Whole tiles from the queue in per-tensor mode
+
+Source: `launch_mode` and the queue branch of `plan` in `fp8gemm_tma_sk.cu`,
+`scripts/fp8gemm_queue_abba.sh`, `results/fp8gemm_tensor_queue.jsonl` (measured 2026-11-08,
+`--models --mode=tensor --iters=20`; `v3-sk` is `SPARK_FP8GEMM_V3_WHOLE_QUEUE=0`, `v3-wq` is 1,
+`v3` the rule).
+
+The per-tensor path runs the same Stream-K queue on the same wide gate/ups, so the tail plus a
+full wave cut in K-passes should cost it the same way. 27 of the 120 shapes are in queue mode
+there. Its k-step is one stage, as with tiled scales, so the rule's counts mean the same thing;
+what differs is the tile. The per-tensor rule runs 128x256 from 512 tokens, so at 512 x 28672
+x 8192 the rule counts 448 tiles of 128x256, 278 of them Stream-K and 62 blocks idle in the
+last wave, the numbers MX mode gets at 256 tokens on 128x128, and a Stream-K tile's fixup moves
+a 128 KB slot instead of 64 KB. I kept the rule as it is and measured it. Every sweep below is
+an ABBA (Stream-K, B, B, Stream-K) in one hold of the GPU, next to cuBLASLt per-tensor fp8 on
+the same bytes.
+
+**Forced on** (two ABBAs, four pairs) it loses: 0.964x to 0.979x on the geometric mean of the
+27 per pair. The shapes whose last wave is nearly empty pay most, as in MX mode: the four at
+3.01 waves (512 tiles of 128x256, 168 blocks idle in the last of four waves) run 0.80x to
+0.81x over the four pairs, the two at 6.02 waves 0.89x and 0.91x, 1024 x 28672 x 8192 at 5.27
+waves 0.97x. Of the 18 shapes the rule leaves alone, the only one up in all four pairs is 4096
+x 5120 x 25600, 1.001x to 1.010x, which the K limit keeps out (200 k-steps). 512 x 25600 x
+5120, a rule shape in MX mode, is on 128x256 here with 110 of the last wave's 170 blocks idle,
+and ran 0.994x to 1.039x.
+
+**By the rule**, two more ABBAs of all 120. It takes 9 shapes and all 9 come out ahead:
+
+| M x N x K | what it is | tile | cuBLASLt | Stream-K | whole tiles | speedup |
+|---|---|---|---|---|---|---|
+| 128 x 28672 x 8192 | Llama 3 70B gate/up, 128 tokens | 128x64 | 299.7 us | 192.7 to 199.6% | 197.1 to 206.5% | 1.032x |
+| 256 x 28672 x 8192 | same, 256 tokens | 128x128 | 356.9 us | 173.8 to 179.1% | 181.2 to 187.6% | 1.041x |
+| 512 x 28672 x 8192 | same, 512 tokens | 128x256 | 370.4 us | 97.9 to 100.4% | 104.0 to 106.2% | 1.056x |
+| 2048 x 10240 x 8192 | Llama 3 70B qkv | 128x256 | 524.6 us | 97.5 to 101.9% | 104.1 to 106.8% | 1.063x |
+| 1024 x 25600 x 5120 | Qwen 3 32B gate/up, 1024 tokens | 128x256 | 398.8 us | 95.3 to 97.2% | 101.2 to 102.0% | 1.069x |
+| 4096 x 25600 x 5120 | same, 4096 tokens | 128x256 | 1.48 ms | 95.5 to 96.5% | 96.9 to 97.9% | 1.017x |
+| 128 x 128256 x 4096 | Llama 3 8B lm_head | 128x64 | 336.5 us | 95.4 to 95.5% | 98.3 to 98.8% | 1.034x |
+| 256 x 128256 x 4096 | same | 128x128 | 426.5 us | 88.7 to 90.1% | 91.3 to 91.9% | 1.028x |
+| 512 x 128256 x 4096 | same | 128x256 | 823.5 us | 94.0 to 96.0% | 96.4 to 98.5% | 1.027x |
+
+% of cuBLASLt over the four passes of each kind, the speedup ours over the four pairs; cuBLASLt's
+time is the first pass's. The lm_head rows are from three more ABBAs at 200 iterations (below), six
+passes of each kind and six pairs. The 9 run 1.037x faster on the geometric mean of the four
+20-iteration pairs; the other 111 run the plan they ran before and read 0.991x to 1.004x per pair,
+0.999x over the four. Over the 120 that is 128.1 to 128.9% of cuBLASLt for Stream-K and 128.4 to
+129.4% with the rule, 14 to 19 shapes below cuBLASLt against 13 to 16: the change is inside the
+sweep-to-sweep noise of the 120, as it was in MX mode.
+
+**The lm_head.** At 20 iterations it is noise. The weight is 525 MB, and its Stream-K rows
+moved by up to 7% between passes (93.7 to 100.4% at 128 tokens); whole tiles lost 4 of its 12
+pairs in the rule sweeps (0.984x at worst) and 3 of 12 in the forced ones. So I ran the 18
+Llama 3 8B shapes at 128, 256 and 512 tokens three more times in ABBA order at 200 iterations
+(`--models=llama3-8b --ms=128,256,512 --iters=200`): whole tiles won all 18 lm_head pairs,
+1.023x to 1.037x, and the 15 shapes the rule does not touch read 1.002x (0.973x to 1.044x).
+It stays in the rule. It is still below cuBLASLt, 91.3 to 91.9% at 256 tokens.
+
+**Bits.** A whole tile is one chain of k32 steps per output from k = 0 to K, variant 4's; the
+Stream-K region adds its K-passes in K order. So on the 9 shapes variant 3 now gives variant
+4's bits on Gaussian inputs, and on exact sums every schedule gives cuBLASLt's.
+`tests/test_fp8gemm.py` checks both on four of the shapes, the first also with tiled scales at
+256 x 28672 x 8192, and that 1024 x 28672 x 8192, which the rule leaves to Stream-K, still
+differs from variant 4. With the knob at 0 the variant 4 tests fail. The engine's `fp8` and
+`fp8-tok` weights call the default, so their prefill steps on these shapes take whole tiles
+now; not measured end to end.
+
 ### The engine
 
 `quant.FP8Linear` (the engine's `fp8` and `fp8-tok` weights) calls `sk.fp8gemm` with the
@@ -1162,8 +1228,9 @@ Open:
 - **Stream-K.** Done in per-tensor mode: variant 3 ("Model shapes"), 129.1% of cuBLASLt over
   the 120 model shapes against 103.8% for the old default, and in MX mode, 111.8% of
   cuBLASLt MXFP8 against 91.6% (118.1% with tiled scales). Open there: the lm_head at 256
-  tokens (85.9%), and the deep-K shapes where variant 2's data-parallel waves still win in
-  both modes.
+  tokens (85.9%; 91.3 to 91.9% with whole tiles from the queue, "Whole tiles from the queue
+  in per-tensor mode"), and the deep-K shapes where variant 2's data-parallel waves still win
+  in both modes.
 - **MX at 90%.** Done for the 128x128 and 64-wide tiles: the tiled scale layout ("MX mode
   with tiled scales") takes 4096³ from 98.5% to 107.2% of cuBLASLt MXFP8 and the model
   shapes from 111.8% to 118.1%. Open: the 128x256 tile, which the per-tensor rule runs on the
