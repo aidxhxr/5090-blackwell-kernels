@@ -101,22 +101,23 @@ timing one launch between events. The fastest of the 2000 one-token launches sho
 latency: 1.98 to 2.02 us for the append, 2.27 to 2.30 with the norm, 3.42 with the second
 launch.
 
-**The load order.** The first version loaded the weights, and the cos and sin tables, after
-the shuffles, where the code first needs them. The compiler does not move a load above a
-shuffle loop, so a one-token rope row went to memory three times in a row (qkv, then the
-weights, then the tables) where the plain append goes once. In the engine that showed: two
-layers of Qwen3's attention with a dense MLP took 2.0 us more per decode step with the norm at
-one token (0.2643 against 0.2663 ms of GPU time for the captured step, `bench_engine_moe`'s
-step timing, two runs alternated) and 1.8 to 2.0 us more at 8. Loading them with qkv, before
-the shuffles, takes the fastest one-token launch from 2.56 to 2.30 us (1.98 to 2.05 for the
-append) and the engine's step to within noise of the step without the norm: 0.2646 against 0.2643 to
-0.2645 ms at one token, 0.2694 to 0.2711 against 0.2695 to 0.2715 at 8, 0.3104 to 0.3107
-against 0.3114 at 64. The cost is registers: the norm's kernels went from 40 to 61, which
-takes a 256-thread block from 6 per SM to 4. On Qwen3's 4096 tokens nothing moved (21.4 to
-21.6 us in both versions), but on Llama's heads at 4096 tokens, the L2-resident 100 MB row,
-the fused row went from 29.7 to 29.8 us to 30.8 to 31.0, 4% over the append, which I put down
-to the lost occupancy. Llama has no QK norm, so I kept the version that is faster at decode. `__launch_bounds__(256, 5)`
-gets it to 48 registers and spills 36 bytes, (256, 6) to 40 and spills 88.
+**The load order.** The first version loaded the weights, and the cos and sin tables, after the
+shuffles, where the code first needs them. The compiler does not move a load above a shuffle
+loop, so a one-token rope row went to memory three times in a row (qkv, then the weights, then
+the tables) where the plain append goes once. In the engine that showed: two layers of Qwen3's
+attention with a dense MLP took 2.0 us more per decode step with the norm at one token (0.2643
+against 0.2663 ms of GPU time for the captured step, `bench_engine_moe.step_times` on a
+dense-MLP Qwen3 from a one-off script that isn't committed, two runs alternated) and 1.8 to 2.0
+us more at 8. Loading them with qkv, before the shuffles, takes the fastest one-token launch
+from 2.56 to 2.30 us (1.98 to 2.05 for the append) and the engine's step to within noise of the
+step without the norm: 0.2646 against 0.2643 to 0.2645 ms at one token, 0.2694 to 0.2711
+against 0.2695 to 0.2715 at 8, 0.3104 to 0.3107 against 0.3114 at 64. The cost is registers:
+the norm's kernels went from 40 to 61, which takes a 256-thread block from 6 per SM to 4. On
+Qwen3's 4096 tokens nothing moved (21.4 to 21.6 us in both versions), but on Llama's heads at
+4096 tokens, the L2-resident 100 MB row, the fused row went from 29.7 to 29.8 us to 30.8 to
+31.0, 4 to 5% over the append, which I put down to the lost occupancy. Llama has no QK norm, so
+I kept the version that is faster at decode. `__launch_bounds__(256, 5)` gets it to 48
+registers and spills 36 bytes, (256, 6) to 40 and spills 88.
 
 ## Paged decode
 
