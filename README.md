@@ -878,6 +878,16 @@ bits of dQ run-to-run dependent; `deterministic=True` computes dQ in a separate 
 kernel below and give the same bits). The numbers, the profiles and the experiments that lost
 are in [the design note](docs/design/attention_bwd.md).
 
+The backward's first launch used to take 3,504 MiB of device memory outside torch's
+allocator: the stack the driver reserves for a routine ptxas put behind the `.shared::cluster`
+bulk load of the (L, Dv) rows (hgemm's TMA loads had the same cost). Naming `.shared::cta`
+there first broke variant 3 at D = 128, and the load wasn't the reason. Without the call in
+the kernel, ptxas moved the block's divisions by the grid split into uniform registers and
+miscompiled them, so blocks got the wrong key tile and query range. The division is a
+multiply by a reciprocal from the host now, the load is `.shared::cta`, and the first launch
+takes 8 MiB, for at most 0.5% of speed at 8K tokens
+([docs/design/hgemm.md](docs/design/hgemm.md), "The attention backward").
+
 ### sliding window and sinks
 
 Most models people run now mix local attention in. Mistral 7B and Gemma 2 limit layers to the

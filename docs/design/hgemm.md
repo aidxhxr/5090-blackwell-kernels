@@ -1490,9 +1490,8 @@ the private bulk load of `cross_entropy.cu`, name `.shared::cta`. In the CMake l
   by 0.80 against a tolerance of 0.022 at S = 200) and passed every D = 64 one; run as part
   of the whole file, the S = 200 case hung instead. The copy's SASS has the same `UBLKCP`,
   destination, barrier and 256-byte size as the hardware branch of the cluster form, so my
-  guess is a race in the kernel that the different schedule exposes, but I haven't found
-  it. Its first launch still takes 3,516 MiB (`attention_with_grad` and a backward at H 8/4,
-  S = 1024, D = 128, measured like the test below).
+  guess was a race in the kernel that the different schedule exposes. It wasn't a race, it
+  was ptxas, and the load is `.shared::cta` now too ("The attention backward", below).
 
 Registers are unchanged (variant 5's two configurations 94 and 126, the grouped GEMM's 101
 to 158) and the stack frame goes from 8 bytes to 0. A `.shared::cta` load is still right
@@ -1544,6 +1543,79 @@ Speed, one lock hold, before and after alternated twice, mean of the two medians
 
 Every row is within 0.4%, in both directions. The fast path was always the hardware copy;
 the fix only takes out a compare and a branch the producer lane never took.
+
+**The attention backward.** The bulk load was fine. What went wrong was the block's share of
+the work, which variant 3's key-tile kernel works out at the top from `blockIdx.x`: its tile is
+`item / s1` and its query range `sub * total / s1`, where s1 (1 to 8 unless forced) is how many
+items the grid split cuts each key tile into. With the syscall in the kernel, ptxas did that
+arithmetic in vector registers. Without it, in three of the eight D = 128 key-tile
+instantiations (the ones without a window, except atomic dQ from 2,048 query rows, where dP^T
+goes early), it moves the three divisions by s1 to uniform registers and gets them wrong there.
+The quotient sequence has two remainder corrections. In the uniform version the first writes
+`r - |s1|` to a fresh register under its own predicate (`@!UP1 UIADD3 UR7, UR4, -UR16`), and
+the second compares that register with `|s1|` whether or not the first ran. When the first
+doesn't run, the second reads a register nothing in the kernel has written, and if it holds s1
+or more the quotient comes out one too high. That is why it came and went.
+
+I found it by dumping each block's tile and query range at S = 256, D = 128, one head: two key
+tiles, s1 = 2, 16 blocks of one query tile each. With the cluster form every block had the
+right ones. With `.shared::cta`, blocks 0 to 7 sat on tile 1 instead of 0 with query ranges
+starting at -8 to -1, and blocks 12 to 15 on a tile 2 that doesn't exist, whose workspace adds
+`compute-sanitizer` reported out of bounds. Against variant 2, dQ, dK and dV were off at every
+D = 128 shape of the test, by 0.16 to 9 at the worst element and inf or NaN on some repeats.
+The first full run of `test_attention_bwd` in my lock hold hung; in a later hold its D = 128
+cases passed three and hung on the fourth. A scan of the SASS for
+uniform registers read before anything writes them unconditionally finds exactly these reads
+(two per kernel, in the three kernels above) in the `.shared::cta` build and none in the
+cluster build. D = 64 never had it: ptxas kept its divisions in vector registers. Uniform
+divisions aren't wrong as such; the deterministic dQ pass at D = 128 has some in both builds,
+and the scan finds nothing there.
+
+The fix is `div_s1` in `attention_bwd.cu`: build_sched stores ceil(2^32 / s1), and a block
+takes x / s1 as the high half of x times that, exact while x (s1 - 1) < 2^32, which build_sched
+checks. No division by s1 is left for ptxas to lower, and the scan finds nothing. With that in,
+the backward's bulk load is common.cuh's `.shared::cta` one, and none of the 24 kernels of
+`attention_bwd.cu` that called the syscall does any more.
+
+First call in a fresh process, measured like `tests/test_first_launch.py` plus
+`cuCtxGetLimit` for the stack limit (a backward at B = 1, H_q = 8, H_kv = 4, S = 1024,
+D = 128, causal, after a forward that already ran; three processes each):
+
+| first call | before | after |
+|---|---|---|
+| attention backward variant 3 | 3,504 MiB, stack 14,608 | 8 MiB, stack 1,024 |
+
+`test_first_launch.py` has the backward now; on the build before this fix it fails that case
+at 3,504 MiB. `test_attention_bwd` passed eight whole-file runs on the fix in two lock holds
+(222 tests each), plus one each with `SPARK_ATTN_BWD_SPLIT` forced to 3, 5 and 7, which
+exercise other multipliers, and one on the persistent grid.
+
+Speed, one lock hold, the base of this branch, the division alone and both changes alternated
+twice, each the median of 7 repetitions of 10 calls of the whole `attention_bwd` op
+(preprocess and dQ conversion included), mean of the two medians, on the bench's prefill
+shapes:
+
+| shape (B x H x S x D) | before ms | division only ms | after ms | after / before |
+|---|---|---|---|---|
+| 1 x 32 x 1024 x 128 | 0.2590 | 0.2584 | 0.2586 | -0.2% |
+| 1 x 32 x 1024 x 128, causal | 0.1331 | 0.1320 | 0.1324 | -0.5% |
+| 1 x 32 x 2048 x 128 | 0.7795 | 0.7761 | 0.7774 | -0.3% |
+| 1 x 32 x 2048 x 128, causal | 0.4713 | 0.4709 | 0.4722 | +0.2% |
+| 1 x 32 x 4096 x 128 | 3.1100 | 3.1033 | 3.1138 | +0.1% |
+| 1 x 32 x 4096 x 128, causal | 1.6704 | 1.6694 | 1.6738 | +0.2% |
+| 1 x 32 x 8192 x 128 | 12.3407 | 12.3277 | 12.3914 | +0.4% |
+| 1 x 32 x 8192 x 128, causal | 6.3909 | 6.3923 | 6.4191 | +0.4% |
+| 4 x 32 x 2048 x 128, causal | 2.1704 | 2.1717 | 2.1690 | -0.1% |
+| 1 x 32 x 4096 x 64, causal | 0.8027 | 0.8009 | 0.8024 | 0.0% |
+| 1 x 32/8 x 4096 x 128 | 3.1676 | 3.1613 | 3.1741 | +0.2% |
+| 1 x 32/8 x 4096 x 128, causal | 1.7321 | 1.7301 | 1.7338 | +0.1% |
+| 1 x 32/8 x 8192 x 128, causal | 6.4072 | 6.4030 | 6.4270 | +0.3% |
+
+The division costs nothing (0.9% faster to 0.1% slower). The load costs a little at the long
+shapes: 0.3 to 0.4% at 8K tokens, and an earlier hold with only before and after gave the same
+picture (+0.3 to +0.5% at 8K, -0.4 to +0.7% below). The key-tile kernel used from 2,048 rows
+has the same 192 `HMMA` and 128 `LDSM` as before and 336 fewer instructions in all (the call
+and its setup), so I don't know yet where the 0.4% goes; I'd take it for 3.4 GiB.
 
 ## Correctness
 
