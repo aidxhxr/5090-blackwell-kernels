@@ -65,6 +65,60 @@ layer.md is gone). The rotation is the same `rotate8` helper in both kernels.
 The 4096-token row is L2-resident (100 MB moved against 96 MB of L2) and pays for the scattered
 16-token pages there; at 8192 tokens both run at 1,460 GB/s.
 
+**Qwen3's QK norm.** Qwen3 RMS-normalizes every q and k head over its head_dim before RoPE
+(`Qwen3RMSNorm`: one `[head_dim]` weight for q and one for k per layer, shared by the heads,
+the model's eps). Both paged kernels take the two weights (`q_norm`, `k_norm`, `eps`) and do
+it in the same launch. A rope row is already D/16 consecutive lanes of one warp, each holding
+16 of the head's elements (the 8 at c and the 8 at c + D/2 it rotates them against), so the
+sum of squares is a shuffle over 8 lanes at D = 128 and the weights are two more 16-byte
+loads that every row shares. The arithmetic is transformers': x in fp32 times rsqrt(mean(x^2)
++ eps), rounded to bf16, times the weight, rounded to bf16 again, then the fp32 rotation as
+before (on the e4m3 cache, the k rotation in fp32 and one rounding to e4m3). Both kernels are
+templates on the norm, and the instantiation without it is the old code from the same lines:
+the build of 004c2cb and this one give the same q and cache bytes on Llama's, Qwen3's and a
+64-wide shape, on both caches, and the engine gives the same logits on the batch-invariant
+kernels.
+
+Against the append without the norm and against the norm as a launch of its own, in place on
+qkv, before the plain append. That launch has the fused kernel's thread split and arithmetic,
+and the two give the same bits on every shape. `bench_rope`, us, medians of 200 launches over
+two runs (2000 launches over three runs for one token):
+
+| shape | append | norm fused into it | norm launch + append |
+|---|---|---|---|
+| Qwen3 (32 / 4 heads), 4096 tokens | 21.4 to 21.5 | 21.4 to 21.5 | 41.8 to 42.0 |
+| Qwen3, 1 token at 4095 | 3.10 to 3.17 | 3.17 to 3.20 | 4.32 |
+| Qwen3, 8 tokens at 4095 | 3.10 to 3.14 | 3.10 to 3.20 | 4.22 to 4.35 |
+| Qwen3, 64 tokens at 4095 | 3.10 to 3.14 | 3.17 to 3.26 | 4.19 to 4.22 |
+| Llama (32 / 8 heads), 4096 tokens | 29.6 | 30.8 to 31.0 | 65.2 to 65.3 |
+| Llama, 8192 tokens | 137.4 to 137.6 | 136.1 | 230.3 |
+
+At 4096 tokens on Qwen3's shape the norm is free: the append moves 84 MB at 3.9 TB/s (L2
+resident, as above) and the shuffles and multiplies hide under it. The separate launch reads
+and writes q and k once more, 75 MB, and takes twice as long (1.95x); at 8192 tokens, from
+DRAM, it is 1.67x. A decode step is one partial wave, and the medians sit on the 3 us floor of
+timing one launch between events. The fastest of the 2000 one-token launches shows the
+latency: 1.98 to 2.02 us for the append, 2.27 to 2.30 with the norm, 3.42 with the second
+launch.
+
+**The load order.** The first version loaded the weights, and the cos and sin tables, after the
+shuffles, where the code first needs them. The compiler does not move a load above a shuffle
+loop, so a one-token rope row went to memory three times in a row (qkv, then the weights, then
+the tables) where the plain append goes once. In the engine that showed: two layers of Qwen3's
+attention with a dense MLP took 2.0 us more per decode step with the norm at one token (0.2643
+against 0.2663 ms of GPU time for the captured step, `bench_engine_moe.step_times` on a
+dense-MLP Qwen3 from a one-off script that isn't committed, two runs alternated) and 1.8 to 2.0
+us more at 8. Loading them with qkv, before the shuffles, takes the fastest one-token launch
+from 2.56 to 2.30 us (1.98 to 2.05 for the append) and the engine's step to within noise of the
+step without the norm: 0.2646 against 0.2643 to 0.2645 ms at one token, 0.2694 to 0.2711
+against 0.2695 to 0.2715 at 8, 0.3104 to 0.3107 against 0.3114 at 64. The cost is registers:
+the norm's kernels went from 40 to 61, which takes a 256-thread block from 6 per SM to 4. On
+Qwen3's 4096 tokens nothing moved (21.4 to 21.6 us in both versions), but on Llama's heads at
+4096 tokens, the L2-resident 100 MB row, the fused row went from 29.7 to 29.8 us to 30.8 to
+31.0, 4 to 5% over the append, which I put down to the lost occupancy. Llama has no QK norm, so
+I kept the version that is faster at decode. `__launch_bounds__(256, 5)` gets it to 48
+registers and spills 36 bytes, (256, 6) to 40 and spills 88.
+
 ## Paged decode
 
 The contiguous flash-decoding kernel splits the keys of each `(b, kv head)` into the same
@@ -569,7 +623,8 @@ that does not fit is refused with the reason instead of failing inside a launch:
   at most 32768.
 - `hgemm` with its fused epilogues (the residual adds, the SwiGLU): N and K multiples of 64.
   Qwen3's are qkv 2048 -> 5120, o 4096 -> 2048 and lm_head 2048 -> V.
-- `rope_append_paged_`: head_dim a multiple of 16, H_q a multiple of H_kv.
+- `rope_append_paged_`: head_dim a multiple of 16, H_q a multiple of H_kv; with Qwen3's QK
+  norm a power of two up to 512.
 - `paged_decode` and `attention_varlen`: head_dim 64 or 128. `paged_decode` takes at most 16
   query heads per K/V head, since variant 1 puts a group's heads in one m16 tile of rows (the
   invariant variant 2 of both has the same limit). Qwen3's group of 8 fills half the tile,
@@ -598,6 +653,26 @@ On the MoE model the rerouted rows are set aside as in the MoE section: 14 of th
 prefill tokens went to another expert somewhere in the two layers (34 on the e4m3 cache),
 none of them a row whose logits are compared, and one decode row in twelve. Graphed and
 eager decode give the same tokens on all three shapes.
+
+**The QK norm.** The rows above have no QK norm, and Qwen3 RMS-normalizes every q and k head
+before RoPE, so a real checkpoint would not have matched. `ModelConfig.qk_norm` turns it on
+(`QWEN3_30B_A3B` has it now): every layer carries `q_norm` and `k_norm` (`LayerWeights`,
+`[head_dim]` each), SparkModel hands them to the append, where the norm costs nothing at a
+prefill (RoPE + paged append, above), and TorchModel runs `ops.qk_norm_ref`, transformers'
+formula, on its q and k. `ModelWeights.random` draws the two weights last, so the rest is the
+same for a seed with the norm or without. The same parity run, with it:
+
+| model | cache | prefill | decode steps |
+|---|---|---|---|
+| Qwen3-30B-A3B attention with the QK norm, dense MLP | bf16 | 0.69% | 0.70 to 0.74% |
+| Qwen3-30B-A3B attention with the QK norm, dense MLP | e4m3 | 1.06% | 1.06 to 1.09% |
+| 64-wide heads in groups of 8, with the QK norm | bf16 | 0.66% | 0.66 to 0.69% |
+| 64-wide heads in groups of 8, with the QK norm | e4m3 | 0.79% | 0.85 to 0.97% |
+
+In the same process Qwen3's attention without the norm gives the table's numbers again
+(0.68% and 0.71 to 0.73% on bf16, 1.10% and 1.00 to 1.09% on e4m3). `tests/test_engine_config.py` runs both 64-wide configs and Qwen3's own (with
+the norm) through every test, and `tests/test_engine_moe.py` runs Qwen3-30B-A3B's experts
+with it.
 
 **The default did not move.** The engine as it was (4b3c497) and this one in one process, on
 the same weights, alternated three times in one lock hold: eight Llama-3-8B layers,
@@ -646,8 +721,13 @@ that is 0.098 ms of GPU time for the 114 MB a layer reads, 1,162 GB/s. The graph
 Llama-shaped models, because a Qwen3 layer is small: at one token the host takes 51 to 56%
 of the GPU's time to issue the step, where it takes 11% on the dense model. It is still
 behind the GPU, so eager keeps it busy. Not run: the whole 48 layers (58 GB of bf16
-experts), and Qwen3's QK norm (a per-head RMSNorm on q and k before RoPE, which this layer
-does not have).
+experts). These rows have no QK norm, which the layer did not have yet. With it (next
+section's append), `--models qwen3 --batches 1,8,64` alternated twice with the 004c2cb build
+in one lock hold gives the same steps: 0.308 ms at one token both ways with graphs, 0.814
+against 0.815 at 8, 1.749 to 1.750 against 1.748 to 1.749 at 64, and 0.294 ms of GPU time for
+the one-token step in both (`results/engine_qk_norm.jsonl`). The empty steps of 4 to 64 slots
+moved by 3 to 31 us either way (1.141 to 1.110 ms at 16, 1.634 to 1.643 at 64): the norm
+changes which experts the padding rows go to, and that is the experts, not the append.
 
 ## Correctness
 

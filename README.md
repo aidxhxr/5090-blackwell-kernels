@@ -723,6 +723,28 @@ A layer adds 0.10 ms at one token (114 MB read at 1,162 GB/s) and the graph save
 more than on the Llama-shaped models because the host's time to issue a step is half the
 GPU's. `tests/test_engine_config.py` has the other shapes.
 
+Qwen3 also RMS-normalizes every q and k head before RoPE, so a real checkpoint needs that
+too. It's `ModelConfig.qk_norm` now, on for Qwen3-30B-A3B, and it rides inside
+`rope_append_paged_` instead of a launch of its own: a head is already 8 lanes of one warp
+there, so the norm is a few shuffles and two more loads of the weights. On Qwen3's heads
+(`bench_rope`, us, medians):
+
+| tokens | append | with the norm fused | norm launch + append |
+|---|---|---|---|
+| 4096 | 21.4 to 21.5 | 21.4 to 21.5 | 41.8 to 42.0 |
+| 1 | 3.10 to 3.17 | 3.17 to 3.20 | 4.32 |
+| 8 | 3.10 to 3.14 | 3.10 to 3.20 | 4.22 to 4.35 |
+| 64 | 3.10 to 3.14 | 3.17 to 3.26 | 4.19 to 4.22 |
+
+The formula is transformers' Qwen3RMSNorm with its two bf16 roundings, the logits match
+TorchModel to 0.69 to 0.74% with it, and without the weights the kernel and the engine give
+the same bits as before. The decode step doesn't move: two layers of Qwen3's attention with a
+dense MLP take 0.2646 ms of GPU time at one token with the norm and 0.2643 to 0.2645 without,
+and the MoE model 0.308 ms a step both ways. That took loading the weights and the cos/sin
+tables before the shuffles. Loaded after them, the step was 2 us slower (three trips to
+memory in a row at one token). Details in [docs/design/serving.md](docs/design/serving.md);
+`results/rope_qk_norm.jsonl`, `results/engine_qk_norm.jsonl`.
+
 ## attention
 
 Fused scaled-dot-product attention, forward, bf16 in and out, fp32 math. Head sizes 64 and

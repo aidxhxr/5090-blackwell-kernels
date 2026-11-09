@@ -6,6 +6,9 @@
 // Validates against a CPU double-precision reference; exits 1 on mismatch.
 // Each shape also runs the paged form (rope_append_paged_bf16, row "rope_paged"): the same
 // B * S tokens packed, positions pos0 + s, k and v into 16-token pages of a shuffled pool.
+// And the paged form with Qwen3's QK norm: fused into the append ("rope_paged_qknorm") and
+// as its own launch in place on qkv before the plain append ("rope_paged_qknorm_split", the
+// norm kernel below). The default shapes add Qwen3-30B-A3B's heads (32 query, 4 K/V, 128).
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -21,6 +24,63 @@
 using namespace spark::bench;
 
 namespace {
+
+using spark::bf16x8;
+
+__device__ __forceinline__ float round_bf16(float x) {
+    return __bfloat162float(__float2bfloat16_rn(x));
+}
+
+// The QK norm as a launch of its own, in place on the q and k heads of qkv [T, (H_q + 2
+// H_kv) * D]: the baseline for the fused form. The fused kernel's thread split (D/16 lanes a
+// head, 8 elements at c and 8 at c + D/2 each) and its arithmetic, so the two give the same
+// bits. D a power of two <= 512.
+__global__ void qk_norm_inplace_kernel(__nv_bfloat16* qkv, const __nv_bfloat16* qn,
+                                       const __nv_bfloat16* kn, int H_q, int H_kv, int D, float eps,
+                                       int64_t total) {
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const int g = D / 16, half = D / 2;
+    const int64_t row = i / g;
+    const int c = static_cast<int>(i - row * g) * 8;
+    const int64_t tok = row / (H_q + H_kv);
+    const int h = static_cast<int>(row - tok * (H_q + H_kv));
+    __nv_bfloat16* src = qkv + tok * (H_q + 2 * H_kv) * D + static_cast<int64_t>(h) * D + c;
+    const __nv_bfloat16* w = h < H_q ? qn : kn;
+    bf16x8 x1 = *reinterpret_cast<const bf16x8*>(src);
+    bf16x8 x2 = *reinterpret_cast<const bf16x8*>(src + half);
+    float a[8], b[8], ss = 0.f;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const float2 u = __bfloat1622float2(x1.h[k]);
+        const float2 v = __bfloat1622float2(x2.h[k]);
+        a[2 * k] = u.x;
+        a[2 * k + 1] = u.y;
+        b[2 * k] = v.x;
+        b[2 * k + 1] = v.y;
+        ss += u.x * u.x + u.y * u.y + v.x * v.x + v.y * v.y;
+    }
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned mask = g == 32 ? 0xffffffffu : ((1u << g) - 1u) << (lane & ~(g - 1u));
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        if (o < g) ss += __shfl_xor_sync(mask, ss, o);
+    }
+    const float r = rsqrtf(ss * (1.0f / static_cast<float>(2 * half)) + eps);
+    const bf16x8 w1 = *reinterpret_cast<const bf16x8*>(w + c);
+    const bf16x8 w2 = *reinterpret_cast<const bf16x8*>(w + c + half);
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const float2 wa = __bfloat1622float2(w1.h[k]);
+        const float2 wb = __bfloat1622float2(w2.h[k]);
+        x1.h[k] = __floats2bfloat162_rn(round_bf16(a[2 * k] * r) * wa.x,
+                                        round_bf16(a[2 * k + 1] * r) * wa.y);
+        x2.h[k] = __floats2bfloat162_rn(round_bf16(b[2 * k] * r) * wb.x,
+                                        round_bf16(b[2 * k + 1] * r) * wb.y);
+    }
+    *reinterpret_cast<bf16x8*>(src) = x1;
+    *reinterpret_cast<bf16x8*>(src + half) = x2;
+}
 
 struct Shape {
     int B, S, H_q, H_kv, D, pos0, cap;
@@ -196,6 +256,130 @@ bool run_shape(const Shape& sh, int iters, cudaStream_t stream) {
         }
     const bool pok = perr <= 2e-2;
     const Timing tp = time_kernel(launch_paged, stream, 10, iters);
+
+    // The QK norm. Reference: Qwen3RMSNorm on each q and k head of the bf16 inputs (fp32 x
+    // times the rsqrt, to bf16, times the weight, to bf16), then the rotation in double.
+    constexpr float kEps = 1e-6f;
+    std::vector<float> h_qn(sh.D), h_kn(sh.D);
+    fill_uniform(h_qn, 0.8f, 1.2f, 5);
+    fill_uniform(h_kn, 0.8f, 1.2f, 6);
+    std::vector<__nv_bfloat16> t_qn(sh.D), t_kn(sh.D);
+    for (int d = 0; d < sh.D; ++d) {
+        t_qn[d] = __float2bfloat16(h_qn[d]);
+        h_qn[d] = __bfloat162float(t_qn[d]);
+        t_kn[d] = __float2bfloat16(h_kn[d]);
+        h_kn[d] = __bfloat162float(t_kn[d]);
+    }
+    auto bf = [](float x) { return __bfloat162float(__float2bfloat16(x)); };
+    const int heads = sh.H_q + sh.H_kv;
+    std::vector<float> ref_n(tokens * heads * sh.D), nx(sh.D);  // [token, q | k head, D]
+    for (size_t i = 0; i < tokens; ++i) {
+        const float* cs = h_cos.data() + static_cast<size_t>(h_pos[i]) * sh.D;
+        const float* sn = h_sin.data() + static_cast<size_t>(h_pos[i]) * sh.D;
+        for (int h = 0; h < heads; ++h) {
+            const float* x = h_qkv.data() + i * width + static_cast<size_t>(h) * sh.D;
+            const float* w = h < sh.H_q ? h_qn.data() : h_kn.data();
+            double ss = 0;
+            for (int d = 0; d < sh.D; ++d) ss += static_cast<double>(x[d]) * x[d];
+            const float r = static_cast<float>(1.0 / std::sqrt(ss / sh.D + kEps));
+            for (int d = 0; d < sh.D; ++d) nx[d] = bf(bf(x[d] * r) * w[d]);
+            float* out = ref_n.data() + (i * heads + h) * sh.D;
+            for (int d = 0; d < sh.D / 2; ++d) {
+                const double x1 = nx[d], x2 = nx[d + sh.D / 2];
+                out[d] = static_cast<float>(x1 * cs[d] - x2 * sn[d]);
+                out[d + sh.D / 2] = static_cast<float>(x2 * cs[d] + x1 * sn[d]);
+            }
+        }
+    }
+    __nv_bfloat16 *d_qn = nullptr, *d_kn = nullptr, *d_qkvn = nullptr;
+    __nv_bfloat16 *d_sq = nullptr, *d_sk = nullptr, *d_sv = nullptr;
+    SPARK_CUDA_CHECK(cudaMalloc(&d_qn, sh.D * sizeof(__nv_bfloat16)));
+    SPARK_CUDA_CHECK(cudaMalloc(&d_kn, sh.D * sizeof(__nv_bfloat16)));
+    SPARK_CUDA_CHECK(cudaMalloc(&d_qkvn, n_qkv * sizeof(__nv_bfloat16)));
+    SPARK_CUDA_CHECK(cudaMalloc(&d_sq, n_q * sizeof(__nv_bfloat16)));
+    SPARK_CUDA_CHECK(cudaMalloc(&d_sk, n_pool * sizeof(__nv_bfloat16)));
+    SPARK_CUDA_CHECK(cudaMalloc(&d_sv, n_pool * sizeof(__nv_bfloat16)));
+    SPARK_CUDA_CHECK(
+        cudaMemcpy(d_qn, t_qn.data(), sh.D * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+    SPARK_CUDA_CHECK(
+        cudaMemcpy(d_kn, t_kn.data(), sh.D * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice));
+    SPARK_CUDA_CHECK(
+        cudaMemcpy(d_qkvn, d_qkv, n_qkv * sizeof(__nv_bfloat16), cudaMemcpyDeviceToDevice));
+    SPARK_CUDA_CHECK(cudaMemset(d_pk, 0, n_pool * sizeof(__nv_bfloat16)));
+    SPARK_CUDA_CHECK(cudaMemset(d_pv, 0, n_pool * sizeof(__nv_bfloat16)));
+    SPARK_CUDA_CHECK(cudaMemset(d_sk, 0, n_pool * sizeof(__nv_bfloat16)));
+    SPARK_CUDA_CHECK(cudaMemset(d_sv, 0, n_pool * sizeof(__nv_bfloat16)));
+    auto launch_fused = [&] {
+        spark::rope_append_paged_bf16(d_qkv, d_cos, d_sin, d_pos, d_slot, d_pq, d_pk, d_pv,
+                                      static_cast<int>(tokens), sh.H_q, sh.H_kv, sh.D, kPage,
+                                      stream, d_qn, d_kn, kEps);
+    };
+    const int64_t norm_items = static_cast<int64_t>(tokens) * heads * (sh.D / 16);
+    // In place, so the timed repeats normalize an already normalized qkv: the same work.
+    auto launch_split = [&] {
+        qk_norm_inplace_kernel<<<static_cast<unsigned>((norm_items + 255) / 256), 256, 0, stream>>>(
+            d_qkvn, d_qn, d_kn, sh.H_q, sh.H_kv, sh.D, kEps, norm_items);
+        spark::rope_append_paged_bf16(d_qkvn, d_cos, d_sin, d_pos, d_slot, d_sq, d_sk, d_sv,
+                                      static_cast<int>(tokens), sh.H_q, sh.H_kv, sh.D, kPage,
+                                      stream);
+    };
+    launch_fused();
+    launch_split();
+    SPARK_CUDA_CHECK(cudaStreamSynchronize(stream));
+    const std::vector<float> nq = fetch(d_pq, n_q), nk = fetch(d_pk, n_pool),
+                             nv = fetch(d_pv, n_pool);
+    const std::vector<float> sq = fetch(d_sq, n_q), sk = fetch(d_sk, n_pool),
+                             sv = fetch(d_sv, n_pool);
+    double nerr = 0;
+    for (size_t i = 0; i < tokens; ++i) {
+        for (int h = 0; h < sh.H_q; ++h)
+            for (int d = 0; d < sh.D; ++d)
+                nerr = std::max(nerr,
+                                std::fabs(static_cast<double>(nq[(i * sh.H_q + h) * sh.D + d] -
+                                                              ref_n[(i * heads + h) * sh.D + d])));
+        for (int h = 0; h < sh.H_kv; ++h) {
+            const size_t dst = ((static_cast<size_t>(h_slot[i] / kPage) * sh.H_kv + h) * kPage +
+                                h_slot[i] % kPage) *
+                               sh.D;
+            for (int d = 0; d < sh.D; ++d)
+                nerr =
+                    std::max(nerr, std::fabs(static_cast<double>(
+                                       nk[dst + d] - ref_n[(i * heads + sh.H_q + h) * sh.D + d])));
+        }
+    }
+    size_t diff = 0;
+    for (size_t i = 0; i < n_q; ++i) diff += nq[i] != sq[i];
+    for (size_t i = 0; i < n_pool; ++i) diff += (nk[i] != sk[i]) + (nv[i] != sv[i]);
+    // the 2e-2 above plus one bf16 step of a normalized value (|x| <= 2.1 here) for the rare
+    // rsqrt that rounds the other way; fused and split are the same arithmetic, the same bits
+    const bool nok = nerr <= 4e-2 && diff == 0;
+    std::fprintf(stderr, "%s: qk norm fused vs split, %zu values differ\n", shape_name(sh).c_str(),
+                 diff);
+    const Timing tn = time_kernel(launch_fused, stream, 10, iters);
+    const Timing ts = time_kernel(launch_split, stream, 10, iters);
+    Row rn, rs;
+    rn.kernel = "rope_paged_qknorm";
+    rs.kernel = "rope_paged_qknorm_split";
+    for (Row* r : {&rn, &rs}) {
+        r->dtype = "bf16";
+        r->variant = 0;
+        r->shape = shape_name(sh);
+        r->max_abs_err = nerr;
+        r->ok = nok;
+        r->ref_ms = tp.median_ms;  // the plain append
+    }
+    rn.median_ms = tn.median_ms;
+    rn.min_ms = tn.min_ms;
+    rn.gbps = moved_gb / (tn.median_ms * 1e-3);
+    rs.median_ms = ts.median_ms;
+    rs.min_ms = ts.min_ms;
+    rs.gbps = moved_gb / (ts.median_ms * 1e-3);
+    SPARK_CUDA_CHECK(cudaFree(d_qn));
+    SPARK_CUDA_CHECK(cudaFree(d_kn));
+    SPARK_CUDA_CHECK(cudaFree(d_qkvn));
+    SPARK_CUDA_CHECK(cudaFree(d_sq));
+    SPARK_CUDA_CHECK(cudaFree(d_sk));
+    SPARK_CUDA_CHECK(cudaFree(d_sv));
     Row rp;
     rp.kernel = "rope_paged";
     rp.dtype = "bf16";
@@ -225,6 +409,8 @@ bool run_shape(const Shape& sh, int iters, cudaStream_t stream) {
     r.ok = ok;
     print_row(r);
     print_row(rp);
+    print_row(rn);
+    print_row(rs);
 
     SPARK_CUDA_CHECK(cudaFree(d_qkv));
     SPARK_CUDA_CHECK(cudaFree(d_q));
@@ -232,7 +418,7 @@ bool run_shape(const Shape& sh, int iters, cudaStream_t stream) {
     SPARK_CUDA_CHECK(cudaFree(d_v));
     SPARK_CUDA_CHECK(cudaFree(d_cos));
     SPARK_CUDA_CHECK(cudaFree(d_sin));
-    return ok && pok;
+    return ok && pok && nok;
 }
 
 }  // namespace
@@ -249,10 +435,10 @@ int main(int argc, char** argv) {
             shapes.push_back({args.geti("b", 1), S, args.geti("hq", 32), args.geti("hkv", 8),
                               args.geti("d", 128), pos0, args.geti("cap", pos0 + S)});
         } else {
-            shapes = {{1, 4096, 32, 8, 128, 0, 4096},
-                      {1, 8192, 32, 8, 128, 0, 8192},
-                      {1, 1, 32, 8, 128, 4095, 4096},
-                      {8, 1, 32, 8, 128, 4095, 4096}};
+            shapes = {{1, 4096, 32, 8, 128, 0, 4096}, {1, 8192, 32, 8, 128, 0, 8192},
+                      {1, 1, 32, 8, 128, 4095, 4096}, {8, 1, 32, 8, 128, 4095, 4096},
+                      {1, 4096, 32, 4, 128, 0, 4096}, {1, 1, 32, 4, 128, 4095, 4096},
+                      {8, 1, 32, 4, 128, 4095, 4096}, {64, 1, 32, 4, 128, 4095, 4096}};
         }
         cudaStream_t stream;
         SPARK_CUDA_CHECK(cudaStreamCreate(&stream));

@@ -80,6 +80,10 @@ class LayerWeights:
     mlp_norm: torch.Tensor  # [4096]
     w_gate_up: torch.Tensor  # [4096, 28672]: gate | up columns
     w_down: torch.Tensor  # [14336, 4096]
+    # Qwen3's QK norm, [head_dim] each, for a model whose config has qk_norm (engine.py);
+    # this layer has none
+    q_norm: torch.Tensor | None = None
+    k_norm: torch.Tensor | None = None
 
     @staticmethod
     def random(device="cuda", seed: int = 0) -> LayerWeights:

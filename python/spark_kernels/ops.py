@@ -650,6 +650,9 @@ def rope_append_paged_(
     H_kv: int,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    q_norm: torch.Tensor | None = None,
+    k_norm: torch.Tensor | None = None,
+    eps: float = 1e-6,
 ) -> torch.Tensor:
     """RoPE plus the K/V append for packed tokens into a paged cache, one launch.
 
@@ -663,9 +666,23 @@ def rope_append_paged_(
     layer) are required: an element x of kv head h is stored as e4m3(x / scale[h]), rounded to
     nearest even and saturated at +-448, k rounded once from its fp32 rotation. The attention
     ops take the same scales (`quantize_kv_cache` is the same rounding in torch).
+
+    q_norm and k_norm (bfloat16 [D], both or neither) add Qwen3's QK norm in the same launch:
+    before the rotation every q head is RMS-normalized over its D elements and scaled by
+    q_norm, every k head by k_norm, as transformers' Qwen3RMSNorm does it,
+    `w * (x.float() * rsqrt(mean(x.float() ** 2) + eps)).to(bfloat16)` (`qk_norm_ref`).
+    D must be a power of two up to 512. Without them the op is unchanged.
     """
     return _C.rope_append_paged_(qkv, cos, sin, positions, slots, k_cache, v_cache, H_q, H_kv,
-                                 k_scale, v_scale)
+                                 k_scale, v_scale, q_norm, k_norm, eps)
+
+
+def qk_norm_ref(x: torch.Tensor, w: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Qwen3RMSNorm over the last dim in torch, the formula `rope_append_paged_` applies to
+    each q and k head: x in fp32 times rsqrt(mean(x^2) + eps), rounded to x's dtype, times w."""
+    xf = x.float()
+    h = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
+    return w * h.to(x.dtype)
 
 
 def paged_decode(

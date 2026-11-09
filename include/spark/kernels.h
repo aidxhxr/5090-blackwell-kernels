@@ -659,20 +659,28 @@ void rope_append_bf16(const __nv_bfloat16* qkv, const float* cos, const float* s
 // slot slots[t] of the caches [num_pages, H_kv, page, D] (slot = page_id * page + row; a
 // negative slot skips the cache write, for padding tokens). q comes out as [T, H_q, D], the
 // layout attention_varlen_bf16 and paged_decode_bf16 take. page a power of two.
+// q_norm and k_norm ([D] bf16, both or neither) add Qwen3's QK norm before the rotation:
+// every q head becomes q_norm * bf16(x * rsqrt(mean(x^2) + eps)), rounded to bf16, over its D
+// elements, every k head the same with k_norm (Qwen3RMSNorm). Needs D a power of two <= 512.
+// Without them the kernel is the one it always was.
 void rope_append_paged_bf16(const __nv_bfloat16* qkv, const float* cos, const float* sin,
                             const int* positions, const int* slots, __nv_bfloat16* q,
                             __nv_bfloat16* k_cache, __nv_bfloat16* v_cache, int T, int H_q,
-                            int H_kv, int D, int page, cudaStream_t stream);
+                            int H_kv, int D, int page, cudaStream_t stream,
+                            const __nv_bfloat16* q_norm = nullptr,
+                            const __nv_bfloat16* k_norm = nullptr, float eps = 1e-6f);
 // The same into an e4m3 cache (docs/design/serving.md, "An fp8 K/V cache"): k_cache and
 // v_cache are [num_pages, H_kv, page, D] e4m3, and the element of kv head h is stored as
 // e4m3(x / scale[h]), round to nearest even, saturating at +-448, with k_scale and v_scale
 // [H_kv] fp32 in device memory (one layer's). k is rotated in fp32 and rounded once, to e4m3;
-// q comes out bf16 as above. The attention ops multiply the scales back in.
+// q comes out bf16 as above. The attention ops multiply the scales back in. q_norm, k_norm
+// and eps as in the bf16 form (k normalized to bf16, then rotated in fp32 and rounded once).
 void rope_append_paged_fp8(const __nv_bfloat16* qkv, const float* cos, const float* sin,
                            const int* positions, const int* slots, __nv_bfloat16* q,
                            __nv_fp8_e4m3* k_cache, __nv_fp8_e4m3* v_cache, const float* k_scale,
                            const float* v_scale, int T, int H_q, int H_kv, int D, int page,
-                           cudaStream_t stream);
+                           cudaStream_t stream, const __nv_bfloat16* q_norm = nullptr,
+                           const __nv_bfloat16* k_norm = nullptr, float eps = 1e-6f);
 
 // ---- Fused attention (scaled dot product, forward) ----------------------------------------
 // O = softmax(Q K^T / sqrt(D)) V per (b, h), for Q, O = [B, H_q, S_q, D] and

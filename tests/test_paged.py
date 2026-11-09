@@ -6,7 +6,9 @@ never adjacent; lengths cover the empty sequence, a single key, partial last pag
 one long sequence among short ones (segments that cross warps of the length-aware split), GQA
 groups of 1, 4 and 8, both head sizes and two page sizes. The varlen cases include prompts
 appended to an existing context (the bottom-right causal mask). The same cases run on an e4m3
-cache with per-head scales against SDPA on the dequantized bytes."""
+cache with per-head scales against SDPA on the dequantized bytes. The append with Qwen3's QK
+norm runs against `qk_norm_ref` (transformers' Qwen3RMSNorm) and the same rotation, on both
+caches, GQA groups of 1 to 8 and both head sizes."""
 
 import pytest
 import torch
@@ -431,6 +433,131 @@ def test_rope_append_paged_fp8(sk, page):
     kr = dequantize_kv_cache(k_ref.view(torch.float8_e4m3fn), ks)
     torch.testing.assert_close(kd, kr, atol=float(ks.max()) * 2 ** -9, rtol=2 ** -3)
     assert (kc.view(torch.uint8) != k_ref).float().mean().item() < 1e-3
+
+
+def _qk_case(hq, hkv, d, page, scale, seed=0):
+    """Tokens of a packed batch (one skipped by a negative slot), qkv of `scale`, Qwen3-like
+    norm weights and RoPE tables of head_dim d."""
+    L = pytest.importorskip("spark_kernels.layer")
+    positions = [0, 1, 2, 40, 41, 7, 1000, 333]
+    slots = [5, 6, 7, 2 * page + 3, 2 * page + 4, -1, 3 * page + page - 1, 1]
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    T = len(positions)
+    qkv = (torch.randn(T, (hq + 2 * hkv) * d, generator=g) * scale).to("cuda", torch.bfloat16)
+    qn = (1 + 0.2 * torch.randn(d, generator=g)).to("cuda", torch.bfloat16)
+    kn = (1 + 0.2 * torch.randn(d, generator=g)).to("cuda", torch.bfloat16)
+    pos_t = torch.tensor(positions, dtype=torch.int32, device="cuda")
+    slot_t = torch.tensor(slots, dtype=torch.int32, device="cuda")
+    return qkv, qn, kn, L.RoPE(1024, head_dim=d), pos_t, slot_t, slots
+
+
+def _rot32(t, cos, sin):
+    """[T, H, d] rotated by cos, sin [T, d] in fp32 (rotate-half), as the kernel does it."""
+    d = t.shape[-1]
+    tf = t.float()
+    r = torch.cat([-tf[..., d // 2:], tf[..., :d // 2]], dim=-1)
+    return tf * cos[:, None] + r * sin[:, None]
+
+
+@pytest.mark.parametrize("hq,hkv,d,scale,eps", [(32, 4, 128, 3.0, 1e-6), (32, 8, 128, 1.0, 1e-6),
+                                                (16, 2, 64, 1.0, 1e-6), (8, 8, 64, 3.0, 1e-6),
+                                                (32, 4, 128, 0.05, 1e-2)])
+def test_rope_append_paged_qk_norm(sk, hq, hkv, d, scale, eps):
+    """q and k RMS-normalized per head (Qwen3RMSNorm) before the rotation, in one launch; the
+    last case has eps large enough to matter."""
+    from spark_kernels.ops import qk_norm_ref
+
+    page = 16
+    qkv, qn, kn, rope, pos_t, slot_t, slots = _qk_case(hq, hkv, d, page, scale)
+    T = qkv.shape[0]
+    kc = torch.randn(4, hkv, page, d, device="cuda", dtype=torch.bfloat16)
+    vc = torch.randn_like(kc)
+    k_ref, v_ref = kc.clone(), vc.clone()
+    q = sk.rope_append_paged_(qkv, rope.cos, rope.sin, pos_t, slot_t, kc, vc, hq, hkv,
+                              q_norm=qn, k_norm=kn, eps=eps)
+
+    cos, sin = rope.cos[pos_t.long()], rope.sin[pos_t.long()]
+    x = qkv.view(T, hq + 2 * hkv, d)
+    q_ref = _rot32(qk_norm_ref(x[:, :hq], qn, eps), cos, sin).to(torch.bfloat16)
+    k_new = _rot32(qk_norm_ref(x[:, hq:hq + hkv], kn, eps), cos, sin).to(torch.bfloat16)
+    for t, s in enumerate(slots):
+        if s < 0:
+            continue
+        k_ref[s // page, :, s % page] = k_new[t]
+        v_ref[s // page, :, s % page] = x[t, hq + hkv:]
+    # The kernel's sum of squares runs in another order than torch's mean, and its rotation
+    # may contract to an fma: either can move a bf16 rounding by one step, rarely.
+    tol = dict(atol=4e-2, rtol=1e-2)
+    torch.testing.assert_close(q.float(), q_ref.float(), **tol)
+    torch.testing.assert_close(kc.float(), k_ref.float(), **tol)
+    assert (q != q_ref).float().mean().item() < 1e-3
+    assert (kc != k_ref).float().mean().item() < 1e-3
+    assert torch.equal(vc, v_ref)
+
+
+def test_rope_append_paged_qk_norm_fp8(sk):
+    """The QK norm into an e4m3 cache: k normalized to bf16, rotated in fp32, rounded once."""
+    from spark_kernels.ops import dequantize_kv_cache, qk_norm_ref, quantize_kv_cache
+
+    hq, hkv, d, page = 32, 4, 128, 16
+    qkv, qn, kn, rope, pos_t, slot_t, slots = _qk_case(hq, hkv, d, page, 3.0, seed=1)
+    T = qkv.shape[0]
+    ks, vs = _head_scales(hkv, base=6.0), _head_scales(hkv, base=8.0)
+    kc = torch.randint(0, 120, (4, hkv, page, d), device="cuda", dtype=torch.uint8).view(
+        torch.float8_e4m3fn)
+    vc = torch.randint(0, 120, (4, hkv, page, d), device="cuda", dtype=torch.uint8).view(
+        torch.float8_e4m3fn)
+    k_ref, v_ref = kc.view(torch.uint8).clone(), vc.view(torch.uint8).clone()
+    q = sk.rope_append_paged_(qkv, rope.cos, rope.sin, pos_t, slot_t, kc, vc, hq, hkv,
+                              k_scale=ks, v_scale=vs, q_norm=qn, k_norm=kn)
+
+    cos, sin = rope.cos[pos_t.long()], rope.sin[pos_t.long()]
+    x = qkv.view(T, hq + 2 * hkv, d)
+    q_ref = _rot32(qk_norm_ref(x[:, :hq], qn), cos, sin)
+    k_new = quantize_kv_cache(_rot32(qk_norm_ref(x[:, hq:hq + hkv], kn), cos, sin), ks)
+    v_new = quantize_kv_cache(x[:, hq + hkv:].float(), vs)
+    for t, s in enumerate(slots):
+        if s < 0:
+            continue
+        k_ref[s // page, :, s % page] = k_new[t].view(torch.uint8)
+        v_ref[s // page, :, s % page] = v_new[t].view(torch.uint8)
+    torch.testing.assert_close(q.float(), q_ref, atol=4e-2, rtol=1e-2)
+    assert torch.equal(vc.view(torch.uint8), v_ref)
+    kd = dequantize_kv_cache(kc, ks)
+    kr = dequantize_kv_cache(k_ref.view(torch.float8_e4m3fn), ks)
+    torch.testing.assert_close(kd, kr, atol=float(ks.max()) * 2 ** -9, rtol=2 ** -3)
+    assert (kc.view(torch.uint8) != k_ref).float().mean().item() < 1e-3
+
+
+def test_rope_append_paged_qk_norm_args(sk):
+    """No weights is the plain append, bit for bit; one weight alone, a wrong dtype or size,
+    and a head_dim that is not a power of two are refused."""
+    hq, hkv, d, page = 32, 4, 128, 16
+    qkv, qn, kn, rope, pos_t, slot_t, _ = _qk_case(hq, hkv, d, page, 1.0)
+    outs = []
+    for kw in ({}, dict(q_norm=None, k_norm=None, eps=0.5)):
+        kc = torch.zeros(4, hkv, page, d, device="cuda", dtype=torch.bfloat16)
+        vc = torch.zeros_like(kc)
+        q = sk.rope_append_paged_(qkv, rope.cos, rope.sin, pos_t, slot_t, kc, vc, hq, hkv, **kw)
+        outs.append((q, kc, vc))
+    for a, b in zip(*outs, strict=True):
+        assert torch.equal(a, b)
+    kc = torch.zeros(4, hkv, page, d, device="cuda", dtype=torch.bfloat16)
+    args = (qkv, rope.cos, rope.sin, pos_t, slot_t, kc, kc.clone(), hq, hkv)
+    for bad in (dict(q_norm=qn), dict(k_norm=kn), dict(q_norm=qn.float(), k_norm=kn),
+                dict(q_norm=qn[:64], k_norm=kn[:64])):
+        with pytest.raises(RuntimeError):
+            sk.rope_append_paged_(*args, **bad)
+    L = pytest.importorskip("spark_kernels.layer")
+    d = 48  # a multiple of 16, so the plain append takes it, but not a power of two
+    rope = L.RoPE(1024, head_dim=d)
+    qkv = torch.randn(pos_t.numel(), (hq + 2 * hkv) * d, device="cuda", dtype=torch.bfloat16)
+    kc = torch.zeros(4, hkv, page, d, device="cuda", dtype=torch.bfloat16)
+    args = (qkv, rope.cos, rope.sin, pos_t, slot_t, kc, kc.clone(), hq, hkv)
+    sk.rope_append_paged_(*args)
+    w = torch.ones(d, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="power of two"):
+        sk.rope_append_paged_(*args, q_norm=w, k_norm=w)
 
 
 def test_paged_ops_reject_bad_fp8_input(sk):
