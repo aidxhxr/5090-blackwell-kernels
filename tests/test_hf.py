@@ -156,6 +156,13 @@ def test_config_eps_and_rope_keys(tmp_path):
     assert cfg.rope_theta == 500000.0 and cfg.rope_scaling == rp
     old = _from(tmp_path, _config(rope_scaling=LLAMA31_SCALING))
     assert torch.equal(cfg.rope(256, device="cpu").cos, old.rope(256, device="cpu").cos)
+    # a mix of the two, read the way transformers 5 reads it: the top-level theta fills in
+    # one rope_parameters doesn't have, and rope_scaling wins over rope_parameters
+    cfg = _from(tmp_path, _config(rope_parameters=LLAMA31_SCALING))
+    assert cfg.rope_theta == 500000.0 and cfg.rope_scaling == LLAMA31_SCALING
+    cfg = _from(tmp_path, _config(rope_scaling=LLAMA31_SCALING,
+                                  rope_parameters={"rope_type": "default", "rope_theta": 1e6}))
+    assert cfg.rope_theta == 500000.0 and cfg.rope_scaling == LLAMA31_SCALING
 
 
 def test_config_rope_has_the_head_dim(tmp_path):

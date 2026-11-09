@@ -46,12 +46,15 @@ MOE_KEYS = ("num_experts", "num_local_experts", "n_routed_experts")
 
 def _rope_params(cfg: dict) -> tuple[float, dict | None]:
     """(theta, rope_scaling) from a config: rope_theta and rope_scaling, or the
-    rope_parameters dict transformers 5 writes in their place (theta and type in one)."""
-    rp = cfg.get("rope_parameters")
-    if rp:
-        kind = rp.get("rope_type", rp.get("type", "default"))
-        return float(rp.get("rope_theta", DEFAULT_THETA)), None if kind == "default" else rp
-    return float(cfg.get("rope_theta", DEFAULT_THETA)), cfg.get("rope_scaling") or None
+    rope_parameters dict transformers 5 writes in their place (theta and type in one).
+    Read the way transformers 5 reads a mix of the two: rope_scaling wins over
+    rope_parameters, and the top-level rope_theta fills in a missing theta."""
+    rp = cfg.get("rope_scaling") or cfg.get("rope_parameters")
+    theta = float(cfg.get("rope_theta", DEFAULT_THETA))
+    if not rp:
+        return theta, None
+    kind = rp.get("rope_type", rp.get("type", "default"))
+    return float(rp.get("rope_theta", theta)), None if kind == "default" else rp
 
 
 def _refuse(cfg: dict) -> None:
