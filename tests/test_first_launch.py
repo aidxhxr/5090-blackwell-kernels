@@ -42,6 +42,13 @@ elif op == "attention5":
     k = torch.randn(1, 4, 1024, 128, device=dev, dtype=bf)
     v = torch.randn(1, 4, 1024, 128, device=dev, dtype=bf)
     run = lambda: sk.attention(q, k, v, causal=True, variant=5)
+elif op == "attention_bwd3":
+    q = torch.randn(1, 8, 1024, 128, device=dev, dtype=bf)
+    k = torch.randn(1, 4, 1024, 128, device=dev, dtype=bf)
+    v = torch.randn(1, 4, 1024, 128, device=dev, dtype=bf)
+    do = torch.randn_like(q)
+    out, lse = sk.attention_fwd(q, k, v, causal=True)
+    run = lambda: sk.attention_bwd(q, k, v, out, do, lse, causal=True, variant=3)
 elif op == "cross_entropy3":
     h = torch.randn(512, 1024, device=dev, dtype=bf, requires_grad=True)
     w = torch.randn(4096, 1024, device=dev, dtype=bf, requires_grad=True)
@@ -58,9 +65,7 @@ taken = free0 - torch.cuda.mem_get_info()[0] - (torch.cuda.memory_reserved() - r
 print(taken)
 """
 
-# Not the attention backward: its 1-D bulk load stays .shared::cluster
-# (src/kernels/attention_bwd.cu), and its first launch still takes the 3.3 GiB.
-OPS = ["hgemm5", "hgemm6", "grouped_gemm", "attention5", "cross_entropy3"]
+OPS = ["hgemm5", "hgemm6", "grouped_gemm", "attention5", "attention_bwd3", "cross_entropy3"]
 
 
 @pytest.mark.parametrize("op", OPS)
