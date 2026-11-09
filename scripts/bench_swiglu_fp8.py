@@ -3,6 +3,7 @@
 replaces, and the fp8-tok engine with it on and off.
 
     python scripts/bench_swiglu_fp8.py --part op        # bench_swiglu's widths, rows 1 to 4096
+    python scripts/bench_swiglu_fp8.py --part cluster   # the same with each cluster size forced
     python scripts/bench_swiglu_fp8.py --part engine    # fp8-tok decode ms/step, prefill tok/s
 
 The op rows time, at the intermediate widths bench_swiglu runs (2048, 5632, 11008, 14336),
@@ -17,6 +18,11 @@ stay in the 96 MB L2 between calls and the 4096-row ones at 5632 and up (92 to 2
 gate|up) do not. Before timing, the fused op's bytes and scales are checked against the two
 ops with torch.equal.
 
+The cluster rows (`kind: cluster_sweep`) are the op rows of swiglu_fp8 and the two ops once per
+size in --clusters, with SPARK_SWIGLU_FP8_CLUSTER set to it. The kernel reads that variable
+once, so each size runs in a process of its own (this script with --part op); the two ops'
+rows are timed again in each, next to the fused op they are compared with.
+
 The engine rows are scripts/bench_serve.py's static batches (prompts log-uniform in 64..2048,
 --new tokens each, greedy) on an fp8-tok SparkModel of --layers of Llama-3-8B's layers with
 random weights, CUDA graphs on, the norms' fp8 fusion on in both, once with
@@ -28,7 +34,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import torch
@@ -102,6 +111,8 @@ def bench_shape(sk, m: int, cols: int, args, rows_out) -> None:
         "swiglu": lambda: sk.swiglu(gate, up),
         "fp8_quantize row": lambda: sk.fp8_quantize(h, "row"),
     }
+    if args.pair_only:
+        ops = {k: ops[k] for k in ("swiglu_fp8", "swiglu + fp8_quantize")}
     # bytes each moves through DRAM or L2 (bf16 = 2, e4m3 = 1 per element, the scales left
     # out): the fused op reads gate and up and writes q
     n = m * cols
@@ -126,6 +137,23 @@ def bench_op(args, rows_out):
         for m in [int(v) for v in args.rows.split(",") if v]:
             bench_shape(sk, m, cols, args, rows_out)
             torch.cuda.empty_cache()
+
+
+def bench_cluster(args, rows_out):
+    """The op rows of the fused op and the two ops, once per forced cluster size, each size in
+    its own process (the kernel reads SPARK_SWIGLU_FP8_CLUSTER once)."""
+    for c in [int(v) for v in args.clusters.split(",") if v]:
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / "rows.jsonl"
+            cmd = [sys.executable, str(Path(__file__).resolve()), "--part", "op", "--pair-only",
+                   "--rows", args.rows, "--cols", args.cols, "--reps", str(args.reps),
+                   "--iters", str(args.iters), "--out", str(out)]
+            print(f"cluster {c}:", file=sys.stderr)
+            subprocess.run(cmd, check=True, env={**os.environ, "SPARK_SWIGLU_FP8_CLUSTER": str(c)})
+            for line in out.read_text().splitlines():
+                r = json.loads(line)
+                r.update(kind="cluster_sweep", cluster=c, iters=args.iters)
+                rows_out.append(r)
 
 
 def bench_engine(args, rows_out):
@@ -180,11 +208,15 @@ def bench_engine(args, rows_out):
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--part", choices=("op", "engine"), default="op")
-    ap.add_argument("--rows", default="1,8,32,64,512,4096")
+    ap.add_argument("--part", choices=("op", "cluster", "engine"), default="op")
+    ap.add_argument("--rows", default=None,
+                    help="op: 1,8,32,64,512,4096; cluster: 1,2,4,8,16,24,32,48,64,128,256,512")
     ap.add_argument("--cols", default="2048,5632,11008,14336")
     ap.add_argument("--reps", type=int, default=20, help="calls per graph / per sample")
-    ap.add_argument("--iters", type=int, default=50)
+    ap.add_argument("--iters", type=int, default=None, help="op: 50, cluster: 30")
+    ap.add_argument("--clusters", default="1,2,4,8", help="cluster sizes the cluster part forces")
+    ap.add_argument("--pair-only", action="store_true",
+                    help="op rows of swiglu_fp8 and the two ops only, not the pieces alone")
     ap.add_argument("--batches", default="1,8,32,64")
     ap.add_argument("--new", type=int, default=64, help="tokens generated per request")
     ap.add_argument("--min-prompt", type=int, default=64)
@@ -197,9 +229,16 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", type=Path, default=OUT)
     args = ap.parse_args()
+    if args.rows is None:
+        args.rows = "1,8,32,64,512,4096" if args.part != "cluster" else \
+            "1,2,4,8,16,24,32,48,64,128,256,512"
+    if args.iters is None:
+        args.iters = 30 if args.part == "cluster" else 50
     rows: list[dict] = []
     if args.part == "op":
         bench_op(args, rows)
+    elif args.part == "cluster":
+        bench_cluster(args, rows)
     else:
         bench_engine(args, rows)
     with open(args.out, "a") as f:

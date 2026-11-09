@@ -239,12 +239,13 @@ __device__ __forceinline__ float ld_cluster_f32(const float* p, unsigned cta) {
 // SwiGLU into fp8 for the down projection, with a scale per token: kC blocks of kT threads per
 // row (a thread block cluster when kC > 1) keep the row's products in registers, rounded to
 // bf16 as swiglu_strided_vec_kernel stores them, reduce their amax and write the pow2_scale
-// of it and the e4m3 bytes of fp8quant.cuh. The bf16 row is never written: one launch and 4
-// bytes per element (read gate and up, write q) where swiglu then fp8_quantize's row mode take
-// 9, and the same bits (the products are the same fp32 expression rounded the same way, and a
-// max does not depend on its order or on how the row is split). Thread t of the row's kC * kT
-// handles vectors t, t + kC * kT, ..., VPT of them. With kC > 1 each block's amax goes to its
-// shared memory, and after a cluster barrier warp 0 of every block reads all kC of them.
+// of it and the e4m3 bytes of fp8quant.cuh. The bf16 row is never written: one launch and 5
+// bytes per element (read 2 + 2 of gate and up, write 1 of q) where swiglu then fp8_quantize's
+// row mode take 9, and the same bits (the products are the same fp32 expression rounded the
+// same way, and a max does not depend on its order or on how the row is split). Thread t of the
+// row's kC * kT handles vectors t, t + kC * kT, ..., VPT of them. With kC > 1 each block's amax
+// goes to its shared memory, and after a cluster barrier warp 0 of every block reads all kC of
+// them.
 template <int kT, int VPT, int kC>
 __global__ void __launch_bounds__(kT)
     swiglu_fp8_kernel(const __nv_bfloat16* __restrict__ gate, const __nv_bfloat16* __restrict__ up,
