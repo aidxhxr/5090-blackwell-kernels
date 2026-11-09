@@ -128,11 +128,13 @@ def test_swiglu_fp8_takes_contiguous_and_unequal_strides(sk):
 
 
 def test_swiglu_fp8_rows_do_not_depend_on_the_batch(sk):
-    """A row's bytes and scale are the same alone and in any batch (one block a row, sized from
-    cols), so the batch-invariant engine can take it as it is."""
+    """A row's bytes and scale are the same alone and in any batch, whichever geometry the row
+    count picks (a cluster of 8 to 41 rows, of 4 to 64, one block a row past that, the block
+    sized for one vector a thread to 128 rows), so the batch-invariant engine can take it as
+    it is."""
     gu = _gate_up(300, 14336, 1.0, 5)
     q, s = sk.swiglu_fp8(gu[:, :14336], gu[:, 14336:])
-    for m in (1, 2, 7, 64, 299):
+    for m in (1, 2, 7, 41, 42, 64, 65, 128, 129, 299):
         _same_fp8(sk.swiglu_fp8(gu[:m, :14336], gu[:m, 14336:]), (q[:m], s[:m]))
 
 
@@ -150,3 +152,39 @@ def test_swiglu_fp8_rejects_what_it_cannot_hold(sk):
         sk.swiglu_fp8(torch.randn(4, 256, device="cuda"), torch.randn(4, 256, device="cuda"))
     with pytest.raises(RuntimeError):  # 2-D only
         sk.swiglu_fp8(x[:, :256].reshape(2, 2, 256), x[:, :256].reshape(2, 2, 256))
+
+
+# Every geometry, forced for a whole process (the kernel reads the variables once) whatever the
+# dispatch would pick at these shapes: each cluster size, blocks sized for one, two or four
+# vectors a thread, and 2 and 4 rows to a cluster (swiglu_fp8_rows_kernel, which only the
+# variable picks; its last cluster is short at 33 and 127 rows). Each must still be the two ops'
+# bits.
+_FORCED = """
+import sys
+import torch
+sys.path.insert(0, sys.argv[1])
+import spark_kernels as sk
+from test_swiglu import FP8_COLS, FP8_SCALE, _gate_up, _same_fp8
+for cols in FP8_COLS:
+    for rows in (1, 3, 33, 64, 127):
+        for scale in FP8_SCALE:
+            gu = _gate_up(rows, cols, scale, rows + cols)
+            gate, up = gu[:, :cols], gu[:, cols:]
+            _same_fp8(sk.swiglu_fp8(gate, up), sk.fp8_quantize(sk.swiglu(gate, up), "row"))
+"""
+
+
+@pytest.mark.parametrize("cluster,rows_per,vpt", [
+    (1, 1, 1), (1, 1, 2), (1, 1, 4), (2, 1, 4), (4, 1, 1), (4, 1, 4), (8, 1, 1), (8, 1, 4),
+    (2, 2, 4), (4, 4, 4), (8, 2, 1), (8, 2, 4), (8, 4, 1)])
+def test_swiglu_fp8_forced_geometries_match(sk, cluster, rows_per, vpt):
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    env = {k: v for k, v in os.environ.items() if not k.startswith("SPARK_SWIGLU_FP8_")}
+    env.update(SPARK_SWIGLU_FP8_CLUSTER=str(cluster), SPARK_SWIGLU_FP8_ROWS=str(rows_per),
+               SPARK_SWIGLU_FP8_VPT=str(vpt))
+    subprocess.run([sys.executable, "-c", _FORCED, str(Path(__file__).resolve().parent)],
+                   env=env, check=True)
