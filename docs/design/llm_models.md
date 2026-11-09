@@ -27,10 +27,12 @@ are still refused.
 
 **Mistral-7B-Instruct-v0.3** has the same hidden size, heads, K/V heads and MLP width, a
 32768 vocabulary (a multiple of 64, so hgemm takes the lm_head as is), rope theta 1e6 and
-rms_norm_eps 1e-5. Theta already came from the config, and eps is the engine's constant, so I
-did not thread eps through the models. `sliding_window` is null in this release, so the
-attention is plain causal. The tensor names are Llama's. The only fix was in `generate.py`:
-it looked up `<|eot_id|>` as a stop token, which Mistral's tokenizer maps to the unknown id 0.
+rms_norm_eps 1e-5. Theta already came from the config, and eps was the engine's constant, so
+I did not thread eps through the models then (now ModelConfig carries it and `hf.py` reads it
+and the rest of the shape from config.json: serving.md, Model shapes). `sliding_window` is
+null in this release, so the attention is plain causal (`hf.py` refuses a window that is
+on). The tensor names are Llama's. The only fix was in `generate.py`: it looked up
+`<|eot_id|>` as a stop token, which Mistral's tokenizer maps to the unknown id 0.
 It now stops on the tokenizer's eos, the generation config's eos ids and `<|eot_id|>` only
 when the vocabulary has it. The chat template and the BOS token come from the tokenizer and
 work unchanged.

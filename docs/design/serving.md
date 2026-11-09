@@ -544,8 +544,9 @@ the whole batch, costs 0.86 to 1.03 ms. That is the MoE decode tax at small batc
 graph does nothing about it.
 
 **Not done.** fp8 or int4 experts in the engine (the layer has no quantized path yet), batch
-invariance for the MoE layers, and an MoE checkpoint loader (`hf.py` loads Llama-shaped
-models only). Other hidden sizes run now: the next section.
+invariance for the MoE layers, and an MoE checkpoint loader (`hf.py` reads a dense model's
+shape from its config.json and refuses experts). Other hidden sizes run now: the next
+section.
 
 ## Model shapes
 
@@ -619,6 +620,36 @@ default kernels the tokens are the same and the logits differ in the low bits, b
 as the old engine differs from itself between two runs (hgemm's decode kernel adds its K
 slices with fp32 atomics, hgemm.md). The random weights are the same for a seed.
 
+**Checkpoints.** `hf.py` checked config.json against Llama-3-8B's shape and refused anything
+else. Now `HFConfig.from_dir` builds the ModelConfig from it: hidden_size,
+num_attention_heads, num_key_value_heads (the query heads when there is none), head_dim
+(hidden_size / heads when there is none, as transformers does), intermediate_size and
+rms_norm_eps, and the RoPE's theta and llama3 scaling from rope_theta and rope_scaling or
+from the rope_parameters dict transformers 5 writes instead. `load` hands it to
+ModelWeights, so the checkpoint's shape is what SparkModel checks and runs. It refuses what
+ModelConfig.check refuses, and, with the reason, what the engine would run wrong today:
+Qwen3 (a per-head RMSNorm on q and k before RoPE, #47), any config with experts (hf.py
+loads none yet), a model_type other than llama and mistral, an activation other than SiLU,
+biases, a sliding window that is on, a partial rotary factor, rope types other than llama3.
+A layer with a q_norm or a bias its config did not announce, or a projection of another
+shape than the config's, is refused at load.
+
+The three checkpoints in ~/models, through 004c2cb's loader (the fixed shape) and this one,
+one after the other in one process: Llama-3-8B-Instruct, Llama-3.1-8B-Instruct (llama3 rope
+scaling) and Mistral-7B-Instruct-v0.3 (theta 1e6, a 32,768 vocabulary), the first 16 of
+their 32 layers (the whole model's 14.96 GiB does not fit in the 14.8 GiB the card has free
+next to its other tenants tonight). On each: the same ModelConfig fields, the same RoPE
+tables bit for bit, the same bytes in all 99 weight tensors, and an engine run of four
+prompts (17, 64, 300 and 1,000 random tokens, 32 greedy tokens each) gives the same 128
+tokens, the same decode logits bit for bit and the same prefill logits at all 1,381
+positions, on the batch-invariant kernels and, in this run, on the default ones too.
+`tests/test_hf.py` also has transformers build and save two small models, a Llama of hidden
+1024 with 16 heads of 64 over 2 K/V heads and a Mistral of hidden 1024 with 16 heads of 128
+over 4 (q is 1024 -> 2048, as in Qwen3), and runs them through `hf.load` and SparkModel
+against transformers' own fp32 forward: the logits at every position of a 37- and a
+100-token prompt are 0.54 to 0.55% off on the Llama and 0.55 to 0.56% on the Mistral
+(relative error per prompt).
+
 **Measured** (`scripts/bench_engine_moe.py --models qwen3,dense`, the MoE section's setup:
 vocabulary 32,000, 0.5 GB of cache, static batches, decode ms/step with graphs / eager).
 Qwen3-30B-A3B is its own layer on its own attention: two layers are 2.75 GB of weights and a
@@ -671,6 +702,9 @@ does not have).
 - `tests/test_engine_config.py`: the same two checks on two dense models of other shapes
   (Qwen3-30B-A3B's attention, and 64-wide heads in groups of 8) on both cache formats, plus
   the default config and the shapes the kernels refuse (Model shapes, above).
+- `tests/test_hf.py`: hf.load in the engine's layout, the ModelConfig built from config.json
+  (the head_dim and K/V head fallbacks, eps, both rope key styles), every refusal with its
+  reason, and two small models saved by transformers through SparkModel against its forward.
 - The fp8 cache's checks are listed in its section above.
 - `bench_paged` validates every variant against a CPU double-precision reference: every row of
   up to eight sequences per decode batch and 256 sampled rows per prefill batch.
