@@ -19,6 +19,19 @@ Script: `scripts/llm_parity.py` (stages `hf`, `spark`, `torch`, `ref`, `report`,
 `results/llm_ppl.jsonl`. All on the RTX 5090, torch 2.14+cu130, transformers 5.18, model
 `llama3-8b-instruct`.
 
+The script took Llama-3-8B's shape for granted until 2026-11-08: the reference viewed q, k and
+v as 32 heads over 8 of 128 and the dumps were 4096 wide. It reads the heads, K/V heads,
+head_dim and widths from the checkpoint's config.json now (`hf.HFConfig`). On
+Llama-3-8B-Instruct the new reference gives the same bits as the old one through all 32
+layers: three sequences of 100, 600 and 1,500 random tokens, the residual stream after every
+layer, the final states and 315 rows of logits. A two-layer Mistral saved by transformers with
+heads wider than hidden / heads (hidden 1024, 16 heads of 128 over 4, random weights,
+Mistral-7B-v0.3's tokenizer) runs the hf, ref and report stages: transformers against the
+reference over 4,294 scored positions, 0.0057 median relative error and 97.74% top-1
+agreement. The old script stopped at the first view of q. I did not rerun the whole parity
+on Llama: its hf stage needs the full bf16 model, which does not fit next to the card's
+other tenants tonight.
+
 ## The four backends
 
 | name | what | precision |
