@@ -402,8 +402,9 @@ struct Sched {
     // the last `tail` are s2 blocks each. A block whose tile is split at all adds fp32 partials
     // of dK and dV to the workspace slot `ws_tile0`-relative tile index; others store bf16.
     int s1, s2, n_items, tail;
-    int ws_tile0;  // first tile with a workspace slot (0 if s1 > 1, else the first tail tile)
-    float* ws;     // per split tile: dK [BN][D] then dV [BN][D], fp32, zeroed
+    unsigned s1_mul;  // ceil(2^32 / s1) for div_s1 (0 when s1 = 1)
+    int ws_tile0;     // first tile with a workspace slot (0 if s1 > 1, else the first tail tile)
+    float* ws;        // per split tile: dK [BN][D] then dV [BN][D], fp32, zeroed
 };
 
 // Tile t -> (K/V head bkv, key tile kt). The tiles run in chunks of `chunk` K/V heads, and
@@ -421,6 +422,19 @@ __host__ __device__ __forceinline__ void tile_coords(int t, int bkv_count, int k
     bkv = c * chunk + (r - kt * heads);
 }
 
+// x / s1 for the x a block divides (x (s1 - 1) < 2^32, checked by build_sched), as the high
+// half of x s1_mul. Not with `/`: ptxas 13.2 puts the kernels' divisions by s1 in uniform
+// registers and gets them wrong there. Of the two remainder corrections of the quotient
+// sequence it writes the first one's result to a fresh register under that correction's
+// predicate, and the second reads that register whether or not the first ran, so the
+// quotient comes out one too high whenever the register already held s1 or more. Nothing in
+// the kernel sets it before that read, which is why the failures came and went. It did this
+// in the D = 128 instantiations of variant 3 once nothing in them called a driver routine
+// (docs/design/hgemm.md, "First-launch memory"): blocks got the wrong tile and query range.
+__device__ __forceinline__ int div_s1(const Sched& s, int x) {
+    return s.s1 == 1 ? x : static_cast<int>(__umulhi(static_cast<unsigned>(x), s.s1_mul));
+}
+
 // The block's tile and its [ib, ie) of the `total` iterations of that tile, and whether the
 // tile is split (so the block adds to the workspace).
 __device__ __forceinline__ void block_work(const Sched& s, int idx, int& tile, int& item,
@@ -436,7 +450,7 @@ __device__ __forceinline__ void block_work(const Sched& s, int idx, int& tile, i
         piece = r % s.s2;
         pieces = s.s2;
     }
-    tile = item / s.s1;
+    tile = div_s1(s, item);
 }
 
 template <int D, int WARPS, int BQ, bool PIPE, bool VREG, bool DQ, bool DEFER>
@@ -511,8 +525,8 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
     const int nq = qt1 - qt0;
     const int total = sched.group * nq;
     // Item sub = item % s1 of the tile, then piece `piece` of `pieces` of that item.
-    const int sub = item % sched.s1;
-    const int lo = sub * total / sched.s1, hi = (sub + 1) * total / sched.s1;
+    const int sub = item - tile * sched.s1;
+    const int lo = div_s1(sched, sub * total), hi = div_s1(sched, (sub + 1) * total);
     const int ib = lo + piece * (hi - lo) / pieces;
     const int ie = lo + (piece + 1) * (hi - lo) / pieces;
     const bool partial = sched.s1 > 1 || pieces > 1;
@@ -1127,8 +1141,8 @@ __global__ void __launch_bounds__(THREADS, 1)
     q_tile_range(k0, BN, BQ, sched.q_tiles, causal, off, window, qt0, qt1);
     const int nq = qt1 - qt0;
     const int total = sched.group * nq;
-    const int sub = item % sched.s1;
-    const int lo = sub * total / sched.s1, hi = (sub + 1) * total / sched.s1;
+    const int sub = item - tile * sched.s1;
+    const int lo = div_s1(sched, sub * total), hi = div_s1(sched, (sub + 1) * total);
     const int ib = lo + piece * (hi - lo) / pieces;
     const int ie = lo + (piece + 1) * (hi - lo) / pieces;
     const bool partial = sched.s1 > 1 || pieces > 1;
@@ -1369,8 +1383,8 @@ __device__ __forceinline__ Item decode_item(const Sched& s, int idx, int BQ, int
     w.qt0 = causal ? min(w.k0 / BQ, s.q_tiles) : 0;
     w.nq = s.q_tiles - w.qt0;
     const int total = s.group * w.nq;
-    const int sub = item % s.s1;
-    const int lo = sub * total / s.s1, hi = (sub + 1) * total / s.s1;
+    const int sub = item - w.tile * s.s1;
+    const int lo = div_s1(s, sub * total), hi = div_s1(s, (sub + 1) * total);
     w.ib = lo + piece * (hi - lo) / pieces;
     w.ie = lo + (piece + 1) * (hi - lo) / pieces;
     w.partial = s.s1 > 1 || pieces > 1;
@@ -2440,6 +2454,13 @@ kv::Sched build_sched(const Args& a, int BN, int BQ, int D, bool split_tail, cud
                          a.off, a.window, min_iters, resident);
     }
     s.s1 = s1;
+    s.s1_mul = s1 > 1 ? static_cast<unsigned>(((uint64_t{1} << 32) + s1 - 1) / s1) : 0u;
+    // div_s1 is exact while x (s1 - 1) < 2^32; x is at most the larger of n_items and
+    // s1 * group * q_tiles.
+    SPARK_REQUIRE(
+        std::max<int64_t>(int64_t{tiles} * s1, int64_t{s1} * s.group * s.q_tiles) * (s1 - 1) <
+            (int64_t{1} << 32),
+        "attention_bwd: split too large");
     s.n_items = tiles * s1;
     s.tail = split_tail ? s.n_items % resident : 0;
     s.s2 = s.tail ? std::max(1, std::min(min_iters / s1, resident / s.tail)) : 1;
