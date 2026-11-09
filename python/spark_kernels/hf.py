@@ -5,8 +5,9 @@ config.json and *.safetensors) loaded into `engine.ModelWeights`.
 (hidden_size, num_attention_heads, num_key_value_heads, head_dim or hidden_size / heads when
 the config has none, intermediate_size, rms_norm_eps), and the weights `load` returns carry
 it, so the models, the cache and the engine take theirs from the checkpoint. It refuses what
-`ModelConfig.check` refuses, a rope_scaling type other than llama3 and a vocabulary hgemm
-cannot take. What it converts:
+`ModelConfig.check` refuses, and what the engine cannot run yet (`_refuse`): another layout
+than Llama's (Mistral's is the same), Qwen3's QK norm (#47), experts, biases, an activation
+other than SiLU, a sliding window, a rope_scaling type other than llama3. What it converts:
 
     q_proj, k_proj, v_proj    [out, in] each, fused into w_qkv [hidden, (H_q + 2 H_kv) D]
                               = [q | k | v]
@@ -37,6 +38,10 @@ from .layer import LayerWeights, RoPE
 # transformers' defaults for a key a config.json leaves out (LlamaConfig's and MistralConfig's)
 DEFAULT_EPS = 1e-6
 DEFAULT_THETA = 10000.0
+# the model types whose checkpoints have Llama's tensor names and blocks
+LAYOUTS = ("llama", "mistral")
+# the keys a config of a mixture-of-experts family gives its expert count in
+MOE_KEYS = ("num_experts", "num_local_experts", "n_routed_experts")
 
 
 def _rope_params(cfg: dict) -> tuple[float, dict | None]:
@@ -52,6 +57,29 @@ def _rope_params(cfg: dict) -> tuple[float, dict | None]:
 def _refuse(cfg: dict) -> None:
     """Raises ValueError for a config whose model the engine cannot run yet, with the reason.
     The shapes are ModelConfig.check's, after this."""
+    kind = cfg.get("model_type", "llama")
+    if kind.startswith("qwen3"):
+        raise ValueError(f"model_type {kind!r}: Qwen3 runs an RMSNorm over each head of q and k "
+                         "before RoPE (QK norm), which the engine does not have yet (#47)")
+    moe = {k: cfg[k] for k in MOE_KEYS if cfg.get(k)}
+    if moe:
+        raise ValueError(f"model_type {kind!r} is a mixture of experts ({moe}): the engine runs "
+                         "MoE layers, but hf.py does not load experts yet")
+    if kind not in LAYOUTS:
+        raise ValueError(f"model_type {kind!r}: hf.py reads the Llama layout, model types "
+                         f"{LAYOUTS}")
+    if cfg.get("hidden_act", "silu") != "silu":
+        raise ValueError(f"hidden_act {cfg['hidden_act']!r}: the MLP is SwiGLU (hgemm_swiglu's "
+                         "epilogue), SiLU only")
+    for k in ("attention_bias", "mlp_bias"):
+        if cfg.get(k):
+            raise ValueError(f"{k} is set: the engine's projections have no bias")
+    if cfg.get("sliding_window") is not None and cfg.get("use_sliding_window", True):
+        raise ValueError(f"sliding_window {cfg['sliding_window']}: the engine attends to the "
+                         "whole context, which changes the outputs past the window")
+    if cfg.get("partial_rotary_factor", 1.0) != 1.0:
+        raise ValueError(f"partial_rotary_factor {cfg['partial_rotary_factor']}: the RoPE "
+                         "kernels rotate the whole head")
     _, scaling = _rope_params(cfg)
     rope_kind = scaling.get("rope_type", scaling.get("type")) if scaling else "default"
     if rope_kind not in ("default", "llama3"):
@@ -118,8 +146,29 @@ class _Tensors:
             for k in h.keys():
                 self.where[k] = f
 
+    def __contains__(self, name: str) -> bool:
+        return name in self.where
+
     def __getitem__(self, name: str) -> torch.Tensor:
         return self.files[self.where[name]].get_tensor(name).to(torch.bfloat16)
+
+
+def _check_layer(t: _Tensors, p: str, c: ModelConfig, tensors: dict[str, torch.Tensor]) -> None:
+    """Refuses a layer with tensors the config did not announce (QK norm, biases) or of
+    another shape than the config's."""
+    if p + "self_attn.q_norm.weight" in t:
+        raise ValueError(f"{p}self_attn.q_norm: the checkpoint has QK norm, which the engine "
+                         "does not have yet (#47)")
+    for n in ("q", "k", "v", "o"):
+        if p + f"self_attn.{n}_proj.bias" in t:
+            raise ValueError(f"{p}self_attn.{n}_proj.bias: the engine's projections have no bias")
+    want = {"self_attn.q_proj": (c.q_width, c.hidden), "self_attn.k_proj": (c.kv_width, c.hidden),
+            "self_attn.v_proj": (c.kv_width, c.hidden), "self_attn.o_proj": (c.hidden, c.q_width),
+            "mlp.gate_proj": (c.intermediate, c.hidden), "mlp.up_proj": (c.intermediate, c.hidden),
+            "mlp.down_proj": (c.hidden, c.intermediate)}
+    for n, x in tensors.items():
+        if tuple(x.shape) != want[n]:
+            raise ValueError(f"{p}{n}.weight is {tuple(x.shape)}, the config says {want[n]}")
 
 
 def load(path: str | Path, device="cuda", n_layers: int | None = None
@@ -129,24 +178,31 @@ def load(path: str | Path, device="cuda", n_layers: int | None = None
     model)."""
     path = Path(path)
     cfg = HFConfig.from_dir(path)
+    c = cfg.shape
     t = _Tensors(path, device)
     n = cfg.n_layers if n_layers is None else n_layers
     layers = []
     for i in range(n):
         p = f"model.layers.{i}."
-        q, k, v = (t[p + f"self_attn.{x}_proj.weight"] for x in "qkv")
-        gate, up = t[p + "mlp.gate_proj.weight"], t[p + "mlp.up_proj.weight"]
+        x = {name: t[p + name + ".weight"] for name in (
+            "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
+            "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")}
+        _check_layer(t, p, c, x)
         layers.append(LayerWeights(
             attn_norm=t[p + "input_layernorm.weight"],
-            w_qkv=torch.cat([q, k, v], dim=0).t().contiguous(),
-            w_o=t[p + "self_attn.o_proj.weight"].t().contiguous(),
+            w_qkv=torch.cat([x[f"self_attn.{s}_proj"] for s in "qkv"], dim=0).t().contiguous(),
+            w_o=x["self_attn.o_proj"].t().contiguous(),
             mlp_norm=t[p + "post_attention_layernorm.weight"],
-            w_gate_up=sk.interleave_gate_up(gate.t(), up.t()).contiguous(),
-            w_down=t[p + "mlp.down_proj.weight"].t().contiguous()))
-        del q, k, v, gate, up
+            w_gate_up=sk.interleave_gate_up(x["mlp.gate_proj"].t(),
+                                            x["mlp.up_proj"].t()).contiguous(),
+            w_down=x["mlp.down_proj"].t().contiguous()))
+        del x
     embed = t["model.embed_tokens.weight"]
+    if tuple(embed.shape) != (cfg.vocab, c.hidden):
+        raise ValueError(f"model.embed_tokens is {tuple(embed.shape)}, the config says "
+                         f"{(cfg.vocab, c.hidden)}")
     head = embed if cfg.tie_embeddings else t["lm_head.weight"]
     w = ModelWeights(embed=embed, layers=layers, final_norm=t["model.norm.weight"],
-                     lm_head=head.t().contiguous(), config=cfg.shape)
+                     lm_head=head.t().contiguous(), config=c)
     torch.cuda.empty_cache()
     return w, cfg
