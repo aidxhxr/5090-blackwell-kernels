@@ -1156,10 +1156,15 @@ the default's wide tiles, with a tile cut only between chains for the last wave:
 ## real models
 
 Everything above ran on random weights. So I loaded real checkpoints into the engine
-(`spark_kernels.hf`, any Hugging Face Llama-3-8B-shaped model) and checked three things: is
-it right, is it fast next to the stacks people actually use, and what do the low-precision
-GEMMs cost on weights that aren't Gaussian. Llama-3-8B-Instruct, Llama-3.1-8B-Instruct and
-Mistral-7B-Instruct-v0.3, all measured 2026-10-02 on the same card.
+(`spark_kernels.hf`, a Hugging Face checkpoint in the Llama layout, its shape read from
+config.json into `engine.ModelConfig`) and checked three things: is it right, is it fast
+next to the stacks people actually use, and what do the low-precision GEMMs cost on weights
+that aren't Gaussian. Llama-3-8B-Instruct, Llama-3.1-8B-Instruct and Mistral-7B-Instruct-v0.3,
+all measured 2026-10-02 on the same card. The loader assumed Llama-3-8B's shape then. Now it
+reads the shape from the config and refuses what the engine cannot run yet (Qwen3's QK norm,
+experts, biases, sliding windows), and on their first 16 layers the three checkpoints load
+to the same bytes as before and run to the same tokens and logits, bit for bit
+(docs/design/serving.md, Model shapes).
 
 ```
 python scripts/generate.py ~/models/llama3-8b-instruct "What is 17 * 23?"   # 391

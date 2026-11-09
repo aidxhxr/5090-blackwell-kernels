@@ -311,7 +311,7 @@ def ref_forward(model_path: str, seqs: list[torch.Tensor], on_layer=None) -> tor
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     torch.set_float32_matmul_precision("highest")
-    cfg = hf.ModelConfig.from_dir(model_path)
+    cfg = hf.HFConfig.from_dir(model_path)
     t = hf._Tensors(Path(model_path), "cuda")
     rope = cfg.rope(8192)
     ids = torch.cat(seqs).cuda()
@@ -369,7 +369,7 @@ def ref_logits(model_path: str, xn: torch.Tensor, rows=None):
 def stage_ref(args, work: Path) -> None:
     from spark_kernels import hf
 
-    cfg = hf.ModelConfig.from_dir(args.model)
+    cfg = hf.HFConfig.from_dir(args.model)
     seqs, _ = logit_set(work)
     T = sum(s.numel() for s in seqs)
     hidden = npy_out(work, "hidden_ref", (cfg.n_layers, T, 4096), torch.float32)
