@@ -252,9 +252,9 @@ to reach `hgemm`'s 90% of peak.
 at M = 1 to 256, symmetric weights, variant 2. Weights (with their scales) rotated past L2,
 median of 50 single launches; "back to back" is 20 launches per event pair, how a decode step
 or a CUDA graph queues its GEMMs. GB/s is the traffic floor (activations, packed weights,
-scales, output, once each) over the time; the roof is `cudaMemcpy`'s 1,532 GB/s. The bf16
-path is `hgemm` variant 6 on the dequantized weights (its decode kernel for M <= 64), timed
-the same way.
+scales, output, once each) over the time; the roof is `cudaMemcpy`'s 1,532 GB/s. The bf16 path
+is `hgemm` variant 6 on the dequantized weights (its decode kernel for M <= 64), timed the same
+way. The JSON rows have been the back-to-back times since 2026-11-08 ([Timing](#timing)).
 
 | projection | M | w4gemm µs | GB/s | % of roof | bf16 hgemm µs | speedup | back to back µs | GB/s | speedup |
 |---|---|---|---|---|---|---|---|---|---|
@@ -505,6 +505,39 @@ On the bf16 cache invariance cost 16 and 23% of a decode step at 32 and 64 slots
 four-warp route and costs 4.3 and 0.5% now; prefill went from 22 to 40% fewer tokens per
 second to within 2% of the default either way. At one slot both routes run the same shapes,
 so the 5 to 7% there is the invariant attention and the one-row GEMMs of the table above.
+
+## Timing
+
+Since 2026-11-08 the rows in `results/w4gemm.json` are chains, as in
+[w1gemm](w1gemm.md#timing): the median and min per launch of 20 launches between one event
+pair over 20 pairs (`spark::bench::time_chained`), every variant, with ref_ms (the bf16
+`hgemm`) and the cuBLAS time on stderr timed the same way. The single-launch medians are on
+stderr and `--chain=1` gives the old rows. The tables above are single launches with the
+back-to-back column next to them, and the chain rows land on that column: v2 at M = 1 is
+10.13 µs on qkv, 7.44 on o, 37.81 on gate/up and 20.87 on down.
+
+The two-run test from w1gemm, two runs of the whole bench back to back in two lock holds,
+rows more than x% apart (80 rows), twice for each:
+
+| rows | pair | > 2% | > 3% | > 5% | largest | largest ref_ms |
+|---|---|---|---|---|---|---|
+| single launches | first | 6 | 4 | 3 | 8.6% | 2.6% |
+| single launches | second | 3 | 1 | 1 | 13.6% | 2.0% |
+| chains of 20 | first | 0 | 0 | 0 | 1.0% | 0.5% |
+| chains of 20 | second | 0 | 0 | 0 | 1.0% | 1.1% |
+
+Any two of the four chain runs are within 1.7% on every row; any two of the four
+single-launch runs have 0 to 3 rows past 5%.
+
+The single-launch rows that moved are the decode ones: v2 at 4 x 6144 x 4096 (11.49 against
+12.48 µs in the first pair, 11.30 against 12.83 in the second), v3 on the same shape (12.10
+against 11.26) and v2 at 64 x 4096 x 4096 (22.72 against 21.44). Against the single-launch rows
+of the same evening, 31 of the 80 chain rows are more than 5% faster and none is more than 5%
+slower. At M = 256 the two are within 3.1% either way, and gate/up is a little slower in a
+chain on every variant: v2 is 319.7 µs a launch there and 316.5 alone. The bf16 reference drops
+about as many µs as the int4 kernel, 2.0 against 1.6 at o and M = 1, a smaller share of its
+time, so the speedups on the small matrices go up: o at M = 1 is 2.88x (7.44 against 21.41 µs)
+where single launches read 2.60x (8.99 against 23.36).
 
 ## Not done
 
