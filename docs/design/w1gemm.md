@@ -502,7 +502,8 @@ launch in front of it; it is the board's power limit, next.
 lone launches, as the rows' chains of 20, and as chains with an event pair around every launch
 and something queued between two launches, and with `spin` it reads the SM clock in the gap.
 2026-11-08, after the bench's 300 ms ramp, us a launch, the median of launches 2 to 20 over 20
-chains:
+chains (every run in this section, with the command that printed it, is a row of
+`results/w1gemm_probe.jsonl`):
 
 | between two launches | us |
 |---|---|
