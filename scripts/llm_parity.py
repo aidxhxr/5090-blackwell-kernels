@@ -6,9 +6,13 @@ Four backends see the same token sequences:
 
     spark   engine.SparkModel, this package's kernels, bf16
     torch   engine.TorchModel, the same model in plain PyTorch, bf16
-    hf      transformers' LlamaForCausalLM, bf16, sdpa attention
+    hf      transformers' model for the checkpoint (LlamaForCausalLM, MistralForCausalLM),
+            bf16, sdpa attention
     ref     the same math in fp32 on the bf16 weights (TF32 off, SDPA's math backend),
             streamed one layer at a time so it fits next to nothing else on the GPU
+
+Every shape (the residual width, the query and K/V heads, head_dim) is the checkpoint's own,
+read from its config.json by `hf.HFConfig`.
 
 Only one model is on the GPU at a time, so each backend is its own stage and writes its
 logits, its residual stream after every layer and its generations to --work; `report` reads
@@ -225,12 +229,15 @@ def stage_hf(args, work: Path) -> None:
 # ---- the engine --------------------------------------------------------------------------------
 
 def scoring_engine(E, model, n_layers, sets):
-    """An idle engine whose one packed prefill fits the largest of `sets` of sequences."""
+    """An idle engine whose one packed prefill fits the largest of `sets` of sequences. No
+    preemption: nothing decodes here, and its watermark (pages kept free at admission) would
+    not leave the exact page count for the prompts."""
     pages = max(sum(E.cdiv(s.numel() + 1, E.PAGE) for s in ss) for ss in sets)
     toks = max(sum(s.numel() for s in ss) for ss in sets)
     longest = max(s.numel() for ss in sets for s in ss)
     return E.Engine(model, n_layers, max_batch=max(len(ss) for ss in sets),
-                    max_seq=longest + 1, num_pages=pages + 1, prefill_tokens=toks, graphs=False)
+                    max_seq=longest + 1, num_pages=pages + 1, prefill_tokens=toks, graphs=False,
+                    preempt=False)
 
 
 def stage_engine(args, work: Path) -> None:
@@ -283,7 +290,7 @@ def stage_engine(args, work: Path) -> None:
     logits = npy_out(work, f"logits_{name}", (T, cfg.vocab), torch.bfloat16)
     for r in range(0, T, 1024):
         put(logits, slice(r, r + 1024), lg[r:r + 1024])
-    hidden = npy_out(work, f"hidden_{name}", (len(trace), T, 4096), torch.bfloat16)
+    hidden = npy_out(work, f"hidden_{name}", (len(trace), T, cfg.shape.hidden), torch.bfloat16)
     for layer, h in enumerate(trace):
         put(hidden, layer, h)
     logits.flush()
@@ -302,8 +309,9 @@ def stage_engine(args, work: Path) -> None:
 
 def ref_forward(model_path: str, seqs: list[torch.Tensor], on_layer=None) -> torch.Tensor:
     """fp32 forward of the checkpoint over each sequence (positions from 0), one layer's
-    weights on the GPU at a time. `on_layer(i, x)` sees the residual stream after layer i.
-    Returns the final normed hidden states [T, 4096] in fp32."""
+    weights on the GPU at a time, in the checkpoint's shape (heads, K/V heads, head_dim and
+    the widths from its config). `on_layer(i, x)` sees the residual stream after layer i.
+    Returns the final normed hidden states [T, hidden] in fp32."""
     from torch.nn.attention import SDPBackend, sdpa_kernel
 
     from spark_kernels import hf
@@ -312,6 +320,8 @@ def ref_forward(model_path: str, seqs: list[torch.Tensor], on_layer=None) -> tor
     torch.backends.cudnn.allow_tf32 = False
     torch.set_float32_matmul_precision("highest")
     cfg = hf.HFConfig.from_dir(model_path)
+    c = cfg.shape
+    half = c.head_dim // 2
     t = hf._Tensors(Path(model_path), "cuda")
     rope = cfg.rope(8192)
     ids = torch.cat(seqs).cuda()
@@ -322,8 +332,8 @@ def ref_forward(model_path: str, seqs: list[torch.Tensor], on_layer=None) -> tor
     def rms(x, w):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + cfg.eps) * w
 
-    def rot(x):  # [T, H, 128], rotate-half
-        return x * cos + torch.cat([-x[..., 64:], x[..., :64]], dim=-1) * sin
+    def rot(x):  # [T, H, head_dim], rotate-half
+        return x * cos + torch.cat([-x[..., half:], x[..., :half]], dim=-1) * sin
 
     x = F.embedding(ids, t["model.embed_tokens.weight"]).float()
     T = x.shape[0]
@@ -334,15 +344,16 @@ def ref_forward(model_path: str, seqs: list[torch.Tensor], on_layer=None) -> tor
             return t[p + name].float()
 
         h = rms(x, g("input_layernorm.weight"))
-        q = rot(F.linear(h, g("self_attn.q_proj.weight")).view(T, 32, 128))
-        k = rot(F.linear(h, g("self_attn.k_proj.weight")).view(T, 8, 128))
-        v = F.linear(h, g("self_attn.v_proj.weight")).view(T, 8, 128)
+        q = rot(F.linear(h, g("self_attn.q_proj.weight")).view(T, c.n_heads, c.head_dim))
+        k = rot(F.linear(h, g("self_attn.k_proj.weight")).view(T, c.n_kv_heads, c.head_dim))
+        v = F.linear(h, g("self_attn.v_proj.weight")).view(T, c.n_kv_heads, c.head_dim)
         outs, t0 = [], 0
         with sdpa_kernel(SDPBackend.MATH):
             for n in lens:
                 qs, ks, vs = (z[t0:t0 + n].transpose(0, 1)[None] for z in (q, k, v))
                 o = F.scaled_dot_product_attention(qs, ks, vs, is_causal=True, enable_gqa=True)
-                outs.append(o[0].transpose(0, 1).reshape(n, 4096))
+                # n_heads * head_dim wide, which is not hidden on every model (Qwen3)
+                outs.append(o[0].transpose(0, 1).reshape(n, c.q_width))
                 t0 += n
         x = x + F.linear(torch.cat(outs), g("self_attn.o_proj.weight"))
         h = rms(x, g("post_attention_layernorm.weight"))
@@ -354,11 +365,18 @@ def ref_forward(model_path: str, seqs: list[torch.Tensor], on_layer=None) -> tor
     return rms(x, t["model.norm.weight"].float())
 
 
-def ref_logits(model_path: str, xn: torch.Tensor, rows=None):
-    """lm_head in fp32 over the rows of xn, a chunk at a time: yields (start, logits)."""
+def head_weight(model_path: str) -> torch.Tensor:
+    """lm_head [V, hidden] in fp32 on the GPU: the embedding when the config ties them."""
     from spark_kernels import hf
 
-    head = hf._Tensors(Path(model_path), "cuda")["lm_head.weight"].float()
+    tied = hf.HFConfig.from_dir(model_path).tie_embeddings
+    name = "model.embed_tokens.weight" if tied else "lm_head.weight"
+    return hf._Tensors(Path(model_path), "cuda")[name].float()
+
+
+def ref_logits(model_path: str, xn: torch.Tensor, rows=None):
+    """lm_head in fp32 over the rows of xn, a chunk at a time: yields (start, logits)."""
+    head = head_weight(model_path)
     rows = range(xn.shape[0]) if rows is None else rows
     rows = list(rows)
     for r in range(0, len(rows), 512):
@@ -372,7 +390,7 @@ def stage_ref(args, work: Path) -> None:
     cfg = hf.HFConfig.from_dir(args.model)
     seqs, _ = logit_set(work)
     T = sum(s.numel() for s in seqs)
-    hidden = npy_out(work, "hidden_ref", (cfg.n_layers, T, 4096), torch.float32)
+    hidden = npy_out(work, "hidden_ref", (cfg.n_layers, T, cfg.shape.hidden), torch.float32)
     t0 = time.perf_counter()
     with torch.no_grad():
         xn = ref_forward(args.model, seqs, on_layer=lambda i, x: put(hidden, i, x))
@@ -398,12 +416,10 @@ def stage_ref(args, work: Path) -> None:
 def stage_ppl(args, work: Path) -> None:
     """Wikitext-2 perplexity of the fp32 reference, in eval_ppl.py's windows and row format,
     --group windows per streamed pass over the layers."""
-    from spark_kernels import hf
-
     tok = tokenizer(args.model)
     ids = tok(TEXT.read_text(), return_tensors="pt").input_ids[0]
     wins = [ids[i:i + args.ctx] for i in range(0, ids.numel() - args.ctx + 1, args.ctx)]
-    head = hf._Tensors(Path(args.model), "cuda")["lm_head.weight"].float()
+    head = head_weight(args.model)
     total, count = 0.0, 0
     t0 = time.perf_counter()
     for g in range(0, len(wins), args.group):
