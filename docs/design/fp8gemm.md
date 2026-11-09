@@ -1196,6 +1196,76 @@ differs from variant 4. With the knob at 0 the variant 4 tests fail. The engine'
 `fp8-tok` weights call the default, so their prefill steps on these shapes take whole tiles
 now; not measured end to end.
 
+### The lm_head at 128 to 512 tokens, in Nsight
+
+Source: `results/fp8gemm_lmhead_ncu.jsonl` (measured 2026-11-08): one launch of each kernel from
+`bench_fp8gemm --m=<M> --n=128256 --k=4096 --variant=3 --mode=tensor` under Nsight Compute,
+caches flushed and `--clock-control none`, so the SM clock is the card's own; then ABBA pairs at
+200 iterations in the same bench, `SPARK_FP8GEMM_V3_ROUTE` forcing a tile.
+
+With whole tiles from the queue the Llama 3 8B lm_head still sits under cuBLASLt in every
+sweep: 98.3 to 98.8% at 128 tokens, 91.3 to 91.9% at 256, 96.4 to 98.5% at 512 (the
+200-iteration ABBAs above).
+
+**What cuBLASLt runs.** Not CUTLASS here: nvjet kernels, no clusters. At 128 tokens
+`nvjet_sm120_qqtst_mma_128x128x64_6_64x64x64_tmaAB_alignCD4_bz_TNNN`, a 128x128 tile on 64-byte
+k-steps, six stages, 128 threads at 255 registers and 50.7 KB of shared memory, and 8016 CTAs
+for the 1002 output tiles: eight to a tile, so by the count it cuts K eight ways. At 256 and 512
+`nvjet_sm120_qqtst_mma_256x128x128_2_64x64x128_tmaAB_alignCD4_bz_TNNN`, 256 rows by 128 columns,
+two stages, 256 threads at 255 registers, 100.4 KB, one CTA per tile (1002 and 2004). Ours is
+128x64, 128x128 and 128x256 on 170 persistent blocks of 288 threads.
+
+| M | kernel | time | SM clock | cycles | least busy SM | DRAM | L2 bytes, hit rate | tensor pipe | instructions |
+|---|---|---|---|---|---|---|---|---|---|
+| 128 | cuBLASLt 128x128 | 331 to 333 us | 2.72 to 2.77 GHz | 902 to 923 K | 646 to 826 K | 1.65 TB/s, 93.7% | 1.35 GB, 59.7% | 42 to 43% | 54 M |
+| 128 | ours 128x64 | 335 to 339 us | 2.64 to 2.69 GHz | 893 to 907 K | 846 to 857 K | 1.62 to 1.64 TB/s, 91.7 to 92.7% | 1.64 GB, 67.3% | 42.7 to 43.5% | 63 M |
+| 256 | cuBLASLt 256x128 | 381 to 384 us | 2.34 to 2.38 GHz | 907 to 915 K | 753 to 758 K | 1.52 to 1.53 TB/s, 86.0 to 86.5% | 1.64 GB, 66.0% | 85 to 86% | 60 M |
+| 256 | ours 128x128 | 402 to 410 us | 2.13 to 2.20 GHz | 884 to 896 K | 794 to 807 K | 1.43 to 1.45 TB/s, 81 to 82% | 2.23 GB, 75.5% | 87 to 88% | 72 M |
+| 256 | ours 128x256 | 387 to 394 us | 2.31 to 2.35 GHz | 918 to 921 K | 751 to 762 K | 1.48 to 1.50 TB/s, 84 to 85% | 1.71 GB, 68.1% | 85% | 65 M |
+| 512 | cuBLASLt 256x128 | 731 to 744 us | 2.35 to 2.39 GHz | 1.76 to 1.77 M | 1.58 M | 0.86 to 0.88 TB/s, 48.9 to 49.8% | 3.28 GB, 82.0% | 88% | 121 M |
+| 512 | ours 128x256 | 741 to 753 us | 2.31 to 2.35 GHz | 1.76 M | 1.58 M | 0.85 to 0.87 TB/s, 48 to 49% | 3.41 GB, 83.5% | 89% | 127 M |
+
+Three launches of each, but two of ours with 128x256 at 256 tokens. DRAM is the share of
+Nsight's peak (1.76 TB/s), the tensor pipe its share of the elapsed cycles, the least busy SM its
+active cycles against the cycles of the whole launch. Top stalls, cycles per issued
+instruction: cuBLASLt's warps sit on `math_pipe_throttle` (13.7 to 13.8 at 256 and 512) and
+little else; ours split about as much between `math_pipe_throttle` (7.5 to 8.5) and `wait` (5.3
+to 5.6). At 128 tokens cuBLASLt waits on memory, `long_scoreboard` (5.2 to 5.5), and ours on
+`branch_resolving` (4.7 to 4.8) and `long_scoreboard` (3.9 to 4.2).
+
+**128 tokens: the DRAM roof.** Both read the 525 MB weight once at 92 to 94% of the roof with
+the tensor pipe 43% busy, and cuBLASLt finishes 1 to 2% sooner at 1.65 TB/s against 1.62 to 1.64.
+There is not much left. The other 64-wide tile, 64x128 forced, ran 1.009x and 1.012x in one
+ABBA (100.0% of cuBLASLt to 101.0%) in the single-shape bench, where the model sweep had the
+default at 98.3 to 98.8%; both fill uniform e4m3 in tensor mode, so the fill doesn't explain that.
+
+**256 tokens: the clock.** This is the gap. We take fewer cycles than cuBLASLt, 884 to 896 K against
+907 to 915 K, and lose in time because the card runs us at 2.13 to 2.20 GHz and cuBLASLt at 2.34 to
+2.38. Both keep the tensor pipe 85 to 88% busy and DRAM at 81 to 86%. I did not log power for these
+launches, so this is the likely cause, not a measured one: it is what 8192³ showed at the 600 W cap
+(Power, above), where the clock was the whole gap. The kernel that costs less per FLOP gets the
+clock, and ours spends more moving bytes, 36% more through L2 (2.23 GB against
+1.64) and 19 to 20% more instructions. The bytes follow from the tile: every tile reads its BM rows
+of activations and its BN rows of the weight, 0.5 MB per 128 rows, so through L2 go 2004 x (0.5 +
+0.5 MB) = 2.1 GB on our 128x128, 1002 x (1 + 0.5 MB) = 1.58 GB on cuBLASLt's 256x128 and 1002 x (0.5
++ 1 MB) = 1.58 GB on our 128x256, plus 66 MB of output on each.
+
+**The cheap change.** 128x256 at 256 tokens moves 1.71 GB through L2 with 65 M instructions, gets
+2.31 to 2.35 GHz, and finishes in 387 to 394 us though it takes more cycles than 128x128 (918 to 921
+K). Three ABBAs at 200 iterations, 128x256 against 128x128 in the same hold: 1.068x to 1.073x in all
+six pairs, from 91.7 to 92.2% of cuBLASLt to 98.4 to 98.7%. Two of the three ran on a build whose
+rule takes it, the same launch as `SPARK_FP8GEMM_V3_ROUTE=0`. The rule sends the wide tile only from
+512 tokens because at 256 it lost on most weights in the forced-tile sweep (256 x 28672 x 8192: 168%
+against 182%, "The rule"), but the lm_head has 1002 wide tiles at 256 tokens, 5.9 waves, where the
+next widest weight has 224. A clause for M >= 256 with 4 waves of wide tiles or more takes exactly
+that one of the 120 shapes. That is the next step, with its route in `tests/test_fp8gemm.py`'s
+table; it is not in this tree.
+
+**512 tokens: level in one launch.** Same tile area on both sides (our 128x256 against its 256x128),
+2.31 to 2.35 GHz against 2.35 to 2.39, 741 to 753 us against 731 to 744 us; we move 4% more L2 bytes
+and 5% more instructions. In the 200-iteration loop that is 98.0 to 98.3% of cuBLASLt in this bench.
+128x128 forced lost, 0.926x in both pairs.
+
 ### The engine
 
 `quant.FP8Linear` (the engine's `fp8` and `fp8-tok` weights) calls `sk.fp8gemm` with the
@@ -1229,8 +1299,9 @@ Open:
   the 120 model shapes against 103.8% for the old default, and in MX mode, 111.8% of
   cuBLASLt MXFP8 against 91.6% (118.1% with tiled scales). Open there: the lm_head at 256
   tokens (85.9%; 91.3 to 91.9% with whole tiles from the queue, "Whole tiles from the queue
-  in per-tensor mode"), and the deep-K shapes where variant 2's data-parallel waves still win
-  in both modes.
+  in per-tensor mode"; the 128x256 tile there would take it to 98.4 to 98.7%, "The lm_head at
+  128 to 512 tokens, in Nsight"), and the deep-K shapes where variant 2's data-parallel waves
+  still win in both modes.
 - **MX at 90%.** Done for the 128x128 and 64-wide tiles: the tiled scale layout ("MX mode
   with tiled scales") takes 4096³ from 98.5% to 107.2% of cuBLASLt MXFP8 and the model
   shapes from 111.8% to 118.1%. Open: the 128x256 tile, which the per-tensor rule runs on the
