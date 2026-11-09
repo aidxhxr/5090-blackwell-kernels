@@ -7,8 +7,11 @@
 #   ./scripts/fp8gemm_queue_abba.sh sweep/mx mx-tiled       # A1 B1 B2 A2 .jsonl and .err
 #   ./scripts/fp8gemm_queue_abba.sh sweep/wq tensor 1       # B forced whole, rows "@v3-wq"
 #   ./scripts/fp8gemm_queue_abba.sh sweep/lm tensor -1 --models=llama3-8b --iters=200
-# B's knob defaults to the rule (-1, the variable unset). Bench args go first, so they win
-# over the defaults here (bench_common.hpp's Args takes the first of a name).
+# B's knob defaults to the rule (-1, the variable unset, even if the caller exported it).
+# Bench args go first, so they win over the defaults here (bench_common.hpp's Args takes the
+# first of a name). In tensor mode the bench writes v1, v2, v3old and v3 rows for every shape;
+# results/fp8gemm_tensor_queue.jsonl keeps only the "@v3", "@v3-sk" and "@v3-wq" rows, and in
+# the forced sweep only the queue-mode shapes.
 # Run it in one hold of whatever keeps other work off the GPU: the two orders only cancel the
 # drift of the card (clocks, power, other processes) when nothing else changes in between.
 set -euo pipefail
@@ -39,7 +42,7 @@ pass() {
   echo "exit $rc" >>"$OUT/$name.err"
 }
 
-B_ENV=(X=0)
+B_ENV=(-u SPARK_FP8GEMM_V3_WHOLE_QUEUE)
 [ -n "$KNOB" ] && B_ENV=(SPARK_FP8GEMM_V3_WHOLE_QUEUE="$KNOB")
 pass A1 -sk SPARK_FP8GEMM_V3_WHOLE_QUEUE=0
 pass B1 "$BTAG" "${B_ENV[@]}"
