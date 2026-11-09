@@ -485,17 +485,25 @@ void swiglu_fp8_rows(int rpc, int kt, int vpt, const SwigluFp8Args& a) {
     }
 }
 
-// Blocks per row: a cluster of 8 up to kClusterRows rows of 4096 values or more, one above.
-// One block a row puts a whole row's silu (an exp and a division per value) on one SM, and at
-// 1 to 8 rows of 14336 that is slower than spreading it: 3.8 us against 2.6 for a cluster of
-// 8. The clusters stop paying past 32 rows: at 48 rows of 14336 the cluster form takes 5.2 us
-// and one block a row 3.8. SPARK_SWIGLU_FP8_CLUSTER=1|2|4|8 forces the cluster size. Then the
-// smallest block of 128 to 1024 threads that holds the block's part at four vectors a thread
-// (SPARK_SWIGLU_FP8_VPT=1|2|4 sets that target), and the fewest vectors a thread that cover
-// it. SPARK_SWIGLU_FP8_ROWS=2|4 gives a cluster that many rows (swiglu_fp8_rows_kernel, the
-// target then per row of the block, and fewer rows if they would not fit 1024 threads). None
-// of this changes a bit of the output.
-constexpr int64_t kClusterRows = 32;
+// Blocks per row. One block a row puts a whole row's silu (an exp and a division per value) on
+// one SM, and at 1 to 8 rows of 14336 that is slower than spreading it: 3.1 us against 2.3 for
+// a cluster of 8. A cluster pays only while every cluster of the launch is resident at once:
+// the 5090 holds 41 clusters of 8 (ncu's Max Active Clusters, about two blocks an SM; 85 of
+// 4), and the 42nd row starts a second wave that pays a row's whole latency again, 2.7 us at
+// 41 rows of 14336 and 4.2 at 42. So a cluster of 8 up to 41 rows of 8192 values or more and
+// up to 16 rows from 4096 (at 5632 one block of 1024 threads ties at 16 rows and wins from 24),
+// a cluster of 4 from 42 to 64 rows of 14336 or more, one block a row otherwise.
+// SPARK_SWIGLU_FP8_CLUSTER=1|2|4|8 forces the cluster size. Then the block: up to 128 rows the
+// smallest block of 128 to 1024 threads that gives each thread one vector of the block's part,
+// since so few rows are latency bound (a few warps an SM, each waiting on its exps and
+// divisions), and past that the smallest one at four vectors a thread, which wins from 192
+// rows, past the 170 blocks of 1024 threads the SMs hold at once.
+// SPARK_SWIGLU_FP8_VPT=1|2|4 forces that target. SPARK_SWIGLU_FP8_ROWS=2|4 gives a cluster
+// that many rows (swiglu_fp8_rows_kernel, the target then per row of the block, and fewer rows
+// if they would not fit 1024 threads); it fits 64 or 128 rows in one wave but is never the
+// fastest, so only the variable picks it. None of this changes a bit of the output.
+constexpr int64_t kClusterRows8 = 41;
+constexpr int64_t kOneVectorRows = 128;
 
 void swiglu_fp8_impl(const __nv_bfloat16* gate, const __nv_bfloat16* up, unsigned char* q,
                      float* scales, int64_t rows, int64_t cols, int64_t ld_gate, int64_t ld_up,
@@ -530,13 +538,15 @@ void swiglu_fp8_impl(const __nv_bfloat16* gate, const __nv_bfloat16* up, unsigne
     int cl = 1;
     if (forced == 1 || forced == 2 || forced == 4 || forced == 8) {
         cl = forced;
-    } else if (rows <= kClusterRows && nvec >= 512) {
+    } else if ((rows <= kClusterRows8 && nvec >= 1024) || (rows <= 16 && nvec >= 512)) {
         cl = 8;
+    } else if (rows <= 64 && nvec >= 1792) {
+        cl = 4;
     }
     const int per_block = cdiv(nvec, cl);
     int rpc = cl > 1 && (forced_rows == 2 || forced_rows == 4) ? forced_rows : 1;
     while (rpc > 1 && per_block > 4 * 1024 / rpc) rpc /= 2;
-    int vt = 4;  // vectors a thread the block is sized for
+    int vt = rows <= kOneVectorRows ? 1 : 4;  // vectors a thread the block is sized for
     if (forced_vpt == 1 || forced_vpt == 2 || forced_vpt == 4) vt = forced_vpt;
     int ktr = 128 / rpc;  // threads a row of the block, kt = rpc * ktr of them in all
     while (ktr < 1024 / rpc && ktr * vt < per_block) ktr *= 2;
