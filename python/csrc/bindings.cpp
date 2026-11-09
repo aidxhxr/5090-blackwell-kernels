@@ -1608,11 +1608,14 @@ const __nv_fp8_e4m3* fp8_ptr(const Tensor& t) {
 // q = rope(qkv[:, :H_q D]) as [T, H_q, D]; token t's rope(k) and v go to slot slots[t] of the
 // paged caches (skipped when slots[t] < 0), rotated at position positions[t].
 // With float8_e4m3fn caches k and v are stored as e4m3(x / scale) of their kv head.
+// q_norm and k_norm ([D] bf16, both or neither) RMS-normalize every q and k head first
+// (Qwen3's QK norm, with eps).
 Tensor rope_append_paged_(const Tensor& qkv, const Tensor& cos, const Tensor& sin,
                           const Tensor& positions, const Tensor& slots, Tensor k_cache,
                           Tensor v_cache, int64_t H_q, int64_t H_kv,
                           const std::optional<Tensor>& k_scale,
-                          const std::optional<Tensor>& v_scale) {
+                          const std::optional<Tensor>& v_scale, const std::optional<Tensor>& q_norm,
+                          const std::optional<Tensor>& k_norm, double eps) {
     check_cuda_contig(qkv, "qkv");
     check_cuda_contig(cos, "cos");
     check_cuda_contig(sin, "sin");
@@ -1635,6 +1638,21 @@ Tensor rope_append_paged_(const Tensor& qkv, const Tensor& cos, const Tensor& si
                 "cos and sin must be [P, D]");
     TORCH_CHECK(D % 16 == 0, "D must be a multiple of 16");
     TORCH_CHECK(T * (H_q + 2 * H_kv) * D < (int64_t{1} << 40), "rope_append_paged_ too large");
+    TORCH_CHECK(q_norm.has_value() == k_norm.has_value(),
+                "rope_append_paged_: give both q_norm and k_norm or neither");
+    const __nv_bfloat16* qn = nullptr;
+    const __nv_bfloat16* kn = nullptr;
+    if (q_norm.has_value()) {
+        for (const Tensor* w : {&*q_norm, &*k_norm}) {
+            check_cuda_contig(*w, "q_norm / k_norm");
+            TORCH_CHECK(w->scalar_type() == at::kBFloat16 && w->dim() == 1 && w->size(0) == D,
+                        "q_norm and k_norm must be bfloat16 [D]");
+        }
+        TORCH_CHECK(D <= 512 && (D & (D - 1)) == 0, "the QK norm needs D a power of two <= 512");
+        TORCH_CHECK(eps >= 0, "eps must be >= 0");
+        qn = bf16_ptr(*q_norm);
+        kn = bf16_ptr(*k_norm);
+    }
     const c10::cuda::CUDAGuard guard(qkv.device());
     Tensor q = at::empty({T, H_q, D}, qkv.options());
     if (fp8) {
@@ -1645,14 +1663,14 @@ Tensor rope_append_paged_(const Tensor& qkv, const Tensor& cos, const Tensor& si
             reinterpret_cast<__nv_fp8_e4m3*>(v_cache.data_ptr()), k_scale->data_ptr<float>(),
             v_scale->data_ptr<float>(), static_cast<int>(T), static_cast<int>(H_q),
             static_cast<int>(H_kv), static_cast<int>(D), static_cast<int>(k_cache.size(2)),
-            current_stream(qkv));
+            current_stream(qkv), qn, kn, static_cast<float>(eps));
         return q;
     }
     spark::rope_append_paged_bf16(
         bf16_ptr(qkv), cos.data_ptr<float>(), sin.data_ptr<float>(), positions.data_ptr<int>(),
         slots.data_ptr<int>(), bf16_ptr_mut(q), bf16_ptr_mut(k_cache), bf16_ptr_mut(v_cache),
         static_cast<int>(T), static_cast<int>(H_q), static_cast<int>(H_kv), static_cast<int>(D),
-        static_cast<int>(k_cache.size(2)), current_stream(qkv));
+        static_cast<int>(k_cache.size(2)), current_stream(qkv), qn, kn, static_cast<float>(eps));
     return q;
 }
 
@@ -2191,11 +2209,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("pos0"), py::arg("H_q"), py::arg("H_kv"));
     m.def("rope_append_paged_", &rope_append_paged_,
           "RoPE on the q and k columns of packed tokens, k and v written to their slots of the "
-          "paged caches (bf16, or float8_e4m3fn divided by k_scale / v_scale [H_kv]); returns q "
-          "as [T, H_q, D]",
+          "paged caches (bf16, or float8_e4m3fn divided by k_scale / v_scale [H_kv]), with "
+          "q_norm and k_norm [D] each head RMS-normalized first (Qwen3); returns q as "
+          "[T, H_q, D]",
           py::arg("qkv"), py::arg("cos"), py::arg("sin"), py::arg("positions"), py::arg("slots"),
           py::arg("k_cache"), py::arg("v_cache"), py::arg("H_q"), py::arg("H_kv"),
-          py::arg("k_scale") = py::none(), py::arg("v_scale") = py::none());
+          py::arg("k_scale") = py::none(), py::arg("v_scale") = py::none(),
+          py::arg("q_norm") = py::none(), py::arg("k_norm") = py::none(), py::arg("eps") = 1e-6);
     m.def("paged_decode", &paged_decode,
           "one query token per sequence against a paged K/V cache: q [B, H_q, D], block_table "
           "[B, max_pages], seq_lens [B]; float8_e4m3fn caches take k_scale and v_scale [H_kv]",
