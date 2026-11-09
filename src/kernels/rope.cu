@@ -22,6 +22,12 @@
 // of [num_pages, H_kv, page, D] caches, and q comes out token-major as [T, H_q, D].
 // rope_append_paged_fp8 writes the caches as e4m3, x / scale[kv head] rounded once from fp32
 // (cvt.rn.satfinite, sm_89+), 8 bytes per thread where the bf16 form stores 16.
+//
+// Both paged forms take Qwen3's QK norm as an option: with q_norm and k_norm ([D] bf16 each,
+// one weight for every q head and one for every k head) each q and k head is RMS-normalized
+// over its D elements before the rotation, in the same launch. A head row is D/16
+// consecutive lanes of one warp, so its sum of squares is a shuffle. Without the weights the
+// kernels are the ones above, instantiated from the same lines.
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -53,14 +59,20 @@ __device__ __forceinline__ float4 ld_f4(const float* p) {
     return *reinterpret_cast<const float4*>(p);
 }
 
-// Rotates the 8 elements at src against the 8 at src + half with 8 columns of the cos and
-// sin tables: o1 = x1 cos - x2 sin, o2 = x2 cos + x1 sin (rotate_half: cat(-x2, x1)).
-__device__ __forceinline__ void rotate8(const __nv_bfloat16* src, int half, const float* cs,
-                                        const float* sn, bf16x8& o1, bf16x8& o2) {
-    const bf16x8 x1 = *reinterpret_cast<const bf16x8*>(src);
-    const bf16x8 x2 = *reinterpret_cast<const bf16x8*>(src + half);
-    const float4 c0 = ld_f4(cs), c1 = ld_f4(cs + 4);
-    const float4 s0 = ld_f4(sn), s1 = ld_f4(sn + 4);
+// 8 columns of the cos and sin tables.
+struct CosSin8 {
+    float4 c0, c1, s0, s1;
+};
+
+__device__ __forceinline__ CosSin8 ld_cs8(const float* cs, const float* sn) {
+    return {ld_f4(cs), ld_f4(cs + 4), ld_f4(sn), ld_f4(sn + 4)};
+}
+
+// Rotates the 8 elements x1 against the 8 at +D/2, x2, with 8 columns of the cos and sin
+// tables: o1 = x1 cos - x2 sin, o2 = x2 cos + x1 sin (rotate_half: cat(-x2, x1)).
+__device__ __forceinline__ void rotate8(const bf16x8& x1, const bf16x8& x2, const CosSin8& t,
+                                        bf16x8& o1, bf16x8& o2) {
+    const float4 c0 = t.c0, c1 = t.c1, s0 = t.s0, s1 = t.s1;
     const float cv[8] = {c0.x, c0.y, c0.z, c0.w, c1.x, c1.y, c1.z, c1.w};
     const float sv[8] = {s0.x, s0.y, s0.z, s0.w, s1.x, s1.y, s1.z, s1.w};
 #pragma unroll
@@ -74,6 +86,61 @@ __device__ __forceinline__ void rotate8(const __nv_bfloat16* src, int half, cons
         r2.y = bb.y * cv[2 * k + 1] + a.y * sv[2 * k + 1];
         o1.h[k] = __float22bfloat162_rn(r1);
         o2.h[k] = __float22bfloat162_rn(r2);
+    }
+}
+
+// rotate8 on the 8 elements at src and the 8 at src + half.
+__device__ __forceinline__ void rotate8(const __nv_bfloat16* src, int half, const float* cs,
+                                        const float* sn, bf16x8& o1, bf16x8& o2) {
+    const bf16x8 x1 = *reinterpret_cast<const bf16x8*>(src);
+    const bf16x8 x2 = *reinterpret_cast<const bf16x8*>(src + half);
+    rotate8(x1, x2, ld_cs8(cs, sn), o1, o2);
+}
+
+__device__ __forceinline__ float round_bf16(float x) {
+    return __bfloat162float(__float2bfloat16_rn(x));
+}
+
+// Qwen3's QK norm on one rope row: loads the thread's 8 elements at src and 8 at src + half
+// and returns them as Qwen3RMSNorm gives them, w * bf16(x * rsqrt(mean(x^2) + eps)) rounded
+// to bf16, w the [D] weight of a q or a k head. The row's g = D/16 threads are lanes
+// g * m .. g * m + g - 1 of one warp (a row starts at a multiple of g and g, a power of two,
+// divides 32), and the sum of squares is a shuffle over them. D a power of two, so the mean's
+// 1/D is exact. The weights are loaded with x, before the shuffles: the compiler does not move
+// a load above them, and at decode a load after them is a second trip to memory.
+__device__ __forceinline__ void load_qk_norm16(const __nv_bfloat16* src, int half,
+                                               const __nv_bfloat16* w, int c, int g, float eps,
+                                               bf16x8& x1, bf16x8& x2) {
+    const bf16x8 w1 = *reinterpret_cast<const bf16x8*>(w + c);
+    const bf16x8 w2 = *reinterpret_cast<const bf16x8*>(w + c + half);
+    x1 = *reinterpret_cast<const bf16x8*>(src);
+    x2 = *reinterpret_cast<const bf16x8*>(src + half);
+    float a[8], b[8], ss = 0.f;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const float2 u = __bfloat1622float2(x1.h[k]);
+        const float2 v = __bfloat1622float2(x2.h[k]);
+        a[2 * k] = u.x;
+        a[2 * k + 1] = u.y;
+        b[2 * k] = v.x;
+        b[2 * k + 1] = v.y;
+        ss += u.x * u.x + u.y * u.y + v.x * v.x + v.y * v.y;
+    }
+    const unsigned lane = threadIdx.x & 31u;
+    const unsigned mask = g == 32 ? 0xffffffffu : ((1u << g) - 1u) << (lane & ~(g - 1u));
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        if (o < g) ss += __shfl_xor_sync(mask, ss, o);
+    }
+    const float r = rsqrtf(ss * (1.0f / static_cast<float>(2 * half)) + eps);
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const float2 wa = __bfloat1622float2(w1.h[k]);
+        const float2 wb = __bfloat1622float2(w2.h[k]);
+        x1.h[k] = __floats2bfloat162_rn(round_bf16(a[2 * k] * r) * wa.x,
+                                        round_bf16(a[2 * k + 1] * r) * wa.y);
+        x2.h[k] = __floats2bfloat162_rn(round_bf16(b[2 * k] * r) * wb.x,
+                                        round_bf16(b[2 * k + 1] * r) * wb.y);
     }
 }
 
@@ -119,7 +186,7 @@ __global__ void rope_append_kernel(Params p) {
 
 // The paged form: token t of a packed batch at position pos[t], its k and v into slot
 // slots[t] of the [num_pages, H_kv, page, D] caches, q out as [T, H_q, D]. Same work split
-// as above with the token index in place of (b, s).
+// as above with the token index in place of (b, s). kNorm: Qwen3's QK norm first.
 struct PagedParams {
     const __nv_bfloat16* qkv;
     const float* cos;
@@ -131,6 +198,9 @@ struct PagedParams {
     __nv_bfloat16* v_cache;
     int H_q, H_kv, D, shift;
     int64_t width, rope_items, per_tok, total;
+    const __nv_bfloat16* q_norm;  // [D], with k_norm, for kNorm
+    const __nv_bfloat16* k_norm;
+    float eps;
 };
 
 // Element offset of (slot, kv head) in a [num_pages, H_kv, page, D] cache.
@@ -139,6 +209,7 @@ __device__ __forceinline__ int64_t slot_offset(int slot, int H_kv, int kh, int s
     return (((page * H_kv + kh) << shift) + r) * D;
 }
 
+template <bool kNorm>
 __global__ void rope_append_paged_kernel(PagedParams p) {
     const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= p.total) return;
@@ -165,7 +236,15 @@ __global__ void rope_append_paged_kernel(PagedParams p) {
     const int half = p.D / 2;
     const int64_t pos = p.pos[tok];
     bf16x8 o1, o2;
-    rotate8(row + h * p.D + c, half, p.cos + pos * p.D + c, p.sin + pos * p.D + c, o1, o2);
+    if constexpr (kNorm) {  // the tables and weights loaded before the shuffles
+        const CosSin8 t = ld_cs8(p.cos + pos * p.D + c, p.sin + pos * p.D + c);
+        bf16x8 x1, x2;
+        load_qk_norm16(row + h * p.D + c, half, h < p.H_q ? p.q_norm : p.k_norm, c, per_row, p.eps,
+                       x1, x2);
+        rotate8(x1, x2, t, o1, o2);
+    } else {
+        rotate8(row + h * p.D + c, half, p.cos + pos * p.D + c, p.sin + pos * p.D + c, o1, o2);
+    }
     __nv_bfloat16* dst = h < p.H_q
                              ? p.q + (tok * p.H_q + h) * p.D + c
                              : p.k_cache + slot_offset(slot, p.H_kv, h - p.H_q, p.shift, p.D) + c;
@@ -175,12 +254,9 @@ __global__ void rope_append_paged_kernel(PagedParams p) {
 
 // rotate8 with fp32 results, for the e4m3 cache: k is rounded once, to e4m3, not to bf16
 // first. Kept apart so the bf16 kernels compile exactly as before.
-__device__ __forceinline__ void rotate8_f32(const __nv_bfloat16* src, int half, const float* cs,
-                                            const float* sn, float (&o1)[8], float (&o2)[8]) {
-    const bf16x8 x1 = *reinterpret_cast<const bf16x8*>(src);
-    const bf16x8 x2 = *reinterpret_cast<const bf16x8*>(src + half);
-    const float4 c0 = ld_f4(cs), c1 = ld_f4(cs + 4);
-    const float4 s0 = ld_f4(sn), s1 = ld_f4(sn + 4);
+__device__ __forceinline__ void rotate8_f32(const bf16x8& x1, const bf16x8& x2, const CosSin8& t,
+                                            float (&o1)[8], float (&o2)[8]) {
+    const float4 c0 = t.c0, c1 = t.c1, s0 = t.s0, s1 = t.s1;
     const float cv[8] = {c0.x, c0.y, c0.z, c0.w, c1.x, c1.y, c1.z, c1.w};
     const float sv[8] = {s0.x, s0.y, s0.z, s0.w, s1.x, s1.y, s1.z, s1.w};
 #pragma unroll
@@ -192,6 +268,13 @@ __device__ __forceinline__ void rotate8_f32(const __nv_bfloat16* src, int half, 
         o2[2 * k] = bb.x * cv[2 * k] + a.x * sv[2 * k];
         o2[2 * k + 1] = bb.y * cv[2 * k + 1] + a.y * sv[2 * k + 1];
     }
+}
+
+__device__ __forceinline__ void rotate8_f32(const __nv_bfloat16* src, int half, const float* cs,
+                                            const float* sn, float (&o1)[8], float (&o2)[8]) {
+    const bf16x8 x1 = *reinterpret_cast<const bf16x8*>(src);
+    const bf16x8 x2 = *reinterpret_cast<const bf16x8*>(src + half);
+    rotate8_f32(x1, x2, ld_cs8(cs, sn), o1, o2);
 }
 
 // Four floats to four e4m3 bytes, x0 in the low byte (round to nearest even, saturating at
@@ -225,10 +308,14 @@ struct PagedFp8Params {
     const float* v_scale;
     int H_q, H_kv, D, shift;
     int64_t width, rope_items, per_tok, total;
+    const __nv_bfloat16* q_norm;  // as PagedParams
+    const __nv_bfloat16* k_norm;
+    float eps;
 };
 
 // rope_append_paged_kernel with e4m3 caches: same items, a cache row is D bytes, and slot
 // offsets in elements are offsets in bytes.
+template <bool kNorm>
 __global__ void rope_append_paged_fp8_kernel(PagedFp8Params p) {
     const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= p.total) return;
@@ -262,16 +349,31 @@ __global__ void rope_append_paged_fp8_kernel(PagedFp8Params p) {
     if (h >= p.H_q && slot < 0) return;
     const int half = p.D / 2;
     const int64_t pos = p.pos[tok];
+    [[maybe_unused]] bf16x8 x1, x2;  // the normalized row, its tables loaded first
+    [[maybe_unused]] CosSin8 t;
+    if constexpr (kNorm) {
+        t = ld_cs8(p.cos + pos * p.D + c, p.sin + pos * p.D + c);
+        load_qk_norm16(row + h * p.D + c, half, h < p.H_q ? p.q_norm : p.k_norm, c, per_row, p.eps,
+                       x1, x2);
+    }
     if (h < p.H_q) {
         bf16x8 o1, o2;
-        rotate8(row + h * p.D + c, half, p.cos + pos * p.D + c, p.sin + pos * p.D + c, o1, o2);
+        if constexpr (kNorm) {
+            rotate8(x1, x2, t, o1, o2);
+        } else {
+            rotate8(row + h * p.D + c, half, p.cos + pos * p.D + c, p.sin + pos * p.D + c, o1, o2);
+        }
         __nv_bfloat16* dst = p.q + (tok * p.H_q + h) * p.D + c;
         *reinterpret_cast<bf16x8*>(dst) = o1;
         *reinterpret_cast<bf16x8*>(dst + half) = o2;
         return;
     }
     float o1[8], o2[8];
-    rotate8_f32(row + h * p.D + c, half, p.cos + pos * p.D + c, p.sin + pos * p.D + c, o1, o2);
+    if constexpr (kNorm) {
+        rotate8_f32(x1, x2, t, o1, o2);
+    } else {
+        rotate8_f32(row + h * p.D + c, half, p.cos + pos * p.D + c, p.sin + pos * p.D + c, o1, o2);
+    }
     const int kh = h - p.H_q;
     const float s = p.k_scale[kh];
     unsigned char* dst = p.k_cache + slot_offset(slot, p.H_kv, kh, p.shift, p.D) + c;
@@ -317,10 +419,24 @@ void rope_append_bf16(const __nv_bfloat16* qkv, const float* cos, const float* s
     SPARK_CHECK_LAUNCH();
 }
 
+// The QK norm's weights: both or neither, and D a power of two from 16 to 512 (a row's
+// D/16 threads in one warp).
+static void check_qk_norm(const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm, int D,
+                          float eps) {
+    SPARK_REQUIRE((q_norm == nullptr) == (k_norm == nullptr),
+                  "rope_append_paged: give both QK norm weights or neither");
+    if (q_norm == nullptr) return;
+    SPARK_REQUIRE(D <= 512 && (D & (D - 1)) == 0,
+                  "rope_append_paged: the QK norm needs D a power of two <= 512");
+    SPARK_REQUIRE(is_aligned16(q_norm) && is_aligned16(k_norm) && eps >= 0.f,
+                  "rope_append_paged: QK norm weights 16-byte aligned, eps >= 0");
+}
+
 void rope_append_paged_bf16(const __nv_bfloat16* qkv, const float* cos, const float* sin,
                             const int* positions, const int* slots, __nv_bfloat16* q,
                             __nv_bfloat16* k_cache, __nv_bfloat16* v_cache, int T, int H_q,
-                            int H_kv, int D, int page, cudaStream_t stream) {
+                            int H_kv, int D, int page, cudaStream_t stream,
+                            const __nv_bfloat16* q_norm, const __nv_bfloat16* k_norm, float eps) {
     SPARK_REQUIRE(qkv != nullptr && cos != nullptr && sin != nullptr && positions != nullptr &&
                       slots != nullptr && q != nullptr && k_cache != nullptr && v_cache != nullptr,
                   "rope_append_paged: null pointer");
@@ -332,6 +448,7 @@ void rope_append_paged_bf16(const __nv_bfloat16* qkv, const float* cos, const fl
     SPARK_REQUIRE(is_aligned16(qkv) && is_aligned16(cos) && is_aligned16(sin) && is_aligned16(q) &&
                       is_aligned16(k_cache) && is_aligned16(v_cache),
                   "rope_append_paged: needs 16-byte aligned pointers");
+    check_qk_norm(q_norm, k_norm, D, eps);
     PagedParams p;
     p.qkv = qkv;
     p.cos = cos;
@@ -351,7 +468,14 @@ void rope_append_paged_bf16(const __nv_bfloat16* qkv, const float* cos, const fl
     p.total = static_cast<int64_t>(T) * p.per_tok;
     const int64_t blocks = cdiv64(p.total, kBlock);
     SPARK_REQUIRE(blocks < (int64_t{1} << 31), "rope_append_paged: too many tokens");
-    rope_append_paged_kernel<<<static_cast<unsigned>(blocks), kBlock, 0, stream>>>(p);
+    p.q_norm = q_norm;
+    p.k_norm = k_norm;
+    p.eps = eps;
+    if (q_norm != nullptr) {
+        rope_append_paged_kernel<true><<<static_cast<unsigned>(blocks), kBlock, 0, stream>>>(p);
+    } else {
+        rope_append_paged_kernel<false><<<static_cast<unsigned>(blocks), kBlock, 0, stream>>>(p);
+    }
     SPARK_CHECK_LAUNCH();
 }
 
@@ -359,7 +483,8 @@ void rope_append_paged_fp8(const __nv_bfloat16* qkv, const float* cos, const flo
                            const int* positions, const int* slots, __nv_bfloat16* q,
                            __nv_fp8_e4m3* k_cache, __nv_fp8_e4m3* v_cache, const float* k_scale,
                            const float* v_scale, int T, int H_q, int H_kv, int D, int page,
-                           cudaStream_t stream) {
+                           cudaStream_t stream, const __nv_bfloat16* q_norm,
+                           const __nv_bfloat16* k_norm, float eps) {
     SPARK_REQUIRE(qkv != nullptr && cos != nullptr && sin != nullptr && positions != nullptr &&
                       slots != nullptr && q != nullptr && k_cache != nullptr &&
                       v_cache != nullptr && k_scale != nullptr && v_scale != nullptr,
@@ -372,6 +497,7 @@ void rope_append_paged_fp8(const __nv_bfloat16* qkv, const float* cos, const flo
     SPARK_REQUIRE(is_aligned16(qkv) && is_aligned16(cos) && is_aligned16(sin) && is_aligned16(q) &&
                       is_aligned16(k_cache) && is_aligned16(v_cache),
                   "rope_append_paged_fp8: needs 16-byte aligned pointers");
+    check_qk_norm(q_norm, k_norm, D, eps);
     PagedFp8Params p;
     p.qkv = qkv;
     p.cos = cos;
@@ -393,7 +519,15 @@ void rope_append_paged_fp8(const __nv_bfloat16* qkv, const float* cos, const flo
     p.total = static_cast<int64_t>(T) * p.per_tok;
     const int64_t blocks = cdiv64(p.total, kBlock);
     SPARK_REQUIRE(blocks < (int64_t{1} << 31), "rope_append_paged_fp8: too many tokens");
-    rope_append_paged_fp8_kernel<<<static_cast<unsigned>(blocks), kBlock, 0, stream>>>(p);
+    p.q_norm = q_norm;
+    p.k_norm = k_norm;
+    p.eps = eps;
+    if (q_norm != nullptr) {
+        rope_append_paged_fp8_kernel<true><<<static_cast<unsigned>(blocks), kBlock, 0, stream>>>(p);
+    } else {
+        rope_append_paged_fp8_kernel<false>
+            <<<static_cast<unsigned>(blocks), kBlock, 0, stream>>>(p);
+    }
     SPARK_CHECK_LAUNCH();
 }
 
