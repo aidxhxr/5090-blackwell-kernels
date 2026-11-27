@@ -498,15 +498,18 @@ void grouped_gemm_swiglu_fp8(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* W, con
 // ladder that uses them is linear_cross_entropy in python/spark_kernels/ops.py
 // (docs/design/cross_entropy.md). h [T, D] and w [V, D] bf16, both D-contiguous (w is the
 // lm_head as nn.Linear stores it), targets int64 [T]; a row "counts" when its target is in
-// [0, V) and not ignore_index.
-// The fused row kernel on materialized bf16 logits [rows][V]: loss[r] and lse[r] in fp32
-// (0 for a row that does not count) and, when scale is not null, the gradient row
-// (softmax - one-hot) * scale[0] written over the logits in bf16 (zeros for a row that does
-// not count). One 1024-thread block per row on a grid of one block per SM; the row is read
-// twice, the second time from L2. V % 8 == 0, 16-byte aligned logits.
-void cross_entropy_rows_bf16(__nv_bfloat16* logits, const int64_t* targets, int rows, int V,
+// [0, V) and not ignore_index. V is any size >= 1: a [T][V] logits or gradient buffer has
+// rows of Vp = V rounded up to 128 (zero past V). softcap > 0 puts the loss on the capped
+// logits softcap * tanh(z / softcap) (Gemma 2, Inkling 2) and the gradient tiles get the
+// factor 1 - tanh^2(z / softcap); 0 is no cap.
+// The fused row kernel on materialized bf16 logits [rows][ld] with V valid columns: loss[r]
+// and lse[r] in fp32 (0 for a row that does not count) and, when scale is not null, the
+// gradient row (softmax - one-hot) * scale[0] written over the logits in bf16 (zeros for a
+// row that does not count and past V). One 1024-thread block per row on a grid of one block
+// per SM; the row is read twice, the second time from L2. ld % 8 == 0, 16-byte aligned logits.
+void cross_entropy_rows_bf16(__nv_bfloat16* logits, const int64_t* targets, int rows, int V, int ld,
                              int ignore_index, const float* scale, float* loss, float* lse,
-                             cudaStream_t stream);
+                             float softcap, cudaStream_t stream);
 // out[c][r] = x[r][c] for r < rows, 0 for rows <= r < ld; x has row stride ldx, out is
 // [ncols][ld]. The K-contiguous A operand of dw += g^T h from a slab of the gradient.
 void transpose_pad_bf16(const __nv_bfloat16* x, int rows, int ldx, __nv_bfloat16* out, int ncols,
@@ -514,13 +517,14 @@ void transpose_pad_bf16(const __nv_bfloat16* x, int rows, int ldx, __nv_bfloat16
 // ce_gemm_bf16: x = h w^T in fp32 on a persistent TMA kernel (grouped_gemm's bf16 mainloop
 // and Stream-K schedule, one expert), then one of three epilogues on each finished 128x128
 // tile:
-//   CE_GEMM_LOGITS  out [T][V] = bf16(x)
-//   CE_GEMM_STATS   partials [T][V/128][2] fp32 = (max, sum exp(x - max)) of the row over
+//   CE_GEMM_LOGITS  out [T][Vp] = bf16(x) (the raw logits, no cap; 0 past V)
+//   CE_GEMM_STATS   partials [T][Vp/128][2] fp32 = (max, sum exp(x - max)) of the row over
 //                   the tile's columns, target_logit [T] = x[row][y] (rows that count); no
 //                   logits are written. ce_combine turns them into lse and loss.
-//   CE_GEMM_GRAD    out [T][V] = bf16((exp(x - lse[row]) - [col == y]) * scale[0]), 0 on
-//                   rows that do not count: d loss / d logits for a reduction scale.
-// Requires V % 128 == 0, D % 64 == 0, 16-byte aligned h and w; any T >= 1. Deterministic.
+//   CE_GEMM_GRAD    out [T][Vp] = bf16((exp(x - lse[row]) - [col == y]) * scale[0]), 0 on
+//                   rows that do not count and past V: d loss / d logits for a reduction
+//                   scale (times 1 - tanh^2 with a softcap, x then being the capped logit).
+// Requires D % 64 == 0, 16-byte aligned h and w; any T >= 1 and V >= 1. Deterministic.
 // Not safe to run concurrently on two streams (one Stream-K workspace).
 enum CeGemmMode { CE_GEMM_LOGITS = 0, CE_GEMM_STATS = 1, CE_GEMM_GRAD = 2 };
 struct CeGemmEpilogue {
@@ -531,6 +535,7 @@ struct CeGemmEpilogue {
     int ignore_index = -100;
     const float* lse = nullptr;    // GRAD: [T]
     const float* scale = nullptr;  // GRAD: [1] on the device
+    float softcap = 0.f;           // STATS, GRAD: the logit softcap, 0 for none
 };
 void ce_gemm_bf16(const __nv_bfloat16* h, const __nv_bfloat16* w, int T, int V, int D, int mode,
                   const CeGemmEpilogue& ep, cudaStream_t stream);
@@ -555,9 +560,10 @@ struct CeBackwardArgs {
     float* dh = nullptr;          // [cdiv(T, 128) * 128][D] fp32, zero on entry
     float* slots = nullptr;       // [slots_n * 128][D] fp32, zero on entry and exit
     int slots_n = 0;              // recycled strips in `slots`; ce_backward_slots() is the default
-    int* flags = nullptr;         // [2 * V / 128 + 1] int32, zero on entry
+    int* flags = nullptr;         // [2 * Vp / 128 + 1] int32, zero on entry
     __nv_bfloat16* dw = nullptr;  // [V][D]
     bool first = true;            // this band stores dw; later bands add to it
+    float softcap = 0.f;          // the logit softcap, 0 for none
 };
 void ce_backward_bf16(const __nv_bfloat16* h, const __nv_bfloat16* w, int T, int V, int D,
                       const CeBackwardArgs& a, cudaStream_t stream);

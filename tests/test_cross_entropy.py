@@ -119,16 +119,16 @@ def test_every_row_ignored_is_nan_like_torch(sk):
 
 
 def test_unsupported_shapes(sk):
-    h, w, y = _inputs(64, 64, 256)
-    w200 = w[:200].contiguous()
-    y = torch.where(y >= 200, y - 200, y)
+    h, w, y = _inputs(64, 96, 256)
     with pytest.raises(ValueError):
-        sk.linear_cross_entropy(h, w200, y, variant=1)
+        sk.linear_cross_entropy(h, w, y, variant=1)
     with pytest.raises(ValueError):
         sk.linear_cross_entropy(h, w, y, reduction="none")
-    # the default steps down to torch for a vocabulary that is not a multiple of 128
-    ref, _, _ = _reference(h, w200, y)
-    torch.testing.assert_close(sk.linear_cross_entropy(h, w200, y), ref, atol=2e-3, rtol=2e-3)
+    with pytest.raises(ValueError):
+        sk.linear_cross_entropy(h, w, y, softcap=0.0)
+    # the default steps down to torch for a hidden size that is not a multiple of 64
+    ref, _, _ = _reference(h, w, y)
+    torch.testing.assert_close(sk.linear_cross_entropy(h, w, y), ref, atol=2e-3, rtol=2e-3)
 
 
 # ---- the pieces --------------------------------------------------------------------------

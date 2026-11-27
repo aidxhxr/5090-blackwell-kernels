@@ -22,6 +22,12 @@
 // plus one wave split along K Stream-K style and summed through hgemm's deterministic
 // chain fixup. Only the epilogue is new, and it runs once per tile, on the finished fp32
 // sums (the piece that ends a tile's K chain), so every mode gives the same bits every run.
+//
+// Every kernel takes an optional logit softcap c (Gemma 2's and Inkling 2's x = c tanh(z / c)
+// on the raw logit z, 0 for none): the loss is over the capped logits and the gradient tiles
+// carry the chain rule's 1 - tanh^2(z / c). V is any size: the last 128-column tile reads
+// w's missing rows as zeros (the TMA fills them) and the epilogues mask its columns past V;
+// a logits or gradient buffer has rows of V rounded up to 128, zero past V.
 
 #include <cuda_bf16.h>
 
@@ -41,6 +47,21 @@ namespace ce {
 
 constexpr float kLog2e = 1.4426950408889634f;
 
+// tanh(z / c) from one exp2, 1 - 2 / (1 + e^(2u)), the argument clamped to |u| <= 15 where
+// tanh is 1 to fp32's precision, so the exponential stays finite.
+__device__ __forceinline__ float cap_tanh(float z, float inv_c) {
+    const float u = fminf(fmaxf(z * inv_c, -15.f), 15.f);
+    return 1.f - __fdividef(2.f, 1.f + exp2f(u * (2.f * kLog2e)));
+}
+
+// A raw logit z as (the logit the loss sees, d it / d z): (c tanh(z / c), 1 - tanh^2(z / c))
+// with a softcap, (z, 1) without (cap 0). The branch is uniform: every lane has the same cap.
+__device__ __forceinline__ float2 capped(float z, float cap, float inv_cap) {
+    if (cap == 0.f) return make_float2(z, 1.f);
+    const float t = cap_tanh(z, inv_cap);
+    return make_float2(cap * t, fmaf(-t, t, 1.f));
+}
+
 // (max, sum) merge of the online softmax; an empty side is (-inf, 0).
 __device__ __forceinline__ void merge(float& m, float& s, float m2, float s2) {
     const float mx = fmaxf(m, m2);
@@ -56,7 +77,9 @@ __device__ __forceinline__ void merge(float& m, float& s, float m2, float s2) {
 // Pass 1 is the online (max, sum) over 16-byte vectors; thread 0 reads the target's logit
 // before the reduction, since pass 2 overwrites the row in place. Pass 2 writes
 // (exp(x - lse) - [col == y]) * scale over the logits. A row that does not count is zeroed
-// without being read.
+// without being read. Rows are `ld` wide (a multiple of 8) and hold V valid columns: pass 1
+// masks the rest and pass 2 writes them as zeros, so a GEMM over all ld columns adds nothing.
+// With a softcap x is c tanh(z / c) of the stored z and the gradient is times 1 - tanh^2.
 constexpr int ROW_THREADS = 1024;
 
 __device__ __forceinline__ void block_merge(float& m, float& s, float2* sh) {
@@ -91,13 +114,16 @@ __device__ __forceinline__ void block_merge(float& m, float& s, float2* sh) {
 
 __global__ void __launch_bounds__(ROW_THREADS)
     ce_rows_kernel(__nv_bfloat16* __restrict__ logits, const int64_t* __restrict__ targets,
-                   int rows, int V, int ignore_index, const float* __restrict__ scale,
-                   float* __restrict__ loss, float* __restrict__ lse_out, bool write_grad) {
+                   int rows, int V, int ld, int ignore_index, const float* __restrict__ scale,
+                   float* __restrict__ loss, float* __restrict__ lse_out, bool write_grad,
+                   float cap) {
     __shared__ float2 sh[33];
-    const int nvec = V / 8;
+    const int nvec = ld / 8;
+    const int nvec_v = cdiv(V, 8);  // the vectors that hold a valid column
     const float sc = write_grad ? __ldg(scale) : 0.f;
+    const float inv_cap = cap > 0.f ? 1.f / cap : 0.f;
     for (int row = blockIdx.x; row < rows; row += gridDim.x) {
-        bf16x8* x = reinterpret_cast<bf16x8*>(logits + static_cast<size_t>(row) * V);
+        bf16x8* x = reinterpret_cast<bf16x8*>(logits + static_cast<size_t>(row) * ld);
         const long long y = targets[row];
         const bool counts = y != ignore_index && y >= 0 && y < V;
         if (!counts) {  // uniform across the block
@@ -114,19 +140,27 @@ __global__ void __launch_bounds__(ROW_THREADS)
             continue;
         }
         float xy = 0.f;
-        if (threadIdx.x == 0) xy = __bfloat162float(logits[static_cast<size_t>(row) * V + y]);
+        if (threadIdx.x == 0)
+            xy =
+                capped(__bfloat162float(logits[static_cast<size_t>(row) * ld + y]), cap, inv_cap).x;
         float m = -INFINITY, s = 0.f;
-        for (int i = threadIdx.x; i < nvec; i += blockDim.x) {
+        for (int i = threadIdx.x; i < nvec_v; i += blockDim.x) {
             const bf16x8 v = x[i];
             float f[8];
             float lm = -INFINITY;
 #pragma unroll
             for (int e = 0; e < 4; ++e) {
                 const float2 q = __bfloat1622float2(v.h[e]);
-                f[2 * e] = q.x;
-                f[2 * e + 1] = q.y;
-                lm = fmaxf(lm, fmaxf(q.x, q.y));
+                f[2 * e] = capped(q.x, cap, inv_cap).x;
+                f[2 * e + 1] = capped(q.y, cap, inv_cap).x;
             }
+            if (i * 8 + 8 > V) {  // the vector that straddles V
+#pragma unroll
+                for (int e = 0; e < 8; ++e)
+                    if (i * 8 + e >= V) f[e] = -INFINITY;
+            }
+#pragma unroll
+            for (int e = 0; e < 8; ++e) lm = fmaxf(lm, f[e]);
             if (lm > m) {
                 s *= exp2f((m - lm) * kLog2e);
                 m = lm;
@@ -149,11 +183,16 @@ __global__ void __launch_bounds__(ROW_THREADS)
 #pragma unroll
             for (int e = 0; e < 4; ++e) {
                 const float2 q = __bfloat1622float2(v.h[e]);
-                float p0 = exp2f(fmaf(q.x, kLog2e, -lb));
-                float p1 = exp2f(fmaf(q.y, kLog2e, -lb));
-                if (i * 8 + 2 * e == yv) p0 -= 1.f;
-                if (i * 8 + 2 * e + 1 == yv) p1 -= 1.f;
-                v.h[e] = __floats2bfloat162_rn(p0 * sc, p1 * sc);
+                const int c0 = i * 8 + 2 * e;
+                const float2 a = capped(q.x, cap, inv_cap);
+                const float2 b = capped(q.y, cap, inv_cap);
+                float p0 = exp2f(fmaf(a.x, kLog2e, -lb));
+                float p1 = exp2f(fmaf(b.x, kLog2e, -lb));
+                if (c0 == yv) p0 -= 1.f;
+                if (c0 + 1 == yv) p1 -= 1.f;
+                p0 = c0 < V ? p0 * a.y * sc : 0.f;
+                p1 = c0 + 1 < V ? p1 * b.y * sc : 0.f;
+                v.h[e] = __floats2bfloat162_rn(p0, p1);
             }
             x[i] = v;
         }
@@ -223,9 +262,10 @@ constexpr int smem_bytes() {
 static_assert(smem_bytes() <= 101376, "two 32 KB stages and the exchange fit");
 
 struct Params {
-    int M, N;      // T rows of h, V rows of w
+    int M, N;      // T rows of h; N = tiles_n * BN, the row stride of out
+    int V;         // rows of w: the valid columns, N - BN < V <= N
     int tiles_m;   // cdiv(M, BM)
-    int tiles_n;   // N / BN
+    int tiles_n;   // cdiv(V, BN)
     int KT;        // k-steps per tile
     int grid;      // resident blocks
     float* slots;  // 2 * grid Stream-K tiles of BM x BN fp32
@@ -238,6 +278,7 @@ struct Params {
     int ignore_index;
     const float* lse;    // GRAD: [M]
     const float* scale;  // GRAD: [1], d loss / d loss_row for a row that counts
+    float cap, inv_cap;  // STATS, GRAD: the logit softcap and 1 / it, 0 for none
 };
 
 struct Split {
@@ -301,12 +342,25 @@ __device__ __forceinline__ void bf16_stage(const unsigned char* as, const unsign
 // so two shuffles give the warp's (max, sum) over its 32 columns; the four warp columns meet
 // in shared memory and one thread per row merges them and writes the tile's pair. The lane
 // that holds the target column writes the target's logit; exactly one lane in the grid does.
-__device__ __forceinline__ void epi_stats(const Acc& acc, const Params& p, int row0, int nt,
-                                          float2* red, int wm, int wn, int lane, int tid) {
+// The softcap and the vocabulary tail (columns past V as -inf) go on the sums first, in place.
+__device__ __forceinline__ void epi_stats(Acc& acc, const Params& p, int row0, int nt, float2* red,
+                                          int wm, int wn, int lane, int tid) {
     constexpr int MT = C::MT, NT = C::NT;
     const int g = lane >> 2;
     const int t = lane & 3;
     const int bn = nt * BN;
+    if (p.cap > 0.f || bn + BN > p.V) {
+#pragma unroll
+        for (int mi = 0; mi < MT; ++mi)
+#pragma unroll
+            for (int nj = 0; nj < NT; ++nj)
+#pragma unroll
+                for (int q = 0; q < 4; ++q) {
+                    const int col = bn + wn * C::WCOLS + nj * 8 + 2 * t + (q & 1);
+                    const float x = capped(acc[mi][nj][q], p.cap, p.inv_cap).x;
+                    acc[mi][nj][q] = col < p.V ? x : -INFINITY;
+                }
+    }
 #pragma unroll
     for (int mi = 0; mi < MT; ++mi) {
 #pragma unroll
@@ -317,7 +371,7 @@ __device__ __forceinline__ void epi_stats(const Acc& acc, const Params& p, int r
                 m = fmaxf(m, fmaxf(acc[mi][nj][2 * h], acc[mi][nj][2 * h + 1]));
             m = fmaxf(m, __shfl_xor_sync(kFullMask, m, 1));
             m = fmaxf(m, __shfl_xor_sync(kFullMask, m, 2));
-            const float mb = m * kLog2e;
+            const float mb = m == -INFINITY ? 0.f : m * kLog2e;  // 32 masked columns: (-inf, 0)
             float s = 0.f;
 #pragma unroll
             for (int nj = 0; nj < NT; ++nj)
@@ -349,6 +403,7 @@ __device__ __forceinline__ void epi_stats(const Acc& acc, const Params& p, int r
 
 // GRAD epilogue: g = (exp(x - lse) - [col == y]) * scale, 0 on a row that does not count,
 // rounded once to bf16 and stored like the plain epilogue (two columns per 4-byte store).
+// With a softcap x is c tanh(z / c) and g is also times 1 - tanh^2; columns past V are 0.
 __device__ __forceinline__ void epi_grad(const Acc& acc, const Params& p, int row0, int bn, int wm,
                                          int wn, int lane) {
     constexpr int MT = C::MT, NT = C::NT;
@@ -362,17 +417,19 @@ __device__ __forceinline__ void epi_grad(const Acc& acc, const Params& p, int ro
             const int row = row0 + wm * C::WROWS + mi * 16 + g + 8 * h;
             if (row >= p.M) continue;
             const long long y = __ldg(p.targets + row);
-            const bool counts = y != p.ignore_index && y >= 0 && y < p.N;
+            const bool counts = y != p.ignore_index && y >= 0 && y < p.V;
             const float coef = counts ? scale : 0.f;
             const float lb = __ldg(p.lse + row) * kLog2e;
             __nv_bfloat16* out = p.out + static_cast<size_t>(row) * p.N;
 #pragma unroll
             for (int nj = 0; nj < NT; ++nj) {
                 const int col = bn + wn * C::WCOLS + nj * 8 + c2;
-                const float p0 = exp2f(fmaf(acc[mi][nj][2 * h], kLog2e, -lb)) - (col == y);
-                const float p1 = exp2f(fmaf(acc[mi][nj][2 * h + 1], kLog2e, -lb)) - (col + 1 == y);
-                *reinterpret_cast<__nv_bfloat162*>(out + col) =
-                    __floats2bfloat162_rn(p0 * coef, p1 * coef);
+                const float2 a = capped(acc[mi][nj][2 * h], p.cap, p.inv_cap);
+                const float2 b = capped(acc[mi][nj][2 * h + 1], p.cap, p.inv_cap);
+                const float p0 = (exp2f(fmaf(a.x, kLog2e, -lb)) - (col == y)) * a.y;
+                const float p1 = (exp2f(fmaf(b.x, kLog2e, -lb)) - (col + 1 == y)) * b.y;
+                *reinterpret_cast<__nv_bfloat162*>(out + col) = __floats2bfloat162_rn(
+                    col < p.V ? p0 * coef : 0.f, col + 1 < p.V ? p1 * coef : 0.f);
             }
         }
     }
@@ -601,9 +658,10 @@ void launch(const __nv_bfloat16* h, const __nv_bfloat16* w, int M, int N, int K,
     if (++ws.epoch == 0) ws.epoch = 1;
 
     p.M = M;
-    p.N = N;
+    p.V = N;
     p.tiles_m = cdiv(M, BM);
-    p.tiles_n = N / BN;
+    p.tiles_n = cdiv(N, BN);
+    p.N = p.tiles_n * BN;
     p.KT = kbytes / BKB;
     p.grid = grid;
     p.slots = ws.slots;
@@ -729,6 +787,7 @@ struct __align__(8) bf16x4 {
 
 struct Params {
     int M;  // rows of h in this band
+    int V;  // rows of w; the last strip's columns past V are masked
     int tiles_m, tiles_n, KT;
     int grid;
     int D;
@@ -736,13 +795,14 @@ struct Params {
     const float* lse;        // [M]
     const float* scale;      // [1]
     int ignore_index;
-    __nv_bfloat16* dw;  // [V][D]
-    float* slots;       // [nslots * 128][D] fp32, zero between uses
-    int* done;          // [tiles_n] tiles of the strip completed
-    int* folded;        // [tiles_n] 1 once the strip is in dw and its slot is zero again
-    int* next_tile;     // [1] the tile counter: blocks take tiles in order as they free up
-    int first;          // first band: dw = slot, else dw += slot
-    int nslots;         // recycled fp32 strips the slots buffer holds
+    __nv_bfloat16* dw;   // [V][D]
+    float* slots;        // [nslots * 128][D] fp32, zero between uses
+    int* done;           // [tiles_n] tiles of the strip completed
+    int* folded;         // [tiles_n] 1 once the strip is in dw and its slot is zero again
+    int* next_tile;      // [1] the tile counter: blocks take tiles in order as they free up
+    int first;           // first band: dw = slot, else dw += slot
+    int nslots;          // recycled fp32 strips the slots buffer holds
+    float cap, inv_cap;  // the logit softcap and 1 / it, 0 for none
 };
 
 __device__ __forceinline__ int ld_acquire_gpu_s32(const int* p) {
@@ -819,7 +879,8 @@ __device__ __forceinline__ void step(const unsigned char* as, const unsigned cha
 }
 
 // The gradient tile into shared memory: g = bf16((exp(x - lse) - [col == y]) * scale), 0 on
-// a row that does not count or past M. Row r of G is 256 bytes, 16-byte chunk c stored at
+// a row that does not count, past M or past V (with a softcap x is c tanh(z / c) and g is
+// also times 1 - tanh^2, as in ce::epi_grad). Row r of G is 256 bytes, 16-byte chunk c stored at
 // chunk c ^ (r & 7), so that the 8 rows of an ldmatrix matrix, with or without .trans, land
 // in 8 different bank groups.
 __device__ __forceinline__ void grad_to_smem(const AccM& acc, const Params& p, unsigned char* G,
@@ -836,7 +897,7 @@ __device__ __forceinline__ void grad_to_smem(const AccM& acc, const Params& p, u
             const int row = row0 + r;
             const bool in = row < p.M;
             const long long y = in ? __ldg(p.targets + row) : -1;
-            const bool counts = in && y != p.ignore_index && y >= 0 && y < p.tiles_n * BN;
+            const bool counts = in && y != p.ignore_index && y >= 0 && y < p.V;
             const float coef = counts ? scale : 0.f;
             const float lb = in ? __ldg(p.lse + row) * kLog2e : 0.f;
             unsigned char* grow = G + r * G_ROW;
@@ -844,11 +905,14 @@ __device__ __forceinline__ void grad_to_smem(const AccM& acc, const Params& p, u
             for (int nj = 0; nj < NT; ++nj) {
                 const int c = wn * Cm::WCOLS + nj * 8 + 2 * t;  // column within the tile
                 const int col = bn + c;
-                const float p0 = exp2f(fmaf(acc[mi][nj][2 * h], kLog2e, -lb)) - (col == y);
-                const float p1 = exp2f(fmaf(acc[mi][nj][2 * h + 1], kLog2e, -lb)) - (col + 1 == y);
+                const float2 a = capped(acc[mi][nj][2 * h], p.cap, p.inv_cap);
+                const float2 b = capped(acc[mi][nj][2 * h + 1], p.cap, p.inv_cap);
+                const float p0 = (exp2f(fmaf(a.x, kLog2e, -lb)) - (col == y)) * a.y;
+                const float p1 = (exp2f(fmaf(b.x, kLog2e, -lb)) - (col + 1 == y)) * b.y;
                 const int ch = (c >> 3) ^ (r & 7);
                 *reinterpret_cast<__nv_bfloat162*>(grow + ch * 16 + (c & 7) * 2) =
-                    __floats2bfloat162_rn(p0 * coef, p1 * coef);
+                    __floats2bfloat162_rn(col < p.V ? p0 * coef : 0.f,
+                                          col + 1 < p.V ? p1 * coef : 0.f);
             }
         }
     }
@@ -947,7 +1011,10 @@ __device__ __forceinline__ void bulk_store_hint(void* gmem_dst, const void* smem
 // once the tile is done): a bulk load of the slot chunk and of the dw chunk, the add and
 // the rounding by the threads in place, a bulk store of the bf16 chunk to dw and of the
 // zeroed chunk back to the slot, FOLD_BUFS chunks in flight with the next chunk's loads
-// issued before this chunk's wait: 110 us per strip measured, 0.6 ms of a block's band.
+// issued before this chunk's wait: 110 us per strip measured, 0.6 ms of a block's band. The
+// last strip of a V that is not a multiple of 128 folds only its rows below V (the slot's
+// other rows only ever had zeros added), so its last chunk may be short: a multiple of 64
+// floats, since D is.
 constexpr int FOLD_CHUNK = 2048;  // floats: 8 KB fp32, 4 KB bf16
 constexpr int FOLD_F32 = FOLD_CHUNK * 4;
 constexpr int FOLD_BF16 = FOLD_CHUNK * 2;
@@ -959,16 +1026,19 @@ __device__ __forceinline__ void fold_strip(const Params& p, int nt, int tid, uns
     const int slot = nt % p.nslots;
     float* s = p.slots + static_cast<size_t>(slot) * BN * p.D;
     __nv_bfloat16* dw = p.dw + static_cast<size_t>(nt) * BN * p.D;
-    const int chunks = BN * p.D / FOLD_CHUNK;
+    const int total = min(BN, p.V - nt * BN) * p.D;  // floats of the strip below V
+    const int chunks = cdiv(total, FOLD_CHUNK);
+    auto len = [&](int c) { return min(FOLD_CHUNK, total - c * FOLD_CHUNK); };
     const unsigned long long evict_first = policy_evict_first();
     const unsigned long long evict_last = policy_evict_last();
     auto load = [&](int c) {
         const int buf = c % FOLD_BUFS;
-        mbar_arrive_expect_tx(&fold_bar[buf], FOLD_F32 + (p.first ? 0 : FOLD_BF16));
-        bulk_load(G + buf * FOLD_F32, s + static_cast<size_t>(c) * FOLD_CHUNK, FOLD_F32,
+        const unsigned n = len(c);
+        mbar_arrive_expect_tx(&fold_bar[buf], n * 4 + (p.first ? 0 : n * 2));
+        bulk_load(G + buf * FOLD_F32, s + static_cast<size_t>(c) * FOLD_CHUNK, n * 4,
                   &fold_bar[buf]);
         if (!p.first)
-            bulk_load_hint(P + buf * FOLD_BF16, dw + static_cast<size_t>(c) * FOLD_CHUNK, FOLD_BF16,
+            bulk_load_hint(P + buf * FOLD_BF16, dw + static_cast<size_t>(c) * FOLD_CHUNK, n * 2,
                            &fold_bar[buf], evict_first);
     };
     if (tid == 0) load(0);
@@ -983,9 +1053,11 @@ __device__ __forceinline__ void fold_strip(const Params& p, int nt, int tid, uns
             load(c + 1);
         }
         mbar_wait(&fold_bar[buf], (c / FOLD_BUFS) & 1);
+        const int n = len(c);
 #pragma unroll
         for (int j = 0; j < FOLD_CHUNK / 4 / CONSUMERS; ++j) {
             const int i = tid + j * CONSUMERS;
+            if (i * 4 >= n) break;
             float4 v = f[i];
             if (!p.first) {
                 const bf16x4 prev = h[i];
@@ -1005,8 +1077,8 @@ __device__ __forceinline__ void fold_strip(const Params& p, int nt, int tid, uns
         fence_proxy_async_smem();
         named_barrier_sync(BAR_EPI, CONSUMERS);
         if (tid == 0) {
-            bulk_store_hint(dw + static_cast<size_t>(c) * FOLD_CHUNK, h, FOLD_BF16, evict_first);
-            bulk_store_hint(s + static_cast<size_t>(c) * FOLD_CHUNK, f, FOLD_F32, evict_last);
+            bulk_store_hint(dw + static_cast<size_t>(c) * FOLD_CHUNK, h, n * 2, evict_first);
+            bulk_store_hint(s + static_cast<size_t>(c) * FOLD_CHUNK, f, n * 4, evict_last);
             asm volatile("cp.async.bulk.commit_group;\n" ::: "memory");
         }
     }
@@ -1215,15 +1287,17 @@ int resident_blocks() {
 
 }  // namespace
 
-void cross_entropy_rows_bf16(__nv_bfloat16* logits, const int64_t* targets, int rows, int V,
+void cross_entropy_rows_bf16(__nv_bfloat16* logits, const int64_t* targets, int rows, int V, int ld,
                              int ignore_index, const float* scale, float* loss, float* lse,
-                             cudaStream_t stream) {
-    SPARK_REQUIRE(V > 0 && V % 8 == 0, "cross_entropy_rows: V must be a multiple of 8");
+                             float softcap, cudaStream_t stream) {
+    SPARK_REQUIRE(ld > 0 && ld % 8 == 0, "cross_entropy_rows: ld must be a multiple of 8");
+    SPARK_REQUIRE(V >= 1 && V <= ld, "cross_entropy_rows: needs 1 <= V <= ld");
+    SPARK_REQUIRE(softcap >= 0.f, "cross_entropy_rows: softcap must be >= 0 (0 for none)");
     SPARK_REQUIRE(is_aligned16(logits), "cross_entropy_rows: logits must be 16-byte aligned");
     if (rows <= 0) return;
     const int grid = std::min(rows, num_sms());
-    ce::ce_rows_kernel<<<grid, ce::ROW_THREADS, 0, stream>>>(logits, targets, rows, V, ignore_index,
-                                                             scale, loss, lse, scale != nullptr);
+    ce::ce_rows_kernel<<<grid, ce::ROW_THREADS, 0, stream>>>(
+        logits, targets, rows, V, ld, ignore_index, scale, loss, lse, scale != nullptr, softcap);
     SPARK_CHECK_LAUNCH();
 }
 
@@ -1237,14 +1311,14 @@ void transpose_pad_bf16(const __nv_bfloat16* x, int rows, int ldx, __nv_bfloat16
 }
 
 bool ce_gemm_supports(int V, int D) {
-    return V >= ce::BN && V % ce::BN == 0 && D > 0 && D % 64 == 0;
+    return V >= 1 && D > 0 && D % 64 == 0;
 }
 
 void ce_gemm_bf16(const __nv_bfloat16* h, const __nv_bfloat16* w, int T, int V, int D, int mode,
                   const CeGemmEpilogue& ep, cudaStream_t stream) {
-    SPARK_REQUIRE(ce_gemm_supports(V, D),
-                  "ce_gemm: requires V a multiple of 128 and D a multiple of 64");
+    SPARK_REQUIRE(ce_gemm_supports(V, D), "ce_gemm: requires V >= 1 and D a multiple of 64");
     SPARK_REQUIRE(h && w, "ce_gemm: null pointer");
+    SPARK_REQUIRE(ep.softcap >= 0.f, "ce_gemm: softcap must be >= 0 (0 for none)");
     SPARK_REQUIRE(is_aligned16(h) && is_aligned16(w), "ce_gemm: h and w must be 16-byte aligned");
     if (T <= 0) return;
     ce::Params p{};
@@ -1255,6 +1329,8 @@ void ce_gemm_bf16(const __nv_bfloat16* h, const __nv_bfloat16* w, int T, int V, 
     p.ignore_index = ep.ignore_index;
     p.lse = ep.lse;
     p.scale = ep.scale;
+    p.cap = ep.softcap;
+    p.inv_cap = ep.softcap > 0.f ? 1.f / ep.softcap : 0.f;
     switch (mode) {
         case CE_GEMM_LOGITS:
             SPARK_REQUIRE(ep.out, "ce_gemm (logits): needs out");
@@ -1281,7 +1357,7 @@ void ce_combine(const float* partials, const float* target_logit, const int64_t*
     constexpr int threads = 256;
     const int rows_per_block = threads / 32;
     ce::ce_combine_kernel<<<cdiv(T, rows_per_block), threads, 0, stream>>>(
-        reinterpret_cast<const float2*>(partials), target_logit, targets, T, V / ce::BN, V,
+        reinterpret_cast<const float2*>(partials), target_logit, targets, T, cdiv(V, ce::BN), V,
         ignore_index, lse, loss);
     SPARK_CHECK_LAUNCH();
 }
@@ -1293,8 +1369,8 @@ int ce_backward_slots() {
 void ce_backward_bf16(const __nv_bfloat16* h, const __nv_bfloat16* w, int T, int V, int D,
                       const CeBackwardArgs& a, cudaStream_t stream) {
     using namespace ce::bwd;
-    SPARK_REQUIRE(ce_gemm_supports(V, D),
-                  "ce_backward: requires V a multiple of 128 and D a multiple of 64");
+    SPARK_REQUIRE(ce_gemm_supports(V, D), "ce_backward: requires V >= 1 and D a multiple of 64");
+    SPARK_REQUIRE(a.softcap >= 0.f, "ce_backward: softcap must be >= 0 (0 for none)");
     SPARK_REQUIRE(h && w && a.targets && a.lse && a.scale && a.dh && a.slots && a.flags && a.dw,
                   "ce_backward: null pointer");
     SPARK_REQUIRE(is_aligned16(h) && is_aligned16(w) && is_aligned16(a.dh) &&
@@ -1315,8 +1391,9 @@ void ce_backward_bf16(const __nv_bfloat16* h, const __nv_bfloat16* w, int T, int
                                                 BK, CU_TENSOR_MAP_SWIZZLE_128B);
     Params p{};
     p.M = T;
+    p.V = V;
     p.tiles_m = tiles_m;
-    p.tiles_n = V / BN;
+    p.tiles_n = cdiv(V, BN);
     p.KT = D / BK;
     p.grid = grid;
     p.D = D;
@@ -1331,6 +1408,8 @@ void ce_backward_bf16(const __nv_bfloat16* h, const __nv_bfloat16* w, int T, int
     p.next_tile = a.flags + 2 * p.tiles_n;
     p.first = a.first ? 1 : 0;
     p.nslots = a.slots_n;
+    p.cap = a.softcap;
+    p.inv_cap = a.softcap > 0.f ? 1.f / a.softcap : 0.f;
     ce_bwd_kernel<<<grid, THREADS, smem_bytes(), stream>>>(tmA, tmB, tmDh, tmDw, p);
     SPARK_CHECK_LAUNCH();
 }

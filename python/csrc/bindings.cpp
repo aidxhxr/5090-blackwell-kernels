@@ -860,7 +860,7 @@ CeShape ce_check(const Tensor& h, const Tensor& w, const Tensor* targets, const 
     const CeShape s{static_cast<int>(h.size(0)), static_cast<int>(w.size(0)),
                     static_cast<int>(h.size(1))};
     TORCH_CHECK(spark::ce_gemm_supports(s.V, s.D), who,
-                " needs V a multiple of 128 and D a multiple of 64, got V = ", s.V, ", D = ", s.D);
+                " needs V >= 1 and D a multiple of 64, got V = ", s.V, ", D = ", s.D);
     TORCH_CHECK(aligned16(h) && aligned16(w), who, " needs 16-byte aligned h and w");
     if (targets) {
         check_cuda_contig(*targets, "targets");
@@ -872,7 +872,9 @@ CeShape ce_check(const Tensor& h, const Tensor& w, const Tensor* targets, const 
     }
     return s;
 }
-Tensor ce_out(const std::optional<Tensor>& out, const Tensor& h, int T, int V) {
+// A [T, V] logits or gradient buffer: rows of V rounded up to 128, zero past V.
+Tensor ce_out(const std::optional<Tensor>& out, const Tensor& h, int T, int V_) {
+    const int V = (V_ + 127) / 128 * 128;
     if (!out) return at::empty({T, V}, h.options());
     check_cuda_contig(*out, "out");
     TORCH_CHECK(out->scalar_type() == at::kBFloat16 && out->dim() == 2 && out->size(0) == T &&
@@ -887,8 +889,12 @@ const float* ce_f32(const Tensor& t, int64_t n, const Tensor& h, const char* nam
                 " must be float32 with ", n, " elements on h's device");
     return t.data_ptr<float>();
 }
+float ce_softcap(double softcap) {
+    TORCH_CHECK(softcap >= 0.0, "softcap must be >= 0 (0 for none), got ", softcap);
+    return static_cast<float>(softcap);
+}
 
-// logits = h @ w.T, bf16 [T, V], into `out` when given.
+// logits = h @ w.T, bf16 [T, Vp] (V rounded up to 128, zero past V), into `out` when given.
 Tensor ce_logits(const Tensor& h, const Tensor& w, const std::optional<Tensor>& out) {
     const CeShape s = ce_check(h, w, nullptr, "ce_logits");
     const c10::cuda::CUDAGuard guard(h.device());
@@ -902,11 +908,11 @@ Tensor ce_logits(const Tensor& h, const Tensor& w, const std::optional<Tensor>& 
 
 // (lse, loss), float32 [T] each, from the GEMM's per-tile (max, sum) partials; no logits.
 std::tuple<Tensor, Tensor> ce_stats(const Tensor& h, const Tensor& w, const Tensor& targets,
-                                    int64_t ignore_index) {
+                                    int64_t ignore_index, double softcap) {
     const CeShape s = ce_check(h, w, &targets, "ce_stats");
     const c10::cuda::CUDAGuard guard(h.device());
     const auto f32 = h.options().dtype(at::kFloat);
-    Tensor part = at::empty({s.T, s.V / 128, 2}, f32);
+    Tensor part = at::empty({s.T, (s.V + 127) / 128, 2}, f32);
     Tensor tgt = at::empty({s.T}, f32);
     Tensor lse = at::empty({s.T}, f32);
     Tensor loss = at::empty({s.T}, f32);
@@ -915,6 +921,7 @@ std::tuple<Tensor, Tensor> ce_stats(const Tensor& h, const Tensor& w, const Tens
     ep.target_logit = tgt.data_ptr<float>();
     ep.targets = targets.data_ptr<int64_t>();
     ep.ignore_index = static_cast<int>(ignore_index);
+    ep.softcap = ce_softcap(softcap);
     cudaStream_t stream = current_stream(h);
     spark::ce_gemm_bf16(bf16_ptr(h), bf16_ptr(w), s.T, s.V, s.D, spark::CE_GEMM_STATS, ep, stream);
     spark::ce_combine(ep.partials, ep.target_logit, ep.targets, s.T, s.V, ep.ignore_index,
@@ -922,10 +929,11 @@ std::tuple<Tensor, Tensor> ce_stats(const Tensor& h, const Tensor& w, const Tens
     return {lse, loss};
 }
 
-// d loss / d logits = (softmax - one-hot) * scale, bf16 [T, V], recomputed from h and w and
-// the forward's lse; scale is float32 [1] on the device.
+// d loss / d logits = (softmax - one-hot) * scale, bf16 [T, Vp] (zero past V), recomputed
+// from h and w and the forward's lse; scale is float32 [1] on the device.
 Tensor ce_grad(const Tensor& h, const Tensor& w, const Tensor& targets, const Tensor& lse,
-               const Tensor& scale, int64_t ignore_index, const std::optional<Tensor>& out) {
+               const Tensor& scale, int64_t ignore_index, const std::optional<Tensor>& out,
+               double softcap) {
     const CeShape s = ce_check(h, w, &targets, "ce_grad");
     const c10::cuda::CUDAGuard guard(h.device());
     Tensor c = ce_out(out, h, s.T, s.V);
@@ -935,15 +943,18 @@ Tensor ce_grad(const Tensor& h, const Tensor& w, const Tensor& targets, const Te
     ep.ignore_index = static_cast<int>(ignore_index);
     ep.lse = ce_f32(lse, s.T, h, "lse");
     ep.scale = ce_f32(scale, 1, h, "scale");
+    ep.softcap = ce_softcap(softcap);
     spark::ce_gemm_bf16(bf16_ptr(h), bf16_ptr(w), s.T, s.V, s.D, spark::CE_GEMM_GRAD, ep,
                         current_stream(h));
     return c;
 }
 
-// The fused row kernel on bf16 logits [rows, V]: (loss, lse) float32 [rows]; with `scale`
-// (float32 [1] on the device) the logits are overwritten by the gradient rows.
+// The fused row kernel on bf16 logits [rows, ld] whose first `vocab` columns are valid (-1:
+// all of them): (loss, lse) float32 [rows]; with `scale` (float32 [1] on the device) the
+// logits are overwritten by the gradient rows, zero past vocab.
 std::tuple<Tensor, Tensor> ce_rows(const Tensor& logits_in, const Tensor& targets,
-                                   int64_t ignore_index, const std::optional<Tensor>& scale) {
+                                   int64_t ignore_index, const std::optional<Tensor>& scale,
+                                   double softcap, int64_t vocab) {
     Tensor logits = logits_in;
     check_cuda_contig(logits, "logits");
     check_cuda_contig(targets, "targets");
@@ -951,7 +962,9 @@ std::tuple<Tensor, Tensor> ce_rows(const Tensor& logits_in, const Tensor& target
                 "ce_rows expects bfloat16 logits [rows, V]");
     const int64_t rows = logits.size(0), V = logits.size(1);
     TORCH_CHECK(rows <= INT32_MAX && V <= INT32_MAX, "ce_rows: dims too large");
-    TORCH_CHECK(V % 8 == 0 && aligned16(logits), "ce_rows needs V % 8 == 0 and aligned logits");
+    TORCH_CHECK(V % 8 == 0 && aligned16(logits), "ce_rows needs ld % 8 == 0 and aligned logits");
+    const int64_t nv = vocab < 0 ? V : vocab;
+    TORCH_CHECK(nv >= 1 && nv <= V, "ce_rows: vocab must be in [1, ", V, "], got ", vocab);
     TORCH_CHECK(targets.scalar_type() == at::kLong && targets.dim() == 1 &&
                     targets.size(0) == rows && targets.device() == logits.device(),
                 "ce_rows expects int64 targets [", rows, "] on the logits' device");
@@ -960,20 +973,21 @@ std::tuple<Tensor, Tensor> ce_rows(const Tensor& logits_in, const Tensor& target
     Tensor loss = at::empty({rows}, f32);
     Tensor lse = at::empty({rows}, f32);
     const float* sc = scale ? ce_f32(*scale, 1, logits, "scale") : nullptr;
-    spark::cross_entropy_rows_bf16(bf16_ptr_mut(logits), targets.data_ptr<int64_t>(),
-                                   static_cast<int>(rows), static_cast<int>(V),
-                                   static_cast<int>(ignore_index), sc, loss.data_ptr<float>(),
-                                   lse.data_ptr<float>(), current_stream(logits));
+    spark::cross_entropy_rows_bf16(
+        bf16_ptr_mut(logits), targets.data_ptr<int64_t>(), static_cast<int>(rows),
+        static_cast<int>(nv), static_cast<int>(V), static_cast<int>(ignore_index), sc,
+        loss.data_ptr<float>(), lse.data_ptr<float>(), ce_softcap(softcap), current_stream(logits));
     return {loss, lse};
 }
 
 // Variant 3's backward for one band of rows (ce_backward_bf16): dh_f32 [>= cdiv(T, 128) *
 // 128, D] float32, zero on entry, receives the band's dh; slots [ce_backward_slots() * 128,
-// D] float32 and flags [>= 2 * V / 128 + 1] int32 are the kernel's scratch, zero on entry (the
+// D] float32 and flags [>= 2 * Vp / 128 + 1] int32 are the kernel's scratch, zero on entry (the
 // slots are zero again on exit); dw [V, D] bf16 is stored when `first` and added to after.
 void ce_backward(const Tensor& h, const Tensor& w, const Tensor& targets, const Tensor& lse,
                  const Tensor& scale, int64_t ignore_index, const Tensor& dh_f32,
-                 const Tensor& slots, const Tensor& flags, const Tensor& dw_in, bool first) {
+                 const Tensor& slots, const Tensor& flags, const Tensor& dw_in, bool first,
+                 double softcap) {
     Tensor dw = dw_in;
     const CeShape s = ce_check(h, w, &targets, "ce_backward");
     const c10::cuda::CUDAGuard guard(h.device());
@@ -989,10 +1003,10 @@ void ce_backward(const Tensor& h, const Tensor& w, const Tensor& targets, const 
                     slots.device() == h.device() && aligned16(slots),
                 "ce_backward: slots must be float32 [n * 128, ", s.D, "] on h's device");
     check_cuda_contig(flags, "flags");
-    TORCH_CHECK(flags.scalar_type() == at::kInt && flags.numel() >= 2 * (s.V / 128) + 1 &&
+    const int64_t strips = (s.V + 127) / 128;
+    TORCH_CHECK(flags.scalar_type() == at::kInt && flags.numel() >= 2 * strips + 1 &&
                     flags.device() == h.device(),
-                "ce_backward: flags must be int32 with at least ", 2 * (s.V / 128) + 1,
-                " elements");
+                "ce_backward: flags must be int32 with at least ", 2 * strips + 1, " elements");
     check_cuda_contig(dw, "dw");
     TORCH_CHECK(dw.scalar_type() == at::kBFloat16 && dw.sizes() == w.sizes() &&
                     dw.device() == h.device() && aligned16(dw),
@@ -1008,6 +1022,7 @@ void ce_backward(const Tensor& h, const Tensor& w, const Tensor& targets, const 
     a.flags = flags.data_ptr<int>();
     a.dw = bf16_ptr_mut(dw);
     a.first = first;
+    a.softcap = ce_softcap(softcap);
     spark::ce_backward_bf16(bf16_ptr(h), bf16_ptr(w), s.T, s.V, s.D, a, current_stream(h));
 }
 int64_t ce_backward_slots() {
@@ -2163,16 +2178,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("ce_stats", &ce_stats,
           "cross-entropy forward without the logits: (lse, loss) float32 [T] from h, w and "
           "int64 targets",
-          py::arg("h"), py::arg("w"), py::arg("targets"), py::arg("ignore_index") = -100);
+          py::arg("h"), py::arg("w"), py::arg("targets"), py::arg("ignore_index") = -100,
+          py::arg("softcap") = 0.0);
     m.def("ce_grad", &ce_grad,
           "(softmax(h @ w.T) - one_hot(targets)) * scale as bf16 [T, V], from the forward's lse",
           py::arg("h"), py::arg("w"), py::arg("targets"), py::arg("lse"), py::arg("scale"),
-          py::arg("ignore_index") = -100, py::arg("out") = py::none());
+          py::arg("ignore_index") = -100, py::arg("out") = py::none(), py::arg("softcap") = 0.0);
     m.def("ce_rows", &ce_rows,
           "cross-entropy rows of bf16 logits: (loss, lse) float32; with scale the logits are "
           "overwritten by (softmax - one_hot) * scale",
           py::arg("logits"), py::arg("targets"), py::arg("ignore_index") = -100,
-          py::arg("scale") = py::none());
+          py::arg("scale") = py::none(), py::arg("softcap") = 0.0, py::arg("vocab") = -1);
     m.def("ce_transpose", &ce_transpose,
           "columns [c0, c1) of x [rows, cols] bf16 transposed into out [c1 - c0, ld], zero "
           "past rows",
@@ -2183,7 +2199,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "tensor",
           py::arg("h"), py::arg("w"), py::arg("targets"), py::arg("lse"), py::arg("scale"),
           py::arg("ignore_index"), py::arg("dh_f32"), py::arg("slots"), py::arg("flags"),
-          py::arg("dw"), py::arg("first"));
+          py::arg("dw"), py::arg("first"), py::arg("softcap") = 0.0);
     m.def("ce_backward_slots", &ce_backward_slots,
           "the recycled fp32 strips of dw that ce_backward's slots buffer holds");
     m.def("grouped_gemm_swiglu", &grouped_gemm_swiglu,
