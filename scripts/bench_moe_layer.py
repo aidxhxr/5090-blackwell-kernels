@@ -2,7 +2,9 @@
 """Time a whole MoE layer, bf16: ours (spark_kernels.moe_layer.MoELayer) against the torch
 layer transformers runs (the experts loop), the same routing with torch._grouped_mm for the
 two projections, and vLLM's fused_moe, on Mixtral 8x7B (8 experts, top-2, 4096 -> 14336) and
-Qwen3-30B-A3B (128, top-8, 2048 -> 768). Writes results/moe_layer.json (JSON lines, one per
+Qwen3-30B-A3B (128, top-8, 2048 -> 768), and on Inkling 2 Mini (128, top-8, 2304 -> 1152,
+the sigmoid router with its bias and route_scale, the softcapped SwiGLU; its torch layer is
+transformers' Inkling2LoopExperts loop). Writes results/moe_layer.json (JSON lines, one per
 config, token count and implementation; a rerun replaces the rows it measures) and prints a
 table plus, for ours, the kernel time per stage from the torch profiler.
 
@@ -10,6 +12,11 @@ table plus, for ours, the kernel time per stage from the torch profiler.
                                               # ours_unfused, torch, torch_grouped
     ~/vllm-env/bin/python scripts/bench_moe_layer.py --impls vllm
     python scripts/bench_moe_layer.py --config qwen3 --tokens 1 16 --iters 100
+    python scripts/bench_moe_layer.py --config inkling --tokens 1 8 64 --iters 200 --impls \
+        ours ours_graph ours_permute ours_plain ours_unfused ours_fp8 torch torch_grouped
+    python scripts/bench_moe_layer.py --config inkling --tokens 4096 --impls \
+        ours ours_permute ours_plain ours_unfused ours_fp8 torch torch_grouped
+    python scripts/bench_moe_layer.py --config inkling --tokens 1 8 64 4096 --softcap-ab
 
 vLLM runs from its own environment (its torch is not the one the extension is built for), so
 that invocation loads moe_layer.py from its file and never imports spark_kernels.
@@ -33,6 +40,13 @@ impls:
   ours_gather    ours with the gather forced at every token count
   ours_permute   ours with the permuted copy forced at every token count
   ours_unfused   the same with the plain grouped GEMM on gate|up and the swiglu kernel after it
+  ours_plain     ours with the plain silu(g) * u epilogue on the same weights and routing, for
+                 a config with a softcapped SwiGLU (Inkling): what the caps cost. Checked
+                 against the torch loop with the plain activation
+  ours_fp8       ours with e4m3 experts (one scale per expert, amax / 448) and e4m3
+                 activations (fp8_quantize per tensor, a power-of-two scale): the routing and
+                 the permuted copy, then fp8_quantize, grouped_gemm_swiglu with the scales,
+                 fp8_quantize, grouped_gemm, moe_combine. Checked at a 0.1 tolerance
   torch          moe_layer.torch_moe: transformers' loop, a torch.where per expert hit
   torch_grouped  moe_layer.torch_grouped_moe: argsort, torch._grouped_mm twice, a gather and
                  a weighted sum
@@ -43,6 +57,8 @@ from __future__ import annotations
 
 import argparse
 import copy
+import dataclasses
+import functools
 import importlib.util
 import json
 import statistics
@@ -58,8 +74,10 @@ OUT = ROOT / "results" / "moe_layer.json"
 TOKENS = [1, 16, 128, 1024, 4096, 16384]
 DEFAULT_IMPLS = ["ours", "ours_graph", "ours_gather", "ours_permute", "ours_unfused", "torch",
                  "torch_grouped"]
-OURS = ("ours", "ours_gather", "ours_permute", "ours_unfused")
-STAGES = ["router", "route", "permute", "gate_up", "down", "combine"]
+OURS = ("ours", "ours_gather", "ours_permute", "ours_unfused", "ours_plain", "ours_fp8")
+PROFILED = ("ours", "ours_gather", "ours_permute", "ours_plain", "ours_fp8")
+TOLERANCE = {"ours_fp8": 0.1}  # rel_err allowed; 2e-2 for the rest
+STAGES = ["router", "route", "permute", "quant", "gate_up", "down", "combine"]
 MEM_GB = 10.0  # device memory this process may take
 GRAPH_MAX_TOKENS = 1024  # ours_graph rows stop here: a graph is for decode-sized steps
 
@@ -109,6 +127,8 @@ def stage_of(name: str) -> str:
         return "permute"
     if "combine_kernel" in name:
         return "combine"
+    if "amax_kernel" in name or "quantize_tensor_kernel" in name:  # ours_fp8's fp8_quantize
+        return "quant"
     if "grouped_kernel<" in name:  # <FP8, BM, BKB, STAGES, SWIGLU, GATHER>
         args = name.split("grouped_kernel<", 1)[1].split(">", 1)[0].replace(" ", "").split(",")
         return "gate_up" if args[4] == "true" else "down"
@@ -146,11 +166,50 @@ def vllm_fn(cfg, wts):
     return run
 
 
+class FP8Layer:
+    """`ours` on e4m3 experts: w13 (interleaved) and w2 quantized once with one scale per
+    expert, the activations quantized per call with one power-of-two scale per tensor. Always
+    the permuted copy (the grouped GEMM's gather is bf16 only)."""
+
+    def __init__(self, ml, layer):
+        from spark_kernels import ops as sk
+
+        self.sk, self.ml, self.layer, self.cfg = sk, ml, layer, layer.cfg
+        self.w13, self.s13 = self._quantize(layer.w13)
+        self.w2, self.s2 = self._quantize(layer.w2)
+
+    @staticmethod
+    def _quantize(w):
+        scale = w.abs().amax(dim=(1, 2)).float().clamp_min(1e-12) / 448.0
+        q = torch.empty(w.shape, dtype=torch.float8_e4m3fn, device=w.device)
+        for e in range(w.shape[0]):  # one expert at a time: no fp32 copy of the layer
+            q[e] = (w[e].float() / scale[e]).to(torch.float8_e4m3fn)
+        return q, scale
+
+    def gathers(self, T: int) -> bool:
+        return False
+
+    def routing(self, x):
+        return self.layer.routing(x)
+
+    def __call__(self, x):
+        sk, cfg = self.sk, self.cfg
+        logits = self.ml.router_logits(x, self.layer.wts)
+        xs, _, w, offsets, pos = sk.moe_dispatch(x, logits, cfg.top_k, cfg.renormalize,
+                                                 **self.layer.route_kw())
+        q, sa = sk.fp8_quantize(xs, "tensor")
+        h = sk.grouped_gemm_swiglu(q, self.w13, offsets, sa, self.s13, softcap=self.layer.softcap)
+        q, sa = sk.fp8_quantize(h, "tensor")
+        y = sk.grouped_gemm(q, self.w2, offsets, sa, self.s2)
+        return sk.moe_combine(y, pos, w)
+
+
 def impl_fns(ml, cfg, wts, impls):
     fns = {}
     ours = None  # the layer the ours_* variants share their interleaved w13 with (1.75 GB
     for name in impls:  # on Mixtral; one copy fits the memory cap, four did not)
-        if name in ("ours", "ours_graph", "ours_gather", "ours_permute") and ours is None:
+        if name in ("ours", "ours_graph", "ours_gather", "ours_permute", "ours_plain",
+                    "ours_fp8") and ours is None:
             ours = ml.MoELayer(wts)
         if name == "ours":
             fns[name] = ours
@@ -159,6 +218,13 @@ def impl_fns(ml, cfg, wts, impls):
         elif name in ("ours_gather", "ours_permute"):
             fns[name] = copy.copy(ours)
             fns[name].gather = name == "ours_gather"
+        elif name == "ours_plain":
+            if cfg.softcap is None:
+                continue  # the same layer as ours
+            fns[name] = copy.copy(ours)
+            fns[name].softcap = None
+        elif name == "ours_fp8":
+            fns[name] = FP8Layer(ml, ours)
         elif name == "ours_unfused":
             fns[name] = ml.MoELayer(wts, fuse_swiglu=False)
         elif name == "torch":
@@ -173,11 +239,16 @@ def impl_fns(ml, cfg, wts, impls):
 
 
 def route_mismatch(ml, layer, wts, x) -> int:
+    """Tokens whose picked keys (the logits; for a sigmoid router the scores plus the bias)
+    differ from torch.topk's on the same logits."""
     ids = layer.routing(x)[0].long()
-    logits = F.linear(x, wts.router).float()
-    _, want = ml._route_torch(logits, wts.cfg)
-    got_v = logits.gather(1, ids).sort(-1).values
-    want_v = logits.gather(1, want).sort(-1).values
+    logits = ml.router_logits(x, wts).float()
+    _, want = ml._route_torch(logits, wts.cfg, wts.bias)
+    key = logits
+    if wts.cfg.scoring == "sigmoid":
+        key = torch.sigmoid(logits) + (wts.bias if wts.bias is not None else 0.0)
+    got_v = key.gather(1, ids).sort(-1).values
+    want_v = key.gather(1, want).sort(-1).values
     return int((got_v != want_v).any(-1).sum().item())
 
 
@@ -192,10 +263,13 @@ def run_config(ml, cfg, args) -> list[dict]:
         pool = [torch.randn(T, cfg.hidden, device="cuda", generator=g).to(torch.bfloat16)
                 for _ in range(n_pool)]
         ref = ml.torch_moe(pool[0], wts, acc_dtype=torch.float32).float()
-        scale = ref.abs().max().item()
+        ref_plain = None
+        if cfg.softcap is not None and "ours_plain" in fns:
+            plain = dataclasses.replace(wts, cfg=dataclasses.replace(cfg, softcap=None))
+            ref_plain = ml.torch_moe(pool[0], plain, acc_dtype=torch.float32).float()
         # What the call has to move and compute: the experts the first input touches (their
         # bf16 weights read once is the floor at small T) and the FLOPs of its T * k rows.
-        _, ids0 = ml._route_torch(F.linear(pool[0], wts.router), cfg)
+        _, ids0 = ml._route_torch(ml.router_logits(pool[0], wts), cfg, wts.bias)
         touched = int(torch.unique(ids0).numel())
         moved = touched * cfg.expert_bytes()
         gflop = 2.0 * T * cfg.top_k * 3 * cfg.hidden * cfg.inter / 1e9
@@ -207,8 +281,9 @@ def run_config(ml, cfg, args) -> list[dict]:
                     continue
                 fn = ml.MoEGraph(fns.get("ours") or copy.copy(fns["ours_gather"]), T)
             out = fn(pool[0])
-            err = (out.float() - ref).abs().max().item() / scale
-            if err > 2e-2:
+            want = ref_plain if name == "ours_plain" else ref
+            err = (out.float() - want).abs().max().item() / want.abs().max().item()
+            if err > TOLERANCE.get(name, 2e-2):
                 raise SystemExit(f"{cfg.name} T={T} {name}: rel err {err:.3g}")
             ramp(fn, pool[0])
             med, mn = time_calls(fn, pool, args.iters)
@@ -222,7 +297,7 @@ def run_config(ml, cfg, args) -> list[dict]:
             if name in OURS:
                 row["route_mismatch"] = route_mismatch(ml, fn, wts, pool[0])
                 row["gather"] = fn.gathers(T)
-            if name in ("ours", "ours_gather", "ours_permute") and not args.no_profile:
+            if name in PROFILED and not args.no_profile:
                 row["breakdown_us"] = breakdown(fn, pool)
             if name == "vllm":
                 import vllm
@@ -240,6 +315,38 @@ def run_config(ml, cfg, args) -> list[dict]:
         del pool, ref
         torch.cuda.empty_cache()
     return rows
+
+
+def softcap_ab(ml, cfg, args) -> None:
+    """The gate/up GEMM alone, softcapped against plain epilogue on the same routing, the two
+    called in alternation (20 rounds of 20 calls each, the min over rounds of each round's
+    median), so a tenant's load on the card lands on both: bf16 with the row table as the
+    layer runs it, and e4m3 on the permuted rows. Prints only."""
+    from spark_kernels import ops as sk
+
+    wts = ml.MoEWeights.random(cfg, seed=0)
+    layer = ml.MoELayer(wts)
+    fp8 = FP8Layer(ml, layer)
+    for T in args.tokens:
+        x = torch.randn(T, cfg.hidden, device="cuda").to(torch.bfloat16)
+        logits = ml.router_logits(x, wts)
+        _, _, offsets, _, rows = sk.moe_route_rows(logits, cfg.top_k, **layer.route_kw())
+        xs = sk.moe_dispatch(x, logits, cfg.top_k, **layer.route_kw())[0]
+        q, sa = sk.fp8_quantize(xs, "tensor")
+        calls = {
+            "bf16": functools.partial(sk.grouped_gemm_swiglu, x, layer.w13, offsets, rows=rows),
+            "fp8": functools.partial(sk.grouped_gemm_swiglu, q, fp8.w13, offsets, sa, fp8.s13),
+        }
+        for kind, call in calls.items():
+            best = {}
+            for _ in range(20):
+                for name, c in (("softcap", cfg.softcap), ("plain", None)):
+                    fn = functools.partial(lambda _x, f, c: f(softcap=c), f=call, c=c)
+                    med, _ = time_calls(fn, [None], 20, warmup=2)
+                    best[name] = min(best.get(name, med), med)
+            print(f"{cfg.name} T={T:<6} gate_up {kind}: softcap {best['softcap'] * 1e3:8.1f} us  "
+                  f"plain {best['plain'] * 1e3:8.1f} us  "
+                  f"({best['softcap'] / best['plain'] - 1:+.1%})", flush=True)
 
 
 def merge(rows: list[dict]) -> None:
@@ -263,6 +370,8 @@ def main() -> None:
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--no-profile", action="store_true")
     ap.add_argument("--no-write", action="store_true")
+    ap.add_argument("--softcap-ab", action="store_true",
+                    help="time the gate/up GEMM with and without the softcaps, alternating")
     args = ap.parse_args()
 
     # The card is shared: hold this process to MEM_GB, so a shape that would need more fails
@@ -273,6 +382,10 @@ def main() -> None:
     if needs_package and "vllm" in args.impls:
         raise SystemExit("run vllm on its own: its environment cannot load the extension")
     ml = load_moe_layer(needs_package)
+    if args.softcap_ab:
+        for name in args.config:
+            softcap_ab(ml, ml.CONFIGS[name], args)
+        return
     rows = []
     for name in args.config:
         rows += run_config(ml, ml.CONFIGS[name], args)

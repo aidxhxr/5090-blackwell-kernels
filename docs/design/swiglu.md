@@ -106,3 +106,12 @@ per operand). A GB10 table is added when the Spark has been benchmarked.
 | bf16 | 4096×11008 | 1 | 0.1803 | 1500 | 98% | 83.7% | 1.61× |
 | bf16 | 4096×14336 | 0 | 0.2241 | 1572 | 103% | 87.7% | — |
 | bf16 | 4096×14336 | 1 | 0.2324 | 1516 | 99% | 84.6% | 1.61× |
+
+## The softcapped form (Inkling 2)
+
+`swiglu(gate, up, softcap=(4.0, 25.0))` is Inkling 2 Mini's activation, softcap(g, 4) *
+sigmoid(g) * softcap(u, 25) with softcap(x, c) = c * tanh(x / c), on the same kernels: the
+activation is a template parameter of each of them, and the softcapped one does the torch
+module's fp32 math op for op (`tanhf`, `expf`, IEEE divisions). I did not time it on its
+own: an MoE layer runs the same activation in the grouped GEMM's epilogue instead, on the
+fast forms, and that and its cost are in [moe_layer.md](moe_layer.md), "Inkling 2 Mini".

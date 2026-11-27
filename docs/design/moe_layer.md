@@ -388,6 +388,157 @@ The same layer with the plain grouped GEMM on gate|up and the swiglu kernel afte
 2.1 to 3.7% on Mixtral and 3.7 to 5.4% on Qwen3 from 1024 tokens up (6.137 against 6.468
 ms at 16384 tokens, where the unfused path writes and reads back 403 MB of gate|up).
 
+## Inkling 2 Mini
+
+Inkling 2 Mini (Thinking Machines, `thinkingmachines/Inkling-2-Mini`; the modeling code is
+transformers 5.24.1's `modeling_inkling2_loop.py`) runs this block in every one of its 48
+layer applications per token: 128 experts, top 8, no shared expert, hidden 2304, expert
+inter 1152 (one expert is 15.9 MB in bf16, the layer's experts 2.04 GB). Two pieces differ
+from Qwen3's, the router and the activation, and both are kernels now. The `inkling` config
+in `moe_layer.py` (`INKLING_2_MINI`) runs them, and its torch layer is transformers'
+`Inkling2LoopExperts` loop. Tests: `tests/test_inkling_moe.py`, against torch copies of the
+HF modules.
+
+**The router** (`Inkling2LoopTopKRouter`):
+
+```
+logits = x.float() @ router.T             fp32, router [128, 2304] fp32
+s      = sigmoid(logits)                  fp32
+ids    = topk(s + bias, 8)                bias: e_score_correction_bias, for the picks only
+w      = s[ids] / (sum(s[ids]) + 1e-20) * 8.0      route_scale
+```
+
+`moe_route_sigmoid` (`ops.moe_route(..., scoring="sigmoid", bias=, scale=)`, and the same
+keywords on `moe_route_rows` and `moe_dispatch`) is the same launch as the softmax routing.
+Each lane turns its 4 logits into scores and keys (score + bias) in registers, the picks are
+the same two-`redux.sync` argmax over the keys, and each lane also carries the unbiased score
+of its best candidate: the lane that wins a round holds the pick as its own best, so one
+shuffle from it gives the pick's score. The renormalization and the scale are a warp sum and
+two operations on the lanes that hold the k picks. The sigmoid is `1 / (1 + expf(-x))`, which
+is what torch's sigmoid computes on the GPU, so the keys are the same bits as the ones
+torch.topk sees and the picks are torch's wherever torch has no tie of its own to break. The
+tests check the ids as a set per token against the HF code (fp32 and bf16 logits, 1 to 4096
+tokens, with and without a bias), including rows where every score is the same (equal
+logits, or logits past 17, where every sigmoid is 1.0 in fp32) and the bias alone decides,
+and the weights to 4e-6 relative; on one 4096-token routing I checked, every weight came
+out the same bits as torch's. The bench's `route_mismatch` was 0 on every row below.
+
+**The activation** (`Inkling2LoopSoftcappedSwiGLU`):
+
+```
+h = softcap(g, 4) * sigmoid(g) * softcap(u, 25),    softcap(x, c) = c * tanh(x / c)
+```
+
+The sigmoid sees the raw g, so this is not silu of a capped gate: the gate factor is bounded
+by 4 and the product by 100. It is an activation of both SwiGLU paths:
+
+* `swiglu(gate, up, softcap=(4.0, 25.0))`: the swiglu kernels with the activation as a
+  template parameter (contiguous, or the two halves of a fused gate|up read in place). The
+  fp32 math is the module's op for op: x / c divided, `tanhf`, `1 / (1 + expf(-g))`. torch's
+  tanh does not always give `tanhf`'s last bit, so on 4096 x 1152 bf16 inputs 26 of the 4.7M
+  outputs are one bf16 ulp from the module's and the rest are the same bits.
+* `grouped_gemm_swiglu(..., softcap=(4.0, 25.0))`: the epilogue of the gate/up GEMM, bf16
+  (with or without the row table) and e4m3, the caps as launch parameters (0 is the plain
+  silu, in the same kernel). The product is formed from the two unrounded fp32 sums, so an
+  expert's [rows, 2304] gate|up never goes to memory.
+
+The epilogue took two changes to cost nothing. It used to form the activation for every row
+of the tile and drop the padding rows at the store; with the module's exact arithmetic (two
+`tanhf`, an `expf`, three IEEE divisions per output) that made the fp8 gate/up GEMM 18 to
+25% slower than the plain epilogue at 1 and 8 tokens, where a 128-row fp8 tile holds one or
+two of an expert's rows. It now skips the rows it will not store. That left the exact
+arithmetic at 4 to 5% of the bf16 gate/up GEMM at 4096 tokens (three runs) and 2 to 15% of
+the fp8 one, so the epilogue uses the fast forms: `tanh.approx.f32` for the two caps
+(relative error about 2^-11) and silu's `__expf` and `__fdividef` for the sigmoid: four
+MUFU operations and a few multiplies per output. That is less error than the bf16 rounding of gate and up
+that the module applies before its activation; the standalone kernel keeps the exact form.
+
+What the caps cost, the gate/up GEMM alone (`bench_moe_layer.py --softcap-ab`): the
+softcapped and the plain epilogue on the same routing called in alternation, 20 rounds of
+20 calls, the min over rounds of each round's median, as % over the plain epilogue's time in
+the same run. The input is the same every call, so at 1 and 8 tokens the touched experts sit
+in L2. The card is shared and absolute times moved by 10 to 30% between runs, which is why
+the two forms alternate:
+
+| tokens | plain, bf16 / fp8 (us, first run) | exact, every row | exact, stored rows | fast, stored rows (two runs) |
+|---|---|---|---|---|
+| 1 | 22.2 / 46.0 | +4.8% / +24.8% | -0.1% / +3.0% | +4.0, -3.9% / +0.8, 0.0% |
+| 8 | 366.2 / 192.1 | +0.4% / +18.1% | 0.0% / +1.2% | 0.0, -0.1% / 0.0, 0.0% |
+| 64 | 831.1 / 429.7 | +0.2% / +6.3% | +0.1% / +0.4% | 0.0, 0.0% / +0.1, +0.2% |
+| 4096 | 1538.1 / 666.2 | -4.4% / +17.7% | +3.8% / +14.6% | -0.5, -0.4% / +1.5, +1.2% |
+
+(The bf16 tile at 1 and 8 tokens is the 16-row one, which has nothing to skip and is a few
+microseconds of epilogue either way; the +-4% at one token is 1 us on 22. Two more runs of
+the exact, stored-rows form at 4096 tokens gave +4.9 and +5.0% in bf16, +8.5 and +2.4% in
+fp8; the -4.4% of the first column's bf16 row is a slow plain run, 1538 us against 1422 to
+1524 in the others.)
+
+**The layer.** Measured 2026-11-26 on the RTX PRO 6000 Blackwell Server Edition (sm_120, 188
+SMs, about 1.8 TB/s GDDR7; other tenants on the card, the timed runs under a lock the
+other benches respect), driver 580.196.07, CUDA 13.2, torch 2.14.1+cu130, the method of
+"Results" above: median of 200 calls (50 at 4096 tokens) over a pool of inputs, the router
+GEMM (fp32 here, on `x.float()`, as the model does) in every row, every row checked against
+the HF loop with fp32 accumulation first (ours within 6.8e-3 of max |ref| on every row).
+`ours` gathers x through the row table at every token count (inter 1152 is under the
+rule's 2048); `ours_permute` is the permuted copy (`moe_dispatch`), `ours_plain` the same
+layer with the plain SwiGLU epilogue, `ours_unfused` the plain gate/up GEMM then the
+softcapped swiglu kernel, `ours_fp8` e4m3 experts with one scale per expert and e4m3
+activations with one power-of-two scale per tensor (`fp8_quantize` before each GEMM,
+through the permuted copy; within 7.4e-2 of max |ref|). Random weights (std 0.02, the
+router std 1 / sqrt(D), the bias std 0.05), not the checkpoint's. ms per layer:
+
+| tokens | experts touched | ours | graph | permuted copy | plain SwiGLU | unfused | fp8 | torch._grouped_mm | transformers loop | vs the loop |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 8 | 0.1217 | 0.1121 | 0.1239 | 0.1224 | 0.1372 | 0.2015 | 1.699 | 3.533 | 29x |
+| 8 | 54 | 0.5771 | 0.5749 | 0.5880 | 0.5803 | 0.5883 | 0.3733 | 2.770 | 19.43 | 34x |
+| 64 | 118 | 1.270 | 1.262 | 1.281 | 1.269 | 1.281 | 0.7062 | 4.274 | 45.80 | 36x |
+| 4096 | 128 | 2.495 | | 2.565 | 2.497 | 2.658 | 1.678 | 8.510 | 53.56 | 21x |
+
+Where our call goes, kernel microseconds per call from the torch profiler (10 calls; `quant`
+is fp8_quantize's two launches per GEMM):
+
+| tokens, path | router GEMM | route | positions, or permute | quant | gate/up + SwiGLU | down | combine | kernels |
+|---|---|---|---|---|---|---|---|---|
+| 1, bf16 | 7.0 | 4.0 | 1.2 | | 62.7 | 33.5 | 2.4 | 110.8 |
+| 1, fp8 | 8.6 | 3.9 | 2.1 | 5.3 | 49.3 | 23.7 | 2.4 | 95.2 |
+| 8, bf16 | 24.6 | 4.4 | 1.1 | | 355.8 | 179.1 | 3.5 | 568.5 |
+| 8, fp8 | 26.9 | 4.3 | 5.4 | 5.9 | 189.2 | 113.5 | 2.8 | 348.0 |
+| 64, bf16 | 11.4 | 6.1 | 1.1 | | 812.3 | 411.5 | 3.9 | 1,246 |
+| 64, fp8 | 13.6 | 6.0 | 5.4 | 7.4 | 424.5 | 213.0 | 3.7 | 674 |
+| 4096, bf16 | 109.3 | 15.2 | 1.4 | | 1,416 | 724.5 | 113.2 | 2,380 |
+| 4096, fp8 | 114.4 | 15.2 | 92.6 | 232.5 | 706.0 | 383.2 | 114.8 | 1,659 |
+
+What the numbers say:
+
+* The caps are free at the layer: the softcapped and the plain layer are within 0.6% of
+  each other on every row (0.1217 against 0.1224 ms at one token, 2.495 against 2.497 at
+  4096), which is what the gate/up GEMM alone said.
+* At 8 and 64 tokens the bf16 layer reads the experts the routing touched at 1.48 to 1.49
+  TB/s (0.86 GB in 0.577 ms, 1.88 GB in 1.270 ms). At one token it is 1.05 TB/s eagerly and
+  1.14 TB/s replayed from the graph: the kernels are 111 us and the call 122, and 8 experts
+  are 127 MB.
+* fp8 halves the bytes and gives 1.55x at 8 tokens and 1.80x at 64 (1.15 and 1.33 TB/s of
+  e4m3 weights), and 1.49x at 4096, where the two GEMMs run 1.97x faster than bf16's and the
+  four quantization launches (233 us, 14% of the call) and the permuted copy (93 us) give
+  part of it back. At one token it is slower than bf16 eagerly (0.2015 ms for 95 us of
+  kernels): eleven launches from Python, and I did not capture it in a graph.
+* Against the transformers loop: 29x at one token, 34x and 36x at 8 and 64 (the loop pays a
+  `torch.where` and a host sync per expert hit, up to 118 here), 21x at 4096.
+  `torch._grouped_mm` with the same routing in torch is 14x slower at one token and 3.4x at
+  64 and 4096.
+* The fused activation against the swiglu kernel after a plain GEMM: 1.9% at 8 tokens, 0.9%
+  at 64, 6.5% at 4096 (2.495 against 2.658 ms: the unfused path writes the 151 MB gate|up
+  and reads it back), and 13% at one token, where the extra launch is a tenth of the call.
+* The router GEMM is fp32 here (the model's choice) and costs 109 us at 4096 tokens, 4% of
+  the call, and 24.6 us at 8 tokens against 11.4 at 64: cuBLAS on [8, 2304] x [2304, 128]
+  fp32 picks something slow. Every implementation makes the same call.
+
+Not done here: NVFP4 experts (the checkpoint's layers 0 to 19) have no grouped path in this
+repo, and the fp8 path above is per-expert-scale e4m3, not the MXFP8 [32, 32] blocks of
+layers 20 to 23 or the 1 x 32 activation blocks; the activation quantization is two
+launches per GEMM where it could be the gate/up epilogue's output format; and none of this
+ran on the checkpoint's weights.
+
 ## Not done
 
 * The combine fused into the down GEMM's epilogue. A token's k rows land in one tile only
@@ -399,7 +550,8 @@ ms at 16384 tokens, where the unfused path writes and reads back 403 MB of gate|
   (a 1-row box per table entry, 128 per stage), was not tried.
 * fp8 weights. `grouped_gemm_swiglu` has the e4m3 form (tested), but the layer would need
   the activations quantized on the way into each GEMM, a scale per tensor computed on the
-  device, and I did not build that; the gather is bf16 only.
+  device, and I did not build that; the gather is bf16 only. (The bench's `ours_fp8` does it
+  with `fp8_quantize` before each GEMM, for Inkling 2 Mini above; it is not in `MoELayer`.)
 * The routing kernel at 16384 tokens is 44 us on Qwen3: 64 blocks of 256 tokens, each warp
   16 tokens in a row. The block count is capped so the last block's scan fits shared memory;
   more blocks would need the scan to change.
