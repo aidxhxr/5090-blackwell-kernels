@@ -22,6 +22,10 @@
 //     smallest index i whose running sum of kept weights (in index order) exceeds r.
 //   * offset[row] += 1 on every call, greedy rows included, so graph replays draw fresh
 //     numbers without the host touching the offsets.
+//   * softcap c > 0 (Gemma 2's and Inkling 2's final logit softcap): the weights are taken on
+//     c tanh(x / c) instead of x, in the same passes that compute them (m capped the same
+//     way). The cap is monotonic, so the argmax (greedy), the order of the 16-bit keys and so
+//     the top-k set are the raw logits'; the probabilities, and so top-p's cut, change.
 //
 // variant 0: one thread per row, bisection over the 16-bit key for each threshold (a full
 //            pass over the row per probe). The reference.
@@ -64,6 +68,18 @@ __device__ __forceinline__ u64 weight(float f, float m, float inv_t) {
     return __float2ull_rz(__expf((f - m) * inv_t) * kMassScale);
 }
 
+// The logit the weights see: c tanh(x / c) with a softcap (cap > 0), x without. tanh by one
+// exp, 1 - 2 / (1 + e^(2u)), the argument clamped to |u| <= 15 (tanh is 1 in fp32 there).
+// Uniform per row, so the branch does not diverge.
+__device__ __forceinline__ float capped(float x, float cap, float inv_cap) {
+    if (!(cap > 0.0f)) return x;
+    const float u = fminf(fmaxf(x * inv_cap, -15.0f), 15.0f);
+    return cap * (1.0f - __fdividef(2.0f, 1.0f + __expf(2.0f * u)));
+}
+__device__ __forceinline__ float value(uint32_t b, float cap, float inv_cap) {
+    return capped(bits_to_f32(b), cap, inv_cap);
+}
+
 // Element e (0..7) of a 16-byte vector of bf16, as raw bits.
 __device__ __forceinline__ uint32_t lane_bits(const uint4& q, int e) {
     const uint32_t w = (e >> 1) == 0 ? q.x : (e >> 1) == 1 ? q.y : (e >> 1) == 2 ? q.z : q.w;
@@ -92,14 +108,14 @@ __device__ __forceinline__ u64 top_p_target(float p, u64 z) {
 // ---------------------------------------------------------------------------
 
 // Count and weight of the nonzero-weight tokens whose key is >= v.
-__device__ void naive_at_least(const unsigned short* xs, int V, float m, float inv_t, uint32_t v,
-                               u64& cnt, u64& mass) {
+__device__ void naive_at_least(const unsigned short* xs, int V, float m, float inv_t, float cap,
+                               float inv_cap, uint32_t v, u64& cnt, u64& mass) {
     cnt = 0;
     mass = 0;
     for (int c = 0; c < V; ++c) {
         const uint32_t b = xs[c];
         if (key16(b) < v) continue;
-        const u64 w = weight(bits_to_f32(b), m, inv_t);
+        const u64 w = weight(value(b, cap, inv_cap), m, inv_t);
         if (w == 0) continue;
         ++cnt;
         mass += w;
@@ -108,13 +124,13 @@ __device__ void naive_at_least(const unsigned short* xs, int V, float m, float i
 
 // The largest key v with F(key >= v) >= target, F the count (by_mass false) or the weight of
 // the nonzero-weight tokens. Needs F(key >= 0) >= target >= 1.
-__device__ uint32_t naive_bisect(const unsigned short* xs, int V, float m, float inv_t,
-                                 bool by_mass, u64 target) {
+__device__ uint32_t naive_bisect(const unsigned short* xs, int V, float m, float inv_t, float cap,
+                                 float inv_cap, bool by_mass, u64 target) {
     uint32_t lo = 0, hi = 65536;  // F(>= lo) >= target, F(>= hi) < target
     while (hi - lo > 1) {
         const uint32_t mid = (lo + hi) / 2;
         u64 cnt, mass;
-        naive_at_least(xs, V, m, inv_t, mid, cnt, mass);
+        naive_at_least(xs, V, m, inv_t, cap, inv_cap, mid, cnt, mass);
         if ((by_mass ? mass : cnt) >= target) {
             lo = mid;
         } else {
@@ -128,7 +144,7 @@ __global__ void sample_naive_kernel(const __nv_bfloat16* __restrict__ logits, in
                                     const float* __restrict__ temperature,
                                     const int* __restrict__ top_k, const float* __restrict__ top_p,
                                     const int64_t* __restrict__ seed, int64_t* __restrict__ offset,
-                                    int64_t* __restrict__ out) {
+                                    int64_t* __restrict__ out, float cap) {
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= B) return;
     const unsigned short* xs =
@@ -153,28 +169,30 @@ __global__ void sample_naive_kernel(const __nv_bfloat16* __restrict__ logits, in
     const float inv_t = 1.0f / fmaxf(T, kMinTemperature);
     const int k = top_k[row];
     const float p = top_p[row];
+    const float ic = cap > 0.0f ? 1.0f / cap : 0.0f;
+    m = capped(m, cap, ic);  // monotonic: the max of the capped values
 
     u64 npos, z;
-    naive_at_least(xs, V, m, inv_t, 0, npos, z);
+    naive_at_least(xs, V, m, inv_t, cap, ic, 0, npos, z);
     uint32_t thr = 0;
     u64 zk = z;
     if (k > 0 && static_cast<u64>(k) < npos) {
-        thr = naive_bisect(xs, V, m, inv_t, false, static_cast<u64>(k));
+        thr = naive_bisect(xs, V, m, inv_t, cap, ic, false, static_cast<u64>(k));
         u64 cnt;
-        naive_at_least(xs, V, m, inv_t, thr, cnt, zk);
+        naive_at_least(xs, V, m, inv_t, cap, ic, thr, cnt, zk);
     }
     if (p < 1.0f) {
-        const uint32_t tp = naive_bisect(xs, V, m, inv_t, true, top_p_target(p, zk));
+        const uint32_t tp = naive_bisect(xs, V, m, inv_t, cap, ic, true, top_p_target(p, zk));
         thr = tp > thr ? tp : thr;
     }
     u64 cnt, zf;
-    naive_at_least(xs, V, m, inv_t, thr, cnt, zf);
+    naive_at_least(xs, V, m, inv_t, cap, ic, thr, cnt, zf);
     const u64 r = __umul64hi(rnd, zf);
     u64 acc = 0;
     for (int c = 0; c < V; ++c) {
         const uint32_t b = xs[c];
         if (key16(b) < thr) continue;
-        acc += weight(bits_to_f32(b), m, inv_t);
+        acc += weight(value(b, cap, ic), m, inv_t);
         if (r < acc) {
             out[row] = c;
             return;
@@ -277,7 +295,7 @@ __device__ void block_argmax(const __nv_bfloat16* __restrict__ xr, int V, float*
 // are hot). Integer atomics: the result does not depend on their order.
 template <bool kVec>
 __device__ void build_hist(const __nv_bfloat16* __restrict__ xr, int V, float m, float inv_t,
-                           uint32_t hi, Hist& h) {
+                           float cap, float inv_cap, uint32_t hi, Hist& h) {
     const int tid = threadIdx.x;
     const int lane = tid & (kWarpSize - 1);
     for (int i = tid; i < kBins; i += kThreads) {
@@ -289,7 +307,7 @@ __device__ void build_hist(const __nv_bfloat16* __restrict__ xr, int V, float m,
     auto add = [&](bool ok, uint32_t bits) {
         const uint32_t key = key16(bits);
         const bool match = ok && (hi == kNone || (key >> 8) == hi);
-        const u64 w = match ? weight(bits_to_f32(bits), m, inv_t) : 0ull;
+        const u64 w = match ? weight(value(bits, cap, inv_cap), m, inv_t) : 0ull;
         const bool take = w != 0;
         const uint32_t digit = take ? (hi == kNone ? key >> 8 : key & 0xFFu) : kNone;
         const unsigned peers = __match_any_sync(kFullMask, digit);
@@ -402,7 +420,7 @@ __global__ void __launch_bounds__(kThreads)
     sample_block_kernel(const __nv_bfloat16* __restrict__ logits, int V,
                         const float* __restrict__ temperature, const int* __restrict__ top_k,
                         const float* __restrict__ top_p, const int64_t* __restrict__ seed,
-                        int64_t* __restrict__ offset, int64_t* __restrict__ out) {
+                        int64_t* __restrict__ offset, int64_t* __restrict__ out, float cap) {
     static_assert(kWarps == kWarpSize, "the scan's second level is one warp");
     __shared__ Hist h1, h2;
     __shared__ float red_f[kWarps];
@@ -431,12 +449,14 @@ __global__ void __launch_bounds__(kThreads)
     const float inv_t = 1.0f / fmaxf(T, kMinTemperature);
     const int k = top_k[row];
     const float p = top_p[row];
+    const float ic = cap > 0.0f ? 1.0f / cap : 0.0f;
+    m = capped(m, cap, ic);  // monotonic: the max of the capped values
     const bool use_k = k > 0 && k < V;
     const bool use_p = p < 1.0f;
 
     uint32_t thr = 0;
     if (use_k || use_p) {
-        build_hist<kVec>(xr, V, m, inv_t, kNone, h1);
+        build_hist<kVec>(xr, V, m, inv_t, cap, ic, kNone, h1);
         u64 acc_c = 0, acc_m = 0;  // thread 0's running sums above the chosen bins
         if (tid == 0) {
             u64 npos = 0, z = 0;
@@ -454,7 +474,7 @@ __global__ void __launch_bounds__(kThreads)
         __syncthreads();
         const int d1 = s_d1;
         if (d1 >= 0) {  // top-k: the low byte among the tokens in bin d1
-            build_hist<kVec>(xr, V, m, inv_t, static_cast<uint32_t>(d1), h2);
+            build_hist<kVec>(xr, V, m, inv_t, cap, ic, static_cast<uint32_t>(d1), h2);
             if (tid == 0) {
                 const int d2 = select_bin(h2, false, static_cast<u64>(k), acc_c, acc_m);
                 s_thr = (static_cast<uint32_t>(d1) << 8) | static_cast<uint32_t>(d2);
@@ -473,7 +493,7 @@ __global__ void __launch_bounds__(kThreads)
             __syncthreads();
             const int e1 = s_e1;
             if (e1 != d1) {  // otherwise h2 already holds bin e1's low bytes
-                build_hist<kVec>(xr, V, m, inv_t, static_cast<uint32_t>(e1), h2);
+                build_hist<kVec>(xr, V, m, inv_t, cap, ic, static_cast<uint32_t>(e1), h2);
             }
             if (tid == 0) {
                 const int e2 = select_bin(h2, true, target, acc_c, acc_m);
@@ -489,7 +509,7 @@ __global__ void __launch_bounds__(kThreads)
     // range holds r walks its chunk again to find the token.
     u64 mine = 0;
     for_chunk<kVec>(xr, V, [&](int, uint32_t b) {
-        if (key16(b) >= thr) mine += weight(bits_to_f32(b), m, inv_t);
+        if (key16(b) >= thr) mine += weight(value(b, cap, ic), m, inv_t);
         return false;
     });
     u64 total;
@@ -499,7 +519,7 @@ __global__ void __launch_bounds__(kThreads)
         u64 acc = before;
         for_chunk<kVec>(xr, V, [&](int c, uint32_t b) {
             if (key16(b) < thr) return false;
-            acc += weight(bits_to_f32(b), m, inv_t);
+            acc += weight(value(b, cap, ic), m, inv_t);
             if (r < acc) {
                 out[row] = c;
                 return true;
@@ -515,24 +535,25 @@ constexpr int kNumVariants = 2;
 
 void sample_bf16(const __nv_bfloat16* logits, int B, int V, const float* temperature,
                  const int* top_k, const float* top_p, const int64_t* seed, int64_t* offset,
-                 int64_t* out, int variant, cudaStream_t stream) {
+                 int64_t* out, int variant, cudaStream_t stream, float softcap) {
     SPARK_REQUIRE(logits != nullptr && temperature != nullptr && top_k != nullptr &&
                       top_p != nullptr && seed != nullptr && offset != nullptr && out != nullptr,
                   "sample: null pointer");
     SPARK_REQUIRE(B >= 0 && V >= 1, "sample: B must be >= 0 and V >= 1");
     SPARK_REQUIRE(V <= kMaxVocab, "sample: V must be <= 2^23");
     SPARK_REQUIRE(variant >= 0 && variant < kNumVariants, "sample: variant out of range");
+    SPARK_REQUIRE(softcap >= 0.0f, "sample: softcap must be >= 0 (0 for none)");
     if (B == 0) return;
     if (variant == 0) {
         const int threads = 128;
         sample_naive_kernel<<<cdiv(B, threads), threads, 0, stream>>>(
-            logits, B, V, temperature, top_k, top_p, seed, offset, out);
+            logits, B, V, temperature, top_k, top_p, seed, offset, out, softcap);
     } else if (V % 8 == 0 && is_aligned16(logits)) {
-        sample_block_kernel<true>
-            <<<B, kThreads, 0, stream>>>(logits, V, temperature, top_k, top_p, seed, offset, out);
+        sample_block_kernel<true><<<B, kThreads, 0, stream>>>(logits, V, temperature, top_k, top_p,
+                                                              seed, offset, out, softcap);
     } else {
-        sample_block_kernel<false>
-            <<<B, kThreads, 0, stream>>>(logits, V, temperature, top_k, top_p, seed, offset, out);
+        sample_block_kernel<false><<<B, kThreads, 0, stream>>>(logits, V, temperature, top_k, top_p,
+                                                               seed, offset, out, softcap);
     }
     SPARK_CHECK_LAUNCH();
 }

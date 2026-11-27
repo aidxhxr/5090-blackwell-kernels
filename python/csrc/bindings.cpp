@@ -205,7 +205,7 @@ void check_row_param(const Tensor& t, const char* name, at::ScalarType dtype, in
 // temperature, top_p (float32), top_k (int32), seed and offset (int64), all [B] on the device;
 // each row's offset is advanced by one in place.
 Tensor sample(const Tensor& logits, const Tensor& temperature, const Tensor& top_k,
-              const Tensor& top_p, const Tensor& seed, Tensor offset, int variant) {
+              const Tensor& top_p, const Tensor& seed, Tensor offset, int variant, double softcap) {
     check_cuda_contig(logits, "logits");
     TORCH_CHECK(logits.scalar_type() == at::kBFloat16 && logits.dim() == 2,
                 "sample expects logits as [B, V] bfloat16");
@@ -219,10 +219,12 @@ Tensor sample(const Tensor& logits, const Tensor& temperature, const Tensor& top
     const c10::cuda::CUDAGuard guard(logits.device());
     Tensor out = at::empty({B}, logits.options().dtype(at::kLong));
     const int v = resolve_variant(variant, spark::sample_num_variants());
-    spark::sample_bf16(
-        bf16_ptr(logits), static_cast<int>(B), static_cast<int>(V), temperature.data_ptr<float>(),
-        top_k.data_ptr<int>(), top_p.data_ptr<float>(), seed.data_ptr<int64_t>(),
-        offset.data_ptr<int64_t>(), out.data_ptr<int64_t>(), v, current_stream(logits));
+    TORCH_CHECK(softcap >= 0.0, "sample: softcap must be >= 0 (0 for none), got ", softcap);
+    spark::sample_bf16(bf16_ptr(logits), static_cast<int>(B), static_cast<int>(V),
+                       temperature.data_ptr<float>(), top_k.data_ptr<int>(),
+                       top_p.data_ptr<float>(), seed.data_ptr<int64_t>(),
+                       offset.data_ptr<int64_t>(), out.data_ptr<int64_t>(), v,
+                       current_stream(logits), static_cast<float>(softcap));
     return out;
 }
 
@@ -2096,7 +2098,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "one token per row of [B, V] bf16 logits with per-row temperature, top_k, top_p, seed "
           "and offset device tensors (offset advanced in place); int64 [B]",
           py::arg("logits"), py::arg("temperature"), py::arg("top_k"), py::arg("top_p"),
-          py::arg("seed"), py::arg("offset"), py::arg("variant") = -1);
+          py::arg("seed"), py::arg("offset"), py::arg("variant") = -1, py::arg("softcap") = 0.0);
     m.def("sgemm", &sgemm, "fp32 GEMM: a @ b (variants 6 and 7: tensor cores in TF32 / 3xTF32)",
           py::arg("a"), py::arg("b"), py::arg("variant") = -1);
     m.def("hgemm", &hgemm,

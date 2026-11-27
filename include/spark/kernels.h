@@ -102,9 +102,12 @@ int softmax_num_variants();
 //            by a two-pass radix select over 256-bin count and weight histograms (the row
 //            re-read from L2), the token by a scan of per-thread sums. No sort. Both variants
 //            give the same token for the same inputs. V <= 2^23
+// softcap > 0: the weights are taken on softcap * tanh(x / softcap) (Gemma 2's and Inkling 2's
+// final logit softcap), before the temperature. Monotonic: greedy and the top-k set are the
+// raw logits', the probabilities (and top-p's cut) are the capped ones'. 0 is no cap.
 void sample_bf16(const __nv_bfloat16* logits, int B, int V, const float* temperature,
                  const int* top_k, const float* top_p, const int64_t* seed, int64_t* offset,
-                 int64_t* out, int variant, cudaStream_t stream);
+                 int64_t* out, int variant, cudaStream_t stream, float softcap = 0.f);
 int sample_num_variants();
 
 // ---- SGEMM (fp32) -------------------------------------------------------------------------

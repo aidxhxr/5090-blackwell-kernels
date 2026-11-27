@@ -82,6 +82,7 @@ def sample(
     seed: torch.Tensor,
     offset: torch.Tensor,
     variant: int = -1,
+    softcap: float | None = None,
 ) -> torch.Tensor:
     """One token per row of `logits` [B, V] bfloat16, returned as int64 [B]. The parameters
     are [B] device tensors, so a CUDA graph that captures the call replays with whatever they
@@ -108,8 +109,17 @@ def sample(
 
     Variant 0 is one thread per row (the reference); variant 1, the default, one block per row
     with a radix select instead of a sort. Both give the same token for the same inputs.
+
+    softcap c (Gemma 2 and Inkling 2's final logit softcap, 30 for Inkling 2 Mini): x above is
+    c * tanh(x / c) of the logits, applied before the temperature, top-k and top-p inside the
+    kernel's passes over the row, so the caller never writes a capped copy. The cap is
+    monotonic: greedy and the top-k set are those of the raw logits, but the probabilities
+    change (the cap flattens the top), and so does what top-p keeps. None is no cap.
     """
-    return _C.sample(logits, temperature, top_k, top_p, seed, offset, variant)
+    if softcap is not None and not softcap > 0:
+        raise ValueError(f"softcap must be None or positive, got {softcap}")
+    cap = 0.0 if softcap is None else float(softcap)
+    return _C.sample(logits, temperature, top_k, top_p, seed, offset, variant, cap)
 
 
 def sgemm(a: torch.Tensor, b: torch.Tensor, variant: int = -1) -> torch.Tensor:
