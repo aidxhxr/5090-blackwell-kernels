@@ -176,6 +176,42 @@ Tensor swiglu(const Tensor& gate, const Tensor& up, int variant) {
     return out;
 }
 
+// Inkling 2's softcapped SwiGLU, softcap(g, cap_gate) * sigmoid(g) * softcap(u, cap_up):
+// contiguous gate and up of any shape, or 2-D ones with contiguous rows read in place (the
+// halves of a fused gate|up projection). The output is contiguous.
+Tensor swiglu_softcap(const Tensor& gate, const Tensor& up, double cap_gate, double cap_up) {
+    check_float_or_bf16(gate, "gate");
+    TORCH_CHECK(up.scalar_type() == gate.scalar_type(), "up must have the same dtype as gate");
+    TORCH_CHECK(gate.is_cuda() && up.is_cuda() && gate.device() == up.device(),
+                "gate and up must be CUDA tensors on one device");
+    TORCH_CHECK(gate.sizes() == up.sizes(), "gate and up must have the same shape");
+    TORCH_CHECK(cap_gate > 0 && cap_up > 0, "swiglu softcaps must be > 0");
+    int64_t rows = 1, cols = gate.numel(), ld_gate = cols, ld_up = cols;
+    if (!(gate.is_contiguous() && up.is_contiguous())) {
+        TORCH_CHECK(gate.dim() == 2 && gate.stride(1) == 1 && up.stride(1) == 1 &&
+                        gate.stride(0) >= gate.size(1) && up.stride(0) >= up.size(1),
+                    "swiglu softcap: gate and up must be contiguous, or 2-D with contiguous rows");
+        rows = gate.size(0);
+        cols = gate.size(1);
+        ld_gate = gate.stride(0);
+        ld_up = up.stride(0);
+    }
+    const c10::cuda::CUDAGuard guard(gate.device());
+    Tensor out = at::empty(gate.sizes(), gate.options());
+    if (out.numel() == 0) return out;
+    cudaStream_t stream = current_stream(gate);
+    const float cg = static_cast<float>(cap_gate), cu = static_cast<float>(cap_up);
+    if (gate.scalar_type() == at::kFloat) {
+        spark::swiglu_softcap_f32(gate.data_ptr<float>(), up.data_ptr<float>(),
+                                  out.data_ptr<float>(), rows, cols, ld_gate, ld_up, cg, cu,
+                                  stream);
+    } else {
+        spark::swiglu_softcap_bf16(bf16_ptr(gate), bf16_ptr(up), bf16_ptr_mut(out), rows, cols,
+                                   ld_gate, ld_up, cg, cu, stream);
+    }
+    return out;
+}
+
 Tensor softmax(const Tensor& x, int variant) {
     check_cuda_contig(x, "x");
     check_float_or_bf16(x, "x");
@@ -1060,8 +1096,8 @@ Tensor ce_transpose(const Tensor& x, int64_t c0, int64_t c1, int64_t ld, const T
 // up (interleave_experts) -> [T, I] bf16, silu(a w_gate^T) * (a w_up^T) from fp32 sums.
 Tensor grouped_gemm_swiglu(const Tensor& a, const Tensor& w, const Tensor& offsets,
                            const std::optional<Tensor>& scale_a,
-                           const std::optional<Tensor>& scale_b,
-                           const std::optional<Tensor>& rows) {
+                           const std::optional<Tensor>& scale_b, const std::optional<Tensor>& rows,
+                           double cap_gate, double cap_up) {
     check_cuda_contig(a, "a");
     check_cuda_contig(w, "w");
     check_cuda_contig(offsets, "offsets");
@@ -1108,8 +1144,26 @@ Tensor grouped_gemm_swiglu(const Tensor& a, const Tensor& w, const Tensor& offse
         TORCH_CHECK(!scale_a.has_value() && !scale_b.has_value(),
                     "grouped_gemm_swiglu: scales are for float8_e4m3fn inputs only");
     }
+    TORCH_CHECK((cap_gate > 0) == (cap_up > 0) && cap_gate >= 0 && cap_up >= 0,
+                "grouped_gemm_swiglu: softcaps are both > 0 or both 0 (plain silu)");
     const c10::cuda::CUDAGuard guard(a.device());
     Tensor c = at::empty({T, N / 2}, a.options().dtype(at::kBFloat16));
+    if (cap_gate > 0) {
+        const float cg = static_cast<float>(cap_gate), cu = static_cast<float>(cap_up);
+        if (fp8) {
+            spark::grouped_gemm_swiglu_softcap_fp8(
+                reinterpret_cast<const __nv_fp8_e4m3*>(a.data_ptr()),
+                reinterpret_cast<const __nv_fp8_e4m3*>(w.data_ptr()), offsets.data_ptr<int32_t>(),
+                bf16_ptr_mut(c), static_cast<int>(T), static_cast<int>(E), static_cast<int>(N),
+                static_cast<int>(K), sa, sb, cg, cu, current_stream(a));
+        } else {
+            spark::grouped_gemm_swiglu_softcap_bf16(
+                bf16_ptr(a), bf16_ptr(w), offsets.data_ptr<int32_t>(), bf16_ptr_mut(c),
+                static_cast<int>(T), static_cast<int>(E), static_cast<int>(N), static_cast<int>(K),
+                cg, cu, current_stream(a), rows_p);
+        }
+        return c;
+    }
     if (fp8) {
         spark::grouped_gemm_swiglu_fp8(
             reinterpret_cast<const __nv_fp8_e4m3*>(a.data_ptr()),
@@ -2194,6 +2248,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "silu(gate) * up (2-D gate and up with contiguous rows may be strided: the halves "
           "of a fused gate|up projection)",
           py::arg("gate"), py::arg("up"), py::arg("variant") = -1);
+    m.def("swiglu_softcap", &swiglu_softcap,
+          "softcap(gate, cap_gate) * sigmoid(gate) * softcap(up, cap_up), softcap(x, c) = c * "
+          "tanh(x / c) (Inkling 2; 2-D gate and up with contiguous rows may be strided)",
+          py::arg("gate"), py::arg("up"), py::arg("cap_gate"), py::arg("cap_up"));
     m.def("softmax", &softmax, "softmax over the last dim (fp32 math)", py::arg("x"),
           py::arg("variant") = -1);
     m.def("sample", &sample,
@@ -2308,9 +2366,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "the recycled fp32 strips of dw that ce_backward's slots buffer holds");
     m.def("grouped_gemm_swiglu", &grouped_gemm_swiglu,
           "grouped_gemm with the SwiGLU in the epilogue: w [E, 2I, K] with rows alternating gate "
-          "and up -> [T, I] bf16",
+          "and up -> [T, I] bf16 (cap_gate, cap_up > 0: Inkling 2's softcapped SwiGLU)",
           py::arg("a"), py::arg("w"), py::arg("offsets"), py::arg("scale_a") = py::none(),
-          py::arg("scale_b") = py::none(), py::arg("rows") = py::none());
+          py::arg("scale_b") = py::none(), py::arg("rows") = py::none(), py::arg("cap_gate") = 0.0,
+          py::arg("cap_up") = 0.0);
     m.def("moe_route", &moe_route,
           "softmax top-k routing of logits [T, E]: (ids [T, k] int32, weights [T, k] fp32, "
           "offsets [E + 1] int32, pos [T, k] int32, the row of expert order)",

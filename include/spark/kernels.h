@@ -65,6 +65,17 @@ void swiglu_strided_f32(const float* gate, const float* up, float* out, int64_t 
 void swiglu_strided_bf16(const __nv_bfloat16* gate, const __nv_bfloat16* up, __nv_bfloat16* out,
                          int64_t rows, int64_t cols, int64_t ld_gate, int64_t ld_up,
                          cudaStream_t stream);
+// Inkling 2's softcapped SwiGLU over the same rows x cols layout: out = softcap(g, cap_gate) *
+// sigmoid(g) * softcap(u, cap_up), softcap(x, c) = c * tanh(x / c), the sigmoid on the raw g
+// (4 and 25 in Inkling 2 Mini). fp32 math with tanhf and expf, one rounding. ld_gate == ld_up
+// == cols is a flat array (variant 1, or 0 for an unaligned pointer); other strides take
+// swiglu_strided's kernels. cap_gate, cap_up > 0.
+void swiglu_softcap_f32(const float* gate, const float* up, float* out, int64_t rows, int64_t cols,
+                        int64_t ld_gate, int64_t ld_up, float cap_gate, float cap_up,
+                        cudaStream_t stream);
+void swiglu_softcap_bf16(const __nv_bfloat16* gate, const __nv_bfloat16* up, __nv_bfloat16* out,
+                         int64_t rows, int64_t cols, int64_t ld_gate, int64_t ld_up, float cap_gate,
+                         float cap_up, cudaStream_t stream);
 
 // ---- Row-wise softmax --------------------------------------------------------------------
 // out[r, :] = softmax(x[r, :]) computed in fp32.
@@ -495,6 +506,19 @@ void grouped_gemm_swiglu_bf16(const __nv_bfloat16* A, const __nv_bfloat16* W,
 void grouped_gemm_swiglu_fp8(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* W, const int32_t* offsets,
                              __nv_bfloat16* C, int T, int E, int N, int K, const float* scale_a,
                              const float* scale_b, cudaStream_t stream);
+// The same GEMMs with Inkling 2's softcapped SwiGLU in the epilogue: C[r, j] =
+// softcap(G, cap_gate) * sigmoid(G) * softcap(U, cap_up), softcap(x, c) = c * tanh(x / c),
+// from the fp32 sums (scaled first, for fp8) and rounded once, tanh by tanh.approx.f32 and
+// the sigmoid by __expf / __fdividef (swiglu_softcap is the exact form). cap_gate, cap_up >
+// 0. Same rules as grouped_gemm_swiglu.
+void grouped_gemm_swiglu_softcap_bf16(const __nv_bfloat16* A, const __nv_bfloat16* W,
+                                      const int32_t* offsets, __nv_bfloat16* C, int T, int E, int N,
+                                      int K, float cap_gate, float cap_up, cudaStream_t stream,
+                                      const int32_t* rows = nullptr);
+void grouped_gemm_swiglu_softcap_fp8(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* W,
+                                     const int32_t* offsets, __nv_bfloat16* C, int T, int E, int N,
+                                     int K, const float* scale_a, const float* scale_b,
+                                     float cap_gate, float cap_up, cudaStream_t stream);
 
 // ---- Linear cross-entropy (src/kernels/cross_entropy.cu) ---------------------------------
 // The pieces of CE(h w^T, y) for a large vocabulary without torch's [T, V] logits; the

@@ -41,7 +41,9 @@
 // template parameter, 128 rows or, for bf16 experts of a few hundred rows or fewer, 64 or 16
 // (the host picks from T / E; the 128-row tile of an 8-row expert is 16 times its MMA work,
 // which at small T bounds the GEMM before the weight stream does), and a SwiGLU epilogue for a
-// weight whose rows alternate gate and up, which writes silu(gate) * up, N / 2 columns.
+// weight whose rows alternate gate and up, which writes silu(gate) * up, N / 2 columns, or
+// Inkling 2's softcapped form, softcap(gate, 4) * sigmoid(gate) * softcap(up, 25) with
+// softcap(x, c) = c * tanh(x / c) (the caps are launch parameters; 0 is the plain silu).
 //
 // A third addition, the gather (GATHER, bf16 only): A is any [*, K] matrix and a row table
 // rows[T] int32 says which of its rows is row r of expert order (-1: zeros), so an MoE layer
@@ -123,6 +125,7 @@ struct Params {
     const int32_t* rows;            // GATHER: [rows_n] the A row of each row of expert order
     int rows_n;
     size_t a_ld;
+    float cap_g, cap_u;  // SWIGLU: the softcaps of gate and up (Inkling 2), 0: plain silu
 };
 
 // The arrive-on of all the executing thread's earlier cp.async copies, counted as one of the
@@ -224,26 +227,56 @@ __device__ __forceinline__ void bf16_stage(const unsigned char* as, const unsign
 // unrounded sums and the output has N / 2 columns. hgemm_epilogue.cuh's SwiGLU store: lanes
 // 2q and 2q + 1 hold output columns j and j + 1 of the same two rows, one shuffle swaps a
 // value, and the even lane stores the upper row's pair, the odd lane the lower row's.
+// With cap_g > 0 the lane forms the softcapped product instead, on the hardware's fast
+// forms: tanh.approx.f32 for the two caps (relative error about 2^-11) and the sigmoid as
+// silu's __expf and __fdividef, about a dozen instructions per output. tanhf, expf and IEEE
+// divisions (swiglu.cu's exact arithmetic) were 4 to 5% of the bf16 gate/up GEMM at 4096
+// tokens; the fast forms err less than the bf16 rounding of gate and up that the torch
+// module sees first.
 __device__ __forceinline__ float silu_f(float x) {
     return __fdividef(x, 1.0f + __expf(-x));
+}
+__device__ __forceinline__ float tanh_approx(float x) {
+    float y;
+    asm("tanh.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+// rc_g, rc_u: 1 / cap_g, 1 / cap_u.
+__device__ __forceinline__ float softcap_silu(float g, float u, float cap_g, float cap_u,
+                                              float rc_g, float rc_u) {
+    const float sg = tanh_approx(g * rc_g) * cap_g;
+    const float su = tanh_approx(u * rc_u) * cap_u;
+    return sg * __fdividef(1.0f, 1.0f + __expf(-g)) * su;
 }
 template <class C>
 __device__ __forceinline__ void store_swiglu(const typename C::Acc& acc, float scale,
                                              __nv_bfloat16* __restrict__ out, int M, int ldc,
-                                             int bm, int bn) {
+                                             int bm, int bn, float cap_g, float cap_u) {
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int wm = warp / C::WN;
     const int wn = warp % C::WN;
     const int g = lane >> 2;
     const bool odd = lane & 1;
+    const float rc_g = cap_g > 0.f ? 1.0f / cap_g : 0.f;
+    const float rc_u = cap_g > 0.f ? 1.0f / cap_u : 0.f;
 #pragma unroll
     for (int mi = 0; mi < C::MT; ++mi) {
 #pragma unroll
         for (int nj = 0; nj < C::NT; ++nj) {
             const float* v = acc[mi][nj];
-            const float y0 = silu_f(v[0] * scale) * (v[1] * scale);  // row
-            const float y1 = silu_f(v[2] * scale) * (v[3] * scale);  // row + 8
+            float y0 = 0.f, y1 = 0.f;
+            if (cap_g > 0.f) {
+                // Only for rows that get stored: a 128-row fp8 tile at decode holds a row or
+                // two of its expert, and the rest would pay the activation for nothing.
+                const int r = bm + wm * C::WROWS + mi * 16 + g;
+                if (r < M) y0 = softcap_silu(v[0] * scale, v[1] * scale, cap_g, cap_u, rc_g, rc_u);
+                if (r + 8 < M)
+                    y1 = softcap_silu(v[2] * scale, v[3] * scale, cap_g, cap_u, rc_g, rc_u);
+            } else {
+                y0 = silu_f(v[0] * scale) * (v[1] * scale);
+                y1 = silu_f(v[2] * scale) * (v[3] * scale);
+            }
             const float recv = __shfl_xor_sync(kFullMask, odd ? y0 : y1, 1);
             const int row = bm + wm * C::WROWS + mi * 16 + g + (odd ? 8 : 0);
             const int j = (bn + wn * C::WCOLS + nj * 8 + (lane & 3) * 2) / 2 - (odd ? 1 : 0);
@@ -494,7 +527,7 @@ __global__ void __launch_bounds__(THREADS, 1)
             const float scale = FP8 ? sa * (p.scale_b ? __ldg(p.scale_b + e) : 1.f) : 1.f;
             // Rows past the expert's last row (row >= row_end) are skipped one by one.
             if constexpr (SWIGLU)
-                store_swiglu<C>(acc, scale, Cout, row_end, p.N / 2, row0, bn);
+                store_swiglu<C>(acc, scale, Cout, row_end, p.N / 2, row0, bn, p.cap_g, p.cap_u);
             else
                 fp8gemm_tile::store_bf16<C>(acc, scale, Cout, row_end, p.N, row0, bn);
         }
@@ -527,7 +560,7 @@ int resident_blocks() {
 template <bool FP8, int BKB, int STAGES, bool SWIGLU = false, int BM = 128, bool GATHER = false>
 void launch(const void* A, const void* W, const int32_t* offsets, __nv_bfloat16* Cout, int T, int E,
             int N, int K, const float* scale_a, const float* scale_b, const int32_t* rows,
-            cudaStream_t stream) {
+            cudaStream_t stream, float cap_g, float cap_u) {
     constexpr int bytes = smem_bytes<BM, BKB, STAGES>();
     const int grid = resident_blocks<FP8, BM, BKB, STAGES, SWIGLU, GATHER>();
     const int kbytes = K * (FP8 ? 1 : 2);
@@ -566,6 +599,8 @@ void launch(const void* A, const void* W, const int32_t* offsets, __nv_bfloat16*
     p.rows = rows;
     p.rows_n = T;
     p.a_ld = static_cast<size_t>(kbytes);
+    p.cap_g = cap_g;
+    p.cap_u = cap_u;
     grouped_kernel<FP8, BM, BKB, STAGES, SWIGLU, GATHER>
         <<<grid, THREADS, bytes, stream>>>(tmA, tmW, Cout, p);
     SPARK_CHECK_LAUNCH();
@@ -575,7 +610,8 @@ void launch(const void* A, const void* W, const int32_t* offsets, __nv_bfloat16*
 // forces one. The defaults are what the plain GEMMs settled on: hgemm variant 6's two 64-k
 // bf16 stages and fp8gemm variant 2's three 128-byte stages for many waves.
 using LaunchFn = void (*)(const void*, const void*, const int32_t*, __nv_bfloat16*, int, int, int,
-                          int, const float*, const float*, const int32_t*, cudaStream_t);
+                          int, const float*, const float*, const int32_t*, cudaStream_t, float,
+                          float);
 template <bool FP8>
 constexpr LaunchFn CONFIGS[] = {
     launch<FP8, 128, 2>,  // 0: 64 KB
@@ -629,36 +665,37 @@ int pick_bm(int T, int E, bool fp8) {
 template <bool FP8, bool SWIGLU>
 void run(const void* A, const void* W, const int32_t* offsets, __nv_bfloat16* C, int T, int E,
          int N, int K, const float* scale_a, const float* scale_b, const int32_t* rows,
-         cudaStream_t stream) {
+         cudaStream_t stream, float cap_g = 0.f, float cap_u = 0.f) {
     const int bm = pick_bm(T, E, FP8);
     if (rows) {
         if constexpr (FP8) {
             SPARK_REQUIRE(false, "grouped_gemm: the row table (gather) is bf16 only");
         } else if (bm == 16) {
             launch<false, 128, 4, SWIGLU, 16, true>(A, W, offsets, C, T, E, N, K, nullptr, nullptr,
-                                                    rows, stream);
+                                                    rows, stream, cap_g, cap_u);
         } else if (bm == 64) {
             launch<false, 128, 3, SWIGLU, 64, true>(A, W, offsets, C, T, E, N, K, nullptr, nullptr,
-                                                    rows, stream);
+                                                    rows, stream, cap_g, cap_u);
         } else {
             launch<false, 128, 2, SWIGLU, 128, true>(A, W, offsets, C, T, E, N, K, nullptr, nullptr,
-                                                     rows, stream);
+                                                     rows, stream, cap_g, cap_u);
         }
         return;
     }
     if (bm == 16) {
         launch<FP8, 128, 4, SWIGLU, 16>(A, W, offsets, C, T, E, N, K, scale_a, scale_b, nullptr,
-                                        stream);
+                                        stream, cap_g, cap_u);
     } else if (bm == 64) {
         launch<FP8, 128, 3, SWIGLU, 64>(A, W, offsets, C, T, E, N, K, scale_a, scale_b, nullptr,
-                                        stream);
+                                        stream, cap_g, cap_u);
     } else if constexpr (SWIGLU) {
         launch<FP8, 128, FP8 ? 3 : 2, true>(A, W, offsets, C, T, E, N, K, scale_a, scale_b, nullptr,
-                                            stream);
+                                            stream, cap_g, cap_u);
     } else {
         int cfg = forced_config();
         if (cfg < 0) cfg = FP8 ? CONFIG_FP8 : CONFIG_BF16;
-        CONFIGS<FP8>[cfg](A, W, offsets, C, T, E, N, K, scale_a, scale_b, nullptr, stream);
+        CONFIGS<FP8>[cfg](A, W, offsets, C, T, E, N, K, scale_a, scale_b, nullptr, stream, 0.f,
+                          0.f);
     }
 }
 
@@ -722,6 +759,37 @@ void grouped_gemm_swiglu_fp8(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* W, con
                   "grouped_gemm: A and W must be 16-byte aligned");
     if (T <= 0) return;
     gg::run<true, true>(A, W, offsets, C, T, E, N, K, scale_a, scale_b, nullptr, stream);
+}
+
+// The softcapped SwiGLU (Inkling 2): the same launches with the caps in the parameters.
+void grouped_gemm_swiglu_softcap_bf16(const __nv_bfloat16* A, const __nv_bfloat16* W,
+                                      const int32_t* offsets, __nv_bfloat16* C, int T, int E, int N,
+                                      int K, float cap_gate, float cap_up, cudaStream_t stream,
+                                      const int32_t* rows) {
+    SPARK_REQUIRE(grouped_gemm_supports(E, N, K, false),
+                  "grouped_gemm (bf16): requires 1 <= E <= 512, N % 128 == 0 and K % 64 == 0");
+    SPARK_REQUIRE(A && W && offsets && C, "grouped_gemm: null pointer");
+    SPARK_REQUIRE(is_aligned16(A) && is_aligned16(W),
+                  "grouped_gemm: A and W must be 16-byte aligned");
+    SPARK_REQUIRE(cap_gate > 0.f && cap_up > 0.f, "grouped_gemm_swiglu_softcap: caps must be > 0");
+    if (T <= 0) return;
+    gg::run<false, true>(A, W, offsets, C, T, E, N, K, nullptr, nullptr, rows, stream, cap_gate,
+                         cap_up);
+}
+
+void grouped_gemm_swiglu_softcap_fp8(const __nv_fp8_e4m3* A, const __nv_fp8_e4m3* W,
+                                     const int32_t* offsets, __nv_bfloat16* C, int T, int E, int N,
+                                     int K, const float* scale_a, const float* scale_b,
+                                     float cap_gate, float cap_up, cudaStream_t stream) {
+    SPARK_REQUIRE(grouped_gemm_supports(E, N, K, true),
+                  "grouped_gemm (fp8): requires 1 <= E <= 512, N % 128 == 0 and K % 128 == 0");
+    SPARK_REQUIRE(A && W && offsets && C, "grouped_gemm: null pointer");
+    SPARK_REQUIRE(is_aligned16(A) && is_aligned16(W),
+                  "grouped_gemm: A and W must be 16-byte aligned");
+    SPARK_REQUIRE(cap_gate > 0.f && cap_up > 0.f, "grouped_gemm_swiglu_softcap: caps must be > 0");
+    if (T <= 0) return;
+    gg::run<true, true>(A, W, offsets, C, T, E, N, K, scale_a, scale_b, nullptr, stream, cap_gate,
+                        cap_up);
 }
 
 }  // namespace spark

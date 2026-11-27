@@ -57,7 +57,8 @@ def add_rmsnorm_(
     return _C.add_rmsnorm_(x, resid, w, eps)
 
 
-def swiglu(gate: torch.Tensor, up: torch.Tensor, variant: int = -1) -> torch.Tensor:
+def swiglu(gate: torch.Tensor, up: torch.Tensor, variant: int = -1,
+           softcap: tuple[float, float] | None = None) -> torch.Tensor:
     """silu(gate) * up, elementwise, fp32 math. Any shape; gate and up must match.
 
     Variant 1 (128-bit loads) needs gate, up and the output to be 16-byte aligned; the default
@@ -65,7 +66,15 @@ def swiglu(gate: torch.Tensor, up: torch.Tensor, variant: int = -1) -> torch.Ten
     With the default variant, 2-D gate and up whose rows are contiguous but not adjacent
     (the two halves `gu[:, :I]` and `gu[:, I:]` of a fused gate|up projection) are read in
     place by a strided kernel; the output is a new contiguous tensor.
+
+    softcap=(cap_gate, cap_up) is Inkling 2's activation (Inkling2LoopSoftcappedSwiGLU, (4.0,
+    25.0) in Inkling 2 Mini): softcap(gate, cap_gate) * sigmoid(gate) * softcap(up, cap_up),
+    softcap(x, c) = c * tanh(x / c), the sigmoid on the raw gate, the module's fp32 arithmetic
+    and one rounding. The same layouts; `variant` does not apply.
     """
+    if softcap is not None:
+        cap_gate, cap_up = softcap
+        return _C.swiglu_softcap(gate, up, float(cap_gate), float(cap_up))
     return _C.swiglu(gate, up, variant)
 
 
@@ -527,15 +536,29 @@ def interleave_experts(w_gate: torch.Tensor, w_up: torch.Tensor) -> torch.Tensor
 def grouped_gemm_swiglu(a: torch.Tensor, w13: torch.Tensor, offsets: torch.Tensor,
                         scale_a: torch.Tensor | None = None,
                         scale_b: torch.Tensor | None = None,
-                        rows: torch.Tensor | None = None) -> torch.Tensor:
+                        rows: torch.Tensor | None = None,
+                        softcap: tuple[float, float] | None = None) -> torch.Tensor:
     """`grouped_gemm` with an MoE expert's SwiGLU in the epilogue: a [T, K] sorted by expert,
     w13 [E, 2I, K] from `interleave_experts` -> [T, I] bf16, silu(a @ w_gate.T) * (a @ w_up.T)
     with both products from the fp32 sums and one rounding. Same types, scales, shape rules
-    and row table (`rows`) as grouped_gemm with N = 2I."""
-    return _C.grouped_gemm_swiglu(a, w13, offsets, scale_a, scale_b, rows)
+    and row table (`rows`) as grouped_gemm with N = 2I. softcap=(cap_gate, cap_up) forms
+    `swiglu(..., softcap=...)`'s activation (Inkling 2) from the same fp32 sums instead, with
+    the hardware's approximate tanh (relative error about 2^-11) for the two caps."""
+    cap_gate, cap_up = softcap if softcap is not None else (0.0, 0.0)
+    return _C.grouped_gemm_swiglu(a, w13, offsets, scale_a, scale_b, rows, float(cap_gate),
+                                  float(cap_up))
 
 
-def moe_route(logits: torch.Tensor, top_k: int, renormalize: bool = True
+def _scoring(scoring: str, bias: torch.Tensor | None, scale: float) -> tuple:
+    if scoring not in ("softmax", "sigmoid"):
+        raise ValueError(f"scoring must be 'softmax' or 'sigmoid', got {scoring!r}")
+    if scoring == "softmax" and (bias is not None or scale != 1.0):
+        raise ValueError("bias and scale are for scoring='sigmoid'")
+    return scoring == "sigmoid", bias, float(scale)
+
+
+def moe_route(logits: torch.Tensor, top_k: int, renormalize: bool = True, *,
+              scoring: str = "softmax", bias: torch.Tensor | None = None, scale: float = 1.0
               ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Softmax top-k routing on the device: logits [T, E] (fp32 or bf16, E <= 512) ->
     (ids [T, k] int32, the experts largest first; weights [T, k] fp32, the softmax over all E
