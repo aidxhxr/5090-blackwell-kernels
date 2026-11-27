@@ -1071,6 +1071,9 @@ int decode_forced_split_k();
 // xin = x with tokens of mask == 0 zeroed (mask: [B, T] bytes or nullptr). state: [B, 3, C] in
 // x's dtype, state[b, 2] the newest input, or nullptr (zeros before t = 0, nothing written);
 // read first, then overwritten with the last three xin of the call (T = 1 is a decode step).
+// slots: int32 [B] on the device or nullptr; with it, state is [num_slots, 3, C] and row b uses
+// state row slots[b] (a negative or out-of-range slot: zeros, nothing written; slots must be
+// distinct).
 // epilogue per head_dim channels: SHORT_CONV_EPI_L2CLIP (param = threshold; k) or
 // SHORT_CONV_EPI_RMS (param = eps; unweighted RMSNorm, v). C % 8 == 0, 16-byte aligned x,
 // out, w, state; heads must split C into multiples of 8 channels.
@@ -1080,11 +1083,13 @@ enum ShortConvEpilogue {
     SHORT_CONV_EPI_RMS = 2
 };
 void short_conv_f32(const float* x, float* out, const float* w, const void* taps, bool taps_bf16,
-                    int heads, float* state, const uint8_t* mask, int B, int T, int C, int epilogue,
-                    int head_dim, float param, cudaStream_t stream);
+                    int heads, float* state, const int32_t* slots, int num_slots,
+                    const uint8_t* mask, int B, int T, int C, int epilogue, int head_dim,
+                    float param, cudaStream_t stream);
 void short_conv_bf16(const __nv_bfloat16* x, __nv_bfloat16* out, const float* w, const void* taps,
-                     bool taps_bf16, int heads, __nv_bfloat16* state, const uint8_t* mask, int B,
-                     int T, int C, int epilogue, int head_dim, float param, cudaStream_t stream);
+                     bool taps_bf16, int heads, __nv_bfloat16* state, const int32_t* slots,
+                     int num_slots, const uint8_t* mask, int B, int T, int C, int epilogue,
+                     int head_dim, float param, cudaStream_t stream);
 // The same norms over rows of D (row r is head r % H of token r / H), mode L2CLIP or RMS as
 // above. scale: [H, D] fp32 multiplied in before the norm, or nullptr. positions: one int32
 // (position_bytes 4) or int64 (8) per token, or nullptr (0): after the norm the row is rounded

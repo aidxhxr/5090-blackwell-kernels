@@ -1940,10 +1940,12 @@ int short_conv_epilogue(const std::string& name) {
 }
 
 // x [B, T, C]; static: weight [C, 4]; dynamic (taps given): weight [4, C], taps [B, T, H, 4].
-// state [B, 3, C] (x's dtype) is read and updated in place.
+// state [B, 3, C] (x's dtype) is read and updated in place; with state_slots (int32 [B]) it is a
+// [num_slots, 3, C] pool and row b uses state row state_slots[b].
 Tensor short_conv(const Tensor& x, const Tensor& weight, const std::optional<Tensor>& taps,
                   const std::optional<Tensor>& state, const std::optional<Tensor>& mask,
-                  const std::string& epilogue, int64_t head_dim, double param) {
+                  const std::string& epilogue, int64_t head_dim, double param,
+                  const std::optional<Tensor>& state_slots) {
     check_cuda_contig(x, "x");
     check_float_or_bf16(x, "x");
     TORCH_CHECK(x.dim() == 3, "short_conv expects x [B, T, C], got ", x.sizes());
@@ -1982,14 +1984,30 @@ Tensor short_conv(const Tensor& x, const Tensor& weight, const std::optional<Ten
         taps_ptr = d.data_ptr();
         taps_bf16 = d.scalar_type() == at::kBFloat16;
     }
+    const bool slotted = state_slots.has_value();
+    TORCH_CHECK(!slotted || state.has_value(), "short_conv: state_slots needs a state");
+    int64_t num_slots = B;
     if (state.has_value()) {
         const Tensor& s = *state;
         check_cuda_contig(s, "state");
-        TORCH_CHECK(s.scalar_type() == x.scalar_type() && s.dim() == 3 && s.size(0) == B &&
-                        s.size(1) == 3 && s.size(2) == C,
-                    "short_conv: state must be [B, 3, C] = [", B, ", 3, ", C,
-                    "] in x's dtype, got ", s.scalar_type(), " ", s.sizes());
+        TORCH_CHECK(s.scalar_type() == x.scalar_type() && s.dim() == 3 &&
+                        (slotted || s.size(0) == B) && s.size(1) == 3 && s.size(2) == C,
+                    "short_conv: state must be [", slotted ? "num_slots" : "B", ", 3, C] = [",
+                    slotted ? "num_slots" : std::to_string(B), ", 3, ", C, "] in x's dtype, got ",
+                    s.scalar_type(), " ", s.sizes());
         TORCH_CHECK(s.device() == x.device(), "short_conv: state must be on x's device");
+        num_slots = s.size(0);
+        TORCH_CHECK(num_slots <= INT32_MAX, "short_conv: too many state slots");
+    }
+    const int32_t* slot_ptr = nullptr;
+    if (slotted) {
+        const Tensor& sl = *state_slots;
+        check_cuda_contig(sl, "state_slots");
+        TORCH_CHECK(sl.scalar_type() == at::kInt && sl.dim() == 1 && sl.size(0) == B,
+                    "short_conv: state_slots must be int32 [B] = [", B, "], got ", sl.scalar_type(),
+                    " ", sl.sizes());
+        TORCH_CHECK(sl.device() == x.device(), "short_conv: state_slots must be on x's device");
+        slot_ptr = sl.data_ptr<int32_t>();
     }
     Tensor m;
     if (mask.has_value()) {
@@ -2009,9 +2027,9 @@ Tensor short_conv(const Tensor& x, const Tensor& weight, const std::optional<Ten
     if (x.scalar_type() == at::kFloat) {
         float* sp = state.has_value() ? state->data_ptr<float>() : nullptr;
         spark::short_conv_f32(x.data_ptr<float>(), out.data_ptr<float>(), weight.data_ptr<float>(),
-                              taps_ptr, taps_bf16, heads, sp, mp, static_cast<int>(B),
-                              static_cast<int>(T), static_cast<int>(C), epi,
-                              static_cast<int>(head_dim), static_cast<float>(param), stream);
+                              taps_ptr, taps_bf16, heads, sp, slot_ptr, static_cast<int>(num_slots),
+                              mp, static_cast<int>(B), static_cast<int>(T), static_cast<int>(C),
+                              epi, static_cast<int>(head_dim), static_cast<float>(param), stream);
     } else {
         __nv_bfloat16* sp = nullptr;
         if (state.has_value()) {
@@ -2019,9 +2037,9 @@ Tensor short_conv(const Tensor& x, const Tensor& weight, const std::optional<Ten
             sp = bf16_ptr_mut(s);
         }
         spark::short_conv_bf16(bf16_ptr(x), bf16_ptr_mut(out), weight.data_ptr<float>(), taps_ptr,
-                               taps_bf16, heads, sp, mp, static_cast<int>(B), static_cast<int>(T),
-                               static_cast<int>(C), epi, static_cast<int>(head_dim),
-                               static_cast<float>(param), stream);
+                               taps_bf16, heads, sp, slot_ptr, static_cast<int>(num_slots), mp,
+                               static_cast<int>(B), static_cast<int>(T), static_cast<int>(C), epi,
+                               static_cast<int>(head_dim), static_cast<float>(param), stream);
     }
     return out;
 }
@@ -2472,13 +2490,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("split"));
     m.def("hgemm_v6_split", &spark::hgemm_v6_split, "hgemm variant 6's split-K setting");
     // Inkling 2 Mini short convolutions and head norms (src/kernels/short_conv.cu).
-    m.def("short_conv", &short_conv,
-          "Inkling 2 Mini's causal short conv (K = 4) over x [B, T, C]: static weight [C, 4], or "
-          "static [4, C] plus per-token taps [B, T, heads, 4]; state [B, 3, C] updated in place; "
-          "optional [B, T] mask and per-head epilogue (\"l2clip\", \"rms\")",
-          py::arg("x"), py::arg("weight"), py::arg("taps") = py::none(),
-          py::arg("state") = py::none(), py::arg("mask") = py::none(), py::arg("epilogue") = "",
-          py::arg("head_dim") = 128, py::arg("param") = 0.0);
+    m.def(
+        "short_conv", &short_conv,
+        "Inkling 2 Mini's causal short conv (K = 4) over x [B, T, C]: static weight [C, 4], or "
+        "static [4, C] plus per-token taps [B, T, heads, 4]; state [B, 3, C] updated in place (or "
+        "a [num_slots, 3, C] pool indexed by state_slots int32 [B]); "
+        "optional [B, T] mask and per-head epilogue (\"l2clip\", \"rms\")",
+        py::arg("x"), py::arg("weight"), py::arg("taps") = py::none(),
+        py::arg("state") = py::none(), py::arg("mask") = py::none(), py::arg("epilogue") = "",
+        py::arg("head_dim") = 128, py::arg("param") = 0.0, py::arg("state_slots") = py::none());
     m.def("head_norm", &head_norm,
           "per-head L2 clip (optional [H, D] scale, optional log scaling by position) or "
           "unweighted RMSNorm over x [..., H, D]",

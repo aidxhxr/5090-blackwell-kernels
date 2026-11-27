@@ -1348,6 +1348,12 @@ def _epilogue(epilogue: str | None, param: float | None) -> tuple[str, float]:
     raise ValueError(f"epilogue must be None, 'l2clip' or 'rms', got {epilogue!r}")
 
 
+def _slots(state_slots: torch.Tensor | None, x: torch.Tensor) -> torch.Tensor | None:
+    if state_slots is None:
+        return None
+    return state_slots.to(device=x.device, dtype=torch.int32).contiguous()
+
+
 def short_conv_state(batch: int, channels: int, dtype: torch.dtype = torch.bfloat16,
                      device: str | torch.device = "cuda") -> torch.Tensor:
     """A zero conv state [B, 3, C] for `short_conv` / `dynamic_short_conv`: the last three
@@ -1358,7 +1364,8 @@ def short_conv_state(batch: int, channels: int, dtype: torch.dtype = torch.bfloa
 
 def short_conv(x: torch.Tensor, weight: torch.Tensor, state: torch.Tensor | None = None,
                mask: torch.Tensor | None = None, epilogue: str | None = None,
-               head_dim: int = 128, epilogue_param: float | None = None) -> torch.Tensor:
+               head_dim: int = 128, epilogue_param: float | None = None,
+               state_slots: torch.Tensor | None = None) -> torch.Tensor:
     """Inkling 2 Mini's static causal short conv (HF `Inkling2LoopShortConvolution`, K = 4):
     out = (depthwise_causal_conv(x * mask) + x) / sqrt(5), fp32 math, x's dtype out.
 
@@ -1368,6 +1375,11 @@ def short_conv(x: torch.Tensor, weight: torch.Tensor, state: torch.Tensor | None
         state: [B, 3, C] in x's dtype (`short_conv_state`), or None for zeros before the first
             token. Read, then overwritten in place with the last three inputs, so T = 1 is a
             decode step and a prefill can be split into chunks.
+        state_slots: [B] integer, or None. With it, state is a pool [num_slots, 3, C] and row
+            b of the call reads and writes state row state_slots[b] (a serving engine's slot
+            per sequence, in any order). A negative slot runs its row from zeros and writes
+            nothing (a padded batch row); out-of-range slots do the same. Two rows on one slot
+            race.
         mask: [B, T] bool (False = padding): those inputs are zeroed for the conv and the
             state, the residual keeps them (HF's `conv_mask`).
         epilogue: None, "l2clip" (k: scale each head down to norm `epilogue_param`, default
@@ -1375,13 +1387,15 @@ def short_conv(x: torch.Tensor, weight: torch.Tensor, state: torch.Tensor | None
             1e-6), over heads of `head_dim` channels, on the output rounded to x's dtype.
     """
     epi, param = _epilogue(epilogue, epilogue_param)
-    return _C.short_conv(x, weight.float().contiguous(), None, state, mask, epi, head_dim, param)
+    return _C.short_conv(x, weight.float().contiguous(), None, state, mask, epi, head_dim, param,
+                         _slots(state_slots, x))
 
 
 def dynamic_short_conv(x: torch.Tensor, static_weight: torch.Tensor, taps: torch.Tensor,
                        state: torch.Tensor | None = None, mask: torch.Tensor | None = None,
                        epilogue: str | None = None, head_dim: int = 128,
-                       epilogue_param: float | None = None) -> torch.Tensor:
+                       epilogue_param: float | None = None,
+                       state_slots: torch.Tensor | None = None) -> torch.Tensor:
     """The full layers' k/v conv (HF `Inkling2LoopDynamicShortConvolution`, K = 4):
     out = (sum_lag (static_weight[lag, c] + taps[b, t, head(c), lag]) * xin[t - lag, c] + x)
     / sqrt(9).
@@ -1390,11 +1404,11 @@ def dynamic_short_conv(x: torch.Tensor, static_weight: torch.Tensor, taps: torch
         static_weight: [4, C] float32, row = backward distance (row 0 the current token).
         taps: [B, T, heads, 4] float32 or bfloat16, `weight_proj(h).view(B, T, heads, 4)`
             (the GEMM stays outside); each head owns C / heads consecutive channels.
-        x, state, mask, epilogue, head_dim, epilogue_param: as in `short_conv`.
+        x, state, mask, epilogue, head_dim, epilogue_param, state_slots: as in `short_conv`.
     """
     epi, param = _epilogue(epilogue, epilogue_param)
     return _C.short_conv(x, static_weight.float().contiguous(), taps.contiguous(), state, mask,
-                         epi, head_dim, param)
+                         epi, head_dim, param, _slots(state_slots, x))
 
 
 def head_l2_clip(x: torch.Tensor, threshold: float = INKLING_QK_CLIP,

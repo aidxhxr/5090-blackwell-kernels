@@ -163,13 +163,14 @@ def make_conv(B, T, C, dtype, seed=0, heads=None):
     return x, w, sw, taps
 
 
-def run_ours(sk, x, w, state=None, mask=None, taps=None, epilogue=None, head_dim=128):
+def run_ours(sk, x, w, state=None, mask=None, taps=None, epilogue=None, head_dim=128,
+             state_slots=None):
     xc = x.cuda()
     if taps is None:
         return sk.short_conv(xc, w.cuda(), state=state, mask=mask, epilogue=epilogue,
-                             head_dim=head_dim)
+                             head_dim=head_dim, state_slots=state_slots)
     return sk.dynamic_short_conv(xc, w.cuda(), taps.cuda(), state=state, mask=mask,
-                                 epilogue=epilogue, head_dim=head_dim)
+                                 epilogue=epilogue, head_dim=head_dim, state_slots=state_slots)
 
 
 def run_hf(x, w, cache=None, mask=None, taps=None, heads=None):
@@ -282,6 +283,87 @@ def test_bf16_taps(sk, dtype):
     taps16 = taps.bfloat16()
     ref = run_hf(x, sw, taps=taps16, heads=heads)
     close(run_ours(sk, x, sw, taps=taps16), ref, dtype)
+
+
+# ---- a pool of state slots (a serving engine's slot per sequence) --------------------------
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=dtype_id)
+@pytest.mark.parametrize("dynamic", [False, True], ids=["static", "dynamic"])
+@pytest.mark.parametrize("T", [1, 2, 9])
+def test_state_slots_shuffled(sk, dtype, dynamic, T):
+    """Rows on pool slots in a shuffled order, one row on slot -1: the same output as the dense
+    call on the gathered rows, the used slots updated like the dense state, the rest untouched."""
+    B, C, S = 5, 1024, 11
+    heads = 8 if dynamic else None
+    x, w, sw, taps = make_conv(B, T, C, dtype, seed=9, heads=heads)
+    weight = sw if dynamic else w
+    pool = torch.randn(S, 3, C).to(dtype).cuda()
+    before = pool.clone()
+    slots = torch.tensor([7, 2, -1, 10, 0])
+    real = slots >= 0
+    dense = before[slots.clamp(min=0).cuda()].clone()
+    dense[2] = 0  # the slot -1 row starts from zeros
+    ref = run_ours(sk, x, weight, state=dense, taps=taps)
+    got = run_ours(sk, x, weight, state=pool, taps=taps, state_slots=slots.cuda())
+    assert torch.equal(got, ref)
+    assert torch.equal(pool[slots[real].cuda()], dense[real.cuda()])
+    untouched = [i for i in range(S) if i not in slots.tolist()]
+    assert torch.equal(pool[untouched], before[untouched])
+    # int64 slots are taken too (the wrapper casts)
+    pool2 = before.clone()
+    assert torch.equal(run_ours(sk, x, weight, state=pool2, taps=taps, state_slots=slots), ref)
+    assert torch.equal(pool2, pool)
+
+
+@pytest.mark.parametrize("dynamic", [False, True], ids=["static", "dynamic"])
+def test_state_slots_continuous_batching(sk, dynamic):
+    """Six sequences on random slots of a pool of 8, prefilled in a shuffled batch, then decoded
+    one token at a time in batches of a changing subset in a changing order, with a padding row
+    on slot -1: every token equals one dense prefill of each whole sequence."""
+    dtype, N, C, S, T0, total = torch.bfloat16, 6, 1024, 8, 4, 14
+    heads = 8 if dynamic else None
+    x, w, sw, taps = make_conv(N, total, C, dtype, seed=10, heads=heads)
+    weight = sw if dynamic else w
+    full = run_ours(sk, x, weight, taps=taps)
+    g = torch.Generator().manual_seed(11)
+    seq_slot = torch.randperm(S, generator=g)[:N]
+    pool = torch.randn(S, 3, C, generator=g).to(dtype).cuda()
+    order = torch.randperm(N, generator=g)
+    pool[seq_slot] = 0  # a fresh sequence starts from a zero state
+    out = run_ours(sk, x[order, :T0].contiguous(), weight, state=pool,
+                   taps=None if taps is None else taps[order, :T0].contiguous(),
+                   state_slots=seq_slot[order].cuda())
+    assert torch.equal(out, full[order.cuda(), :T0])
+    pos = [T0] * N
+    steps = 0
+    while any(p < total for p in pos):
+        live = [n for n in range(N) if pos[n] < total]
+        k = int(torch.randint(1, len(live) + 1, (1,), generator=g))
+        pick = [live[i] for i in torch.randperm(len(live), generator=g)[:k].tolist()]
+        xb = torch.stack([x[n, pos[n]] for n in pick] + [torch.randn(C).to(dtype)])[:, None]
+        tb = None
+        if taps is not None:
+            tb = torch.stack([taps[n, pos[n]] for n in pick] + [torch.randn(heads, K)])[:, None]
+        sl = torch.tensor([int(seq_slot[n]) for n in pick] + [-1], dtype=torch.int32)
+        out = run_ours(sk, xb, weight, state=pool, taps=tb, state_slots=sl.cuda())
+        for i, n in enumerate(pick):
+            assert torch.equal(out[i, 0], full[n, pos[n]])
+            pos[n] += 1
+        steps += 1
+    assert steps >= total - T0
+
+
+def test_state_slots_bad_input_raises(sk):
+    x = torch.randn(2, 3, 1024, device="cuda")
+    w = torch.randn(1024, 4, device="cuda")
+    pool = torch.zeros(5, 3, 1024, device="cuda")
+    with pytest.raises(RuntimeError):
+        sk.short_conv(x, w, state_slots=torch.tensor([0, 1], device="cuda"))  # no state
+    with pytest.raises(RuntimeError):
+        sk.short_conv(x, w, state=pool, state_slots=torch.tensor([0, 1, 2], device="cuda"))
+    with pytest.raises(RuntimeError):
+        sk.short_conv(x, w, state=pool)  # a pool without slots must be [B, 3, C]
 
 
 # ---- the fused epilogues -------------------------------------------------------------------

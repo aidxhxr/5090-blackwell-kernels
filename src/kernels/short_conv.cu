@@ -13,8 +13,11 @@
 // keeps them). Before t = 0 it is the conv state: [B, 3, C] in x's dtype, state[b, j, c] = xin
 // at position j - 3 (j = 2 the newest). It is read at the start and rewritten with the last
 // three xin of the call at the end, so a prefill in chunks, or decode one token at a time,
-// continues it. HF keeps [B, C, 4] fp32 (column 3 the newest, column 0 never read); ours is
-// hf[:, :, 1:].transpose(1, 2), and bf16 is exact for it since it only ever holds inputs.
+// continues it. With slots, row b of the call uses state row slots[b] of a [num_slots, 3, C]
+// pool (a serving engine's slot per sequence); a negative or out-of-range slot runs that row
+// from zeros and writes nothing (two rows on one slot would race). HF keeps [B, C, 4] fp32
+// (column 3 the newest, column 0 never read); ours is hf[:, :, 1:].transpose(1, 2), and bf16 is
+// exact for it since it only ever holds inputs.
 //
 // Epilogues, per head of head_dim channels, on the conv output rounded to x's dtype (HF rounds
 // there too: the conv module returns x's dtype and the norm module reads that):
@@ -132,6 +135,7 @@ template <typename T, bool kDynamic, typename TapT>
 __global__ void __launch_bounds__(kStrip* kChunksPerBlock)
     short_conv_kernel(const T* __restrict__ x, T* __restrict__ out, const float* __restrict__ w,
                       const TapT* __restrict__ taps, T* __restrict__ state,
+                      const int32_t* __restrict__ slots, int num_slots,
                       const uint8_t* __restrict__ mask, int T_len, int C, int heads, int epilogue,
                       int head_dim, float param) {
     using V = Vec<T>;
@@ -147,7 +151,12 @@ __global__ void __launch_bounds__(kStrip* kChunksPerBlock)
     const T* xb = x + tok0 * C + c0;
     T* ob = out + tok0 * C + c0;
     const uint8_t* mb = mask != nullptr ? mask + tok0 : nullptr;
-    T* sb = state != nullptr ? state + static_cast<int64_t>(b) * kHist * C + c0 : nullptr;
+    // Only chunk 0 reads or writes the state, so only it looks up the slot.
+    T* sb = nullptr;
+    if (chunk == 0 && state != nullptr) {
+        const int slot = slots != nullptr ? slots[b] : b;
+        if (slot >= 0 && slot < num_slots) sb = state + static_cast<int64_t>(slot) * kHist * C + c0;
+    }
 
     // wl[lag][i]: the static tap of channel c0 + i at backward distance lag.
     float wl[kTaps][kN];
@@ -294,8 +303,8 @@ __global__ void __launch_bounds__(kStrip* kChunksPerBlock)
 
 template <typename T, bool kDynamic, typename TapT>
 void launch_conv(const T* x, T* out, const float* w, const TapT* taps, int heads, T* state,
-                 const uint8_t* mask, int B, int T_len, int C, int epilogue, int head_dim,
-                 float param, cudaStream_t stream) {
+                 const int32_t* slots, int num_slots, const uint8_t* mask, int B, int T_len, int C,
+                 int epilogue, int head_dim, float param, cudaStream_t stream) {
     constexpr int kN = Vec<T>::kN;
     const int strips = cdiv(C / kN, kStrip);
     const int chunks = cdiv(T_len, kChunk);
@@ -303,14 +312,15 @@ void launch_conv(const T* x, T* out, const float* w, const TapT* taps, int heads
     const dim3 block(kStrip, cy);
     const dim3 grid(strips, cdiv(chunks, cy), B);
     short_conv_kernel<T, kDynamic, TapT><<<grid, block, 0, stream>>>(
-        x, out, w, taps, state, mask, T_len, C, heads, epilogue, head_dim, param);
+        x, out, w, taps, state, slots, num_slots, mask, T_len, C, heads, epilogue, head_dim, param);
     SPARK_CHECK_LAUNCH();
 }
 
 template <typename T>
 void short_conv_impl(const T* x, T* out, const float* w, const void* taps, bool taps_bf16,
-                     int heads, T* state, const uint8_t* mask, int B, int T_len, int C,
-                     int epilogue, int head_dim, float param, cudaStream_t stream) {
+                     int heads, T* state, const int32_t* slots, int num_slots, const uint8_t* mask,
+                     int B, int T_len, int C, int epilogue, int head_dim, float param,
+                     cudaStream_t stream) {
     constexpr int kN = Vec<T>::kN;
     SPARK_REQUIRE(B > 0 && T_len > 0 && C > 0, "short_conv: empty input");
     SPARK_REQUIRE(B <= 65535, "short_conv: batch above 65535");
@@ -318,6 +328,8 @@ void short_conv_impl(const T* x, T* out, const float* w, const void* taps, bool 
     SPARK_REQUIRE(is_aligned16(x) && is_aligned16(out) && is_aligned16(w) &&
                       (state == nullptr || is_aligned16(state)),
                   "short_conv: x, out, w and state need 16-byte aligned storage");
+    if (slots == nullptr) num_slots = B;  // row b is state row b
+    SPARK_REQUIRE(state != nullptr || slots == nullptr, "short_conv: slots without a state");
     SPARK_REQUIRE(epilogue >= SHORT_CONV_EPI_NONE && epilogue <= SHORT_CONV_EPI_RMS,
                   "short_conv: unknown epilogue");
     if (epilogue != SHORT_CONV_EPI_NONE) {
@@ -328,8 +340,8 @@ void short_conv_impl(const T* x, T* out, const float* w, const void* taps, bool 
                       "(bf16) or 4 (fp32) with head_dim / that a power of two up to 32");
     }
     if (taps == nullptr) {
-        launch_conv<T, false, float>(x, out, w, nullptr, 1, state, mask, B, T_len, C, epilogue,
-                                     head_dim, param, stream);
+        launch_conv<T, false, float>(x, out, w, nullptr, 1, state, slots, num_slots, mask, B, T_len,
+                                     C, epilogue, head_dim, param, stream);
         return;
     }
     SPARK_REQUIRE(heads > 0 && C % heads == 0 && (C / heads) % kN == 0,
@@ -338,11 +350,12 @@ void short_conv_impl(const T* x, T* out, const float* w, const void* taps, bool 
                   "short_conv: taps need 8-byte (bf16) or 16-byte (fp32) aligned storage");
     if (taps_bf16) {
         launch_conv<T, true, __nv_bfloat16>(x, out, w, static_cast<const __nv_bfloat16*>(taps),
-                                            heads, state, mask, B, T_len, C, epilogue, head_dim,
-                                            param, stream);
+                                            heads, state, slots, num_slots, mask, B, T_len, C,
+                                            epilogue, head_dim, param, stream);
     } else {
-        launch_conv<T, true, float>(x, out, w, static_cast<const float*>(taps), heads, state, mask,
-                                    B, T_len, C, epilogue, head_dim, param, stream);
+        launch_conv<T, true, float>(x, out, w, static_cast<const float*>(taps), heads, state, slots,
+                                    num_slots, mask, B, T_len, C, epilogue, head_dim, param,
+                                    stream);
     }
 }
 
@@ -421,17 +434,19 @@ void head_norm_impl(const T* x, T* out, int64_t rows, int H, int D, int mode, fl
 }  // namespace
 
 void short_conv_f32(const float* x, float* out, const float* w, const void* taps, bool taps_bf16,
-                    int heads, float* state, const uint8_t* mask, int B, int T, int C, int epilogue,
-                    int head_dim, float param, cudaStream_t stream) {
-    short_conv_impl(x, out, w, taps, taps_bf16, heads, state, mask, B, T, C, epilogue, head_dim,
-                    param, stream);
+                    int heads, float* state, const int32_t* slots, int num_slots,
+                    const uint8_t* mask, int B, int T, int C, int epilogue, int head_dim,
+                    float param, cudaStream_t stream) {
+    short_conv_impl(x, out, w, taps, taps_bf16, heads, state, slots, num_slots, mask, B, T, C,
+                    epilogue, head_dim, param, stream);
 }
 
 void short_conv_bf16(const __nv_bfloat16* x, __nv_bfloat16* out, const float* w, const void* taps,
-                     bool taps_bf16, int heads, __nv_bfloat16* state, const uint8_t* mask, int B,
-                     int T, int C, int epilogue, int head_dim, float param, cudaStream_t stream) {
-    short_conv_impl(x, out, w, taps, taps_bf16, heads, state, mask, B, T, C, epilogue, head_dim,
-                    param, stream);
+                     bool taps_bf16, int heads, __nv_bfloat16* state, const int32_t* slots,
+                     int num_slots, const uint8_t* mask, int B, int T, int C, int epilogue,
+                     int head_dim, float param, cudaStream_t stream) {
+    short_conv_impl(x, out, w, taps, taps_bf16, heads, state, slots, num_slots, mask, B, T, C,
+                    epilogue, head_dim, param, stream);
 }
 
 void head_norm_f32(const float* x, float* out, int64_t rows, int H, int D, int mode, float param,

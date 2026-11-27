@@ -73,6 +73,20 @@ T < 3 they are a mix of the old state and x, as `cat([state, x])[-3:]` would be.
 - `state=None` means zeros before t = 0 and nothing written (HF's first prefill pads with
   zeros the same way).
 
+Slots: a serving engine keeps one state per sequence in a pool and batches whichever
+sequences are running, in whatever order. With `state_slots` (int32 [B], any integer dtype in
+Python) the state is that pool, `[num_slots, 3, C]`, and row b of the call reads and writes
+pool row `state_slots[b]`; the pool rows no row names are not touched. Without it, row b is
+state row b, as before. The thread of chunk 0 is the only one that touches the state, so it is
+the only one that loads the slot: one 4-byte load per row of the call. A negative slot (or one
+past the pool) runs its row from zeros and writes nothing, which is what a padded row of a
+fixed-size batch (a CUDA graph's) wants. Two rows on the same slot in one call race; the
+kernel does not check. A new sequence starts from a zeroed pool row
+(`state[slot] = 0`), the way `short_conv_state` starts a dense state. The tests run six
+sequences on random slots of a pool of 8, prefilled in a shuffled batch and then decoded in
+batches of a random subset in a random order with a padding row on slot -1, and check every
+token bit for bit against one dense prefill of each sequence.
+
 Padding: a `[B, T]` mask (bool or integer, 0 = padding) zeroes those inputs for the conv and
 for the state, and the residual keeps them, as HF's `conv_mask` does. With left padding the
 first real token sees zeros before it, as from a fresh state; with right padding the state
@@ -139,6 +153,9 @@ comparison.
 - prefill then six decode steps at B = 1, 8, 64: bit-identical to the prefill, and against HF's
   decode path (`causal_conv1d_update` for the static conv) step by step, state included;
 - the padding mask (left, right and scattered) against HF's `conv_mask`, bool and int masks;
+- `state_slots`: rows on pool slots in a shuffled order with one on slot -1, equal to the
+  dense call on the gathered rows, the unnamed pool rows untouched (T = 1, 2, 9, both convs,
+  fp32 and bf16, int32 and int64 slots); continuous batching over a pool, as above;
 - bf16 per-token taps (what the weight_proj GEMM gives) against HF's `.float()` of them;
 - both epilogues fused into both convs against HF's conv then norm, on inputs scaled so the
   head norms straddle 22.627, and against our conv then the standalone op;
@@ -153,7 +170,7 @@ comparison.
 RTX PRO 6000 Blackwell Server Edition (sm_120, 188 SMs, 128 MB L2), CUDA 13.2, driver 580.196,
 600 W, `scripts/bench_short_conv.py` under the GPU lock, rows in `results/short_conv.jsonl`.
 A 256 MB device-to-device copy ran at 1,435 GB/s in the same run. All bf16, B = 1 for prefill.
-113 tests pass on the same card.
+128 tests pass on the same card.
 
 **Prefill, 8192 tokens, L2 overwritten before every call** (what a cold read from DRAM gives;
 "copy" is `y.copy_(x)` of a tensor the size of x, the floor at that size; GB/s counts x, out,
@@ -202,9 +219,8 @@ launch is the cost, and the next step is fusing them into the GEMMs around them 
 ## Not done
 
 - `seq_idx` (packed sequences in one row) is not supported; the padding mask is.
-- The state has no slot indirection: row b of the state is sequence b of the call. A serving
-  engine with a slot per sequence would want `state_slots[b]`, which is one more index load in
-  the thread of chunk 0.
+- The bench above was run before `state_slots` went in; the dense path only gained a check
+  in the thread of chunk 0, and I have not re-timed it.
 - No CUDA graph or fusion with the GEMM before the conv (the conv on o_proj's output or the k/v
   projections could be the GEMM's epilogue, which would remove the conv's read of x).
 - Only measured on sm_120. It builds for sm_121 (the DGX Spark); not run there.
