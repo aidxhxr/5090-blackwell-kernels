@@ -1483,3 +1483,35 @@ def inkling_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, r: torc
     kernel's key slices. Returns [B, H_q, S_q, 128] bf16.
     """
     return _C.inkling_attention(q, k, v, r, proj, sinks, window, variant, split)
+
+
+# ---- Inkling 2 Mini: block attention residuals (src/kernels/attn_res.cu,
+# docs/design/attn_res.md) ----
+
+
+def attn_res(blocks: torch.Tensor | None, partial: torch.Tensor, query: torch.Tensor,
+             eps: float = 1e-6) -> torch.Tensor:
+    """Block attention residual (HF `Inkling2LoopBlockAttentionResidual`, and with the four
+    message queries of a loop layer `Inkling2LoopMessageAttentionResidual`).
+
+    For every token the sources are the nb block states `blocks[..., s, :]` (bfloat16) and the
+    partial state `partial[..., :]` (bfloat16 or float32), each RMS-normalized without a
+    weight; each query of `query` ([H] or [nq, H], float32) mixes them with softmax weights
+    over (query . n(source)) / sqrt(H). Returns float32 [nq, ..., H] (index 0 for one query).
+    One block per token reads every source once for all the queries, so the twelve message
+    inputs of a loop pass (same sources, 12 x 4 queries) can run as one call with nq = 48.
+
+    blocks is [..., nb, H] with partial's leading dims, or None for no block states; any
+    strides with the last dim contiguous (a view into a preallocated buffer is fine). Needs
+    nb <= 7, H a multiple of 8 and at most 8192.
+    """
+    H = partial.shape[-1]
+    lead = partial.shape[:-1]
+    p = partial.reshape(-1, H)
+    q = query.reshape(-1, H)
+    b = None
+    if blocks is not None and blocks.shape[-2] > 0:
+        b = blocks.reshape(-1, blocks.shape[-2], H)
+    out = _C.attn_res(b, p, q, eps)
+    return out.reshape(q.shape[0], *lead, H)
+

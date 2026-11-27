@@ -1152,4 +1152,17 @@ void inkling_attention_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, cons
                             int kv_cap, int extent, int window, int variant, int split,
                             cudaStream_t stream);
 
+// ---- Inkling 2 Mini: block attention residual (src/kernels/attn_res.cu,
+// docs/design/attn_res.md) ----------------------------------------------------------------
+// attn_res_fwd: for every token t the sources are x_s = blocks[t * tok_stride + s * blk_stride
+// + (0..H-1)] for s < nb (bf16, the last dim contiguous) and x_nb = partial[t, :] (bf16 or
+// fp32, [T, H] contiguous). With n(x) = x * rsqrt(mean(x^2) + eps) and the queries [nq, H]
+// fp32, out [nq, T, H] fp32 gets out[q, t] = sum_s softmax_s(query[q] . n(x_s) / sqrt(H))
+// n(x_s). Needs nb + 1 <= kAttnResMaxSources, H % 8 == 0, H <= 8192, 16-byte aligned rows.
+constexpr int kAttnResMaxSources = 8;
+bool attn_res_supports(int nb, int H);
+void attn_res_fwd(const __nv_bfloat16* blocks, int64_t tok_stride, int64_t blk_stride, int nb,
+                  const void* partial, bool partial_bf16, const float* query, int nq, float* out,
+                  int T, int H, float eps, cudaStream_t stream);
+
 }  // namespace spark

@@ -2182,6 +2182,50 @@ Tensor head_norm(const Tensor& x, const std::string& mode, double param,
                               static_cast<int>(D), m, static_cast<float>(param), sp, pp, pbytes,
                               static_cast<float>(alpha), static_cast<float>(n_floor), stream);
     }
+
+// ---- Inkling 2 Mini: block attention residual -------------------------
+// blocks [T, nb, H] bf16 with the last dim contiguous (any token and block strides: a slice of a
+// preallocated [T, nb_max, H] buffer works), partial [T, H] bf16 or fp32, query [nq, H] fp32
+// -> [nq, T, H] fp32.
+Tensor attn_res(const std::optional<Tensor>& blocks, const Tensor& partial, const Tensor& query,
+                double eps) {
+    check_cuda_contig(partial, "partial");
+    check_float_or_bf16(partial, "partial");
+    TORCH_CHECK(partial.dim() == 2, "attn_res: partial must be [T, H], got ", partial.sizes());
+    const int64_t T = partial.size(0), H = partial.size(1);
+    check_cuda_contig(query, "query");
+    TORCH_CHECK(query.scalar_type() == at::kFloat && query.dim() == 2 && query.size(1) == H,
+                "attn_res: query must be float32 [nq, ", H, "], got ", query.scalar_type(), " ",
+                query.sizes());
+    const int64_t nq = query.size(0);
+    int64_t nb = 0, ts = 0, bs = 0;
+    const __nv_bfloat16* bp = nullptr;
+    if (blocks.has_value() && blocks->numel() > 0) {
+        const Tensor& b = *blocks;
+        TORCH_CHECK(b.is_cuda() && b.scalar_type() == at::kBFloat16 && b.dim() == 3 &&
+                        b.size(0) == T && b.size(2) == H && b.stride(2) == 1,
+                    "attn_res: blocks must be bfloat16 [T, nb, H] = [", T, ", nb, ", H,
+                    "] with the last dim contiguous, got ", b.scalar_type(), " ", b.sizes());
+        nb = b.size(1);
+        ts = b.stride(0);
+        bs = b.stride(1);
+        TORCH_CHECK(aligned16(b) && ts % 8 == 0 && bs % 8 == 0,
+                    "attn_res: blocks needs 16-byte aligned rows");
+        TORCH_CHECK(b.device() == partial.device(), "attn_res: blocks must be on partial's device");
+        bp = reinterpret_cast<const __nv_bfloat16*>(b.data_ptr());
+    }
+    TORCH_CHECK(query.device() == partial.device(), "attn_res: query must be on partial's device");
+    TORCH_CHECK(spark::attn_res_supports(static_cast<int>(nb), static_cast<int>(H)),
+                "attn_res: needs nb + 1 <= ", spark::kAttnResMaxSources,
+                " sources and H a multiple of 8, at most 8192; got nb = ", nb, ", H = ", H);
+    TORCH_CHECK(T <= INT32_MAX && nq <= INT32_MAX, "attn_res: too many tokens or queries");
+    TORCH_CHECK(aligned16(partial) && aligned16(query), "attn_res needs 16-byte aligned storage");
+    const c10::cuda::CUDAGuard guard(partial.device());
+    Tensor out = at::empty({nq, T, H}, partial.options().dtype(at::kFloat));
+    spark::attn_res_fwd(bp, ts, bs, static_cast<int>(nb), partial.data_ptr(),
+                        partial.scalar_type() == at::kBFloat16, query.data_ptr<float>(),
+                        static_cast<int>(nq), out.data_ptr<float>(), static_cast<int>(T),
+                        static_cast<int>(H), static_cast<float>(eps), current_stream(partial));
     return out;
 }
 
@@ -2611,4 +2655,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("inkling_attention_decode_fits", &spark::inkling_attention_decode_fits,
           "whether inkling_attention's 16-row decode tile takes the shape", py::arg("H_q"),
           py::arg("H_kv"), py::arg("S_q"));
+
+    // Inkling 2 Mini's block attention residual (src/kernels/attn_res.cu).
+    m.def("attn_res", &attn_res,
+          "block attention residual: blocks [T, nb, H] bf16 (or None), partial [T, H], query "
+          "[nq, H] fp32 -> [nq, T, H] fp32, a softmax over the RMS-normalized sources per query",
+          py::arg("blocks"), py::arg("partial"), py::arg("query"), py::arg("eps") = 1e-6);
 }

@@ -70,6 +70,9 @@ Ops (all run on the current CUDA stream, all accept float32 or bfloat16 unless n
                                              per-head norms over [..., H, D] (q's scaled clip
                                              with the log scaling by position)
     num_variants(name)                       how many implementations exist for `name`
+    attn_res(blocks, partial, query, eps=1e-6)
+                                             Inkling 2 Mini's block attention residual: a
+                                             softmax mix of the normalized block states
 
 `variant` selects a rung on the optimization ladder described in docs/DESIGN.md; -1 picks
 the fastest one that accepts the input (see ops.py for the two ladders where that is not the
@@ -229,3 +232,9 @@ from .ops import (  # noqa: E402
 
 __all__ += ["dynamic_short_conv", "head_l2_clip", "head_rms_norm", "short_conv",
             "short_conv_state"]
+
+
+# Inkling 2 Mini's block attention residuals (docs/design/attn_res.md).
+from .ops import attn_res  # noqa: E402
+
+__all__ += ["attn_res"]
