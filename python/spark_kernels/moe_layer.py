@@ -2,7 +2,10 @@
 renormalization, the rows into expert order, the gate/up grouped GEMM with the SwiGLU in its
 epilogue, the down grouped GEMM, and the weighted combine back into token order. Mixtral 8x7B
 (8 experts, top-2, 4096 -> 14336) and Qwen3-30B-A3B (128 experts, top-8, 2048 -> 768) are the
-two configurations the bench runs (docs/design/moe_layer.md).
+two configurations the bench runs (docs/design/moe_layer.md). Inkling 2 Mini (128 experts,
+top-8, 2304 -> 1152) is the third: a sigmoid router in fp32 with a correction bias for the
+picks and route_scale 8 on the renormalized weights, and the softcapped SwiGLU,
+softcap(g, 4) * sigmoid(g) * softcap(u, 25), in the same epilogue.
 
 `MoELayer.forward(x)` is six launches, none of which waits on the host:
 
@@ -35,7 +38,10 @@ Two torch layers sit next to it, for the tests and the bench, both on the same `
 
 `MoEWeights` keeps the expert weights the way checkpoints and vLLM do: w13 [E, 2I, D] with
 gate rows 0..I-1 and up rows I..2I-1, w2 [E, D, I], router [E, D]; `MoELayer` takes an
-interleaved copy of w13 for its epilogue.
+interleaved copy of w13 for its epilogue. For a sigmoid config (Inkling) the router is fp32
+and run on x.float(), as transformers' Inkling2LoopTopKRouter does, and `bias` is the
+e_score_correction_bias [E] fp32; the torch layers then follow Inkling2LoopExperts (the
+softcapped activation, the sum in fp32).
 """
 
 from __future__ import annotations
@@ -50,7 +56,8 @@ import torch.nn.functional as F
 class MoELayerConfig:
     """One MoE layer's shape: `experts` SwiGLU experts hidden -> inter -> hidden, each token
     routed to `top_k` of them by a softmax over the router logits, the k weights renormalized
-    to sum 1 when `renormalize`."""
+    to sum 1 when `renormalize`. scoring="sigmoid" is the sigmoid router with a pick bias,
+    the weights times `route_scale`; `softcap` (cap_gate, cap_up) the softcapped SwiGLU."""
 
     name: str
     hidden: int
@@ -58,6 +65,9 @@ class MoELayerConfig:
     experts: int
     top_k: int
     renormalize: bool = True
+    scoring: str = "softmax"
+    route_scale: float = 1.0
+    softcap: tuple[float, float] | None = None
 
     def expert_bytes(self) -> int:
         """bf16 bytes of one expert (gate, up, down)."""
@@ -70,24 +80,29 @@ class MoELayerConfig:
 
 MIXTRAL_8X7B = MoELayerConfig("mixtral", hidden=4096, inter=14336, experts=8, top_k=2)
 QWEN3_30B_A3B = MoELayerConfig("qwen3", hidden=2048, inter=768, experts=128, top_k=8)
-CONFIGS = {c.name: c for c in (MIXTRAL_8X7B, QWEN3_30B_A3B)}
+INKLING_2_MINI = MoELayerConfig("inkling", hidden=2304, inter=1152, experts=128, top_k=8,
+                                scoring="sigmoid", route_scale=8.0, softcap=(4.0, 25.0))
+CONFIGS = {c.name: c for c in (MIXTRAL_8X7B, QWEN3_30B_A3B, INKLING_2_MINI)}
 
 
 @dataclass
 class MoEWeights:
-    """router [E, D], w13 [E, 2I, D] (gate rows then up rows), w2 [E, D, I], all bf16."""
+    """router [E, D], w13 [E, 2I, D] (gate rows then up rows), w2 [E, D, I], all bf16; for a
+    sigmoid config the router is fp32 and bias [E] fp32 the correction bias."""
 
     cfg: MoELayerConfig
     router: torch.Tensor
     w13: torch.Tensor
     w2: torch.Tensor
+    bias: torch.Tensor | None = None
 
     @staticmethod
     def random(cfg: MoELayerConfig, device="cuda", seed: int = 0, std: float = 0.02
                ) -> MoEWeights:
         """Normal weights, std 0.02 for the experts. The router is std 1 / sqrt(D), so the
         logits of unit-variance tokens are about N(0, 1) and the routing spreads over the
-        experts the way a trained router's roughly does."""
+        experts the way a trained router's roughly does. A sigmoid config gets an fp32 router
+        and a bias of std 0.05, about the gap between neighbouring top scores."""
         g = torch.Generator(device=device).manual_seed(seed)
         E, D, inter = cfg.experts, cfg.hidden, cfg.inter
 
@@ -97,13 +112,51 @@ class MoEWeights:
                 out[e] = (torch.randn(*shape[1:], device=device, generator=g) * s)
             return out
 
-        return MoEWeights(cfg, rand(E, D, s=D ** -0.5), rand(E, 2 * inter, D, s=std),
-                          rand(E, D, inter, s=std))
+        router = rand(E, D, s=D ** -0.5)
+        w13 = rand(E, 2 * inter, D, s=std)
+        w2 = rand(E, D, inter, s=std)
+        if cfg.scoring == "sigmoid":
+            bias = torch.randn(E, device=device, generator=g) * 0.05
+            return MoEWeights(cfg, router.float(), w13, w2, bias)
+        return MoEWeights(cfg, router, w13, w2)
 
 
-def _route_torch(logits: torch.Tensor, cfg: MoELayerConfig
+def router_logits(x: torch.Tensor, wts: MoEWeights) -> torch.Tensor:
+    """The router GEMM: bf16 for a softmax config, fp32 on x.float() for a sigmoid one."""
+    if wts.cfg.scoring == "sigmoid":
+        return F.linear(x.float(), wts.router)
+    return F.linear(x, wts.router)
+
+
+def softcap_swiglu_torch(gate: torch.Tensor, up: torch.Tensor, caps: tuple[float, float]
+                         ) -> torch.Tensor:
+    """transformers' Inkling2LoopSoftcappedSwiGLU: c * tanh(x / c) on gate and up, the
+    sigmoid on the raw gate, fp32 math, back to the input dtype."""
+    dtype = gate.dtype
+    gate, up = gate.float(), up.float()
+    cg, cu = caps
+    return (torch.tanh(gate / cg) * cg * torch.sigmoid(gate) * (torch.tanh(up / cu) * cu)).to(dtype)
+
+
+def _act_torch(gate: torch.Tensor, up: torch.Tensor, cfg: MoELayerConfig) -> torch.Tensor:
+    if cfg.softcap is not None:
+        return softcap_swiglu_torch(gate, up, cfg.softcap)
+    return F.silu(gate) * up
+
+
+def _route_torch(logits: torch.Tensor, cfg: MoELayerConfig, bias: torch.Tensor | None = None
                  ) -> tuple[torch.Tensor, torch.Tensor]:
-    """transformers' router: softmax in fp32, top-k, renormalized -> (weights fp32, ids)."""
+    """transformers' router: softmax in fp32, top-k, renormalized -> (weights fp32, ids).
+    For a sigmoid config Inkling2LoopTopKRouter's: sigmoid scores, the picks by score + bias
+    (unsorted, as there), the picks' scores over (their sum + 1e-20), times route_scale."""
+    if cfg.scoring == "sigmoid":
+        scores = torch.sigmoid(logits.float())
+        key = scores + bias if bias is not None else scores
+        ids = torch.topk(key, cfg.top_k, dim=-1, sorted=False).indices
+        w = scores.gather(1, ids)
+        if cfg.renormalize:
+            w = w / (w.sum(dim=-1, keepdim=True) + 1e-20)
+        return w * cfg.route_scale, ids
     p = torch.softmax(logits, dim=-1, dtype=torch.float32)
     w, ids = torch.topk(p, cfg.top_k, dim=-1)
     if cfg.renormalize:
@@ -115,12 +168,13 @@ def torch_moe(x: torch.Tensor, wts: MoEWeights, acc_dtype: torch.dtype | None = 
               ) -> torch.Tensor:
     """transformers' eager MoE experts loop over [T, D] bf16. Like the models, the routing
     weights are cast to bf16 and the output accumulates in x's dtype; acc_dtype=float32 keeps
-    both in fp32 (the reference the tests compare against)."""
+    both in fp32 (the reference the tests compare against). A sigmoid config is
+    Inkling2LoopSparseMoeBlock, whose loop keeps both in fp32 already."""
     cfg = wts.cfg
     inter = cfg.inter
-    acc = acc_dtype or x.dtype
-    logits = F.linear(x, wts.router)
-    w, ids = _route_torch(logits, cfg)
+    acc = acc_dtype or (torch.float32 if cfg.scoring == "sigmoid" else x.dtype)
+    logits = router_logits(x, wts)
+    w, ids = _route_torch(logits, cfg, wts.bias)
     w = w.to(acc)
     out = torch.zeros(x.shape[0], cfg.hidden, dtype=acc, device=x.device)
     mask = F.one_hot(ids, num_classes=cfg.experts).permute(2, 1, 0)  # [E, k, T]
@@ -128,7 +182,7 @@ def torch_moe(x: torch.Tensor, wts: MoEWeights, acc_dtype: torch.dtype | None = 
     for e in hit.flatten().tolist():
         slot, tok = torch.where(mask[e])
         gate, up = F.linear(x[tok], wts.w13[e]).split(inter, dim=-1)
-        h = F.silu(gate) * up
+        h = _act_torch(gate, up, cfg)
         y = F.linear(h, wts.w2[e]).to(acc) * w[tok, slot, None]
         out.index_add_(0, tok, y)
     return out.to(x.dtype)
@@ -140,14 +194,14 @@ def torch_grouped_moe(x: torch.Tensor, wts: MoEWeights) -> torch.Tensor:
     a gather of each token's k rows times their weights, summed in fp32."""
     cfg = wts.cfg
     T, k, inter = x.shape[0], cfg.top_k, cfg.inter
-    logits = F.linear(x, wts.router)
-    w, ids = _route_torch(logits, cfg)
+    logits = router_logits(x, wts)
+    w, ids = _route_torch(logits, cfg, wts.bias)
     flat = ids.reshape(-1)
     order = torch.argsort(flat, stable=True)
     offs = torch.cumsum(torch.bincount(flat, minlength=cfg.experts), 0).to(torch.int32)
     xs = x.index_select(0, order // k)
     gu = torch._grouped_mm(xs, wts.w13.transpose(1, 2), offs=offs)
-    h = F.silu(gu[:, :inter]) * gu[:, inter:]
+    h = _act_torch(gu[:, :inter], gu[:, inter:], cfg)
     y = torch._grouped_mm(h, wts.w2.transpose(1, 2), offs=offs)
     inv = torch.empty_like(order)
     inv[order] = torch.arange(order.numel(), device=x.device)
@@ -169,7 +223,9 @@ class MoELayer:
     """The layer on the kernels. `fuse_swiglu=False` runs the gate/up GEMM plain on the
     concatenated w13 and the swiglu kernel after it (the ablation of the fused epilogue).
     `gather` picks the gathered gate/up loads over the permuted copy: None applies the rule
-    above (GATHER_MAX_INTER, GATHER_SMALL_ROWS), True or False forces one."""
+    above (GATHER_MAX_INTER, GATHER_SMALL_ROWS), True or False forces one. `softcap` is the
+    config's (cap_gate, cap_up), which the epilogue applies; setting it to None runs the
+    plain SwiGLU on the same weights (the bench's measure of what the caps cost)."""
 
     def __init__(self, wts: MoEWeights, fuse_swiglu: bool = True, gather: bool | None = None):
         from spark_kernels import ops as sk
@@ -177,6 +233,8 @@ class MoELayer:
         cfg = wts.cfg
         self.cfg = cfg
         self.router = wts.router
+        self.wts = wts
+        self.softcap = cfg.softcap
         self.w2 = wts.w2
         self.fuse_swiglu = fuse_swiglu
         self.gather = gather
@@ -191,8 +249,15 @@ class MoELayer:
         """(ids, weights, offsets, pos) of x's tokens from the routing kernel."""
         from spark_kernels import ops as sk
 
-        logits = F.linear(x, self.router)
-        return sk.moe_route(logits, self.cfg.top_k, self.cfg.renormalize)
+        logits = router_logits(x, self.wts)
+        return sk.moe_route(logits, self.cfg.top_k, self.cfg.renormalize, **self.route_kw())
+
+    def route_kw(self) -> dict:
+        """The routing kernel's scoring arguments for the config."""
+        cfg = self.cfg
+        if cfg.scoring == "sigmoid":
+            return dict(scoring="sigmoid", bias=self.wts.bias, scale=cfg.route_scale)
+        return {}
 
     def gathers(self, T: int) -> bool:
         """Whether a forward of T tokens gathers x in the gate/up GEMM's loads."""
@@ -208,18 +273,21 @@ class MoELayer:
         from spark_kernels import ops as sk
 
         cfg = self.cfg
-        logits = F.linear(x, self.router)
+        logits = router_logits(x, self.wts)
+        kw = self.route_kw()
         if self.gathers(x.shape[0]):
-            _, w, offsets, pos, rows = sk.moe_route_rows(logits, cfg.top_k, cfg.renormalize)
+            _, w, offsets, pos, rows = sk.moe_route_rows(logits, cfg.top_k, cfg.renormalize,
+                                                         **kw)
             xs = x
         else:
-            xs, _, w, offsets, pos = sk.moe_dispatch(x, logits, cfg.top_k, cfg.renormalize)
+            xs, _, w, offsets, pos = sk.moe_dispatch(x, logits, cfg.top_k, cfg.renormalize,
+                                                     **kw)
             rows = None
         if self.fuse_swiglu:
-            h = sk.grouped_gemm_swiglu(xs, self.w13, offsets, rows=rows)
+            h = sk.grouped_gemm_swiglu(xs, self.w13, offsets, rows=rows, softcap=self.softcap)
         else:
             gu = sk.grouped_gemm(xs, self.w13, offsets, rows=rows)
-            h = sk.swiglu(gu[:, :cfg.inter], gu[:, cfg.inter:])
+            h = sk.swiglu(gu[:, :cfg.inter], gu[:, cfg.inter:], softcap=self.softcap)
         y = sk.grouped_gemm(h, self.w2, offsets)
         return sk.moe_combine(y, pos, w)
 

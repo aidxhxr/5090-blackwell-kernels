@@ -63,7 +63,7 @@ def test_torch_moe_matches_dense_on_cpu():
 def test_config_sizes():
     assert ml.MIXTRAL_8X7B.layer_bytes() == 8 * 3 * 4096 * 14336 * 2  # 2.8 GB
     assert ml.QWEN3_30B_A3B.layer_bytes() == 128 * 3 * 2048 * 768 * 2  # 1.2 GB
-    assert set(ml.CONFIGS) == {"mixtral", "qwen3"}
+    assert set(ml.CONFIGS) == {"mixtral", "qwen3", "inkling"}
 
 
 # ---- GPU: routing --------------------------------------------------------------------------
