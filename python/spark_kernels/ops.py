@@ -1420,7 +1420,7 @@ def head_rms_norm(x: torch.Tensor, eps: float = 1e-6, inplace: bool = False) -> 
 
 def inkling_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, r: torch.Tensor,
                       proj: torch.Tensor, sinks: torch.Tensor | None = None, window: int = 0,
-                      variant: int = -1) -> torch.Tensor:
+                      variant: int = -1, split: int = 0) -> torch.Tensor:
     """Inkling 2 Mini's attention core (docs/design/inkling_attention.md).
 
     q [B, H_q, S_q, 128] (already clipped and scaled), k, v [B, H_kv, S_kv, 128] (or the
@@ -1431,7 +1431,8 @@ def inkling_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, r: torc
     q_i . k_j / sqrt(128) + r_i . proj[:, pos_i - j] for 0 <= pos_i - j < extent (0 past it),
     causal, and ``window`` > 0 keeps pos_i - j < window (HF's sliding window). This is
     ``eager_attention_forward`` of the HF model with its position bias, mask and sink column,
-    with fp32 logits. variant 0 (the default) is the 64-row prefill tile. Returns
-    [B, H_q, S_q, 128] bf16.
+    with fp32 logits. variant 0 is the 64-row prefill tile, 1 the 16-row decode tile
+    ((H_q / H_kv) * S_q <= 16), -1 picks decode when it fits; ``split`` > 0 forces the decode
+    kernel's key slices. Returns [B, H_q, S_q, 128] bf16.
     """
-    return _C.inkling_attention(q, k, v, r, proj, sinks, window, variant)
+    return _C.inkling_attention(q, k, v, r, proj, sinks, window, variant, split)

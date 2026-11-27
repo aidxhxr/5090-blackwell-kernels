@@ -23,6 +23,14 @@
 //
 //   prefill: one block per (b, q head, 64-row Q tile), 4 warps, 64-key tiles, two cp.async
 //            stages of K, V and the band, the KV tiles before the first row's window skipped.
+//   decode:  the flash-decoding layout of attention_decode.cu: one block per (b, kv head, key
+//            slice), the (H_q / H_kv) * S_q rows of a K/V head in one 16-row tile, four warps
+//            each streaming its own 16-key slabs (and their 16 x 40 band) through a private
+//            two-stage pipeline, partials merged in shared memory and across slices by the last
+//            block to arrive. Taken when the rows fit 16: S_q <= 5 at Inkling's 3:1 grouping.
+#include <algorithm>
+#include <cstdlib>
+
 #include "attention_internal.cuh"
 #include "spark/common.cuh"
 #include "spark/kernels.h"
@@ -370,12 +378,369 @@ void launch(const Args& a, int B, cudaStream_t stream) {
 
 }  // namespace pre
 
+// ---- decode: the rows of a K/V head in one 16-row tile -------------------------------------
+namespace dec {
+
+constexpr int WARPS = 4, THREADS = WARPS * 32;
+constexpr int ROWS = 16, BN = 16, STAGES = 2;
+constexpr int NT = BN / 8;
+constexpr int kTargetBlocks = 128;  // attention_decode.cu's split rule
+constexpr int kMaxSplit = 256;
+// A slab's distances: rows at positions off .. off + S_q - 1 (S_q <= 16) against 16 keys, at
+// most 30 + 7 past floor8(dmin): 4 n8 tiles cover S_q <= 5 (the decode tile at 3:1 GQA).
+constexpr int WTILES = 4;
+constexpr int BAND = 8 * WTILES;  // 32 columns
+constexpr int BSTRIDE = 40;       // 80-byte rows: the 8 rows of an ldmatrix in 8 bank groups
+constexpr int SB = 39;            // SB + 1 = 8 (mod 32), as the prefill scratch
+constexpr int SLAB_ELEMS = 2 * BN * D + DR * BSTRIDE;
+constexpr int WARP_BYTES = STAGES * SLAB_ELEMS * 2 + ROWS * SB * 4;
+constexpr int SMEM = WARPS * WARP_BYTES;  // 85760 B
+constexpr int PF = ROWS * (D + 2);        // one partial: O rows, m, l
+static_assert(ROWS * D <= SLAB_ELEMS, "the Q tile is staged through one slab");
+static_assert(PF * 4 <= WARP_BYTES, "a warp's partial is parked in its own region");
+static_assert(WARP_BYTES % 16 == 0, "");
+static_assert(3 * kMaxSplit * ROWS * 4 + ROWS * 4 <= SMEM, "the merge fits");
+
+struct Params {
+    Args a;
+    int rows;   // (H_q / H_kv) * S_q, row hg * S_q + t
+    int slab0;  // the first slab the first token's window holds
+    int split;
+    float* ws;
+    int* counters;
+};
+
+__global__ void __launch_bounds__(THREADS, 1) kernel(Params p) {
+    constexpr int KV_ITERS = BN * CH / 32;
+    constexpr int Q_ITERS = ROWS * CH / 32;
+    extern __shared__ __align__(128) unsigned char smem_raw[];
+    __shared__ int s_last;
+    const Args& a = p.a;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int g = lane >> 2, c2 = (lane & 3) * 2;
+    unsigned char* wbase = smem_raw + warp * WARP_BYTES;
+    bf16* wsm = reinterpret_cast<bf16*>(wbase);
+    float* sb = reinterpret_cast<float*>(wbase + STAGES * SLAB_ELEMS * 2);
+
+    const int bkv = blockIdx.x / p.split, slice = blockIdx.x - bkv * p.split;
+    const int b = bkv / a.H_kv, kv = bkv - b * a.H_kv;
+    const int group = a.H_q / a.H_kv;
+    // Rows hg * S_q + t of heads kv * group + hg: one contiguous slab of Q, R, sinks and O.
+    const size_t row0 = (static_cast<size_t>(b) * a.H_q + static_cast<size_t>(kv) * group) * a.S_q;
+    const bf16* Qg = a.Q + row0 * D;
+    bf16* Og = a.O + row0 * D;
+    const bf16* Kg = a.K + static_cast<size_t>(bkv) * a.kv_cap * D;
+    const bf16* Vg = a.V + static_cast<size_t>(bkv) * a.kv_cap * D;
+
+    const int nslab = cdiv(a.S_kv, BN) - p.slab0;
+    const int bb = p.slab0 + slice * nslab / p.split;
+    const int be = p.slab0 + (slice + 1) * nslab / p.split;
+    const int sbeg = bb + warp * (be - bb) / WARPS, send = bb + (warp + 1) * (be - bb) / WARPS;
+
+    auto load = [&](int stage, int s) {
+        bf16* ks = wsm + stage * SLAB_ELEMS;
+        bf16* vs = ks + BN * D;
+#pragma unroll
+        for (int i = 0; i < KV_ITERS; ++i) {
+            const int c = lane + i * 32;
+            const int row = c / CH, ch = c % CH;
+            const int j = s * BN + row;
+            const bool ok = j < a.S_kv;
+            const size_t o = static_cast<size_t>(ok ? j : 0) * D + ch * 8;
+            cp_async_16_zfill(ks + row * D + swz(row, ch) * 8, Kg + o, ok);
+            cp_async_16_zfill(vs + row * D + swz(row, ch) * 8, Vg + o, ok);
+        }
+        const int dmin = a.off - s * BN - (BN - 1);
+        if (dmin < a.extent)  // past the extent the bias is zero and no band is read
+            load_band(vs + BN * D, BSTRIDE, BAND / 8, a.P, a.extent, floor8(dmin), lane, 32);
+    };
+
+    bf16* qs = wsm + (STAGES - 1) * SLAB_ELEMS;
+#pragma unroll
+    for (int i = 0; i < Q_ITERS; ++i) {
+        const int c = lane + i * 32;
+        const int row = c / CH, ch = c % CH;
+        const bool ok = row < p.rows;
+        cp_async_16_zfill(qs + row * D + swz(row, ch) * 8,
+                          Qg + static_cast<size_t>(ok ? row : 0) * D + ch * 8, ok);
+    }
+    cp_async_commit();
+#pragma unroll
+    for (int s = 0; s < STAGES - 1; ++s) {
+        if (sbeg + s < send) load(s, sbeg + s);
+        cp_async_commit();
+    }
+    unsigned rf[4];
+    load_r(rf, a.R + row0 * DR, p.rows, lane);
+    cp_async_wait<STAGES - 1>();
+    __syncwarp();
+    unsigned qf[KT][4];
+    {
+        const int row = lane & 15;
+#pragma unroll
+        for (int kk = 0; kk < KT; ++kk)
+            ldmatrix_x4(qf[kk], qs + row * D + swz(row, 2 * kk + (lane >> 4)) * 8);
+    }
+    __syncwarp();
+
+    float o[DT][4];
+#pragma unroll
+    for (int dj = 0; dj < DT; ++dj)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) o[dj][e] = 0.f;
+    float m[2] = {-INFINITY, -INFINITY}, l[2] = {0.f, 0.f};
+
+    for (int s = sbeg, it = 0; s < send; ++s, ++it) {
+        cp_async_wait<STAGES - 2>();
+        __syncwarp();
+        {
+            const int ns = s + STAGES - 1;
+            if (ns < send) load((it + STAGES - 1) % STAGES, ns);
+            cp_async_commit();
+        }
+        const bf16* ks = wsm + (it % STAGES) * SLAB_ELEMS;
+        const bf16* vs = ks + BN * D;
+        const int kv0 = s * BN;
+
+        float sc[NT][4];
+        qk<NT>(sc, qf, ks, lane);
+        const int dmin = a.off - kv0 - (BN - 1);
+        const int dw = floor8(dmin);
+        const bool biased = dmin < a.extent;
+        if (biased) {
+            band_bias<WTILES, SB>(sb, rf, vs + BN * D, BSTRIDE, 0, lane);
+            __syncwarp();
+        }
+        const bool edge = kv0 + BN > a.S_kv || kv0 + BN - 1 > a.off ||
+                          (a.window > 0 && kv0 < a.S_q + a.off - a.window);
+#pragma unroll
+        for (int nj = 0; nj < NT; ++nj)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int lr = g + (e >> 1) * 8;
+                const int pos = lr % a.S_q + a.off;
+                const int j = kv0 + nj * 8 + c2 + (e & 1);
+                const float bias = biased ? sb[lr * SB + (pos - j - dw)] : 0.f;
+                sc[nj][e] = fmaf(sc[nj][e], a.scale_log2, bias);
+                if (edge && (j >= a.S_kv || j > pos || (a.window > 0 && j <= pos - a.window)))
+                    sc[nj][e] = -INFINITY;
+            }
+        softmax_row<NT>(sc, o, m[0], l[0], 0);
+        softmax_row<NT>(sc, o, m[1], l[1], 1);
+        pv<NT>(o, sc, vs, lane);
+        __syncwarp();  // every lane has read the scratch before the next slab's bias is stored
+    }
+    cp_async_wait<0>();
+    __syncwarp();
+
+    // The warps' partials, then the block's (attention_decode.cu, same layout and merge).
+    constexpr int WSTRIDE = WARP_BYTES / 4;  // floats between warp regions
+    float* mine = reinterpret_cast<float*>(wbase);
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+        float ls = l[r];
+        ls += __shfl_xor_sync(kFullMask, ls, 1);
+        ls += __shfl_xor_sync(kFullMask, ls, 2);
+        const int lrow = g + 8 * r;
+#pragma unroll
+        for (int dj = 0; dj < DT; ++dj)
+            *reinterpret_cast<float2*>(mine + lrow * D + swz(lrow, dj * 2 + (c2 >> 2)) * 4 +
+                                       (c2 & 3)) = make_float2(o[dj][2 * r], o[dj][2 * r + 1]);
+        if ((lane & 3) == 0) {
+            mine[ROWS * D + lrow] = m[r];
+            mine[ROWS * D + ROWS + lrow] = ls;
+        }
+    }
+    __syncthreads();
+
+    const float* all = reinterpret_cast<const float*>(smem_raw);
+    float* part = p.split > 1 ? p.ws + (static_cast<size_t>(bkv) * p.split + slice) * PF : nullptr;
+    for (int i = tid; i < ROWS * CH; i += THREADS) {
+        const int row = i / CH, ch = i % CH;
+        if (row >= p.rows) continue;
+        float M = -INFINITY;
+#pragma unroll
+        for (int w = 0; w < WARPS; ++w) M = fmaxf(M, all[w * WSTRIDE + ROWS * D + row]);
+        float L = 0.f, acc[8];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) acc[e] = 0.f;
+#pragma unroll
+        for (int w = 0; w < WARPS; ++w) {
+            const float* pw = all + w * WSTRIDE;
+            const float wt = ex2(pw[ROWS * D + row] - M);
+            L = fmaf(pw[ROWS * D + ROWS + row], wt, L);
+            const float4 x = *reinterpret_cast<const float4*>(pw + row * D + swz(row, 2 * ch) * 4);
+            const float4 y =
+                *reinterpret_cast<const float4*>(pw + row * D + swz(row, 2 * ch + 1) * 4);
+            acc[0] = fmaf(x.x, wt, acc[0]);
+            acc[1] = fmaf(x.y, wt, acc[1]);
+            acc[2] = fmaf(x.z, wt, acc[2]);
+            acc[3] = fmaf(x.w, wt, acc[3]);
+            acc[4] = fmaf(y.x, wt, acc[4]);
+            acc[5] = fmaf(y.y, wt, acc[5]);
+            acc[6] = fmaf(y.z, wt, acc[6]);
+            acc[7] = fmaf(y.w, wt, acc[7]);
+        }
+        if (p.split == 1) {
+            float inv = 1.f / L;
+            if (a.sinks != nullptr) inv = sink_norm(M, L, __ldg(a.sinks + row0 + row) * kLog2e);
+            uint4 u;
+            u.x = pack_bf16x2(acc[0] * inv, acc[1] * inv);
+            u.y = pack_bf16x2(acc[2] * inv, acc[3] * inv);
+            u.z = pack_bf16x2(acc[4] * inv, acc[5] * inv);
+            u.w = pack_bf16x2(acc[6] * inv, acc[7] * inv);
+            *reinterpret_cast<uint4*>(Og + static_cast<size_t>(row) * D + ch * 8) = u;
+        } else {
+            *reinterpret_cast<float4*>(part + row * D + ch * 8) =
+                make_float4(acc[0], acc[1], acc[2], acc[3]);
+            *reinterpret_cast<float4*>(part + row * D + ch * 8 + 4) =
+                make_float4(acc[4], acc[5], acc[6], acc[7]);
+            if (ch == 0) {
+                part[ROWS * D + row] = M;
+                part[ROWS * D + ROWS + row] = L;
+            }
+        }
+    }
+    if (p.split == 1) return;
+
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) s_last = atomicAdd(p.counters + bkv, 1) == p.split - 1;
+    __syncthreads();
+    if (!s_last) return;
+    __threadfence();
+    const float* base = p.ws + static_cast<size_t>(bkv) * p.split * PF;
+    float* sm = reinterpret_cast<float*>(smem_raw);  // [split][ROWS] m, l, weights; [ROWS] norm
+    float* sl = sm + p.split * ROWS;
+    float* sw = sl + p.split * ROWS;
+    float* sL = sw + p.split * ROWS;
+    for (int i = tid; i < p.split * ROWS; i += THREADS) {
+        const int k = i / ROWS, row = i - k * ROWS;
+        sm[i] = __ldcg(base + k * PF + ROWS * D + row);
+        sl[i] = __ldcg(base + k * PF + ROWS * D + ROWS + row);
+    }
+    __syncthreads();
+    if (tid < ROWS) {
+        float M = -INFINITY;
+        for (int k = 0; k < p.split; ++k) M = fmaxf(M, sm[k * ROWS + tid]);
+        float L = 0.f;
+        for (int k = 0; k < p.split; ++k) {
+            const float wt = ex2(sm[k * ROWS + tid] - M);
+            sw[k * ROWS + tid] = wt;
+            L = fmaf(sl[k * ROWS + tid], wt, L);
+        }
+        float f = 1.f / L;
+        if (a.sinks != nullptr && tid < p.rows)
+            f = sink_norm(M, L, __ldg(a.sinks + row0 + tid) * kLog2e);
+        sL[tid] = f;
+    }
+    __syncthreads();
+    for (int i = tid; i < ROWS * CH; i += THREADS) {
+        const int row = i / CH, ch = i % CH;
+        if (row >= p.rows) continue;
+        float acc[8];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) acc[e] = 0.f;
+#pragma unroll 8
+        for (int k = 0; k < p.split; ++k) {
+            const float wt = sw[k * ROWS + row];
+            const float* pk = base + k * PF + row * D + ch * 8;
+            const float4 x = __ldcg(reinterpret_cast<const float4*>(pk));
+            const float4 y = __ldcg(reinterpret_cast<const float4*>(pk + 4));
+            acc[0] = fmaf(x.x, wt, acc[0]);
+            acc[1] = fmaf(x.y, wt, acc[1]);
+            acc[2] = fmaf(x.z, wt, acc[2]);
+            acc[3] = fmaf(x.w, wt, acc[3]);
+            acc[4] = fmaf(y.x, wt, acc[4]);
+            acc[5] = fmaf(y.y, wt, acc[5]);
+            acc[6] = fmaf(y.z, wt, acc[6]);
+            acc[7] = fmaf(y.w, wt, acc[7]);
+        }
+        const float inv = sL[row];
+        uint4 u;
+        u.x = pack_bf16x2(acc[0] * inv, acc[1] * inv);
+        u.y = pack_bf16x2(acc[2] * inv, acc[3] * inv);
+        u.z = pack_bf16x2(acc[4] * inv, acc[5] * inv);
+        u.w = pack_bf16x2(acc[6] * inv, acc[7] * inv);
+        *reinterpret_cast<uint4*>(Og + static_cast<size_t>(row) * D + ch * 8) = u;
+    }
+    if (tid == 0) atomicExch(p.counters + bkv, 0);
+}
+
+struct Workspace {
+    float* ws = nullptr;
+    int* counters = nullptr;
+    size_t floats = 0;
+    size_t heads = 0;
+};
+
+Workspace& workspace(size_t floats, size_t heads) {
+    static Workspace w;
+    if (w.floats < floats) {
+        if (w.ws) SPARK_CUDA_CHECK(cudaFree(w.ws));
+        w.floats = std::max(floats, w.floats * 2);
+        SPARK_CUDA_CHECK(cudaMalloc(&w.ws, w.floats * sizeof(float)));
+    }
+    if (w.heads < heads) {
+        if (w.counters) SPARK_CUDA_CHECK(cudaFree(w.counters));
+        w.heads = std::max(heads, w.heads * 2);
+        SPARK_CUDA_CHECK(cudaMalloc(&w.counters, w.heads * sizeof(int)));
+        SPARK_CUDA_CHECK(cudaMemset(w.counters, 0, w.heads * sizeof(int)));
+    }
+    return w;
+}
+
+bool fits(int H_q, int H_kv, int S_q) {
+    // ROWS rows in the tile, and the slab's distances in WTILES n8 tiles: 15 + S_q + 7 <= BAND.
+    return (H_q / H_kv) * S_q <= ROWS && BN - 1 + S_q + 7 <= BAND;
+}
+
+void launch(const Args& a, int B, int split, cudaStream_t stream) {
+    static int resident = 0;
+    if (resident == 0) {
+        SPARK_CUDA_CHECK(
+            cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM));
+        int per_sm = 0;
+        SPARK_CUDA_CHECK(
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kernel, THREADS, SMEM));
+        resident = (per_sm > 0 ? per_sm : 1) * num_sms();
+    }
+    Params p;
+    p.a = a;
+    p.rows = (a.H_q / a.H_kv) * a.S_q;
+    p.slab0 = window_lo(a.off, a.window) / BN;
+    const int heads = B * a.H_kv;
+    const int nslab = cdiv(a.S_kv, BN) - p.slab0;
+    if (split <= 0) {
+        // attention_decode.cu's rule: about 128 blocks, at least two slabs per warp.
+        split = std::max(1, std::min(kTargetBlocks, resident) / heads);
+        split = std::min(split, std::max(1, nslab / (2 * WARPS)));
+    }
+    split = std::max(1, std::min(split, std::min(nslab, kMaxSplit)));
+    p.split = split;
+    p.ws = nullptr;
+    p.counters = nullptr;
+    if (split > 1) {
+        Workspace& w = workspace(static_cast<size_t>(heads) * split * PF, heads);
+        p.ws = w.ws;
+        p.counters = w.counters;
+    }
+    kernel<<<heads * split, THREADS, SMEM, stream>>>(p);
+}
+
+}  // namespace dec
+
 }  // namespace
+
+bool inkling_attention_decode_fits(int H_q, int H_kv, int S_q) {
+    return H_kv > 0 && H_q % H_kv == 0 && dec::fits(H_q, H_kv, S_q);
+}
 
 void inkling_attention_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_bfloat16* V,
                             const __nv_bfloat16* R, const __nv_bfloat16* P, const float* sinks,
                             __nv_bfloat16* O, int B, int H_q, int H_kv, int S_q, int S_kv,
-                            int kv_cap, int extent, int window, int variant, cudaStream_t stream) {
+                            int kv_cap, int extent, int window, int variant, int split,
+                            cudaStream_t stream) {
     SPARK_REQUIRE(B > 0 && H_q > 0 && H_kv > 0 && S_q > 0 && S_kv > 0,
                   "inkling_attention: empty shape");
     SPARK_REQUIRE(H_q % H_kv == 0, "inkling_attention: H_q must be a multiple of H_kv");
@@ -401,8 +766,14 @@ void inkling_attention_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, cons
     a.window = window < S_kv ? window : 0;  // a window holding every key is no window
     a.off = S_kv - S_q;
     a.scale_log2 = kLog2e / sqrtf(static_cast<float>(D));
-    SPARK_REQUIRE(variant == -1 || variant == 0, "inkling_attention: variant is 0");
-    pre::launch(a, B, stream);
+    const bool fits = inkling_attention_decode_fits(H_q, H_kv, S_q);
+    if (variant < 0) variant = fits ? 1 : 0;
+    SPARK_REQUIRE(variant == 0 || variant == 1, "inkling_attention: variant is 0 or 1");
+    SPARK_REQUIRE(variant == 0 || fits, "inkling_attention: decode rows exceed the 16-row tile");
+    if (variant == 1)
+        dec::launch(a, B, split, stream);
+    else
+        pre::launch(a, B, stream);
     SPARK_CUDA_CHECK(cudaGetLastError());
 }
 

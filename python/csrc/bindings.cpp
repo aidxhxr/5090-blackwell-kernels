@@ -2087,7 +2087,7 @@ Tensor head_norm(const Tensor& x, const std::string& mode, double param,
 // [B, H_q, S_q, 16], proj bf16 [16, extent], sinks [B, H_q, S_q] (any float dtype, or none).
 Tensor inkling_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& r,
                          const Tensor& proj, const std::optional<Tensor>& sinks, int64_t window,
-                         int variant) {
+                         int variant, int64_t split) {
     check_attention_inputs(q, k, v, /*cache_kv=*/true);
     const int64_t B = q.size(0), H_q = q.size(1), S_q = q.size(2), S_kv = k.size(2);
     TORCH_CHECK(q.size(3) == 128, "inkling_attention needs head_dim 128, got ", q.size(3));
@@ -2107,7 +2107,11 @@ Tensor inkling_attention(const Tensor& q, const Tensor& k, const Tensor& v, cons
     TORCH_CHECK(aligned16(r) && aligned16(proj), "inkling_attention needs 16-byte aligned r, proj");
     TORCH_CHECK(r.device() == q.device() && proj.device() == q.device(),
                 "r and proj must be on q's device");
-    TORCH_CHECK(variant >= -1 && variant <= 0, "inkling_attention variant is -1 or 0");
+    TORCH_CHECK(variant >= -1 && variant <= 1, "inkling_attention variant is -1, 0 or 1");
+    TORCH_CHECK(variant != 1 ||
+                    spark::inkling_attention_decode_fits(
+                        static_cast<int>(H_q), static_cast<int>(k.size(1)), static_cast<int>(S_q)),
+                "inkling_attention variant 1 needs (H_q / H_kv) * S_q <= 16 and S_q <= 10");
     const int w = window_arg(window);
     std::optional<Tensor> s32;
     if (sinks.has_value()) {
@@ -2125,7 +2129,7 @@ Tensor inkling_attention(const Tensor& q, const Tensor& k, const Tensor& v, cons
         s32.has_value() ? s32->data_ptr<float>() : nullptr, bf16_ptr_mut(out), static_cast<int>(B),
         static_cast<int>(H_q), static_cast<int>(k.size(1)), static_cast<int>(S_q),
         static_cast<int>(S_kv), static_cast<int>(cap > 0 ? cap : S_kv),
-        static_cast<int>(proj.size(1)), w, variant, current_stream(q));
+        static_cast<int>(proj.size(1)), w, variant, static_cast<int>(split), current_stream(q));
     return out;
 }
 
@@ -2487,5 +2491,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Inkling 2 Mini attention: softmax(q k^T / sqrt(128) + r . proj[:, pos_i - j], sink) v "
           "with the bias 0 past proj's extent, causal, window > 0 keeping pos_i - j < window",
           py::arg("q"), py::arg("k"), py::arg("v"), py::arg("r"), py::arg("proj"),
-          py::arg("sinks") = py::none(), py::arg("window") = 0, py::arg("variant") = -1);
+          py::arg("sinks") = py::none(), py::arg("window") = 0, py::arg("variant") = -1,
+          py::arg("split") = 0);
+    m.def("inkling_attention_decode_fits", &spark::inkling_attention_decode_fits,
+          "whether inkling_attention's 16-row decode tile takes the shape", py::arg("H_q"),
+          py::arg("H_kv"), py::arg("S_q"));
 }
