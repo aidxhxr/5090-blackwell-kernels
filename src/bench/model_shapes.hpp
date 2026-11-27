@@ -47,6 +47,20 @@ inline const std::vector<ModelWeight>& model_weights() {
         {"qwen3-30b-a3b", "expert down", 2048, 768},
         {"deepseek", "expert up", 2304, 5120},
         {"deepseek", "expert down", 5120, 2304},
+        // Inkling 2 Mini (docs/design/inkling_decode.md). The tiny ones (sinks, dynamic conv
+        // taps, message-gate down) are under every variant's N or K granularity, so only
+        // cuBLAS runs them; lm_head is the unpadded 200058 rows and the 201024-row padding.
+        {"inkling2-mini", "q_proj/gate_proj", 3072, 2304},
+        {"inkling2-mini", "k_proj/v_proj", 1024, 2304},
+        {"inkling2-mini", "o_proj", 2304, 3072},
+        {"inkling2-mini", "rel state", 384, 2304},
+        {"inkling2-mini", "sink_proj", 24, 2304},
+        {"inkling2-mini", "conv taps", 32, 2304},
+        {"inkling2-mini", "msg gate down", 64, 4608},
+        {"inkling2-mini", "expert gate_up", 2304, 2304},
+        {"inkling2-mini", "expert down", 2304, 1152},
+        {"inkling2-mini", "lm_head", 200058, 2304},
+        {"inkling2-mini", "lm_head padded", 201024, 2304},
     };
     return w;
 }

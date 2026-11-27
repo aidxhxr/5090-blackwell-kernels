@@ -444,6 +444,18 @@ struct ModelCand {
 bool run_models_weight(cudaStream_t stream, const spark::bench::ModelWeight& w,
                        const std::vector<int>& ms, bool mx, bool tiles, int iters) {
     const int N = w.N, K = w.K, KB = K / 32;
+    // A weight no variant runs (Inkling's 24-row sink_proj, its unpadded 200058-row lm_head)
+    // is skipped before cuBLASLt is asked for it: it may have no fp8 algorithm either.
+    bool any = false;
+    for (int M : ms)
+        for (int v = 0; v < spark::fp8gemm_num_variants(); ++v)
+            any = any || (mx ? spark::fp8gemm_mx_supports(M, N, K, v)
+                             : spark::fp8gemm_supports(M, N, K, v));
+    if (!any) {
+        std::fprintf(stderr, "  %s %s: no variant runs N = %d, K = %d, skipped\n", w.model, w.name,
+                     N, K);
+        return true;
+    }
     const int max_m = *std::max_element(ms.begin(), ms.end());
     const size_t nB = static_cast<size_t>(N) * K;  // bytes
     const int copies =
