@@ -22,6 +22,17 @@ window 1024 or full, 24 q / 8 kv heads of 128, no RoPE, an additive relative pos
 per-query sinks, a sigmoid output gate) goes through a short causal conv; a second residual
 mix picks the MoE input (128 experts, top 8, sigmoid router with a selection bias, softcapped
 SwiGLU); the MoE output goes through another short conv. Six layers form one block.
+
+    cfg = InklingConfig.from_hf("~/models/Inkling-2-Mini")
+    ref = InklingForCausalLM(cfg).to_model_dtype(torch.bfloat16)
+    ref.load_state_dict(hf.state_dict(), strict=True)
+    logits = ref(ids)                           # prefill without a cache, [B, T, 200058]
+    cache = InklingCache(cfg)
+    logits = ref(ids, cache)                    # prefill into the 48-layer cache
+    logits = ref.decode_step(next_ids, cache)   # one token per sequence, [B, 200058]
+
+It is a reference: the experts run as a loop over the picked experts, attention builds the
+whole [T, T] score matrix, nothing is fused. Padding (an attention mask) is not supported.
 """
 
 from __future__ import annotations
@@ -247,6 +258,63 @@ class InklingConfig:
         return counts
 
 
+# ---- decode cache ----------------------------------------------------------------------------
+
+
+class InklingCache:
+    """Everything a decode step needs from the tokens before it, for the 48 cache layers
+    (cfg.cache_index maps a layer and pass to one):
+
+        keys[c], values[c]   [B, Hkv, L, D] in the model dtype, after the conv and the clip or
+                             norm; a sliding cache layer keeps the last `sliding_window`
+                             positions (1024), a full one keeps all of them
+        conv[c][s]           [B, k - 1, C] fp32, the last 3 inputs of conv s of cache layer
+                             c: 0 the key conv (C = 1024), 1 the value conv (1024), 2 the
+                             attention output conv (2304), 3 the MLP output conv (2304)
+        length               tokens seen so far (the next token's position)
+
+    Nothing else carries over between tokens: the block residual mixes and the loop's
+    messages mix over depth, within one token, so the block states are rebuilt every step.
+    """
+
+    def __init__(self, cfg: InklingConfig):
+        self.cfg = cfg
+        self.types = cfg.cache_layer_types()
+        n = cfg.num_cache_layers
+        self.keys: list[torch.Tensor | None] = [None] * n
+        self.values: list[torch.Tensor | None] = [None] * n
+        self.conv: list[list[torch.Tensor | None]] = [[None] * 4 for _ in range(n)]
+        self.length = 0
+
+    def conv_context(self, layer: int, slot: int, x: torch.Tensor, k: int) -> torch.Tensor:
+        """x [B, T, C] fp32 -> [B, T + k - 1, C], the stored k - 1 inputs (zeros before the
+        first token) in front of x; keeps the last k - 1 of the result."""
+        state = self.conv[layer][slot]
+        if state is None:
+            state = x.new_zeros(x.shape[0], k - 1, x.shape[2])
+        ctx = torch.cat([state, x], dim=1)
+        self.conv[layer][slot] = ctx[:, ctx.shape[1] - (k - 1):]
+        return ctx
+
+    def append_kv(self, layer: int, k: torch.Tensor, v: torch.Tensor):
+        """Append this step's k, v [B, Hkv, T, D] (positions length .. length + T - 1).
+        Returns the keys and values to attend over (stored + new) and the position of the
+        first of them; a sliding layer then keeps only the last `sliding_window`."""
+        new = k.shape[2]
+        if self.keys[layer] is not None:
+            k = torch.cat([self.keys[layer], k], dim=2)
+            v = torch.cat([self.values[layer], v], dim=2)
+        first = self.length + new - k.shape[2]
+        keep = self.cfg.sliding_window if self.types[layer] == SLIDING else k.shape[2]
+        self.keys[layer], self.values[layer] = k[:, :, -keep:], v[:, :, -keep:]
+        return k, v, first
+
+    def nbytes(self) -> int:
+        ts = [t for t in self.keys + self.values if t is not None]
+        ts += [t for row in self.conv for t in row if t is not None]
+        return sum(t.numel() * t.element_size() for t in ts)
+
+
 # ---- modules ---------------------------------------------------------------------------------
 #
 # Attribute names follow HF's Inkling2Loop modules so the state_dict keys are the same. The
@@ -344,19 +412,28 @@ class MessageGate(nn.Module):
         return (1 - forget) * h + gain * m
 
 
+def _conv_context(x, k, cache, layer, slot):
+    """The conv input with its k - 1 tokens of left context: zeros without a cache, the
+    cached inputs with one."""
+    if cache is None:
+        return F.pad(x, (0, 0, k - 1, 0))
+    return cache.conv_context(layer, slot, x, k)
+
+
 class ShortConv(nn.Module):
     """Causal depthwise conv over time with static taps, kernel 4, plus the input:
     out = (conv(x) + x) / sqrt(k + 1), in fp32. conv1d.weight is [C, 1, k], tap k-1 on the
     current token."""
 
-    def __init__(self, channels: int, k: int):
+    def __init__(self, channels: int, k: int, slot: int):
         super().__init__()
-        self.k = k
+        self.k, self.slot = k, slot  # slot: which of the cache layer's four conv states
         self.conv1d = nn.Conv1d(channels, channels, k, groups=channels, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cache: InklingCache | None = None,
+                layer: int = 0) -> torch.Tensor:
         xf = x.float()
-        ctx = F.pad(xf, (0, 0, self.k - 1, 0))  # [B, T + k - 1, C], zeros before the start
+        ctx = _conv_context(xf, self.k, cache, layer, self.slot)  # [B, T + k - 1, C]
         y = F.conv1d(ctx.transpose(1, 2), self.conv1d.weight.float(), groups=xf.shape[-1])
         return ((y.transpose(1, 2) + xf) / math.sqrt(self.k + 1)).to(x.dtype)
 
@@ -366,18 +443,19 @@ class DynamicShortConv(nn.Module):
     plus per-token taps weight_proj(dyn_input), one set of k per kv head.
     out = (conv(x) + x) / sqrt(2k + 1), in fp32."""
 
-    def __init__(self, channels: int, input_size: int, heads: int, k: int):
+    def __init__(self, channels: int, input_size: int, heads: int, k: int, slot: int):
         super().__init__()
-        self.k, self.heads = k, heads
+        self.k, self.heads, self.slot = k, heads, slot
         self.static_weight = nn.Parameter(torch.zeros(k, channels))
         self.weight_proj = nn.Linear(input_size, heads * k, bias=False)
 
-    def forward(self, x: torch.Tensor, dyn_input: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, dyn_input: torch.Tensor,
+                cache: InklingCache | None = None, layer: int = 0) -> torch.Tensor:
         b, t, c = x.shape
         dyn = self.weight_proj(dyn_input).float().view(b, t, self.heads, 1, self.k)
         taps = self.static_weight.float().T.reshape(self.heads, c // self.heads, self.k) + dyn
         xf = x.float()
-        ctx = F.pad(xf, (0, 0, self.k - 1, 0))
+        ctx = _conv_context(xf, self.k, cache, layer, self.slot)
         # windows[..., lag] is the token `lag` steps back
         windows = ctx.unfold(1, self.k, 1).flip(-1).reshape(b, t, self.heads, -1, self.k)
         y = (windows * taps).sum(-1).reshape(b, t, c)
@@ -419,12 +497,17 @@ class KeyValueProjection(nn.Module):
         super().__init__()
         self.cfg, self.dim, self.is_key = cfg, dim, is_key
         self.linear = nn.Linear(cfg.hidden_size, heads * dim, bias=False)
-        self.sconv = (DynamicShortConv(heads * dim, cfg.hidden_size, heads, cfg.conv_kernel)
-                      if dynamic else ShortConv(heads * dim, cfg.conv_kernel))
+        slot = 0 if is_key else 1
+        self.sconv = (DynamicShortConv(heads * dim, cfg.hidden_size, heads, cfg.conv_kernel, slot)
+                      if dynamic else ShortConv(heads * dim, cfg.conv_kernel, slot))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cache: InklingCache | None = None,
+                layer: int = 0) -> torch.Tensor:
         s = self.linear(x)
-        s = self.sconv(s, x) if isinstance(self.sconv, DynamicShortConv) else self.sconv(s)
+        if isinstance(self.sconv, DynamicShortConv):
+            s = self.sconv(s, x, cache, layer)
+        else:
+            s = self.sconv(s, cache, layer)
         s = s.view(*s.shape[:-1], -1, self.dim)
         if self.is_key:
             return l2_clip(s, self.cfg.qk_clip).to(s.dtype)
@@ -491,13 +574,19 @@ class Attention(nn.Module):
         self.sink_proj = nn.Linear(cfg.hidden_size, nh, bias=False)
         self.relative_position_bias = RelativeBias(cfg, nh, extent, log=self.full)
 
-    def forward(self, xq, xk, xv, positions):
+    def forward(self, xq, xk, xv, positions, cache=None, layer=0):
         """xq, xk, xv [B, T, H] are the query, key and value inputs (the same tensor in the
-        sliding layers outside the loop); the gate, the sinks and the relative bias read xq."""
+        sliding layers outside the loop); the gate, the sinks and the relative bias read xq.
+        With a cache, the keys and values of the earlier tokens come from cache layer
+        `layer` and this step's are appended to it."""
         q = self.q_proj(xq, positions).transpose(1, 2)
-        k = self.k_proj(xk).transpose(1, 2)
-        v = self.v_proj(xv).transpose(1, 2)
-        distance = positions[:, None] - positions[None, :]
+        k = self.k_proj(xk, cache, layer).transpose(1, 2)
+        v = self.v_proj(xv, cache, layer).transpose(1, 2)
+        key_positions = positions
+        if cache is not None:
+            k, v, first = cache.append_kv(layer, k, v)
+            key_positions = torch.arange(first, first + k.shape[2], device=positions.device)
+        distance = positions[:, None] - key_positions[None, :]
         visible = distance >= 0
         if self.window is not None:
             visible &= distance < self.window
@@ -587,8 +676,8 @@ class DecoderLayer(nn.Module):
         else:
             self.input_layernorm = RMSNorm(h, eps)
         self.post_attention_layernorm = RMSNorm(h, eps)
-        self.post_attention_convolution = ShortConv(h, cfg.conv_kernel)
-        self.post_mlp_convolution = ShortConv(h, cfg.conv_kernel)
+        self.post_attention_convolution = ShortConv(h, cfg.conv_kernel, slot=2)
+        self.post_mlp_convolution = ShortConv(h, cfg.conv_kernel, slot=3)
         self.loop = cfg.is_loop_layer(layer)
         if self.loop:
             self.q_message_gate = MessageGate(cfg)
@@ -596,10 +685,10 @@ class DecoderLayer(nn.Module):
             self.v_message_gate = MessageGate(cfg)
             self.mlp_message_gate = MessageGate(cfg)
 
-    def forward(self, x, blocks, positions, messages=None):
+    def forward(self, x, blocks, positions, messages=None, cache=None, layer=0):
         """x [B, T, H] the partial block so far (model dtype), blocks the finished block
-        states, messages (q, k, v, mlp) from the previous pass or None. Returns the new
-        partial block in the model dtype."""
+        states, messages (q, k, v, mlp) from the previous pass or None, `layer` the cache
+        layer of this application. Returns the new partial block in the model dtype."""
         dtype = x.dtype
         if self.attention_input is None:
             mixed = [x] * 3
@@ -614,8 +703,8 @@ class DecoderLayer(nn.Module):
             xq, xk, xv = (n(m).to(dtype) for n, m in zip(norms, mixed, strict=True))
         else:
             xq, xk, xv = (self.input_layernorm(m).to(dtype) for m in mixed)
-        a = self.self_attn(xq, xk, xv, positions)
-        a = self.post_attention_convolution(a).float()
+        a = self.self_attn(xq, xk, xv, positions, cache, layer)
+        a = self.post_attention_convolution(a, cache, layer).float()
         # a block boundary starts a new partial block: the input becomes a finished block
         if self.is_block_boundary:
             blocks, partial = [*blocks, x], a
@@ -625,7 +714,7 @@ class DecoderLayer(nn.Module):
         if messages is not None:
             m = self.mlp_message_gate(m, messages[3])
         m = self.mlp(self.post_attention_layernorm(m).to(dtype))
-        m = self.post_mlp_convolution(m)
+        m = self.post_mlp_convolution(m, cache, layer)
         return (partial + m).to(dtype)
 
 
@@ -640,36 +729,42 @@ class InklingTextModel(nn.Module):
         self.final_input = ResidualMix((h,))
         self.message_input = ResidualMix((cfg.num_loop_layers, 4, h))
 
-    def _run(self, layers, x, blocks, positions, msgs_from=None):
-        """Run `layers` in order; a block-boundary layer's input joins the finished blocks.
-        msgs_from = (blocks, partial) of the previous loop pass, for passes 2 and 3."""
-        for j, layer in enumerate(layers):
+    def _run(self, first, last, x, blocks, positions, cache, loop_pass=0, msgs_from=None):
+        """Run layers first..last-1 in order; a block-boundary layer's input joins the
+        finished blocks. msgs_from = (blocks, partial) of the previous loop pass, for passes
+        2 and 3."""
+        for i in range(first, last):
+            layer = self.layers[i]
             messages = None
             if msgs_from is not None:
-                messages = self.message_input(*msgs_from, row=j)
-            new = layer(x, blocks, positions, messages)
+                messages = self.message_input(*msgs_from, row=i - first)
+            c = self.cfg.cache_index(i, loop_pass)
+            new = layer(x, blocks, positions, messages, cache, c)
             if layer.is_block_boundary:
                 blocks = [*blocks, x]
             x = new
         return x, blocks
 
-    def forward(self, ids: torch.Tensor) -> torch.Tensor:
-        """ids [B, T] -> final hidden states [B, T, H] (model dtype)."""
+    def forward(self, ids: torch.Tensor, cache: InklingCache | None = None) -> torch.Tensor:
+        """ids [B, T] -> final hidden states [B, T, H] (model dtype). With a cache, ids are
+        the next T tokens after the cached ones, and the cache takes them in."""
         cfg = self.cfg
-        positions = torch.arange(ids.shape[1], device=ids.device)
+        start = 0 if cache is None else cache.length
+        positions = torch.arange(start, start + ids.shape[1], device=ids.device)
         x = self.embed_tokens(ids)
-        layers = list(self.layers)
         lo, hi = cfg.loop_start, cfg.loop_end
-        x, blocks = self._run(layers[:lo], x, [], positions)
+        x, blocks = self._run(0, lo, x, [], positions, cache)
         prelude = (x, blocks)
-        x, blocks = self._run(layers[lo:hi], x, blocks, positions)
-        for _ in range(1, cfg.loop_passes):
+        x, blocks = self._run(lo, hi, x, blocks, positions, cache)
+        for p in range(1, cfg.loop_passes):
             # the previous pass's own blocks (past the prelude's and the one it closed at
             # loop_start) and its partial block are what the messages read
             prev = (blocks[len(prelude[1]) + 1:], x)
-            x, blocks = self._run(layers[lo:hi], *prelude, positions, msgs_from=prev)
-        x, blocks = self._run(layers[hi:], x, blocks, positions)
+            x, blocks = self._run(lo, hi, *prelude, positions, cache, p, msgs_from=prev)
+        x, blocks = self._run(hi, cfg.num_layers, x, blocks, positions, cache)
         x = self.final_input(blocks, x)[0]
+        if cache is not None:
+            cache.length += ids.shape[1]
         return self.norm(x).to(self.embed_tokens.weight.dtype)
 
 
@@ -688,7 +783,14 @@ class InklingForCausalLM(nn.Module):
             t.data = t.data.to(torch.float32 if any(k in name for k in FP32_KEYS) else dtype)
         return self
 
-    def forward(self, ids: torch.Tensor) -> torch.Tensor:
-        """Prefill without a cache: ids [B, T] -> softcapped logits [B, T, 200058] fp32."""
-        h = self.model(ids)
+    def forward(self, ids: torch.Tensor, cache: InklingCache | None = None) -> torch.Tensor:
+        """ids [B, T] -> softcapped logits [B, T, 200058] fp32. Without a cache this is the
+        whole-prompt prefill; with one, ids continue the cached tokens (a prefill into the
+        cache, or a chunk of one)."""
+        h = self.model(ids, cache)
         return softcap(self.lm_head(h).float(), self.cfg.logit_softcap)
+
+    def decode_step(self, token: torch.Tensor, cache: InklingCache) -> torch.Tensor:
+        """One token per sequence, token [B] -> logits [B, 200058], through all 48 cache
+        layers."""
+        return self(token[:, None], cache)[:, -1]
