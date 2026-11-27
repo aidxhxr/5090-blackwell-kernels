@@ -1134,7 +1134,15 @@ struct MoeRouting {
     int T, E, k;
 };
 
-MoeRouting run_moe_route(const Tensor& logits, int64_t top_k, bool renormalize) {
+// The sigmoid form's options: sigmoid scores, the pick bias [E] fp32 (or none), route_scale.
+struct MoeScoring {
+    bool sigmoid = false;
+    std::optional<Tensor> bias;
+    double scale = 1.0;
+};
+
+MoeRouting run_moe_route(const Tensor& logits, int64_t top_k, bool renormalize,
+                         const MoeScoring& sc = {}) {
     check_cuda_contig(logits, "logits");
     check_float_or_bf16(logits, "logits");
     TORCH_CHECK(logits.dim() == 2, "logits must be [T, E]");
@@ -1153,6 +1161,24 @@ MoeRouting run_moe_route(const Tensor& logits, int64_t top_k, bool renormalize) 
     r.weights = at::empty({T, top_k}, logits.options().dtype(at::kFloat));
     r.offsets = at::empty({E + 1}, i32);
     r.pos = at::empty({T, top_k}, i32);
+    if (sc.sigmoid) {
+        const float* bias = nullptr;
+        if (sc.bias.has_value()) {
+            const Tensor& b = *sc.bias;
+            TORCH_CHECK(b.is_cuda() && b.device() == logits.device() &&
+                            b.scalar_type() == at::kFloat && b.dim() == 1 && b.size(0) == E &&
+                            b.is_contiguous(),
+                        "moe_route: bias must be a contiguous float32 [E] on logits' device");
+            bias = b.data_ptr<float>();
+        }
+        r.plan = spark::moe_route_sigmoid(
+            logits.data_ptr(), logits.scalar_type() == at::kFloat, r.T, r.E, r.k, renormalize, bias,
+            static_cast<float>(sc.scale), r.ids.data_ptr<int32_t>(), r.weights.data_ptr<float>(),
+            r.pos.data_ptr<int32_t>(), r.offsets.data_ptr<int32_t>(), current_stream(logits));
+        return r;
+    }
+    TORCH_CHECK(!sc.bias.has_value() && sc.scale == 1.0,
+                "moe_route: bias and scale are for the sigmoid scoring");
     r.plan = spark::moe_route(logits.data_ptr(), logits.scalar_type() == at::kFloat, r.T, r.E, r.k,
                               renormalize, r.ids.data_ptr<int32_t>(), r.weights.data_ptr<float>(),
                               r.pos.data_ptr<int32_t>(), r.offsets.data_ptr<int32_t>(),
@@ -1163,8 +1189,10 @@ MoeRouting run_moe_route(const Tensor& logits, int64_t top_k, bool renormalize) 
 // Softmax top-k routing: (ids, weights, offsets, pos), pos [T, k] the row of expert order each
 // (token, slot) goes to. Two launches (the routing, then the positions).
 std::tuple<Tensor, Tensor, Tensor, Tensor> moe_route(const Tensor& logits, int64_t top_k,
-                                                     bool renormalize) {
-    MoeRouting r = run_moe_route(logits, top_k, renormalize);
+                                                     bool renormalize, bool sigmoid,
+                                                     const std::optional<Tensor>& bias,
+                                                     double scale) {
+    MoeRouting r = run_moe_route(logits, top_k, renormalize, {sigmoid, bias, scale});
     spark::moe_positions(r.ids.data_ptr<int32_t>(), r.pos.data_ptr<int32_t>(), r.plan, r.T, r.E,
                          r.k, current_stream(logits));
     return {r.ids, r.weights, r.offsets, r.pos};
@@ -1174,8 +1202,11 @@ std::tuple<Tensor, Tensor, Tensor, Tensor> moe_route(const Tensor& logits, int64
 // int32 with rows[pos[t, s]] = t, the token of each row of expert order, which is the row
 // table grouped_gemm's gather takes in place of the permuted copy. Two launches.
 std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> moe_route_rows(const Tensor& logits,
-                                                                  int64_t top_k, bool renormalize) {
-    MoeRouting r = run_moe_route(logits, top_k, renormalize);
+                                                                  int64_t top_k, bool renormalize,
+                                                                  bool sigmoid,
+                                                                  const std::optional<Tensor>& bias,
+                                                                  double scale) {
+    MoeRouting r = run_moe_route(logits, top_k, renormalize, {sigmoid, bias, scale});
     Tensor rows = at::empty({static_cast<int64_t>(r.T) * r.k}, r.ids.options());
     spark::moe_positions(r.ids.data_ptr<int32_t>(), r.pos.data_ptr<int32_t>(), r.plan, r.T, r.E,
                          r.k, current_stream(logits), rows.data_ptr<int32_t>());
@@ -1186,7 +1217,9 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> moe_route_rows(const Tensor& 
 // launches (the routing, then the permute, which finishes pos as it moves the rows).
 std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> moe_dispatch(const Tensor& x,
                                                                 const Tensor& logits, int64_t top_k,
-                                                                bool renormalize) {
+                                                                bool renormalize, bool sigmoid,
+                                                                const std::optional<Tensor>& bias,
+                                                                double scale) {
     check_cuda_contig(x, "x");
     TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.dim() == 2, "x must be bfloat16 [T, D]");
     TORCH_CHECK(logits.dim() == 2 && logits.size(0) == x.size(0),
@@ -1196,7 +1229,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> moe_dispatch(const Tensor& x,
     TORCH_CHECK(spark::moe_permute_supports(static_cast<int>(D), static_cast<int>(top_k)),
                 "moe_dispatch needs D a multiple of 8, at most 8192, and top_k <= 16");
     TORCH_CHECK(aligned16(x), "moe_dispatch needs 16-byte aligned x");
-    MoeRouting r = run_moe_route(logits, top_k, renormalize);
+    MoeRouting r = run_moe_route(logits, top_k, renormalize, {sigmoid, bias, scale});
     const c10::cuda::CUDAGuard guard(x.device());
     Tensor xs = at::empty({x.size(0) * top_k, D}, x.options());
     spark::moe_permute_bf16(bf16_ptr(x), r.ids.data_ptr<int32_t>(), r.pos.data_ptr<int32_t>(),
@@ -2281,14 +2314,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("moe_route", &moe_route,
           "softmax top-k routing of logits [T, E]: (ids [T, k] int32, weights [T, k] fp32, "
           "offsets [E + 1] int32, pos [T, k] int32, the row of expert order)",
-          py::arg("logits"), py::arg("top_k"), py::arg("renormalize") = true);
+          py::arg("logits"), py::arg("top_k"), py::arg("renormalize") = true,
+          py::arg("sigmoid") = false, py::arg("bias") = py::none(), py::arg("scale") = 1.0);
     m.def("moe_route_rows", &moe_route_rows,
           "moe_route plus rows [T * k] int32, the token of each row of expert order",
-          py::arg("logits"), py::arg("top_k"), py::arg("renormalize") = true);
+          py::arg("logits"), py::arg("top_k"), py::arg("renormalize") = true,
+          py::arg("sigmoid") = false, py::arg("bias") = py::none(), py::arg("scale") = 1.0);
     m.def("moe_dispatch", &moe_dispatch,
           "moe_route plus the rows of x [T, D] in expert order: (xs [T * k, D], ids, weights, "
           "offsets, pos)",
-          py::arg("x"), py::arg("logits"), py::arg("top_k"), py::arg("renormalize") = true);
+          py::arg("x"), py::arg("logits"), py::arg("top_k"), py::arg("renormalize") = true,
+          py::arg("sigmoid") = false, py::arg("bias") = py::none(), py::arg("scale") = 1.0);
     m.def("moe_combine", &moe_combine,
           "out [T, D] = sum over s of weights[t, s] * y[pos[t, s]], fp32, fixed order",
           py::arg("y"), py::arg("pos"), py::arg("weights"));

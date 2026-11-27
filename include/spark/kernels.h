@@ -607,6 +607,15 @@ void moe_permute_bf16(const __nv_bfloat16* x, const int32_t* ids, int32_t* pos,
                       cudaStream_t stream);
 void moe_combine_bf16(const __nv_bfloat16* y, const int32_t* pos, const float* weights,
                       __nv_bfloat16* out, int T, int k, int D, cudaStream_t stream);
+// moe_route_sigmoid: moe_route with sigmoid scores (DeepSeek V3, Inkling 2 Mini): s =
+// sigmoid(logits) in fp32, the top k of s + bias (bias [E] fp32 on the device, or null),
+// ids largest key first, ties to the lower id; weights the picks' unbiased s, divided by
+// (their sum + 1e-20) when `renorm`, times `scale` (route_scale). The other outputs, the
+// plan and the rules are moe_route's.
+MoeRoutePlan moe_route_sigmoid(const void* logits, bool logits_fp32, int T, int E, int k,
+                               bool renorm, const float* bias, float scale, int32_t* ids,
+                               float* weights, int32_t* rank, int32_t* offsets,
+                               cudaStream_t stream);
 
 // ---- RoPE + K/V cache append -------------------------------------------------------------
 // From qkv = [B, S, (H_q + 2 H_kv) * D] bf16 (a fused q|k|v projection) and rotary tables

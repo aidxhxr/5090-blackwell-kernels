@@ -26,6 +26,16 @@
 //
 // Every output is the same bits every run: no float atomics, and the integer counter only
 // picks which block does the scan.
+//
+// The sigmoid form (moe_route_sigmoid) is the routing of DeepSeek V3 and of Inkling 2 Mini
+// (top-8 of 128, Inkling2LoopTopKRouter): scores = sigmoid(logits) in fp32, the k picked by
+// score + a per-expert correction bias, the weights the unbiased scores of the picks divided
+// by (their sum + 1e-20), times route_scale. The picks are the same warp argmax over the
+// biased scores as keys; each lane also carries the unbiased score of its best candidate,
+// and the winning lane hands it over with one shuffle per round. The sigmoid is
+// 1 / (1 + expf(-x)) and the key s + bias, the arithmetic torch's sigmoid and add do in fp32
+// on the GPU, so the keys torch.topk sees are the same bits and so are the picks (where torch
+// has no tie of its own to break).
 
 #include <algorithm>
 
@@ -49,11 +59,14 @@ constexpr int TOKENS_PER_BLOCK = 16;  // the least, before the block count is ca
 struct Params {
     int T, E, k, tb, nb;
     bool renorm;
-    int32_t* ids;      // [T, k]
-    float* weights;    // [T, k]
-    int32_t* rank;     // [T, k]: index among the block's assignments to the same expert
-    int32_t* base;     // [nb, E]: counts, then (last block) each block's first row per expert
-    int32_t* offsets;  // [E + 1]
+    bool sigmoid;       // sigmoid scores (moe_route_sigmoid), else the softmax
+    const float* bias;  // sigmoid: [E] added to the scores for the picks only, or null
+    float scale;        // every weight times this (route_scale), after the renormalization
+    int32_t* ids;       // [T, k]
+    float* weights;     // [T, k]
+    int32_t* rank;      // [T, k]: index among the block's assignments to the same expert
+    int32_t* base;      // [nb, E]: counts, then (last block) each block's first row per expert
+    int32_t* offsets;   // [E + 1]
     unsigned* counter;
 };
 
@@ -123,6 +136,13 @@ __global__ void __launch_bounds__(THREADS) route_kernel(const LT* __restrict__ l
             dst[j] = e < E ? logit_f32(row + e) : -INFINITY;
         }
     };
+    // The sigmoid's per-expert bias, this lane's experts' (it is the same for every token).
+    float bias[J];
+#pragma unroll
+    for (int j = 0; j < J; ++j) {
+        const int e = lane + 32 * j;
+        bias[j] = p.sigmoid && p.bias && e < E ? __ldg(p.bias + e) : 0.f;
+    }
     float vn[J];
     if (t0 + warp < t1) load(t0 + warp, vn);
     for (int t = t0 + warp; t < t1; t += WARPS) {
@@ -130,23 +150,37 @@ __global__ void __launch_bounds__(THREADS) route_kernel(const LT* __restrict__ l
 #pragma unroll
         for (int j = 0; j < J; ++j) v[j] = vn[j];
         if (t + WARPS < t1) load(t + WARPS, vn);
-        float m = v[0];
+        // Softmax: v stays the logits, the picks' weights come from the max m and sum s.
+        // Sigmoid: sc holds the scores and v becomes the keys, score + bias.
+        float m = 0.f, s = 1.f;
+        float sc[J];
+        if (p.sigmoid) {
 #pragma unroll
-        for (int j = 1; j < J; ++j) m = fmaxf(m, v[j]);
-        m = key_float(__reduce_max_sync(kFullMask, order_key(m)));
-        float s = 0.f;
+            for (int j = 0; j < J; ++j) {
+                sc[j] = 1.f / (1.f + expf(-v[j]));
+                v[j] = sc[j] + bias[j];
+            }
+        } else {
+            m = v[0];
 #pragma unroll
-        for (int j = 0; j < J; ++j)
-            if (lane + 32 * j < E) s += expf(v[j] - m);
-        s = warp_reduce_sum(s);
+            for (int j = 1; j < J; ++j) m = fmaxf(m, v[j]);
+            m = key_float(__reduce_max_sync(kFullMask, order_key(m)));
+            s = 0.f;
+#pragma unroll
+            for (int j = 0; j < J; ++j)
+                if (lane + 32 * j < E) s += expf(v[j] - m);
+            s = warp_reduce_sum(s);
+        }
 
         unsigned taken = 0;  // bit j: expert lane + 32 j already picked
         int my_e = 0;
         float my_p = 0.f;
         for (int r = 0; r < k; ++r) {
-            // The lane's best untaken logit (the lowest id among equals), as a key; 0 = none.
+            // The lane's best untaken key (the lowest id among equals), as a u32; 0 = none.
+            // bs is that candidate's score (sigmoid).
             unsigned bk = 0;
             int bi = 0x7fffffff;
+            float bs = 0.f;
 #pragma unroll
             for (int j = 0; j < J; ++j) {
                 const int e = lane + 32 * j;
@@ -154,6 +188,7 @@ __global__ void __launch_bounds__(THREADS) route_kernel(const LT* __restrict__ l
                 if (e < E && !((taken >> j) & 1u) && key > bk) {
                     bk = key;
                     bi = e;
+                    if (p.sigmoid) bs = sc[j];
                 }
             }
             const unsigned top = __reduce_max_sync(kFullMask, bk);
@@ -161,16 +196,19 @@ __global__ void __launch_bounds__(THREADS) route_kernel(const LT* __restrict__ l
                 __reduce_min_sync(kFullMask, bk == top ? static_cast<unsigned>(bi) : 0xffffffffu));
             const float bv = key_float(top);
             if ((bi & 31) == lane) taken |= 1u << (bi >> 5);
+            // The winner's lane holds bi as its own best, so its bs is the pick's score.
+            if (p.sigmoid) bs = __shfl_sync(kFullMask, bs, bi & 31);
             if (lane == r) {
                 my_e = bi;
-                my_p = expf(bv - m) / s;
+                my_p = p.sigmoid ? bs : expf(bv - m) / s;
             }
         }
         float w = my_p;
         if (p.renorm) {
             const float sum = warp_reduce_sum(lane < k ? my_p : 0.f);
-            w = my_p / sum;
+            w = p.sigmoid ? my_p / (sum + 1e-20f) : my_p / sum;
         }
+        w *= p.scale;
         if (lane < k) {
             const size_t i = static_cast<size_t>(t) * k + lane;
             p.ids[i] = my_e;
@@ -307,9 +345,11 @@ bool moe_route_supports(int E, int k) {
     return E >= 1 && E <= mr::MAX_E && k >= 1 && k <= mr::MAX_K && k <= E;
 }
 
-MoeRoutePlan moe_route(const void* logits, bool logits_fp32, int T, int E, int k, bool renorm,
-                       int32_t* ids, float* weights, int32_t* rank, int32_t* offsets,
-                       cudaStream_t stream) {
+namespace {
+
+MoeRoutePlan route(const void* logits, bool logits_fp32, int T, int E, int k, bool renorm,
+                   bool sigmoid, const float* bias, float scale, int32_t* ids, float* weights,
+                   int32_t* rank, int32_t* offsets, cudaStream_t stream) {
     SPARK_REQUIRE(moe_route_supports(E, k), "moe_route: requires 1 <= k <= min(E, 16), E <= 512");
     SPARK_REQUIRE(logits && ids && weights && rank && offsets, "moe_route: null pointer");
     SPARK_REQUIRE(T >= 1, "moe_route: needs at least one token");
@@ -336,6 +376,9 @@ MoeRoutePlan moe_route(const void* logits, bool logits_fp32, int T, int E, int k
     p.tb = tb;
     p.nb = nb;
     p.renorm = renorm;
+    p.sigmoid = sigmoid;
+    p.bias = bias;
+    p.scale = scale;
     p.ids = ids;
     p.weights = weights;
     p.rank = rank;
@@ -352,6 +395,23 @@ MoeRoutePlan moe_route(const void* logits, bool logits_fp32, int T, int E, int k
     plan.tb = tb;
     plan.nb = nb;
     return plan;
+}
+
+}  // namespace
+
+MoeRoutePlan moe_route(const void* logits, bool logits_fp32, int T, int E, int k, bool renorm,
+                       int32_t* ids, float* weights, int32_t* rank, int32_t* offsets,
+                       cudaStream_t stream) {
+    return route(logits, logits_fp32, T, E, k, renorm, false, nullptr, 1.f, ids, weights, rank,
+                 offsets, stream);
+}
+
+MoeRoutePlan moe_route_sigmoid(const void* logits, bool logits_fp32, int T, int E, int k,
+                               bool renorm, const float* bias, float scale, int32_t* ids,
+                               float* weights, int32_t* rank, int32_t* offsets,
+                               cudaStream_t stream) {
+    return route(logits, logits_fp32, T, E, k, renorm, true, bias, scale, ids, weights, rank,
+                 offsets, stream);
 }
 
 void moe_positions(const int32_t* ids, int32_t* pos, const MoeRoutePlan& plan, int T, int E, int k,

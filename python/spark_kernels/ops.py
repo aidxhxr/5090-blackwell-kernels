@@ -541,25 +541,35 @@ def moe_route(logits: torch.Tensor, top_k: int, renormalize: bool = True
     (ids [T, k] int32, the experts largest first; weights [T, k] fp32, the softmax over all E
     at those experts, renormalized to sum 1 when `renormalize`; offsets [E + 1] int32, rows per
     expert in expert order; pos [T, k] int32, the row of expert order each (token, slot) takes,
-    sorted by expert, then token, then slot). No host sync; k <= 16."""
-    return _C.moe_route(logits, top_k, renormalize)
+    sorted by expert, then token, then slot). No host sync; k <= 16.
+
+    scoring="sigmoid" is DeepSeek V3's and Inkling 2's router (Inkling2LoopTopKRouter):
+    scores = sigmoid(logits) in fp32, the k experts picked by scores + bias (float32 [E], the
+    e_score_correction_bias, picks only; None: no bias), ids by that key largest first;
+    weights the picks' unbiased scores divided by (their sum + 1e-20) when `renormalize`,
+    then times `scale` (route_scale, 8.0 for Inkling)."""
+    return _C.moe_route(logits, top_k, renormalize, *_scoring(scoring, bias, scale))
 
 
-def moe_route_rows(logits: torch.Tensor, top_k: int, renormalize: bool = True
+def moe_route_rows(logits: torch.Tensor, top_k: int, renormalize: bool = True, *,
+                   scoring: str = "softmax", bias: torch.Tensor | None = None,
+                   scale: float = 1.0
                    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
                               torch.Tensor]:
     """`moe_route` plus the inverse of pos: (ids, weights, offsets, pos, rows), rows [T * k]
     int32 with rows[pos[t, s]] = t, the token of each row of expert order. That is the row
     table `grouped_gemm(..., rows=rows)` gathers x through, in place of `moe_dispatch`'s
-    permuted copy. Two launches, no host sync."""
-    return _C.moe_route_rows(logits, top_k, renormalize)
+    permuted copy. Two launches, no host sync. scoring, bias, scale: `moe_route`'s."""
+    return _C.moe_route_rows(logits, top_k, renormalize, *_scoring(scoring, bias, scale))
 
 
-def moe_dispatch(x: torch.Tensor, logits: torch.Tensor, top_k: int, renormalize: bool = True
+def moe_dispatch(x: torch.Tensor, logits: torch.Tensor, top_k: int, renormalize: bool = True, *,
+                 scoring: str = "softmax", bias: torch.Tensor | None = None, scale: float = 1.0
                  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """`moe_route` plus the rows: (xs [T * k, D] bf16 with xs[pos[t, s]] = x[t], ids, weights,
-    offsets, pos), two launches. xs and offsets are what grouped_gemm takes."""
-    return _C.moe_dispatch(x, logits, top_k, renormalize)
+    offsets, pos), two launches. xs and offsets are what grouped_gemm takes. scoring, bias,
+    scale: `moe_route`'s."""
+    return _C.moe_dispatch(x, logits, top_k, renormalize, *_scoring(scoring, bias, scale))
 
 
 def moe_combine(y: torch.Tensor, pos: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
