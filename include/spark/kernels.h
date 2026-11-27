@@ -1051,4 +1051,41 @@ bool decode_fits_l2(int64_t bytes, int device = DECODE_DEVICE_CURRENT);
 void decode_force_split_k(int split);
 int decode_forced_split_k();
 
+// ---- Inkling 2 Mini: short causal convolutions and the per-head q/k/v norms --------------
+// (src/kernels/short_conv.cu, docs/design/short_conv.md.) x, out [B, T, C] contiguous, out not
+// aliasing x, K = 4 taps, fp32 math.
+//   static (taps == nullptr): w is the nn.Conv1d weight [C, 4] fp32 (column 3 = current
+//     token), out = (conv(xin) + x) / sqrt(5)
+//   dynamic: w is static_weight [4, C] fp32 (row = backward distance, row 0 = current token),
+//     taps [B, T, heads, 4] fp32 or bf16 (taps_bf16) per token and head, lag last,
+//     out = (sum_lag (w + taps) * xin + x) / sqrt(9)
+// xin = x with tokens of mask == 0 zeroed (mask: [B, T] bytes or nullptr). state: [B, 3, C] in
+// x's dtype, state[b, 2] the newest input, or nullptr (zeros before t = 0, nothing written);
+// read first, then overwritten with the last three xin of the call (T = 1 is a decode step).
+// epilogue per head_dim channels: SHORT_CONV_EPI_L2CLIP (param = threshold; k) or
+// SHORT_CONV_EPI_RMS (param = eps; unweighted RMSNorm, v). C % 8 == 0, 16-byte aligned x,
+// out, w, state; heads must split C into multiples of 8 channels.
+enum ShortConvEpilogue {
+    SHORT_CONV_EPI_NONE = 0,
+    SHORT_CONV_EPI_L2CLIP = 1,
+    SHORT_CONV_EPI_RMS = 2
+};
+void short_conv_f32(const float* x, float* out, const float* w, const void* taps, bool taps_bf16,
+                    int heads, float* state, const uint8_t* mask, int B, int T, int C, int epilogue,
+                    int head_dim, float param, cudaStream_t stream);
+void short_conv_bf16(const __nv_bfloat16* x, __nv_bfloat16* out, const float* w, const void* taps,
+                     bool taps_bf16, int heads, __nv_bfloat16* state, const uint8_t* mask, int B,
+                     int T, int C, int epilogue, int head_dim, float param, cudaStream_t stream);
+// The same norms over rows of D (row r is head r % H of token r / H), mode L2CLIP or RMS as
+// above. scale: [H, D] fp32 multiplied in before the norm, or nullptr. positions: one int32
+// (position_bytes 4) or int64 (8) per token, or nullptr (0): after the norm the row is rounded
+// to its dtype and multiplied by tau = 1 + alpha * log(max((pos + 1) / n_floor, 1)).
+// D / (8 bf16 or 4 fp32) must be a power of two up to 32. out may be x.
+void head_norm_f32(const float* x, float* out, int64_t rows, int H, int D, int mode, float param,
+                   const float* scale, const void* positions, int position_bytes, float alpha,
+                   float n_floor, cudaStream_t stream);
+void head_norm_bf16(const __nv_bfloat16* x, __nv_bfloat16* out, int64_t rows, int H, int D,
+                    int mode, float param, const float* scale, const void* positions,
+                    int position_bytes, float alpha, float n_floor, cudaStream_t stream);
+
 }  // namespace spark

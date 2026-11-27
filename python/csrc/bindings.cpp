@@ -1913,6 +1913,156 @@ Tensor w1moe_decode(const Tensor& x, const Tensor& expert_ids, const Tensor& exp
     return y;
 }
 
+// ---- Inkling 2 Mini short convolutions and head norms (src/kernels/short_conv.cu) --------
+int short_conv_epilogue(const std::string& name) {
+    if (name.empty() || name == "none") return spark::SHORT_CONV_EPI_NONE;
+    if (name == "l2clip") return spark::SHORT_CONV_EPI_L2CLIP;
+    if (name == "rms") return spark::SHORT_CONV_EPI_RMS;
+    throw std::invalid_argument("epilogue must be \"\", \"l2clip\" or \"rms\", got \"" + name +
+                                "\"");
+}
+
+// x [B, T, C]; static: weight [C, 4]; dynamic (taps given): weight [4, C], taps [B, T, H, 4].
+// state [B, 3, C] (x's dtype) is read and updated in place.
+Tensor short_conv(const Tensor& x, const Tensor& weight, const std::optional<Tensor>& taps,
+                  const std::optional<Tensor>& state, const std::optional<Tensor>& mask,
+                  const std::string& epilogue, int64_t head_dim, double param) {
+    check_cuda_contig(x, "x");
+    check_float_or_bf16(x, "x");
+    TORCH_CHECK(x.dim() == 3, "short_conv expects x [B, T, C], got ", x.sizes());
+    const int64_t B = x.size(0), T = x.size(1), C = x.size(2);
+    TORCH_CHECK(B <= 65535 && T <= INT32_MAX && C <= INT32_MAX && B * T * C <= INT64_MAX / 4,
+                "short_conv: x too large, ", x.sizes());
+    TORCH_CHECK(C % 8 == 0, "short_conv needs C % 8 == 0, got C = ", C);
+    check_cuda_contig(weight, "weight");
+    TORCH_CHECK(weight.scalar_type() == at::kFloat, "short_conv: weight must be float32");
+    TORCH_CHECK(weight.device() == x.device(), "short_conv: weight must be on x's device");
+    const bool dynamic = taps.has_value();
+    if (dynamic) {
+        TORCH_CHECK(weight.dim() == 2 && weight.size(0) == 4 && weight.size(1) == C,
+                    "dynamic short_conv: static weight must be [4, C] = [4, ", C, "], got ",
+                    weight.sizes());
+    } else {
+        TORCH_CHECK(weight.dim() == 2 && weight.size(0) == C && weight.size(1) == 4,
+                    "short_conv: weight must be [C, 4] = [", C,
+                    ", 4] (nn.Conv1d's, squeezed), got ", weight.sizes());
+    }
+    int heads = 1;
+    const void* taps_ptr = nullptr;
+    bool taps_bf16 = false;
+    if (dynamic) {
+        const Tensor& d = *taps;
+        check_cuda_contig(d, "taps");
+        check_float_or_bf16(d, "taps");
+        TORCH_CHECK(d.dim() == 4 && d.size(0) == B && d.size(1) == T && d.size(3) == 4,
+                    "dynamic short_conv: taps must be [B, T, heads, 4] = [", B, ", ", T,
+                    ", heads, 4], got ", d.sizes());
+        TORCH_CHECK(d.device() == x.device(), "short_conv: taps must be on x's device");
+        heads = static_cast<int>(d.size(2));
+        TORCH_CHECK(heads > 0 && C % heads == 0 && (C / heads) % 8 == 0,
+                    "dynamic short_conv: heads must split C into multiples of 8 channels, got ",
+                    heads, " heads over C = ", C);
+        taps_ptr = d.data_ptr();
+        taps_bf16 = d.scalar_type() == at::kBFloat16;
+    }
+    if (state.has_value()) {
+        const Tensor& s = *state;
+        check_cuda_contig(s, "state");
+        TORCH_CHECK(s.scalar_type() == x.scalar_type() && s.dim() == 3 && s.size(0) == B &&
+                        s.size(1) == 3 && s.size(2) == C,
+                    "short_conv: state must be [B, 3, C] = [", B, ", 3, ", C,
+                    "] in x's dtype, got ", s.scalar_type(), " ", s.sizes());
+        TORCH_CHECK(s.device() == x.device(), "short_conv: state must be on x's device");
+    }
+    Tensor m;
+    if (mask.has_value()) {
+        TORCH_CHECK(mask->dim() == 2 && mask->size(0) == B && mask->size(1) == T,
+                    "short_conv: mask must be [B, T], got ", mask->sizes());
+        TORCH_CHECK(mask->device() == x.device(), "short_conv: mask must be on x's device");
+        m = mask->scalar_type() == at::kBool ? mask->contiguous() : mask->ne(0).contiguous();
+    }
+    const int epi = short_conv_epilogue(epilogue);
+    TORCH_CHECK(aligned16(x) && aligned16(weight) && (!state.has_value() || aligned16(*state)),
+                "short_conv needs 16-byte aligned x, weight and state");
+    const c10::cuda::CUDAGuard guard(x.device());
+    Tensor out = at::empty_like(x);
+    const uint8_t* mp =
+        m.defined() ? reinterpret_cast<const uint8_t*>(m.data_ptr<bool>()) : nullptr;
+    const auto stream = current_stream(x);
+    if (x.scalar_type() == at::kFloat) {
+        float* sp = state.has_value() ? state->data_ptr<float>() : nullptr;
+        spark::short_conv_f32(x.data_ptr<float>(), out.data_ptr<float>(), weight.data_ptr<float>(),
+                              taps_ptr, taps_bf16, heads, sp, mp, static_cast<int>(B),
+                              static_cast<int>(T), static_cast<int>(C), epi,
+                              static_cast<int>(head_dim), static_cast<float>(param), stream);
+    } else {
+        __nv_bfloat16* sp = nullptr;
+        if (state.has_value()) {
+            Tensor s = *state;
+            sp = bf16_ptr_mut(s);
+        }
+        spark::short_conv_bf16(bf16_ptr(x), bf16_ptr_mut(out), weight.data_ptr<float>(), taps_ptr,
+                               taps_bf16, heads, sp, mp, static_cast<int>(B), static_cast<int>(T),
+                               static_cast<int>(C), epi, static_cast<int>(head_dim),
+                               static_cast<float>(param), stream);
+    }
+    return out;
+}
+
+// x [..., H, D]; mode "l2clip" (param = threshold) or "rms" (param = eps); scale [H, D] fp32;
+// positions: one int32 / int64 per token (x.numel() / (H * D) of them) for the log scaling.
+Tensor head_norm(const Tensor& x, const std::string& mode, double param,
+                 const std::optional<Tensor>& scale, const std::optional<Tensor>& positions,
+                 double alpha, double n_floor, bool inplace) {
+    check_cuda_contig(x, "x");
+    check_float_or_bf16(x, "x");
+    TORCH_CHECK(x.dim() >= 2, "head_norm expects x [..., H, D], got ", x.sizes());
+    const int64_t H = x.size(-2), D = x.size(-1);
+    const int64_t rows = x.numel() / D;
+    const int m = short_conv_epilogue(mode);
+    TORCH_CHECK(m != spark::SHORT_CONV_EPI_NONE, "head_norm: mode must be \"l2clip\" or \"rms\"");
+    TORCH_CHECK(H <= INT32_MAX && D <= INT32_MAX, "head_norm: x too large");
+    const float* sp = nullptr;
+    if (scale.has_value()) {
+        check_cuda_contig(*scale, "scale");
+        TORCH_CHECK(scale->scalar_type() == at::kFloat && scale->dim() == 2 &&
+                        scale->size(0) == H && scale->size(1) == D,
+                    "head_norm: scale must be float32 [H, D] = [", H, ", ", D, "], got ",
+                    scale->scalar_type(), " ", scale->sizes());
+        TORCH_CHECK(scale->device() == x.device(), "head_norm: scale must be on x's device");
+        sp = scale->data_ptr<float>();
+    }
+    const void* pp = nullptr;
+    int pbytes = 0;
+    if (positions.has_value()) {
+        check_cuda_contig(*positions, "positions");
+        TORCH_CHECK(positions->scalar_type() == at::kLong || positions->scalar_type() == at::kInt,
+                    "head_norm: positions must be int32 or int64");
+        TORCH_CHECK(positions->numel() == rows / H,
+                    "head_norm: positions must hold one entry per "
+                    "token (",
+                    rows / H, "), got ", positions->numel());
+        TORCH_CHECK(positions->device() == x.device(),
+                    "head_norm: positions must be on x's device");
+        pp = positions->data_ptr();
+        pbytes = positions->scalar_type() == at::kLong ? 8 : 4;
+    }
+    TORCH_CHECK(aligned16(x), "head_norm needs 16-byte aligned x");
+    const c10::cuda::CUDAGuard guard(x.device());
+    Tensor out = inplace ? x : at::empty_like(x);
+    const auto stream = current_stream(x);
+    if (x.scalar_type() == at::kFloat) {
+        spark::head_norm_f32(x.data_ptr<float>(), out.data_ptr<float>(), rows, static_cast<int>(H),
+                             static_cast<int>(D), m, static_cast<float>(param), sp, pp, pbytes,
+                             static_cast<float>(alpha), static_cast<float>(n_floor), stream);
+    } else {
+        spark::head_norm_bf16(bf16_ptr(x), bf16_ptr_mut(out), rows, static_cast<int>(H),
+                              static_cast<int>(D), m, static_cast<float>(param), sp, pp, pbytes,
+                              static_cast<float>(alpha), static_cast<float>(n_floor), stream);
+    }
+    return out;
+}
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -2252,4 +2402,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "hgemm variant 6's split-K: -1 the rule, 0 off, n >= 2 forces n K-slices",
           py::arg("split"));
     m.def("hgemm_v6_split", &spark::hgemm_v6_split, "hgemm variant 6's split-K setting");
+    // Inkling 2 Mini short convolutions and head norms (src/kernels/short_conv.cu).
+    m.def("short_conv", &short_conv,
+          "Inkling 2 Mini's causal short conv (K = 4) over x [B, T, C]: static weight [C, 4], or "
+          "static [4, C] plus per-token taps [B, T, heads, 4]; state [B, 3, C] updated in place; "
+          "optional [B, T] mask and per-head epilogue (\"l2clip\", \"rms\")",
+          py::arg("x"), py::arg("weight"), py::arg("taps") = py::none(),
+          py::arg("state") = py::none(), py::arg("mask") = py::none(), py::arg("epilogue") = "",
+          py::arg("head_dim") = 128, py::arg("param") = 0.0);
+    m.def("head_norm", &head_norm,
+          "per-head L2 clip (optional [H, D] scale, optional log scaling by position) or "
+          "unweighted RMSNorm over x [..., H, D]",
+          py::arg("x"), py::arg("mode"), py::arg("param"), py::arg("scale") = py::none(),
+          py::arg("positions") = py::none(), py::arg("alpha") = 0.1, py::arg("n_floor") = 8192.0,
+          py::arg("inplace") = false);
 }

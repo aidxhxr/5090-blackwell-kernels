@@ -62,6 +62,13 @@ Ops (all run on the current CUDA stream, all accept float32 or bfloat16 unless n
     grouped_gemm(a, w, offsets, scale_a=None, scale_b=None)
                                              every expert of an MoE layer in one launch, a
                                              sorted by expert (moe_offsets), bf16 or e4m3
+    short_conv(x, weight, state=None, mask=None, epilogue=None)
+    dynamic_short_conv(x, static_weight, taps, state=None, mask=None, epilogue=None)
+                                             Inkling 2 Mini's causal short convs (K = 4) with
+                                             a conv state and an optional k / v head norm
+    head_l2_clip(x, threshold, scale=None, positions=None), head_rms_norm(x, eps)
+                                             per-head norms over [..., H, D] (q's scaled clip
+                                             with the log scaling by position)
     num_variants(name)                       how many implementations exist for `name`
 
 `variant` selects a rung on the optimization ladder described in docs/DESIGN.md; -1 picks
@@ -207,3 +214,16 @@ from .ops import (  # noqa: E402
 
 __all__ += ["grouped_gemm_swiglu", "interleave_experts", "moe_combine", "moe_dispatch",
             "moe_route", "moe_route_rows"]
+
+# Inkling 2 Mini's short causal convolutions and per-head q/k/v norms
+# (docs/design/short_conv.md).
+from .ops import (  # noqa: E402
+    dynamic_short_conv,
+    head_l2_clip,
+    head_rms_norm,
+    short_conv,
+    short_conv_state,
+)
+
+__all__ += ["dynamic_short_conv", "head_l2_clip", "head_rms_norm", "short_conv",
+            "short_conv_state"]

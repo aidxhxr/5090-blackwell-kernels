@@ -1286,3 +1286,90 @@ def fits_l2(bytes_: int, device: str = "") -> bool:
 def decode_force_split_k(split: int) -> None:
     """Force the K split of every decode kernel that has one; 0 restores the rule. For sweeps."""
     _C.decode_force_split_k(split)
+
+
+# ---- Inkling 2 Mini: short causal convolutions and the per-head q/k/v norms ---------------
+# (src/kernels/short_conv.cu, docs/design/short_conv.md)
+
+INKLING_QK_CLIP = 22.627416997969522  # config.qk_l2_clip_threshold, sqrt(512)
+INKLING_REL_CLIP = 8.0  # config.rel_l2_clip_threshold
+
+
+def _epilogue(epilogue: str | None, param: float | None) -> tuple[str, float]:
+    if epilogue is None:
+        return "", 0.0
+    if epilogue == "l2clip":
+        return epilogue, INKLING_QK_CLIP if param is None else param
+    if epilogue == "rms":
+        return epilogue, 1e-6 if param is None else param
+    raise ValueError(f"epilogue must be None, 'l2clip' or 'rms', got {epilogue!r}")
+
+
+def short_conv_state(batch: int, channels: int, dtype: torch.dtype = torch.bfloat16,
+                     device: str | torch.device = "cuda") -> torch.Tensor:
+    """A zero conv state [B, 3, C] for `short_conv` / `dynamic_short_conv`: the last three
+    inputs of every channel, index 2 the newest. HF's cache holds [B, C, 4] fp32 with column 3
+    the newest; ours is `hf[:, :, 1:].transpose(1, 2)` in x's dtype (exact: inputs only)."""
+    return torch.zeros(batch, 3, channels, dtype=dtype, device=device)
+
+
+def short_conv(x: torch.Tensor, weight: torch.Tensor, state: torch.Tensor | None = None,
+               mask: torch.Tensor | None = None, epilogue: str | None = None,
+               head_dim: int = 128, epilogue_param: float | None = None) -> torch.Tensor:
+    """Inkling 2 Mini's static causal short conv (HF `Inkling2LoopShortConvolution`, K = 4):
+    out = (depthwise_causal_conv(x * mask) + x) / sqrt(5), fp32 math, x's dtype out.
+
+    Args:
+        x: [B, T, C] float32 or bfloat16, C % 8 == 0.
+        weight: [C, 4] float32, `conv1d.weight.squeeze(1)` (column 3 weights the current token).
+        state: [B, 3, C] in x's dtype (`short_conv_state`), or None for zeros before the first
+            token. Read, then overwritten in place with the last three inputs, so T = 1 is a
+            decode step and a prefill can be split into chunks.
+        mask: [B, T] bool (False = padding): those inputs are zeroed for the conv and the
+            state, the residual keeps them (HF's `conv_mask`).
+        epilogue: None, "l2clip" (k: scale each head down to norm `epilogue_param`, default
+            22.627) or "rms" (v: unweighted RMSNorm per head, eps `epilogue_param`, default
+            1e-6), over heads of `head_dim` channels, on the output rounded to x's dtype.
+    """
+    epi, param = _epilogue(epilogue, epilogue_param)
+    return _C.short_conv(x, weight.float().contiguous(), None, state, mask, epi, head_dim, param)
+
+
+def dynamic_short_conv(x: torch.Tensor, static_weight: torch.Tensor, taps: torch.Tensor,
+                       state: torch.Tensor | None = None, mask: torch.Tensor | None = None,
+                       epilogue: str | None = None, head_dim: int = 128,
+                       epilogue_param: float | None = None) -> torch.Tensor:
+    """The full layers' k/v conv (HF `Inkling2LoopDynamicShortConvolution`, K = 4):
+    out = (sum_lag (static_weight[lag, c] + taps[b, t, head(c), lag]) * xin[t - lag, c] + x)
+    / sqrt(9).
+
+    Args:
+        static_weight: [4, C] float32, row = backward distance (row 0 the current token).
+        taps: [B, T, heads, 4] float32 or bfloat16, `weight_proj(h).view(B, T, heads, 4)`
+            (the GEMM stays outside); each head owns C / heads consecutive channels.
+        x, state, mask, epilogue, head_dim, epilogue_param: as in `short_conv`.
+    """
+    epi, param = _epilogue(epilogue, epilogue_param)
+    return _C.short_conv(x, static_weight.float().contiguous(), taps.contiguous(), state, mask,
+                         epi, head_dim, param)
+
+
+def head_l2_clip(x: torch.Tensor, threshold: float = INKLING_QK_CLIP,
+                 scale: torch.Tensor | None = None, positions: torch.Tensor | None = None,
+                 alpha: float = 0.1, n_floor: float = 8192.0, inplace: bool = False
+                 ) -> torch.Tensor:
+    """Per-head L2 clip over x [..., H, D] (D = 128 for q, 16 for the relative states):
+    y = x * scale, then y * min(threshold / (|y| + 1e-6), 1) (HF `Inkling2LoopScaledL2Clip`).
+    With positions (one per token, int32 or int64), the full layers' log scaling follows
+    (`Inkling2LoopLogScaledL2Clip`): round to x's dtype, times
+    tau = 1 + alpha * log(max((pos + 1) / n_floor, 1)). scale: [H, D], any float dtype.
+    """
+    s = None if scale is None else scale.float().contiguous()
+    p = None if positions is None else positions.contiguous()
+    return _C.head_norm(x, "l2clip", threshold, s, p, alpha, n_floor, inplace)
+
+
+def head_rms_norm(x: torch.Tensor, eps: float = 1e-6, inplace: bool = False) -> torch.Tensor:
+    """Unweighted RMSNorm over the last dim of x [..., H, D] (HF
+    `Inkling2LoopUnweightedRMSNorm`, v's norm), fp32 math."""
+    return _C.head_norm(x, "rms", eps, None, None, 0.0, 1.0, inplace)
