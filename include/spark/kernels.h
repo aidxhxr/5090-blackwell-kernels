@@ -1152,7 +1152,7 @@ void inkling_attention_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, cons
                             int kv_cap, int extent, int window, int variant, int split,
                             cudaStream_t stream);
 
-// ---- Inkling 2 Mini: block attention residual (src/kernels/attn_res.cu,
+// ---- Inkling 2 Mini: block attention residual and loop message gates (src/kernels/attn_res.cu,
 // docs/design/attn_res.md) ----------------------------------------------------------------
 // attn_res_fwd: for every token t the sources are x_s = blocks[t * tok_stride + s * blk_stride
 // + (0..H-1)] for s < nb (bf16, the last dim contiguous) and x_nb = partial[t, :] (bf16 or
@@ -1164,5 +1164,35 @@ bool attn_res_supports(int nb, int H);
 void attn_res_fwd(const __nv_bfloat16* blocks, int64_t tok_stride, int64_t blk_stride, int nb,
                   const void* partial, bool partial_bf16, const float* query, int nq, float* out,
                   int T, int H, float eps, cudaStream_t stream);
+// Message gates: out = (1 - tanh(wf z)) * h + tanh(wg z) * m, z = wd [n(h); n(m)], for up to
+// kGateMaxGates gates in one launch (a loop layer's q, k and v gates; h may be shared). h, m,
+// out [T, H] fp32; wd [64, 2H] bf16 (nn.Linear layout); wf, wg [H, 64] fp32, or bf16 with
+// up_bf16 (the checkpoint stores them in bf16 and HF upcasts them, so bf16 gives the same
+// result from two thirds of the bytes). H % 64 == 0, H <= 8192, 16-byte aligned storage.
+//   message_gate_decode: the whole gate in one cooperative launch, T <= kGateDecodeMaxTokens;
+//     `workspace` holds message_gate_decode_workspace_floats(G, T) floats (zeroed inside).
+//   message_gate_prep: x [T, 2H] bf16 = [bf16(n(h)); bf16(n(m))], the A of the Wd GEMM.
+//   message_gate_up: from z [T, 64] bf16 (that GEMM's output), the up-projections, the tanh
+//     and the mix.
+constexpr int kGateRank = 64;
+constexpr int kGateMaxGates = 3;
+constexpr int kGateDecodeMaxTokens = 64;
+struct MessageGateSet {
+    int G = 0;
+    const float* h[kGateMaxGates] = {};
+    const float* m[kGateMaxGates] = {};
+    float* out[kGateMaxGates] = {};
+    const __nv_bfloat16* wd[kGateMaxGates] = {};  // decode
+    const void* wf[kGateMaxGates] = {};           // float, or __nv_bfloat16 with up_bf16
+    const void* wg[kGateMaxGates] = {};
+    bool up_bf16 = false;
+    __nv_bfloat16* x[kGateMaxGates] = {};        // prep output
+    const __nv_bfloat16* z[kGateMaxGates] = {};  // up input
+};
+int64_t message_gate_decode_workspace_floats(int G, int T);
+void message_gate_decode(const MessageGateSet& a, float* workspace, int T, int H, float eps,
+                         cudaStream_t stream);
+void message_gate_prep(const MessageGateSet& a, int T, int H, float eps, cudaStream_t stream);
+void message_gate_up(const MessageGateSet& a, int T, int H, cudaStream_t stream);
 
 }  // namespace spark

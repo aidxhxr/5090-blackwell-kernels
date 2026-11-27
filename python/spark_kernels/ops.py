@@ -1485,7 +1485,7 @@ def inkling_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, r: torc
     return _C.inkling_attention(q, k, v, r, proj, sinks, window, variant, split)
 
 
-# ---- Inkling 2 Mini: block attention residuals (src/kernels/attn_res.cu,
+# ---- Inkling 2 Mini: block attention residuals and loop message gates (src/kernels/attn_res.cu,
 # docs/design/attn_res.md) ----
 
 
@@ -1515,3 +1515,46 @@ def attn_res(blocks: torch.Tensor | None, partial: torch.Tensor, query: torch.Te
     out = _C.attn_res(b, p, q, eps)
     return out.reshape(q.shape[0], *lead, H)
 
+
+def message_gates(h: list[torch.Tensor], m: list[torch.Tensor], wd: list[torch.Tensor],
+                  wf: list[torch.Tensor], wg: list[torch.Tensor], eps: float = 1e-6,
+                  path: str | None = None,
+                  wd_t: list[torch.Tensor] | None = None) -> list[torch.Tensor]:
+    """One to three loop message gates (HF `Inkling2LoopMessageGate`) in as few launches as
+    the path allows: out = (1 - tanh(wf z)) * h + tanh(wg z) * m with z = wd [n(h); n(m)].
+
+    h and m are float32 [..., H] (a loop layer's q, k and v gates may share one h), wd
+    bfloat16 [64, 2H] as nn.Linear stores it, wf and wg [H, 64] float32 as HF holds them or
+    bfloat16 as the checkpoint stores them (the same values, a third fewer bytes per gate).
+    Returns float32 [..., H] per gate.
+
+    path "decode" (the default up to 16 tokens, takes up to 64): one cooperative kernel for
+    all the gates, fp32 atomics on the rank-64 z, so the last bits can differ between runs.
+    path "prefill" (the default above 16 tokens, where it is faster on the RTX PRO 6000): a
+    prep kernel for the bf16 GEMM input, `hgemm` for wd (one per gate; pass `wd_t`, the
+    [2H, 64] transposes, to skip the copy), then one kernel for the up-projections, the tanh
+    and the mix. Needs H a multiple of 64, at most 8192.
+    """
+    H = h[0].shape[-1]
+    lead = h[0].shape[:-1]
+    hs = [x.reshape(-1, H) for x in h]
+    ms = [x.reshape(-1, H) for x in m]
+    T = hs[0].shape[0]
+    if path is None:
+        path = "decode" if T <= 16 else "prefill"
+    if path == "decode":
+        outs = _C.message_gate_decode(hs, ms, list(wd), list(wf), list(wg), eps)
+    elif path == "prefill":
+        xs = _C.message_gate_prep(hs, ms, eps)
+        wts = wd_t if wd_t is not None else [w.t().contiguous() for w in wd]
+        zs = [hgemm(x, w) for x, w in zip(xs, wts, strict=True)]
+        outs = _C.message_gate_up(zs, hs, ms, list(wf), list(wg))
+    else:
+        raise ValueError(f"path must be 'decode' or 'prefill', got {path!r}")
+    return [o.reshape(*lead, H) for o in outs]
+
+
+def message_gate(h: torch.Tensor, m: torch.Tensor, wd: torch.Tensor, wf: torch.Tensor,
+                 wg: torch.Tensor, eps: float = 1e-6, path: str | None = None) -> torch.Tensor:
+    """One loop message gate; see `message_gates`."""
+    return message_gates([h], [m], [wd], [wf], [wg], eps, path)[0]

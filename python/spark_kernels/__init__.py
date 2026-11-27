@@ -73,6 +73,8 @@ Ops (all run on the current CUDA stream, all accept float32 or bfloat16 unless n
     attn_res(blocks, partial, query, eps=1e-6)
                                              Inkling 2 Mini's block attention residual: a
                                              softmax mix of the normalized block states
+    message_gates(h, m, wd, wf, wg, eps=1e-6, path=None)
+                                             Inkling's loop message gates, up to three per launch
 
 `variant` selects a rung on the optimization ladder described in docs/DESIGN.md; -1 picks
 the fastest one that accepts the input (see ops.py for the two ladders where that is not the
@@ -234,7 +236,11 @@ __all__ += ["dynamic_short_conv", "head_l2_clip", "head_rms_norm", "short_conv",
             "short_conv_state"]
 
 
-# Inkling 2 Mini's block attention residuals (docs/design/attn_res.md).
-from .ops import attn_res  # noqa: E402
+# Inkling 2 Mini's block attention residuals and loop message gates (docs/design/attn_res.md).
+from .ops import (  # noqa: E402
+    attn_res,
+    message_gate,
+    message_gates,
+)
 
-__all__ += ["attn_res"]
+__all__ += ["attn_res", "message_gate", "message_gates"]

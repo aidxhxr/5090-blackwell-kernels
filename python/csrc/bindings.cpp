@@ -2182,8 +2182,10 @@ Tensor head_norm(const Tensor& x, const std::string& mode, double param,
                               static_cast<int>(D), m, static_cast<float>(param), sp, pp, pbytes,
                               static_cast<float>(alpha), static_cast<float>(n_floor), stream);
     }
+    return out;
+}
 
-// ---- Inkling 2 Mini: block attention residual -------------------------
+// ---- Inkling 2 Mini: block attention residual and loop message gates -------------------------
 // blocks [T, nb, H] bf16 with the last dim contiguous (any token and block strides: a slice of a
 // preallocated [T, nb_max, H] buffer works), partial [T, H] bf16 or fp32, query [nq, H] fp32
 // -> [nq, T, H] fp32.
@@ -2226,6 +2228,130 @@ Tensor attn_res(const std::optional<Tensor>& blocks, const Tensor& partial, cons
                         partial.scalar_type() == at::kBFloat16, query.data_ptr<float>(),
                         static_cast<int>(nq), out.data_ptr<float>(), static_cast<int>(T),
                         static_cast<int>(H), static_cast<float>(eps), current_stream(partial));
+    return out;
+}
+
+// The gates' h and m: G = 1..3 pairs of fp32 [T, H], every one the same shape and device.
+spark::MessageGateSet gate_inputs(const std::vector<Tensor>& h, const std::vector<Tensor>& m,
+                                  const char* who, int64_t& T, int64_t& H) {
+    const int64_t G = static_cast<int64_t>(h.size());
+    TORCH_CHECK(G >= 1 && G <= spark::kGateMaxGates && static_cast<int64_t>(m.size()) == G, who,
+                ": takes 1 to ", spark::kGateMaxGates, " gates, as many m as h");
+    TORCH_CHECK(h[0].dim() == 2, who, ": h must be [T, H], got ", h[0].sizes());
+    T = h[0].size(0);
+    H = h[0].size(1);
+    TORCH_CHECK(H % 64 == 0 && H <= 8192 && T <= INT32_MAX, who,
+                ": needs H a multiple of 64, at most 8192, got ", H);
+    spark::MessageGateSet a;
+    a.G = static_cast<int>(G);
+    for (int64_t g = 0; g < G; ++g) {
+        for (const Tensor* t : {&h[g], &m[g]}) {
+            check_cuda_contig(*t, t == &h[g] ? "h" : "m");
+            TORCH_CHECK(t->scalar_type() == at::kFloat && t->sizes() == h[0].sizes() &&
+                            t->device() == h[0].device() && aligned16(*t),
+                        who, ": h and m must be 16-byte aligned float32 [", T, ", ", H,
+                        "] on one device, got ", t->scalar_type(), " ", t->sizes());
+        }
+        a.h[g] = h[g].data_ptr<float>();
+        a.m[g] = m[g].data_ptr<float>();
+    }
+    return a;
+}
+
+void gate_up_weights(spark::MessageGateSet& a, const std::vector<Tensor>& wf,
+                     const std::vector<Tensor>& wg, const Tensor& like, int64_t H,
+                     const char* who) {
+    TORCH_CHECK(static_cast<int>(wf.size()) == a.G && static_cast<int>(wg.size()) == a.G, who,
+                ": one wf and one wg per gate");
+    a.up_bf16 = wf[0].scalar_type() == at::kBFloat16;
+    for (int g = 0; g < a.G; ++g) {
+        for (const Tensor* t : {&wf[g], &wg[g]}) {
+            check_cuda_contig(*t, "wf / wg");
+            TORCH_CHECK(t->scalar_type() == wf[0].scalar_type() &&
+                            (t->scalar_type() == at::kFloat || t->scalar_type() == at::kBFloat16),
+                        who, ": wf and wg must all be float32 or all bfloat16, got ",
+                        t->scalar_type());
+            TORCH_CHECK(t->dim() == 2 && t->size(0) == H && t->size(1) == spark::kGateRank &&
+                            t->device() == like.device() && aligned16(*t),
+                        who, ": wf and wg must be [", H, ", ", spark::kGateRank, "], got ",
+                        t->sizes());
+        }
+        a.wf[g] = wf[g].data_ptr();
+        a.wg[g] = wg[g].data_ptr();
+    }
+}
+
+std::vector<Tensor> gate_outputs(spark::MessageGateSet& a, const std::vector<Tensor>& h) {
+    std::vector<Tensor> out;
+    for (int g = 0; g < a.G; ++g) {
+        out.push_back(at::empty_like(h[g]));
+        a.out[g] = out.back().data_ptr<float>();
+    }
+    return out;
+}
+
+std::vector<Tensor> message_gate_decode(const std::vector<Tensor>& h, const std::vector<Tensor>& m,
+                                        const std::vector<Tensor>& wd,
+                                        const std::vector<Tensor>& wf,
+                                        const std::vector<Tensor>& wg, double eps) {
+    int64_t T = 0, H = 0;
+    spark::MessageGateSet a = gate_inputs(h, m, "message_gate_decode", T, H);
+    TORCH_CHECK(T <= spark::kGateDecodeMaxTokens, "message_gate_decode takes at most ",
+                spark::kGateDecodeMaxTokens, " tokens, got ", T);
+    TORCH_CHECK(static_cast<int>(wd.size()) == a.G, "message_gate_decode: one wd per gate");
+    for (int g = 0; g < a.G; ++g) {
+        check_cuda_contig(wd[g], "wd");
+        TORCH_CHECK(wd[g].scalar_type() == at::kBFloat16 && wd[g].dim() == 2 &&
+                        wd[g].size(0) == spark::kGateRank && wd[g].size(1) == 2 * H &&
+                        wd[g].device() == h[0].device() && aligned16(wd[g]),
+                    "message_gate_decode: wd must be bfloat16 [", spark::kGateRank, ", ", 2 * H,
+                    "], got ", wd[g].scalar_type(), " ", wd[g].sizes());
+        a.wd[g] = bf16_ptr(wd[g]);
+    }
+    gate_up_weights(a, wf, wg, h[0], H, "message_gate_decode");
+    const c10::cuda::CUDAGuard guard(h[0].device());
+    std::vector<Tensor> out = gate_outputs(a, h);
+    Tensor ws = at::empty({spark::message_gate_decode_workspace_floats(a.G, static_cast<int>(T))},
+                          h[0].options());
+    spark::message_gate_decode(a, ws.data_ptr<float>(), static_cast<int>(T), static_cast<int>(H),
+                               static_cast<float>(eps), current_stream(h[0]));
+    return out;
+}
+
+std::vector<Tensor> message_gate_prep(const std::vector<Tensor>& h, const std::vector<Tensor>& m,
+                                      double eps) {
+    int64_t T = 0, H = 0;
+    spark::MessageGateSet a = gate_inputs(h, m, "message_gate_prep", T, H);
+    const c10::cuda::CUDAGuard guard(h[0].device());
+    std::vector<Tensor> x;
+    for (int g = 0; g < a.G; ++g) {
+        x.push_back(at::empty({T, 2 * H}, h[0].options().dtype(at::kBFloat16)));
+        a.x[g] = bf16_ptr_mut(x.back());
+    }
+    spark::message_gate_prep(a, static_cast<int>(T), static_cast<int>(H), static_cast<float>(eps),
+                             current_stream(h[0]));
+    return x;
+}
+
+std::vector<Tensor> message_gate_up(const std::vector<Tensor>& z, const std::vector<Tensor>& h,
+                                    const std::vector<Tensor>& m, const std::vector<Tensor>& wf,
+                                    const std::vector<Tensor>& wg) {
+    int64_t T = 0, H = 0;
+    spark::MessageGateSet a = gate_inputs(h, m, "message_gate_up", T, H);
+    TORCH_CHECK(static_cast<int>(z.size()) == a.G, "message_gate_up: one z per gate");
+    for (int g = 0; g < a.G; ++g) {
+        check_cuda_contig(z[g], "z");
+        TORCH_CHECK(z[g].scalar_type() == at::kBFloat16 && z[g].dim() == 2 && z[g].size(0) == T &&
+                        z[g].size(1) == spark::kGateRank && z[g].device() == h[0].device() &&
+                        aligned16(z[g]),
+                    "message_gate_up: z must be bfloat16 [", T, ", ", spark::kGateRank, "], got ",
+                    z[g].scalar_type(), " ", z[g].sizes());
+        a.z[g] = bf16_ptr(z[g]);
+    }
+    gate_up_weights(a, wf, wg, h[0], H, "message_gate_up");
+    const c10::cuda::CUDAGuard guard(h[0].device());
+    std::vector<Tensor> out = gate_outputs(a, h);
+    spark::message_gate_up(a, static_cast<int>(T), static_cast<int>(H), current_stream(h[0]));
     return out;
 }
 
@@ -2656,9 +2782,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "whether inkling_attention's 16-row decode tile takes the shape", py::arg("H_q"),
           py::arg("H_kv"), py::arg("S_q"));
 
-    // Inkling 2 Mini's block attention residual (src/kernels/attn_res.cu).
+    // Inkling 2 Mini's block attention residual and loop message gates (src/kernels/attn_res.cu).
     m.def("attn_res", &attn_res,
           "block attention residual: blocks [T, nb, H] bf16 (or None), partial [T, H], query "
           "[nq, H] fp32 -> [nq, T, H] fp32, a softmax over the RMS-normalized sources per query",
           py::arg("blocks"), py::arg("partial"), py::arg("query"), py::arg("eps") = 1e-6);
+    m.def("message_gate_decode", &message_gate_decode,
+          "1 to 3 loop message gates in one cooperative launch (T <= 64): lists of h, m [T, H] "
+          "fp32, wd [64, 2H] bf16, wf, wg [H, 64] fp32 or bf16 -> list of out [T, H] fp32",
+          py::arg("h"), py::arg("m"), py::arg("wd"), py::arg("wf"), py::arg("wg"),
+          py::arg("eps") = 1e-6);
+    m.def("message_gate_prep", &message_gate_prep,
+          "the prefill gates' GEMM input: lists of h, m [T, H] fp32 -> list of [T, 2H] bf16 "
+          "[n(h); n(m)]",
+          py::arg("h"), py::arg("m"), py::arg("eps") = 1e-6);
+    m.def("message_gate_up", &message_gate_up,
+          "the prefill gates' rank-64 up-projections, tanh and mix: lists of z [T, 64] bf16, "
+          "h, m [T, H] fp32, wf, wg [H, 64] fp32 or bf16 -> list of out [T, H] fp32",
+          py::arg("z"), py::arg("h"), py::arg("m"), py::arg("wf"), py::arg("wg"));
 }
