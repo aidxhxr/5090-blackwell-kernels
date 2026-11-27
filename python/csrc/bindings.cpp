@@ -2082,6 +2082,53 @@ Tensor head_norm(const Tensor& x, const std::string& mode, double param,
 
 }  // namespace
 
+// ---- Inkling 2 Mini attention (docs/design/inkling_attention.md) -------------------------
+// q [B, H_q, S_q, 128], k, v [B, H_kv, S_kv, 128] (or the leading rows of a cache), r bf16
+// [B, H_q, S_q, 16], proj bf16 [16, extent], sinks [B, H_q, S_q] (any float dtype, or none).
+Tensor inkling_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& r,
+                         const Tensor& proj, const std::optional<Tensor>& sinks, int64_t window,
+                         int variant) {
+    check_attention_inputs(q, k, v, /*cache_kv=*/true);
+    const int64_t B = q.size(0), H_q = q.size(1), S_q = q.size(2), S_kv = k.size(2);
+    TORCH_CHECK(q.size(3) == 128, "inkling_attention needs head_dim 128, got ", q.size(3));
+    TORCH_CHECK(S_q <= S_kv,
+                "inkling_attention: the queries are the last S_q positions, got S_q = ", S_q,
+                ", S_kv = ", S_kv);
+    check_cuda_contig(r, "r");
+    check_cuda_contig(proj, "proj");
+    TORCH_CHECK(r.scalar_type() == at::kBFloat16 && proj.scalar_type() == at::kBFloat16,
+                "inkling_attention expects bfloat16 r and proj");
+    TORCH_CHECK(
+        r.dim() == 4 && r.size(0) == B && r.size(1) == H_q && r.size(2) == S_q && r.size(3) == 16,
+        "r must be [B, H_q, S_q, 16], got ", r.sizes());
+    TORCH_CHECK(
+        proj.dim() == 2 && proj.size(0) == 16 && proj.size(1) % 8 == 0 && proj.size(1) <= INT32_MAX,
+        "proj must be [16, extent] with extent a multiple of 8, got ", proj.sizes());
+    TORCH_CHECK(aligned16(r) && aligned16(proj), "inkling_attention needs 16-byte aligned r, proj");
+    TORCH_CHECK(r.device() == q.device() && proj.device() == q.device(),
+                "r and proj must be on q's device");
+    TORCH_CHECK(variant >= -1 && variant <= 0, "inkling_attention variant is -1 or 0");
+    const int w = window_arg(window);
+    std::optional<Tensor> s32;
+    if (sinks.has_value()) {
+        TORCH_CHECK(sinks->is_cuda() && sinks->device() == q.device(),
+                    "sinks must be on q's device");
+        TORCH_CHECK(sinks->numel() == B * H_q * S_q, "sinks must be [B, H_q, S_q], got ",
+                    sinks->sizes());
+        s32 = sinks->to(at::kFloat).contiguous();
+    }
+    const c10::cuda::CUDAGuard guard(q.device());
+    Tensor out = at::empty_like(q);
+    const int64_t cap = kv_capacity(k, v);
+    spark::inkling_attention_bf16(
+        bf16_ptr(q), bf16_ptr(k), bf16_ptr(v), bf16_ptr(r), bf16_ptr(proj),
+        s32.has_value() ? s32->data_ptr<float>() : nullptr, bf16_ptr_mut(out), static_cast<int>(B),
+        static_cast<int>(H_q), static_cast<int>(k.size(1)), static_cast<int>(S_q),
+        static_cast<int>(S_kv), static_cast<int>(cap > 0 ? cap : S_kv),
+        static_cast<int>(proj.size(1)), w, variant, current_stream(q));
+    return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "spark-kernels: hand-written CUDA kernels for LLM inference on sm_120 / sm_121";
     m.def("rmsnorm", &rmsnorm, "RMSNorm over the last dim", py::arg("x"), py::arg("w"),
@@ -2434,4 +2481,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("x"), py::arg("mode"), py::arg("param"), py::arg("scale") = py::none(),
           py::arg("positions") = py::none(), py::arg("alpha") = 0.1, py::arg("n_floor") = 8192.0,
           py::arg("inplace") = false);
+
+    // Inkling 2 Mini attention (docs/design/inkling_attention.md).
+    m.def("inkling_attention", &inkling_attention,
+          "Inkling 2 Mini attention: softmax(q k^T / sqrt(128) + r . proj[:, pos_i - j], sink) v "
+          "with the bias 0 past proj's extent, causal, window > 0 keeping pos_i - j < window",
+          py::arg("q"), py::arg("k"), py::arg("v"), py::arg("r"), py::arg("proj"),
+          py::arg("sinks") = py::none(), py::arg("window") = 0, py::arg("variant") = -1);
 }

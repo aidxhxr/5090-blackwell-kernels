@@ -1097,4 +1097,17 @@ void head_norm_bf16(const __nv_bfloat16* x, __nv_bfloat16* out, int64_t rows, in
                     int mode, float param, const float* scale, const void* positions,
                     int position_bytes, float alpha, float n_floor, cudaStream_t stream);
 
+// Inkling 2 Mini's attention core (src/kernels/inkling_attention.cu,
+// docs/design/inkling_attention.md): Q, O = [B, H_q, S_q, 128], K, V = [B, H_kv, S_kv, 128]
+// (the first S_kv of kv_cap rows per head, 0 or S_kv when packed), R = [B, H_q, S_q, 16] bf16
+// relative states, P = [16, extent] bf16 the layer's bias bank (extent a multiple of 8),
+// sinks fp32 [B, H_q, S_q] or null. Query i sits at position i + S_kv - S_q; the mask is
+// causal, and window > 0 keeps the keys with pos_i - j < window. The logit is
+// q_i . k_j / sqrt(128) + r_i . P[:, pos_i - j] (the bias 0 past the extent) and the sink is
+// one more softmax logit with no value. variant 0 (or -1): the 64-row prefill tile.
+void inkling_attention_bf16(const __nv_bfloat16* Q, const __nv_bfloat16* K, const __nv_bfloat16* V,
+                            const __nv_bfloat16* R, const __nv_bfloat16* P, const float* sinks,
+                            __nv_bfloat16* O, int B, int H_q, int H_kv, int S_q, int S_kv,
+                            int kv_cap, int extent, int window, int variant, cudaStream_t stream);
+
 }  // namespace spark

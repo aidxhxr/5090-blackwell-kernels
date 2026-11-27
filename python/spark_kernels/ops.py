@@ -1416,3 +1416,22 @@ def head_rms_norm(x: torch.Tensor, eps: float = 1e-6, inplace: bool = False) -> 
     """Unweighted RMSNorm over the last dim of x [..., H, D] (HF
     `Inkling2LoopUnweightedRMSNorm`, v's norm), fp32 math."""
     return _C.head_norm(x, "rms", eps, None, None, 0.0, 1.0, inplace)
+
+
+def inkling_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, r: torch.Tensor,
+                      proj: torch.Tensor, sinks: torch.Tensor | None = None, window: int = 0,
+                      variant: int = -1) -> torch.Tensor:
+    """Inkling 2 Mini's attention core (docs/design/inkling_attention.md).
+
+    q [B, H_q, S_q, 128] (already clipped and scaled), k, v [B, H_kv, S_kv, 128] (or the
+    leading S_kv rows of a cache), r [B, H_q, S_q, 16] the relative states, proj [16, extent]
+    the layer's bias bank (``relative_position_bias.proj``), sinks [B, H_q, S_q] one logit per
+    query and head with no value, all bf16 (sinks any float dtype). The queries are the last
+    S_q positions: pos_i = i + S_kv - S_q. The logit is
+    q_i . k_j / sqrt(128) + r_i . proj[:, pos_i - j] for 0 <= pos_i - j < extent (0 past it),
+    causal, and ``window`` > 0 keeps pos_i - j < window (HF's sliding window). This is
+    ``eager_attention_forward`` of the HF model with its position bias, mask and sink column,
+    with fp32 logits. variant 0 (the default) is the 64-row prefill tile. Returns
+    [B, H_q, S_q, 128] bf16.
+    """
+    return _C.inkling_attention(q, k, v, r, proj, sinks, window, variant)
