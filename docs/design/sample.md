@@ -107,6 +107,55 @@ Each decode bucket is captured twice, ending in argmax and in `sk.sample`. A ste
 sampling graph only while some running request samples; a run with only greedy requests
 replays the argmax graphs it replayed before, bit for bit.
 
+## The logit softcap (Inkling 2 Mini)
+
+Inkling 2 Mini's logits are `30 * tanh(z / 30)` of the lm_head's output (Gemma 2's final
+logit softcap). `sk.sample(..., softcap=30.0)` applies it inside the kernel, so a serving loop
+samples from the raw bf16 logits and never writes a capped copy of the row:
+
+    x_i = c tanh(z_i / c),   m = c tanh(max z / c),   w_i = floor(exp((x_i - m) / T) * 2^40)
+
+tanh is the one-exp form the cross-entropy kernels use, `1 - 2 / (1 + e^(2u))` with u = z / c
+clamped to |u| <= 15 (tanh is 1 in fp32 there), computed wherever a pass already computes a
+weight: H1, K2, P2 and S in variant 1, every probe of variant 0. Pass A still finds the raw
+max and argmax.
+
+The cap is monotonic, so three things do not move: greedy (the argmax), the order of the
+16-bit keys the radix select works on, and with it the top-k set. What moves is every
+probability. The cap pulls the top of the row together, so the draw and top-p's cut change:
+on the 64-token test row with raw logits over about +-60, the kept distributions with and
+without the cap are 0.31 to 1.45 apart in L1 across the five cases of
+`test_sample_softcap_distribution`. The keys stay those of the raw bf16 bits, so two raw
+values far out in the tail that the cap rounds to the same fp32 value keep their raw order,
+where a sort of the capped values would tie them.
+
+**Measured.** RTX PRO 6000 (sm_120), 2026-11-26, the card shared with a vLLM server and
+other test runs (the timed runs held a lock). `python scripts/bench_sample.py --vocab
+200058 --softcap 30 --iters 200`, random normal logits times 3, medians of 200 calls, ms:
+
+| case | B | capped | no cap | torch, capped |
+|---|---|---|---|---|
+| greedy | 1 | 0.0104 | 0.0104 | 0.0082 |
+| temperature 1 | 1 | 0.0709 | 0.0657 | 0.1106 |
+| top_k = 50 | 1 | 0.3856 | 0.3812 | 0.2990 |
+| top_p = 0.9 | 1 | 0.5978 | 0.5869 | 0.2605 |
+| top_k = 50, top_p = 0.9 | 1 | 0.3931 | 0.3947 | 0.3274 |
+| greedy | 64 | 0.0170 | 0.0248 | 0.0351 |
+| temperature 1 | 64 | 0.0926 | 0.0837 | 0.3254 |
+| top_k = 50 | 64 | 0.4150 | 0.3990 | 0.3601 |
+| top_p = 0.9 | 64 | 0.6156 | 0.6047 | 2.1314 |
+| top_k = 50, top_p = 0.9 | 64 | 0.4222 | 0.4059 | 0.3744 |
+
+B = 8 is in `results/sample_softcap.jsonl` with the rest. The cap costs 8 to 11% on plain
+temperature, where the weight pass is most of the kernel, and up to 4% where the radix passes
+dominate; greedy does not compute a weight (the 0.0248 is noise, the two greedy paths are the
+same code). The torch column is the eager path of `bench_sample.py` with one more elementwise
+op for the cap. These rows also show what the earlier note could not: at V = 200058 the
+kernel's top-k and top-p paths are slower than torch's at B = 1 (0.39 to 0.60 ms against 0.26
+to 0.33), and ahead only for top-p alone at B = 8 and 64, where torch sorts every row. The
+radix passes, not the cap, are that cost, and the leads under "What to measure" are where to
+look.
+
 ## What to measure
 
 - `python scripts/bench_sample.py`: B in 1, 8, 64 at V = 128256 for greedy, temperature,

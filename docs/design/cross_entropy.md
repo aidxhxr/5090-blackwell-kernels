@@ -343,6 +343,108 @@ bf16's resolution everywhere, which for a trained model's peaked distribution is
 them; on the random weights these benches use the softmax is not sparse, so that filter
 cannot be judged here and is not built.
 
+## The logit softcap and an unpadded vocabulary (Inkling 2 Mini)
+
+Inkling 2 Mini ends in `logits = lm_head(h).float(); logits = 30 * tanh(logits / 30)`
+(`Inkling2LoopForCausalLM.forward`), Gemma 2's final logit softcap, over an lm_head of
+200058 rows: the unpadded vocabulary, not a multiple of 128 (1563 tiles, the last with 122
+columns). `linear_cross_entropy(..., softcap=30.0)` takes both, in every variant.
+
+**The math.** With z the raw logit, c the cap and t = tanh(z / c), the loss sees x = c t:
+
+    loss_row = lse(x) - x_y
+    d loss / d z = (softmax(x) - [col == y]) * scale * (1 - t^2)
+
+since d x / d z = 1 - tanh^2(z / c). Nothing else changes: the lse, the per-row scale and
+the ignored rows are what they were. tanh is one exp2 and a fast divide,
+`1 - 2 / (1 + e^(2u))` with u = z / c clamped to |u| <= 15 (tanh is 1 in fp32 there, and
+the exponential stays finite). The cap goes on where each variant already touches a logit:
+variant 1's row kernel applies it to the bf16 logits as it reads them, which is HF's order
+exactly (bf16 product, `.float()`, cap); variants 2 and 3 apply it in the GEMM epilogues to
+the fp32 sums, one rounding fewer than HF. In each place the gradient factor is computed from
+the same t as the capped logit, so it costs one more multiply on top of the tanh.
+
+**Any V.** The GEMMs (`ce_gemm` in all three modes and variant 3's band kernel) used to
+require V % 128 == 0. Now the last tile's w box reads past the end of w and the TMA fills
+those rows with zeros, so the sums there are exactly 0, and the epilogues mask the columns
+at or past V: STATS treats them as -inf (a warp whose 32 columns are all masked contributes
+(-inf, 0), with the exponent guarded so it is not inf - inf), GRAD and the band kernel's
+gradient tile write 0. A logits or gradient chunk has rows of Vp = V rounded up to 128 (200064
+for Inkling), zero past V, so the row kernel's 16-byte loads stay aligned and hgemm sees a
+K that is a multiple of 64; the row kernel takes the valid V separately, masks the straddling
+vector in its first pass and writes zeros past V in its second. The band kernel folds only
+the rows below V of the last vocabulary strip (its last fold chunk is short, a multiple of 64
+floats since D is); the slot's other rows only ever get zeros added. dw's transposed slabs
+stop at V, so dw is never padded.
+
+One piece has no mask: dh = g @ w by hgemm, whose K is the chunk's padded width, so hgemm
+would need w with Vp rows, a zero-padded copy. The first version made that copy; the second
+gives dh to cuBLAS on the `[C, V]` view of the padded chunk (`torch.mm` passes lda = Vp, so
+nothing is copied). For one 2048-row chunk at D = 2304 on the RTX PRO 6000:
+
+| dh for one chunk at V = 200058 | ms | |
+|---|---|---|
+| the zero-padded copy of w (0.92 GB) | 1.88 | |
+| hgemm on the copy | 7.67 | 246 TFLOPS |
+| cuBLAS on the strided view | **5.12** | 369 TFLOPS |
+
+cuBLAS's max error against fp32 there is 0.8% of the largest entry, hgemm's 0.3% (torch's
+default bf16 reduced-precision reduction), both inside the tests' 2%. A V that is a multiple of
+128 keeps hgemm. That hgemm runs this M = 2048, N = 2304, K = 200064 product a third slower
+than cuBLAS on this card is its own lead (see What is left). Variant 3 has no hgemm.
+
+**Measured.** RTX PRO 6000 Blackwell Server Edition (sm_120, 188 SMs), CUDA 13.2, torch
+cu130, on 2026-11-26, the card shared: a vLLM server and other correctness runs
+were on it, and the timed runs held a lock. `scripts/bench_logit_softcap.py`: V =
+200058, D = 2304, c = 30, 5% of the targets ignored, the forward and the backward
+(`torch.autograd.grad` for h and w), the process capped at 32 GB. To keep the comparison fair
+on a busy card the methods are timed interleaved, one call of each per round in a rotating
+order, and the row is the median over the rounds (15 at 4096 tokens, 8 at 16384).
+Peak is `max_memory_allocated` above what was allocated before the call, so it includes the
+returned dh and dw (dw alone is 0.92 GB).
+
+| method | T = 4096 | peak | T = 16384 | peak |
+|---|---|---|---|---|
+| torch eager, capped | 87.35 ms | 13.11 GB | does not fit in 32 GB | |
+| torch.compile, capped | 36.17 ms | 2.58 GB | **149.10 ms** | 7.55 GB |
+| v1, capped | 37.00 ms | 1.83 GB | 149.28 ms | 1.89 GB |
+| v1, no cap | 37.49 ms | 1.83 GB | 148.70 ms | 1.89 GB |
+| v2, capped | 46.40 ms | 1.83 GB | 185.39 ms | 1.89 GB |
+| v2, no cap | 45.82 ms | 1.83 GB | 184.16 ms | 1.89 GB |
+| v3, capped | 61.97 ms | **0.98 GB** | 246.00 ms | **1.04 GB** |
+| v3, no cap | 61.51 ms | 0.98 GB | 245.66 ms | 1.04 GB |
+
+Both runs held clocks of 2.0 to 2.3 GHz; two earlier runs at 16384 tokens caught the card hot
+or under a neighbour (1.0 to 1.6 GHz, 80 C) and are not in the table.
+
+How to read it:
+
+* **The cap costs nothing measurable.** Each variant with the cap is within 1.3% of itself
+  without it, timed in the same rounds: the tanh is one exp2 and a divide per logit in a pass
+  that is GEMM-bound, and the gradient factor reuses it. Torch pays for the cap in memory
+  instead: in eager mode the `.float()` copy, the division, the tanh and the multiply each
+  make an fp32 `[T, V]` tensor (3.3 GB at 4096 tokens) before the loss's own, 13.1 GB at the
+  peak, and 16384 tokens do not fit in 32 GB.
+* **Variant 1 ties `torch.compile` on time and holds less.** At 4096 tokens 37.0 against 36.2
+  ms (2% behind), 1.83 GB against 2.58; at 16384 tokens 149.28 against 149.10 ms, 1.89 GB
+  against 7.55. Compile keeps the bf16 logits, 1.64 GB per 4096 tokens, so its peak grows
+  with T and ours does not.
+* **Variant 3 holds the least**, 0.98 GB at 4096 tokens and 1.04 at 16384 (the two gradients
+  and 38 MB of fp32 band and slots), at 1.65 to 1.67x variant 1's time, against 1.45x at the
+  Llama shape on the 5090. I have not profiled where the extra goes at this shape.
+* The forward alone (`bench_cross_entropy.py --softcap 30`, back to back, not interleaved) is
+  10.9 ms for variants 2 and 3 at 4096 tokens, 11.7 for variant 1 and 12.9 for
+  `torch.compile`, with 0.05 GB against compile's 1.64.
+
+Tests: `tests/test_logit_softcap.py`, 58, all pass on the card: the loss, dh and dw of
+variants -1 to 3 against fp32 torch at H = 2304, V = 200058 with the cap (300 rows in ragged
+128-row chunks, logits of standard deviation 12 so the cap bends them), variant 0 against
+HF's bf16-logit spelling, the plain loss at 200058, V = 333, 129 and 1000 with and without a
+cap at chunks of 64 and 4096, "sum" with an upstream gradient, and the pieces at an odd V (the
+row kernel on padded rows with junk past V, the three `ce_gemm` epilogues on a `[T, 384]`
+buffer, the band kernel over two bands with a 77-row last strip). The 59 tests of
+`tests/test_cross_entropy.py` still pass.
+
 ## What is left
 
 **hgemm with a transposed A.** dw goes through a transposed copy of the gradient because
@@ -355,6 +457,11 @@ could write `g^T` next to `g` (the accumulator layout gives each lane two rows o
 columns; one `__shfl_xor` turns that into 4-byte stores of two rows of one column), which
 would save the transpose's read. I left it for the transposed-A mode, which removes the
 whole pass.
+
+**hgemm on the lm_head's dh shape.** At Inkling 2's dh product (M = 2048, N = 2304, K =
+200064) cuBLAS ran 369 TFLOPS and hgemm 246 on the RTX PRO 6000. A schedule for a K that
+long and an N that narrow, and a row count for B (the TMA would fill w's missing rows with
+zeros, as `ce_gemm` already lets it), would let variants 1 and 2 keep hgemm at every V.
 
 **dw in fp32.** dw is summed in bf16 across chunks, one rounding per chunk, as Liger does;
 with 2048-row chunks that is four roundings at 8192 tokens. An fp32 accumulator would cost

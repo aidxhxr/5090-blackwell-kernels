@@ -3,6 +3,11 @@ function, and spark_kernels.linear_cross_entropy variants 1 to 3 (docs/design/cr
 
     python scripts/bench_cross_entropy.py --vocab 128256 --tokens 2048 4096 8192
     python scripts/bench_cross_entropy.py --vocab 151936 --tokens 8192 --methods v1 v2
+    python scripts/bench_cross_entropy.py --vocab 200058 --d-model 2304 --softcap 30 --tokens 4096
+
+--softcap C puts Gemma 2's and Inkling 2's final logit softcap on every method (torch's as HF
+spells it: the bf16 logits, `.float()`, then C * tanh(x / C), then the loss); a run without it
+at the same shape is the same op with no cap.
 
 For each (V, T) and method it times the forward alone (under no_grad: the loss) and the
 forward plus the backward (torch.autograd.grad of the loss for h and w, so nothing is
@@ -88,19 +93,20 @@ def peak_gb(fn) -> float:
     return peak / 1e9
 
 
-def reference(h, w, y):
-    return F.cross_entropy((h @ w.t()).float(), y)
+def make_methods(sk, chunk, softcap=None):
+    def reference(h, w, y):
+        logits = (h @ w.t()).float()
+        if softcap is not None:
+            logits = torch.tanh(logits / softcap) * softcap
+        return F.cross_entropy(logits, y)
 
+    def ours(variant):
+        return lambda h, w, y: sk.linear_cross_entropy(h, w, y, variant=variant, chunk=chunk,
+                                                       softcap=softcap)
 
-def make_methods(sk, chunk):
     compiled = torch.compile(reference, dynamic=False)
-    return {
-        "torch": reference,
-        "torch_compile": compiled,
-        "v1": lambda h, w, y: sk.linear_cross_entropy(h, w, y, variant=1, chunk=chunk),
-        "v2": lambda h, w, y: sk.linear_cross_entropy(h, w, y, variant=2, chunk=chunk),
-        "v3": lambda h, w, y: sk.linear_cross_entropy(h, w, y, variant=3, chunk=chunk),
-    }
+    return {"torch": reference, "torch_compile": compiled, "v1": ours(1), "v2": ours(2),
+            "v3": ours(3)}
 
 
 def write_row(row: dict, args) -> None:
@@ -147,6 +153,8 @@ def run_shape(sk, V: int, T: int, methods: dict, names: list[str], args) -> list
             row = {"kernel": "cross_entropy", "V": V, "D": D_MODEL, "T": T, "method": name,
                    "mode": mode, "chunk": args.chunk if name in ("v1", "v2", "v3") else None,
                    "budget_gb": args.budget_gb}
+            if args.softcap is not None:
+                row["softcap"] = args.softcap
             t0 = time.perf_counter()
             try:
                 out = step()  # also compiles torch_compile
@@ -178,7 +186,8 @@ def run_shape(sk, V: int, T: int, methods: dict, names: list[str], args) -> list
                     flops / row["ms"] / 1e9, 1)
             except torch.OutOfMemoryError:
                 row = {k: v for k, v in row.items() if k in ("kernel", "V", "D", "T", "method",
-                                                             "mode", "chunk", "budget_gb")}
+                                                             "mode", "chunk", "budget_gb",
+                                                             "softcap")}
                 row["fits"] = False
                 row["note"] = f"does not fit in {args.budget_gb:g} GB"
             gc.collect()
@@ -201,7 +210,7 @@ def run_pieces(sk, V: int, T: int, chunk: int, args) -> list[dict]:
         torch.bfloat16)
     y = torch.randint(0, V, (T,), device="cuda", generator=g)
     hc, yc = h[:chunk], y[:chunk]
-    logits = torch.empty(chunk, V, device="cuda", dtype=torch.bfloat16)
+    logits = torch.empty(chunk, sk.ops._ce_vpad(V), device="cuda", dtype=torch.bfloat16)
     lse, _ = C_.ce_stats(hc, w, yc, -100)
     scale = torch.full((1,), 1.0 / T, device="cuda")
     c_pad = (chunk + 63) // 64 * 64
@@ -212,7 +221,7 @@ def run_pieces(sk, V: int, T: int, chunk: int, args) -> list[dict]:
     C_.ce_logits(hc, w, logits)
     dh_f32 = torch.zeros((chunk + 127) // 128 * 128, D_MODEL, device="cuda")
     slots = torch.zeros(C_.ce_backward_slots() * 128, D_MODEL, device="cuda")
-    flags = torch.zeros(2 * (V // 128) + 1, device="cuda", dtype=torch.int32)
+    flags = torch.zeros(2 * (sk.ops._ce_vpad(V) // 128) + 1, device="cuda", dtype=torch.int32)
 
     def bwd_band():
         flags.zero_()
@@ -261,6 +270,7 @@ def run_pieces(sk, V: int, T: int, chunk: int, args) -> list[dict]:
 
 
 def main() -> int:
+    global D_MODEL
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--vocab", type=int, nargs="+", default=[128256, 151936])
     ap.add_argument("--tokens", type=int, nargs="+", default=[2048, 4096, 8192])
@@ -274,7 +284,11 @@ def main() -> int:
     ap.add_argument("--no-write", action="store_true")
     ap.add_argument("--pieces", action="store_true",
                     help="time the kernels one at a time instead of the whole op")
+    ap.add_argument("--d-model", type=int, default=D_MODEL, help="hidden size D (default 4096)")
+    ap.add_argument("--softcap", type=float, default=None,
+                    help="final logit softcap on every method (Inkling 2 Mini: 30)")
     args = ap.parse_args()
+    D_MODEL = args.d_model
 
     import spark_kernels as sk
 
@@ -288,7 +302,7 @@ def main() -> int:
             for T in args.tokens:
                 rows += run_pieces(sk, V, T, min(args.chunk, T), args)
     else:
-        methods = make_methods(sk, args.chunk)
+        methods = make_methods(sk, args.chunk, args.softcap)
         for V in args.vocab:
             for T in args.tokens:
                 rows += run_shape(sk, V, T, methods, args.methods, args)

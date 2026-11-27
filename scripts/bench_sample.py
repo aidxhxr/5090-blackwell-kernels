@@ -6,6 +6,11 @@ prints a table.
 
     python scripts/bench_sample.py
     python scripts/bench_sample.py --batch 1 64 --iters 200 --variant 0   # the reference rung
+    python scripts/bench_sample.py --vocab 200058 --softcap 30 --out results/sample_softcap.jsonl
+
+With --softcap C both paths apply Inkling 2's final logit softcap C * tanh(x / C) (torch's as
+one more elementwise op on the fp32 logits), and each row also times our kernel without the
+cap on the same logits, so the cap's own cost is ours_ms - ours_nocap_ms.
 
 Times are CUDA-event medians of one call each (no graph); `torch` is the eager path a
 serving loop without a fused sampler runs. The PyTorch path with top-p and no top-k sorts the
@@ -33,12 +38,15 @@ CASES = [("greedy", 0.0, 0, 1.0), ("temperature", 1.0, 0, 1.0), ("top_k=50", 1.0
 
 
 def torch_sample(logits: torch.Tensor, T: float, k: int, p: float,
-                 gen: torch.Generator) -> torch.Tensor:
+                 gen: torch.Generator, softcap: float | None = None) -> torch.Tensor:
     """The usual eager path: top-k by torch.topk, top-p by a sort and a cumsum, then
     torch.multinomial over what is left."""
     if T <= 0:
         return torch.argmax(logits, dim=-1)
-    x = logits.float() / T
+    x = logits.float()
+    if softcap is not None:
+        x = torch.tanh(x / softcap) * softcap
+    x = x / T
     idx = None
     if k > 0:
         x, idx = torch.topk(x, k, dim=-1)  # sorted, descending
@@ -74,7 +82,10 @@ def main() -> int:
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--variant", type=int, default=-1)
     ap.add_argument("--out", type=Path, default=OUT)
+    ap.add_argument("--vocab", type=int, default=V)
+    ap.add_argument("--softcap", type=float, default=None)
     args = ap.parse_args()
+    vocab, cap = args.vocab, args.softcap
 
     import spark_kernels as sk
 
@@ -85,7 +96,7 @@ def main() -> int:
     print(f"{'case':<20} {'B':>3} {'ours ms':>9} {'torch ms':>9} {'speedup':>8}  {device}")
     for B in args.batch:
         # random normal logits: flatter than a model's, so more tokens land in the refined bins
-        logits = (torch.randn(B, V, device=dev, generator=gen) * 3).to(torch.bfloat16)
+        logits = (torch.randn(B, vocab, device=dev, generator=gen) * 3).to(torch.bfloat16)
         for name, T, k, p in CASES:
             temp = torch.full((B,), T, device=dev)
             top_k = torch.full((B,), k, device=dev, dtype=torch.int32)
@@ -93,14 +104,19 @@ def main() -> int:
             seed = torch.arange(B, device=dev, dtype=torch.long)
             offset = torch.zeros(B, device=dev, dtype=torch.long)
             ours = time_ms(lambda: sk.sample(logits, temp, top_k, top_p, seed, offset,  # noqa: B023
-                                             args.variant), args.warmup, args.iters)
-            ref = time_ms(lambda: torch_sample(logits, T, k, p, gen),  # noqa: B023
+                                             args.variant, softcap=cap), args.warmup, args.iters)
+            ref = time_ms(lambda: torch_sample(logits, T, k, p, gen, cap),  # noqa: B023
                           args.warmup, args.iters)
-            row = {"device": device, "kernel": "sample", "case": name, "B": B, "V": V,
+            row = {"device": device, "kernel": "sample", "case": name, "B": B, "V": vocab,
                    "temperature": T, "top_k": k, "top_p": p, "variant": args.variant,
                    "ours_ms": ours, "torch_ms": ref, "speedup": ref / ours,
                    # the one read of the logits the kernel must do, against its time
-                   "gbps": B * V * 2 / (ours * 1e-3) / 1e9}
+                   "gbps": B * vocab * 2 / (ours * 1e-3) / 1e9}
+            if cap is not None:
+                row["softcap"] = cap
+                row["ours_nocap_ms"] = time_ms(
+                    lambda: sk.sample(logits, temp, top_k, top_p, seed, offset,  # noqa: B023
+                                      args.variant), args.warmup, args.iters)
             rows.append(row)
             print(f"{name:<20} {B:>3} {ours:9.4f} {ref:9.4f} {ref / ours:7.2f}x")
     args.out.parent.mkdir(parents=True, exist_ok=True)
