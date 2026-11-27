@@ -239,3 +239,199 @@ class Checkpoint:
                 raise OSError(f"{self.path}: short read of {name}")
         t = torch.frombuffer(buf, dtype=torch.uint8) if buf else torch.empty(0, dtype=torch.uint8)
         return t.view(dtype).reshape(shape).to(device)
+
+    def experts(self, layer: int, proj: str, experts: slice | None = None
+                ) -> NVFP4Experts | MXFP8Experts:
+        """Layer `layer`'s experts of projection "w13" or "w2" (a range of them with
+        `experts`) repacked for fp4gemm (layers 0-19) or fp8gemm in MX mode (20-23)."""
+        p = f"model.llm.layers.{layer}.mlp.experts.{proj}_weight"
+        if p + "_amax" in self.header:
+            rows = experts if experts is not None else slice(None)
+            amax = self.tensor(p + "_amax")[rows]
+            return repack_nvfp4(self.tensor(p, experts), self.tensor(p + "_scale", experts),
+                                amax, self.tensor(p + "_outer_scale_denominator"))
+        return repack_mxfp8(self.tensor(p, experts), self.tensor(p + "_scale", experts))
+
+
+# ---- the expert weights -------------------------------------------------------------------
+# NVFP4 (layers 0-19), "amax_denominator" scale format. Per projection four tensors:
+#   *_weight         uint8 [E, N, K / 2]   two e2m1 codes a byte, element 2i in the low nibble
+#   *_weight_scale   e4m3  [E, N, K / 16]  one block scale per 16 consecutive k of a row
+#   *_weight_amax    fp32  [E]             max |w| of the expert
+#   *_weight_outer_scale_denominator  fp32 [1]  6 * 448 = 2688 in the file
+# w = e2m1 * block_scale * (amax / denominator), in fp32 in that order, then bf16
+# (transformers' Inkling2LoopDequantizeExperts). "fouroversix_mae" is how the quantizer chose
+# each block scale (block max to 4 or to 6, the lower error); the decode does not depend on it.
+# That is the operand set of fp4gemm already: the same codes as b_t, the same e4m3 bytes as
+# sfb in the blocked layout, amax / denominator (the same fp32 division) as scale_b.
+#
+# MXFP8 (layers 20-23): *_weight e4m3 [E, N, K], *_weight_scale uint8 [E, N, K / 32], an
+# E8M0 exponent per 32 consecutive k of a row, w = e4m3 * 2 ** (scale - 127). The quant config
+# says weight_block_shape [32, 32], but the stored scales are one per row (no two of the 2304
+# scale rows of an expert are equal), so the file is in the 1x32 layout fp8gemm's sfb takes.
+#
+# fp4gemm and fp8gemm's MX mode need K a multiple of 256. w13 (K = 2304) is; w2 (K = 1152) is
+# padded to 1280 with zero codes, whose products add exact zeros.
+
+GEMM_K_MULTIPLE = 256
+
+
+class NVFP4Experts:
+    """One projection's experts as fp4gemm operands: q [E, N, Kp / 2] uint8 (b_t), sf [E,
+    blocked bytes] uint8 (sfb, `reference.to_blocked` of the [N, Kp / 16] e4m3 scales), scale
+    [E] fp32 (scale_b), and k, the K before padding to Kp."""
+
+    fmt = "nvfp4"
+
+    def __init__(self, q: torch.Tensor, sf: torch.Tensor, scale: torch.Tensor, k: int):
+        self.q, self.sf, self.scale, self.k = q, sf, scale, k
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        """(E, N, K) of the weight, K unpadded."""
+        return self.q.shape[0], self.q.shape[1], self.k
+
+    def expert(self, e: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """(b_t, sfb, scale_b) of expert e for `fp4gemm(a, b_t, sfa, sfb, scale_a, scale_b)`."""
+        return self.q[e], self.sf[e], self.scale[e:e + 1]
+
+    def to(self, device) -> NVFP4Experts:
+        return NVFP4Experts(self.q.to(device), self.sf.to(device), self.scale.to(device), self.k)
+
+
+class MXFP8Experts:
+    """One projection's experts as fp8gemm MX operands: q [E, N, Kp] e4m3 (b_t), sf [E, N,
+    Kp / 32] uint8 E8M0 (sfb, row-major), and k, the K before padding to Kp."""
+
+    fmt = "mxfp8"
+
+    def __init__(self, q: torch.Tensor, sf: torch.Tensor, k: int):
+        self.q, self.sf, self.k = q, sf, k
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        return self.q.shape[0], self.q.shape[1], self.k
+
+    def expert(self, e: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """(b_t, sfb) of expert e for `fp8gemm(a, b_t, sfa=sfa, sfb=sfb)`."""
+        return self.q[e], self.sf[e]
+
+    def to(self, device) -> MXFP8Experts:
+        return MXFP8Experts(self.q.to(device), self.sf.to(device), self.k)
+
+
+def _pad_last(t: torch.Tensor, n: int, value: int = 0) -> torch.Tensor:
+    if t.shape[-1] == n:
+        return t.contiguous()
+    out = torch.full((*t.shape[:-1], n), value, dtype=torch.uint8, device=t.device)
+    out[..., :t.shape[-1]] = t.view(torch.uint8)
+    return out.view(t.dtype)
+
+
+def _padded_k(k: int, multiple: int) -> int:
+    return -(-k // multiple) * multiple
+
+
+# transformers' table: the codes 8..15 are the negatives, code 8 is -0.0
+E2M1_HF = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
+
+
+def nvfp4_dequantize_hf(weight: torch.Tensor, scale: torch.Tensor, amax: torch.Tensor,
+                        denominator: torch.Tensor) -> torch.Tensor:
+    """fp32 [E, N, K] from the file's four NVFP4 tensors, transformers' arithmetic operation
+    for operation (its result is this cast to bf16)."""
+    codes = weight.view(torch.uint8).long()
+    lut = torch.tensor(E2M1_HF, device=weight.device)
+    byte = torch.arange(256, device=weight.device)
+    byte_to_values = torch.stack((lut[byte & 0xF], lut[byte >> 4]), dim=-1)
+    bs = scale.float()
+    values = byte_to_values[codes].view(*bs.shape, 16) * bs[..., None]
+    factor = amax.float() / denominator.float()
+    values = values * factor[:, None, None, None]
+    E, N = weight.shape[:2]
+    return values.reshape(E, N, -1)
+
+
+def mxfp8_dequantize_hf(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """fp32 [E, N, K] from the file's MXFP8 weight and E8M0 scales, transformers' arithmetic
+    (exact: a power of two times an e4m3 value)."""
+    bs = scale.float()
+    values = weight.float().view(*bs.shape, 32) * torch.exp2(bs - 127)[..., None]
+    return values.reshape(weight.shape)
+
+
+def repack_nvfp4(weight: torch.Tensor, scale: torch.Tensor, amax: torch.Tensor,
+                 denominator: torch.Tensor, k_multiple: int = GEMM_K_MULTIPLE) -> NVFP4Experts:
+    """The file's NVFP4 tensors of E experts -> NVFP4Experts. The codes and the e4m3 bytes are
+    copied (K padded with zero codes and zero block scales), the block scales of each expert
+    put in the blocked layout, and amax / denominator computed in fp32 as transformers does,
+    so dequantize_nvfp4 of the result equals nvfp4_dequantize_hf bit for bit."""
+    E, N, half = weight.shape
+    k = 2 * half
+    if scale.shape != (E, N, k // 16):
+        raise ValueError(f"scale {tuple(scale.shape)} does not fit weight {tuple(weight.shape)}")
+    kp = _padded_k(k, k_multiple)
+    q = _pad_last(weight.view(torch.uint8), kp // 2)
+    sf_rows = _pad_last(scale.view(torch.uint8), kp // 16)
+    sf = torch.stack([R.to_blocked(sf_rows[e]) for e in range(E)])
+    factor = (amax.float() / denominator.float()).reshape(E)
+    return NVFP4Experts(q, sf, factor.contiguous(), k)
+
+
+def dequantize_nvfp4(experts: NVFP4Experts) -> torch.Tensor:
+    """fp32 [E, N, K] of NVFP4Experts the way fp4gemm reads them: `reference.dequantize_fp4`
+    (codes times block scales out of the blocked layout) times scale_b, padding cut off."""
+    E, N, k = experts.shape
+    out = [R.dequantize_fp4(experts.q[e], experts.sf[e], "nvfp4", experts.scale[e])
+           for e in range(E)]
+    return torch.stack(out)[..., :k]
+
+
+def repack_mxfp8(weight: torch.Tensor, scale: torch.Tensor,
+                 k_multiple: int = GEMM_K_MULTIPLE) -> MXFP8Experts:
+    """The file's MXFP8 tensors of E experts -> MXFP8Experts: the same e4m3 and E8M0 bytes,
+    K padded with zero elements whose scale byte is 127 (2 ** 0, so 0 times it stays 0)."""
+    E, N, k = weight.shape
+    if scale.shape != (E, N, k // 32):
+        raise ValueError(f"scale {tuple(scale.shape)} does not fit weight {tuple(weight.shape)}")
+    kp = _padded_k(k, k_multiple)
+    q = _pad_last(weight, kp)
+    sf = _pad_last(scale.view(torch.uint8), kp // 32, value=127)
+    return MXFP8Experts(q, sf, k)
+
+
+def dequantize_mxfp8(experts: MXFP8Experts) -> torch.Tensor:
+    """fp32 [E, N, K] of MXFP8Experts as fp8gemm reads them (`reference.dequantize_mx`)."""
+    return R.dequantize_mx(experts.q, experts.sf)[..., :experts.k]
+
+
+def hf_expert_weight(ck: Checkpoint, layer: int, proj: str, experts: slice | None = None,
+                     dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+    """What transformers loads into mlp.experts.gate_up_proj ("w13") or down_proj ("w2") of
+    a layer: the dequantized experts in `dtype`, w13 deinterleaved to [gate; up]."""
+    p = f"model.llm.layers.{layer}.mlp.experts.{proj}_weight"
+    if p + "_amax" in ck.header:
+        rows = experts if experts is not None else slice(None)
+        w = nvfp4_dequantize_hf(ck.tensor(p, experts), ck.tensor(p + "_scale", experts),
+                                ck.tensor(p + "_amax")[rows],
+                                ck.tensor(p + "_outer_scale_denominator"))
+    else:
+        w = mxfp8_dequantize_hf(ck.tensor(p, experts), ck.tensor(p + "_scale", experts))
+    w = w.to(dtype)
+    return hf_gate_up(w) if proj == "w13" else w
+
+
+def _load_reference():
+    try:
+        from . import reference
+    except ImportError:  # loaded from this file alone (CPU tests): reference.py is next to it
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "spark_reference", Path(__file__).resolve().parent / "reference.py")
+        reference = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(reference)
+    return reference
+
+
+R = _load_reference()
