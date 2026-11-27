@@ -110,3 +110,4 @@ docs:
 - [unified memory: a kernel reading cudaMalloc, managed, host-mapped and plain system memory, advice, and the CPU-GPU flag round trip](design/unified.md) (not measured yet)
 - [DeepSeek V4.1 Flash on the GB10's 128 GB: the footprint, the step budget and the fused 1-bit expert kernel w1moe_decode](design/moe_spark.md) (not measured yet)
 - [decode grids on the GB10: bytes in flight, split-K from the SM count, the 24 MB L2](design/decode_spark.md) (not measured yet)
+- [Inkling 2 Mini attention: the relative position bias folded into the flash tile, prefill and decode](design/inkling_attention.md)
