@@ -923,16 +923,6 @@ def _ce_vpad(V):
     return (V + 127) // 128 * 128
 
 
-def _ce_w_for_dh(w):
-    """w as the [Vp, D] B operand of dh = g @ w, whose K is the gradient chunk's padded
-    width: w itself when V is a multiple of 128, else a copy with Vp - V zero rows (hgemm
-    wants K % 64 == 0 and has no row-masking mode; the zero rows meet the chunk's zero
-    columns)."""
-    V = w.shape[0]
-    Vp = _ce_vpad(V)
-    return w if Vp == V else torch.nn.functional.pad(w, (0, 0, 0, Vp - V))
-
-
 def _ce_counts(targets, ignore_index):
     return (targets != ignore_index).sum()
 
@@ -952,15 +942,23 @@ def _ce_reduce(loss_rows, targets, ignore_index, reduction):
     return total / _ce_counts(targets, ignore_index)  # nan when no row counts, as torch
 
 
-def _ce_backprop_chunk(g, h_c, w_k, dh_c, dw, first, slab_buf):
+def _ce_backprop_chunk(g, h_c, w, dh_c, dw, first, slab_buf):
     """dh_c = g @ w and dw (+)= g^T @ h_c for one chunk's logit gradient g [C, Vp] bf16
-    (zero past V), both by hgemm; w_k is `_ce_w_for_dh(w)`. hgemm takes its A operand
-    K-contiguous, so g^T goes through `slab_buf` (flat, CE_SLAB x the chunk rounded up to 64)
-    one vocabulary slab at a time, its columns padded to a multiple of 64 with zeros, and
-    h_c gets zero rows to match. dw accumulates in bf16 across chunks, as Liger's does."""
-    C = g.shape[0]
+    (zero past V), both by hgemm. hgemm takes its A operand K-contiguous, so g^T goes through
+    `slab_buf` (flat, CE_SLAB x the chunk rounded up to 64) one vocabulary slab at a time,
+    its columns padded to a multiple of 64 with zeros, and h_c gets zero rows to match. dw
+    accumulates in bf16 across chunks, as Liger's does.
+
+    When V is not a multiple of 128 (Vp > V), hgemm would need K = Vp rows of w, a
+    zero-padded copy (0.92 GB and 1.9 ms at Inkling 2's 200058 x 2304), so dh is cuBLAS on
+    the [C, V] view of the padded rows instead (lda = Vp, no copy): 5.1 ms against hgemm's
+    7.7 for a 2048-row chunk there on the RTX PRO 6000 (docs/design/cross_entropy.md)."""
+    C, Vp = g.shape
     V = dw.shape[0]
-    hgemm(g, w_k, out=dh_c)
+    if Vp == V:
+        hgemm(g, w, out=dh_c)
+    else:
+        torch.mm(g[:, :V], w, out=dh_c)
     c_pad = (C + 63) // 64 * 64
     if c_pad != C:
         h_c = torch.nn.functional.pad(h_c, (0, 0, 0, c_pad - C))
@@ -1011,19 +1009,18 @@ class LinearCrossEntropyChunked(torch.autograd.Function):
         scale = _ce_scale(targets, ignore_index, reduction) if need_grad else None
         logits, slab_buf = _ce_buffers(h, V, T, chunk, need_grad)
         losses = []
-        dh = dw = w_k = None
+        dh = dw = None
         if need_grad:
             dh = torch.empty_like(h)
             dw = torch.empty_like(w)
-            w_k = _ce_w_for_dh(w)
         for t0, t1 in _ce_chunks(T, chunk):
             lg = logits[: t1 - t0]
             _C.ce_logits(h[t0:t1], w, lg)
             loss_c, _ = _C.ce_rows(lg, targets[t0:t1], ignore_index, scale, cap, V)
             losses.append(loss_c)
             if need_grad:
-                _ce_backprop_chunk(lg, h[t0:t1], w_k, dh[t0:t1], dw, t0 == 0, slab_buf)
-        del logits, slab_buf, w_k
+                _ce_backprop_chunk(lg, h[t0:t1], w, dh[t0:t1], dw, t0 == 0, slab_buf)
+        del logits, slab_buf
         loss = _ce_reduce(torch.cat(losses), targets, ignore_index, reduction)
         ctx.save_for_backward(dh, dw)
         return loss
@@ -1060,12 +1057,11 @@ class LinearCrossEntropyFused(torch.autograd.Function):
         dh = torch.empty_like(h)
         dw = torch.empty_like(w)
         g, slab_buf = _ce_buffers(h, V, T, ctx.chunk)
-        w_k = _ce_w_for_dh(w)
         for t0, t1 in _ce_chunks(T, ctx.chunk):
             gc = g[: t1 - t0]
             _C.ce_grad(h[t0:t1], w, targets[t0:t1], lse[t0:t1], scale, ctx.ignore_index, gc,
                        ctx.cap)
-            _ce_backprop_chunk(gc, h[t0:t1], w_k, dh[t0:t1], dw, t0 == 0, slab_buf)
+            _ce_backprop_chunk(gc, h[t0:t1], w, dh[t0:t1], dw, t0 == 0, slab_buf)
         return dh, dw, None, None, None, None, None, None
 
 
@@ -1130,10 +1126,10 @@ def linear_cross_entropy(
 
     -1 picks 1 when a gradient is needed (three GEMMs against variant 2's four) and 2 when
     not. Variants 1 to 3 need D a multiple of 64; -1 falls back to 0 otherwise. Any V >= 1:
-    the GEMMs mask the last 128-column tile past V, and variants 1 and 2 (whose dh GEMM has no
-    such mask) also make a zero-padded copy of w for it when V is not a multiple of 128, a
-    transient [Vp, D] (0.92 GB for Inkling 2's 200058 x 2304). dw is accumulated in bf16
-    across chunks (one rounding per chunk).
+    the GEMMs mask the last 128-column tile past V, and when V is not a multiple of 128
+    variants 1 and 2 take dh from cuBLAS on the padded chunk read in place, since hgemm would
+    need a zero-padded copy of w. dw is accumulated in bf16 across chunks (one rounding per
+    chunk).
 
     softcap c (Gemma 2 and Inkling 2's final logit softcap): the loss is over
     c * tanh(z / c) of the raw logits z, and the gradient tiles carry 1 - tanh^2(z / c),
